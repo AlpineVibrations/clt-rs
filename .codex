@@ -1,0 +1,25 @@
+# Readme 
+general github readme. living document that we update as we add features
+# Design and Concepts
+Design for the project is in design.md
+This is a living document. update it as we progress.
+
+# Workflow
+at the start of the project we might break things many times as we find our vibe and groove of the project. this is good.
+we learn from our failures.
+
+# Tasks
+* When asked to work on the project check the todo list and see if there is something to do.
+* Keep track of the tasks for the project. first add them to todo. then doing, then done.
+* Tasks are in the task folder. 3 files todo.md doing.md and done.md 
+* each file is a list for that file names status
+* when you start working on something move it to the doing list.
+* when you finish working on something move it to the done list.
+* each task gets its own line
+  
+* each line is just the task description. no extra checkboxes. like 
+  - Example: 
+    - Task name 1
+    - Task B
+    - task other
+    - do this
