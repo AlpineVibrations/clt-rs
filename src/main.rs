@@ -253,6 +253,30 @@ enum Mode {
     Input,
 }
 
+fn wrap_text(text: &str, width: usize) -> String {
+    if width == 0 {
+        return text.to_string();
+    }
+    let mut result = String::new();
+    let mut current_line = String::new();
+
+    for word in text.split_whitespace() {
+        if current_line.is_empty() {
+            current_line.push_str(word);
+        } else if current_line.len() + 1 + word.len() <= width {
+            current_line.push(' ');
+            current_line.push_str(word);
+        } else {
+            result.push_str(&current_line);
+            result.push('\n');
+            current_line.clear();
+            current_line.push_str(word);
+        }
+    }
+    result.push_str(&current_line);
+    result
+}
+
 fn tui_view() -> Result<()> {
     // Setup terminal
     enable_raw_mode()?;
@@ -299,19 +323,26 @@ fn tui_view() -> Result<()> {
                 .split(kanban_area);
 
             for (i, status) in statuses.iter().enumerate() {
+                let selected_idx = board_states[i].selected();
+                let col_width = (size.width / 3) as usize;
                 let tasks = read_tasks(status).unwrap_or_default();
                 let items: Vec<ListItem> = tasks
                     .into_iter()
                     .enumerate()
                     .map(|(idx, t)| {
                         let cleaned = t.replace("- ", "");
-                        ListItem::new(format!("{}. {}", idx + 1, cleaned))
+                        if Some(idx) == selected_idx {
+                            let wrapped = wrap_text(&cleaned, col_width.saturating_sub(5));
+                            ListItem::new(format!("{}. {}", idx + 1, wrapped))
+                        } else {
+                            ListItem::new(format!("{}. {}", idx + 1, cleaned))
+                        }
                     })
                     .collect();
 
                 let list = List::new(items)
                     .block(Block::default()
-                        .title(format!("{} {}", titles[i], if selected_board == i { " <--" } else { "" }))
+                        .title(format!("{} {}", titles[i], if selected_board == i { " <<-****x`" } else { "" }))
                         .borders(Borders::ALL)
                         .border_style(Style::default().fg(colors[i])))
                     .style(Style::default().fg(Color::White))
@@ -514,24 +545,24 @@ fn tui_view() -> Result<()> {
                                          }
                                      }
                                  }
-                                 KeyCode::Left => {
-                                     if selected_board > 0 {
-                                         selected_board -= 1;
-                                         for state in board_states.iter_mut() { state.select(None); }
-                                         board_states[selected_board].select(Some(0));
-                                     } else {
-                                         feedback_buffer = "Already at the first board".to_string();
-                                     }
-                                 }
-                                 KeyCode::Right => {
-                                     if selected_board < 2 {
-                                         selected_board += 1;
-                                         for state in board_states.iter_mut() { state.select(None); }
-                                         board_states[selected_board].select(Some(0));
-                                     } else {
-                                         feedback_buffer = "Already at the last board".to_string();
-                                     }
-                                 }
+                                  KeyCode::Left => {
+                                      if selected_board > 0 {
+                                          selected_board -= 1;
+                                      } else {
+                                          selected_board = 2;
+                                      }
+                                      for state in board_states.iter_mut() { state.select(None); }
+                                      board_states[selected_board].select(Some(0));
+                                  }
+                                  KeyCode::Right => {
+                                      if selected_board < 2 {
+                                          selected_board += 1;
+                                      } else {
+                                          selected_board = 0;
+                                      }
+                                      for state in board_states.iter_mut() { state.select(None); }
+                                      board_states[selected_board].select(Some(0));
+                                  }
                                 KeyCode::Char(c) if c.is_ascii_digit() => {
                                     let new_pos = (c as u8 - b'0') as usize;
                                     let state = &mut board_states[selected_board];

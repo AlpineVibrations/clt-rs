@@ -12,3 +12,5 @@
 - when you add a new task in the cli it tels you the order number in response
 - the output from action in the kanban view should be in a console output at th bottom below the input line
 - the kanban view should show the auto numbered tasks also
+- in the kanban view if your at the left and you press left it should loop and also if at the right and you press right it should loop
+- in kanban view when you have a task selected/focused it should expand it to multiple lines if neeed
