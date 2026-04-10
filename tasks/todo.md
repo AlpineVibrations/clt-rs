@@ -1,6 +1,6 @@
 # To Do Tasks
-<!-- Tasks added here -->- [ ] 1: Test Task 1 (meta1)
-- [ ] 1: Test Task 2 (meta2)
-- [ ] 2: add command for moving a task to done.
-- [ ] 3: add sub command to list command to view only a single status like todo
-- [ ] 4: the feedback when entering a task in the view mode needs a better place. its overwriting other stuff right now. maybe it should be below the input
+- the kanban view should show the auto numbered tasks also
+- make a shell script that runs through the flow of adding a new task and moving it and finishing it
+- the output from action in the kanban view should be in a console output at th bottom below the input line
+- when you add a new task in the cli it tels you the order number in response
+- Final verification task

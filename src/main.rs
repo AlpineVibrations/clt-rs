@@ -5,7 +5,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use crossterm::{
-    event::{self, Event, KeyCode},
+    event::{self, Event, KeyCode, KeyModifiers},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
@@ -13,7 +13,7 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Style},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Block, Borders, List, ListItem, Paragraph, ListState},
     Terminal,
 };
 
@@ -35,16 +35,27 @@ enum Commands {
         description: String,
         /// Optional metadata for the task
         metadata: Option<String>,
-    },
+    },    
     /// Changes the status of a task
     Status {
-        /// The transition (e.g., "todo->doing")
-        transition: String,
-        /// The ID of the task to move
-        task_id: String,
+        /// The source status (e.g., "todo")
+        from: String,
+        /// The destination status (e.g., "doing")
+        to: String,
+        /// The index of the task to move
+        task_index: String,
     },
-    /// Lists all tasks across all states
-    List,
+    /// Marks a task as done
+    Done {
+        /// The status the task is currently in (todo, doing)
+        status: String,
+        /// The index of the task to mark as done
+        task_index: String,
+    },
+    /// Lists tasks. Optional status to filter by (todo, doing, done)
+    List {
+        status: Option<String>,
+    },
     /// Opens the Kanban TUI view
     View,
 }
@@ -57,13 +68,22 @@ fn main() -> Result<()> {
             init_tasks()?;
         }
         Commands::Add { description, metadata } => {
-            add_task(&description, metadata)?;
+            let msg = add_task(&description, metadata)?;
+            println!("{}", msg);
         }
-        Commands::Status { transition, task_id } => {
-            move_task(&transition, &task_id)?;
+        Commands::Status { from, to, task_index } => {
+            move_task(&from, &to, &task_index)?;
         }
-        Commands::List => {
-            list_tasks()?;
+        Commands::Done { status, task_index } => {
+            if status == "done" {
+                println!("Task is already done.");
+            } else {
+                move_task(&status, "done", &task_index)?;
+                println!("Task {} from {} marked as done.", task_index, status);
+            }
+        }
+        Commands::List { status } => {
+            list_tasks(status)?;
         }
         Commands::View => {
             tui_view()?;
@@ -82,107 +102,130 @@ fn get_file_path(status: &str) -> Result<std::path::PathBuf> {
     }
 }
 
-fn move_task(transition: &str, task_id: &str) -> Result<()> {
-    let parts: Vec<&str> = transition.split("->").collect();
-    if parts.len() != 2 {
-        anyhow::bail!("Invalid transition format. Use 'source->dest' (e.g., 'todo->doing')");
-    }
+// find_task_status is no longer needed for index-based referencing
+// as the user must specify the source list.
 
-    let src_path = get_file_path(parts[0])?;
-    let dest_path = get_file_path(parts[1])?;
+fn move_task(from: &str, to: &str, task_index_str: &str) -> Result<()> {
+    let src_path = get_file_path(from)?;
+    let dest_path = get_file_path(to)?;
+
+    let task_index = task_index_str.parse::<usize>().context("Invalid task index. Please provide a number.")?;
+    if task_index == 0 {
+        anyhow::bail!("Task index must be 1 or greater.");
+    }
 
     let content = fs::read_to_string(&src_path).context("Failed to read source file")?;
     let lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
     
-    let mut found_index = None;
-    let mut task_line = String::new();
+    // Filter for task lines only to find the Nth task
+    let task_lines: Vec<(usize, &String)> = lines.iter().enumerate()
+        .filter(|(_, line)| line.starts_with("- "))
+        .collect();
 
-    for (i, line) in lines.iter().enumerate() {
-        // Match "- [ ] 1: " or "- [x] 1: "
-        if line.contains(&format!(" {}: ", task_id)) && (line.starts_with("- [ ]") || line.starts_with("- [x]")) {
-            found_index = Some(i);
-            task_line = line.clone();
-            break;
-        }
+    if task_index > task_lines.len() {
+        anyhow::bail!("Task index {} out of range. Only {} tasks found in {}.", task_index, task_lines.len(), from);
     }
 
-    let idx = found_index.context(format!("Task ID {} not found in {:?}", task_id, src_path))?;
+    let (actual_line_idx, task_line) = task_lines[task_index - 1];
+    let task_line_content = task_line.clone();
 
     // Remove from source
     let mut new_src_lines = lines.clone();
-    new_src_lines.remove(idx);
+    new_src_lines.remove(actual_line_idx);
     fs::write(&src_path, new_src_lines.join("\n") + "\n").context("Failed to update source file")?;
 
-    // Update checkbox for destination
-    let final_line = if parts[1] == "done" {
-        task_line.replace("- [ ]", "- [x]")
-    } else if parts[1] == "todo" {
-        task_line.replace("- [x]", "- [ ]")
+    // Ensure the destination file ends with a newline before appending to prevent line merging
+    let mut dest_content = fs::read_to_string(&dest_path).context("Failed to read destination file")?;
+    if !dest_content.is_empty() && !dest_content.ends_with('\n') {
+        dest_content.push('\n');
+    }
+    dest_content.push_str(&task_line_content);
+    dest_content.push('\n');
+    fs::write(&dest_path, dest_content).context("Failed to update destination file")?;
+
+    //println!("Task {} moved from {} to {}.", task_index, from, to);
+    Ok(())
+}
+
+fn reorder_task(status: &str, from_idx: usize, to_idx: usize) -> Result<()> {
+    let path = get_file_path(status)?;
+    let content = fs::read_to_string(&path).context("Failed to read file")?;
+    let lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+
+    let task_indices: Vec<usize> = lines.iter().enumerate()
+        .filter(|(_, line)| line.starts_with("- "))
+        .map(|(i, _)| i)
+        .collect();
+
+    if from_idx >= task_indices.len() {
+        anyhow::bail!("Task index out of range");
+    }
+
+    let actual_from_idx = task_indices[from_idx];
+    let task_line = lines[actual_from_idx].clone();
+
+    let mut new_lines = lines.clone();
+    new_lines.remove(actual_from_idx);
+
+    // Find the new position for the task line
+    let new_task_indices: Vec<usize> = new_lines.iter().enumerate()
+        .filter(|(_, line)| line.starts_with("- "))
+        .map(|(i, _)| i)
+        .collect();
+
+    let insert_at_idx = if to_idx < new_task_indices.len() {
+        new_task_indices[to_idx]
     } else {
-        task_line
+        new_lines.len()
     };
 
-    let mut dest_file = fs::OpenOptions::new()
-        .append(true)
-        .open(&dest_path)
-        .context("Failed to open destination file")?;
-
-    dest_file.write_all(format!("{}\n", final_line).as_bytes()).context("Failed to write to destination file")?;
-
-    println!("Task {} moved from {} to {}.", task_id, parts[0], parts[1]);
+    new_lines.insert(insert_at_idx, task_line);
+    fs::write(&path, new_lines.join("\n") + "\n").context("Failed to write file")?;
     Ok(())
 }
 
-fn list_tasks() -> Result<()> {
-    let statuses = ["todo", "doing", "done"];
-    for status in statuses {
-        let path = get_file_path(status)?;
-        println!("\n--- {} ---", status.to_uppercase());
+fn list_tasks(filter_status: Option<String>) -> Result<()> {
+    if let Some(ref s) = filter_status {
+        let path = get_file_path(s)?;
+        println!("\n--- {} ---", s.to_uppercase());
         let content = fs::read_to_string(&path).context(format!("Failed to read {:?}", path))?;
+        let mut index = 1;
         for line in content.lines() {
-            if line.starts_with("- [") {
-                println!("{}", line);
+            if line.starts_with("- ") {
+                println!("{}. {}", index, &line[2..]);
+                index += 1;
             }
         }
-    }
-    Ok(())
-}
-
-fn add_task(description: &str, metadata: Option<String>) -> Result<()> {
-    let path = Path::new("tasks/todo.md");
-    if !path.exists() {
-        anyhow::bail!("Tasks not initialized. Please run 'init' first.");
-    }
-
-    // Find the maximum ID across all task files to ensure uniqueness
-    let mut max_id = 0;
-    for status in ["todo", "doing", "done"] {
-        if let Ok(tasks) = read_tasks(status) {
-            for task in tasks {
-                // Task format: "- [ ] 1: Description"
-                if let Some(id_part) = task.split(':').next() {
-                    // The id_part might be "- [ ] 1" or "- [x] 1", so we need to be careful
-                    // Better: split by space and take the last part before the colon
-                    let parts: Vec<&str> = id_part.split_whitespace().collect();
-                    if let Some(last) = parts.last() {
-                        if let Ok(id) = last.parse::<usize>() {
-                            if id > max_id {
-                                max_id = id;
-                            }
-                        }
-                    }
+    } else {
+        let statuses = ["todo", "doing", "done"];
+        for status in statuses {
+            let path = get_file_path(status)?;
+            println!("\n--- {} ---", status.to_uppercase());
+            let content = fs::read_to_string(&path).context(format!("Failed to read {:?}", path))?;
+            let mut index = 1;
+            for line in content.lines() {
+                if line.starts_with("- ") {
+                    println!("{}. {}", index, &line[2..]);
+                    index += 1;
                 }
             }
         }
     }
-    let task_id = max_id + 1;
+    Ok(())
+}
+
+fn add_task(description: &str, metadata: Option<String>) -> Result<String> {
+    let path = Path::new("tasks/todo.md");
+    if !path.exists() {
+        anyhow::bail!("Tasks not initialized. Please run 'init' first.");
+    }
 
     let metadata_str = match metadata {
         Some(m) => format!(" ({})", m),
         None => "".to_string(),
     };
 
-    let task_line = format!("- [ ] {}: {}{}\n", task_id, description, metadata_str);
+    let task_line = format!("- {}{}\n", description, metadata_str);
     
     let mut file = fs::OpenOptions::new()
         .append(true)
@@ -191,8 +234,7 @@ fn add_task(description: &str, metadata: Option<String>) -> Result<()> {
 
     file.write_all(task_line.as_bytes()).context("Failed to write task to todo.md")?;
 
-    println!("Task added with ID: {}", task_id);
-    Ok(())
+    Ok("Task added successfully.".to_string())
 }
 
 fn read_tasks(status: &str) -> Result<Vec<String>> {
@@ -200,7 +242,7 @@ fn read_tasks(status: &str) -> Result<Vec<String>> {
     let content = fs::read_to_string(&path).context(format!("Failed to read {:?}", path))?;
     let tasks = content
         .lines()
-        .filter(|l| l.starts_with("- ["))
+        .filter(|l| l.starts_with("- "))
         .map(|l| l.to_string())
         .collect();
     Ok(tasks)
@@ -219,17 +261,30 @@ fn tui_view() -> Result<()> {
 
     let mut current_mode = Mode::View;
     let mut input_buffer = String::new();
+    let mut feedback_buffer = String::from("Welcome to Kanban View! 't/p/d' to switch boards, Arrows to navigate, Ctrl+Up/Down to move task, Left/Right to move tasks, Numbers to reorder, Enter to add, 'q' to quit.");
+
+    let mut selected_board = 0; // 0: todo, 1: doing, 2: done
+    let mut board_states = [
+        ListState::default(),
+        ListState::default(),
+        ListState::default(),
+    ];
+
+    let statuses = ["todo", "doing", "done"];
+    let titles = ["To Do", "In Progress", "Done"];
+    let colors = [Color::Yellow, Color::Cyan, Color::Green];
 
     loop {
         terminal.draw(|f| {
             let size = f.size();
             
-            // Main layout: Kanban board on top, input area at bottom if in Input mode
+            // Main layout: Kanban board, input area (if active), and feedback console
             let main_layout = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Min(0),
                     if matches!(current_mode, Mode::Input) { Constraint::Length(3) } else { Constraint::Length(0) },
+                    Constraint::Length(3),
                 ])
                 .split(size);
 
@@ -243,28 +298,27 @@ fn tui_view() -> Result<()> {
                 ])
                 .split(kanban_area);
 
-            let statuses = ["todo", "doing", "done"];
-            let titles = ["To Do", "In Progress", "Done"];
-            let colors = [Color::Yellow, Color::Cyan, Color::Green];
-
             for (i, status) in statuses.iter().enumerate() {
                 let tasks = read_tasks(status).unwrap_or_default();
                 let items: Vec<ListItem> = tasks
                     .into_iter()
-                    .map(|t| {
-                        let cleaned = t.replace("- [ ] ", "").replace("- [x] ", "");
-                        ListItem::new(cleaned)
+                    .enumerate()
+                    .map(|(idx, t)| {
+                        let cleaned = t.replace("- ", "");
+                        ListItem::new(format!("{}. {}", idx + 1, cleaned))
                     })
                     .collect();
 
                 let list = List::new(items)
                     .block(Block::default()
-                        .title(titles[i])
+                        .title(format!("{} {}", titles[i], if selected_board == i { " <--" } else { "" }))
                         .borders(Borders::ALL)
                         .border_style(Style::default().fg(colors[i])))
-                    .style(Style::default().fg(Color::White));
+                    .style(Style::default().fg(Color::White))
+                    .highlight_style(Style::default().fg(Color::Black).bg(Color::White))
+                    .highlight_symbol(">> ");
 
-                f.render_widget(list, chunks[i]);
+                f.render_stateful_widget(list, chunks[i], &mut board_states[i]);
             }
 
             if matches!(current_mode, Mode::Input) {
@@ -274,24 +328,147 @@ fn tui_view() -> Result<()> {
                     .style(Style::default().fg(Color::White));
                 f.render_widget(input_paragraph, main_layout[1]);
             }
+
+            let feedback_paragraph = Paragraph::new(feedback_buffer.as_str())
+                .block(Block::default().borders(Borders::ALL).title("Console"))
+                .style(Style::default().fg(Color::Gray));
+            
+            // The feedback area is always the last element of main_layout
+            let feedback_area = *main_layout.last().unwrap();
+            f.render_widget(feedback_paragraph, feedback_area);
         })?;
 
         if event::poll(std::time::Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 match current_mode {
                     Mode::View => {
-                        if key.code == KeyCode::Char('q') {
-                            break;
-                        } else if key.code == KeyCode::Enter {
-                            current_mode = Mode::Input;
-                            input_buffer.clear();
+                        if key.modifiers.contains(KeyModifiers::CONTROL) {
+                            match key.code {
+                                KeyCode::Up => {
+                                    let state = &mut board_states[selected_board];
+                                    if let Some(idx) = state.selected() {
+                                        if idx > 0 {
+                                            match reorder_task(statuses[selected_board], idx, idx - 1) {
+                                                Ok(_) => feedback_buffer = format!("Moved task up to position {}", idx),
+                                                Err(e) => feedback_buffer = format!("Error: {}", e),
+                                            }
+                                            state.select(Some(idx - 1));
+                                        } else {
+                                            feedback_buffer = "Already at the top".to_string();
+                                        }
+                                    }
+                                }
+                                KeyCode::Down => {
+                                    let state = &mut board_states[selected_board];
+                                    if let Some(idx) = state.selected() {
+                                        let tasks = read_tasks(statuses[selected_board]).unwrap_or_default();
+                                        if idx < tasks.len() - 1 {
+                                            match reorder_task(statuses[selected_board], idx, idx + 1) {
+                                                Ok(_) => feedback_buffer = format!("Moved task down to position {}", idx + 2),
+                                                Err(e) => feedback_buffer = format!("Error: {}", e),
+                                            }
+                                            state.select(Some(idx + 1));
+                                        } else {
+                                            feedback_buffer = "Already at the bottom".to_string();
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        } else {
+                            match key.code {
+                                KeyCode::Char('q') => break,
+                                KeyCode::Enter => {
+                                    current_mode = Mode::Input;
+                                    input_buffer.clear();
+                                }
+                                KeyCode::Char('t') => {
+                                    selected_board = 0;
+                                    board_states[selected_board].select(Some(0));
+                                }
+                                KeyCode::Char('p') => {
+                                    selected_board = 1;
+                                    board_states[selected_board].select(Some(0));
+                                }
+                                KeyCode::Char('d') => {
+                                    selected_board = 2;
+                                    board_states[selected_board].select(Some(0));
+                                }
+                                KeyCode::Up => {
+                                    let state = &mut board_states[selected_board];
+                                    let i = state.selected().unwrap_or(0);
+                                    if i > 0 {
+                                        state.select(Some(i - 1));
+                                    } else {
+                                        state.select(Some(0));
+                                    }
+                                }
+                                KeyCode::Down => {
+                                    let state = &mut board_states[selected_board];
+                                    let i = state.selected().unwrap_or(0);
+                                    let tasks = read_tasks(statuses[selected_board]).unwrap_or_default();
+                                    if i < tasks.len() - 1 {
+                                        state.select(Some(i + 1));
+                                    } else {
+                                        state.select(Some(tasks.len().saturating_sub(1)));
+                                    }
+                                }
+                                KeyCode::Left => {
+                                    let state = &mut board_states[selected_board];
+                                    if let Some(idx) = state.selected() {
+                                        if selected_board > 0 {
+                                            let from = statuses[selected_board];
+                                            let to = statuses[selected_board - 1];
+                                            match move_task(&from, &to, &(idx + 1).to_string()) {
+                                                Ok(_) => feedback_buffer = format!("Moved task to {}", to),
+                                                Err(e) => feedback_buffer = format!("Error: {}", e),
+                                            }
+                                        } else {
+                                            feedback_buffer = "Already at the first board".to_string();
+                                        }
+                                    }
+                                }
+                                KeyCode::Right => {
+                                    let state = &mut board_states[selected_board];
+                                    if let Some(idx) = state.selected() {
+                                        if selected_board < 2 {
+                                            let from = statuses[selected_board];
+                                            let to = statuses[selected_board + 1];
+                                            match move_task(&from, &to, &(idx + 1).to_string()) {
+                                                Ok(_) => feedback_buffer = format!("Moved task to {}", to),
+                                                Err(e) => feedback_buffer = format!("Error: {}", e),
+                                            }
+                                        } else {
+                                            feedback_buffer = "Already at the last board".to_string();
+                                        }
+                                    }
+                                }
+                                KeyCode::Char(c) if c.is_ascii_digit() => {
+                                    let new_pos = (c as u8 - b'0') as usize;
+                                    let state = &mut board_states[selected_board];
+                                    if let Some(idx) = state.selected() {
+                                        if new_pos > 0 {
+                                            match reorder_task(statuses[selected_board], idx, new_pos - 1) {
+                                                Ok(_) => feedback_buffer = format!("Reordered task to position {}", new_pos),
+                                                Err(e) => feedback_buffer = format!("Error: {}", e),
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
                         }
                     }
                     Mode::Input => {
                         match key.code {
                             KeyCode::Enter => {
                                 if !input_buffer.trim().is_empty() {
-                                    add_task(&input_buffer, None)?;
+                                    match add_task(&input_buffer, None) {
+                                        Ok(msg) => feedback_buffer = msg,
+                                        Err(e) => feedback_buffer = format!("Error: {}", e),
+                                    }
+                                } else {
+                                    feedback_buffer = "Task description cannot be empty.".to_string();
                                 }
                                 current_mode = Mode::View;
                                 input_buffer.clear();

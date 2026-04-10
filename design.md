@@ -18,8 +18,8 @@ Each markdown file should start with appropriate headers (e.g., `# To Do Tasks`,
 The CLI needs commands to interact with tasks:
 *   `lls-cli-task init`: Initializes the `tasks/` directory and the three markdown files if they don't exist.
 *   `lls-cli-task add <task_description> [optional_metadata]`: Creates a new task and adds it to `todo.md`.
-*   `lls-cli-task status <task_id>`: Allows moving a task from one list to another (e.g., `status todo -> doing <task_id>`).
-*   `lls-cli-task list`: Displays an overview of all tasks across the three files.
+*   `lls-cli-task status <transition> <task_index>`: Allows moving a task from one list to another (e.g., `status todo->doing 1`).
+*   `lls-cli-task list`: Displays an overview of all tasks across the three files, numbered by their current index.
 
 ### 4. View Layer (TUI/Kanban View)
 The primary interaction view, accessible via a dedicated command (e.g., `lls-cli-task view`), must use `ratatui` to render a Kanban board representation of the tasks.
@@ -30,20 +30,20 @@ The screen will be divided into three visible columns corresponding to the state
 2.  **In Progress:** Tasks read from `tasks/doing.md`.
 3.  **Done:** Tasks read from `tasks/done.md`.
 
-Tasks within each column must display key information (e.g., Title, ID).
+Tasks within each column must display their description.
 
 ### 5. Implementation Notes
 *   **State Persistence**: All task data must be persisted in the respective Markdown files (`todo.md`, `doing.md`, `done.md`).
-*   **Task Identification**: A unique ID or index must be assigned to each task to manage status transitions accurately.
-*   **Markdown Parsing**: The CLI must reliably parse tasks from Markdown content to extract actionable data (Title, Status, Metadata).
+*   **Task Identification**: Tasks are identified by their 1-based index within their current list. This allows for a clean markdown format without stored IDs.
+*   **Markdown Parsing**: The CLI must reliably parse tasks from Markdown content (lines starting with `- `).
 
 ---
-### Implementation Summary (Completed)
-The project has been fully implemented with the following technical choices:
+### Implementation Summary
+The project has been implemented with the following technical choices:
 - **CLI Framework**: `clap` (derive) for command-line argument parsing.
 - **TUI Framework**: `ratatui` with `crossterm` backend for the Kanban view.
 - **Error Handling**: `anyhow` for flexible error propagation.
-- **ID Management**: Implemented a global ID scanner that finds the maximum ID across all three state files to ensure uniqueness when adding new tasks.
+- **Indexing**: Implemented a dynamic index-based system where the position of the task in the file determines its ID for that session.
 - **Persistence**: Direct file I/O using `std::fs` to maintain Markdown compatibility.
 
-**Status**: Fully Implemented.
+**Status**: Updated to Index-Based System.
