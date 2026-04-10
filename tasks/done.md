@@ -3,3 +3,12 @@
 - add sub command to list command to view only a single status like todo
 - the feedback when entering a task in the view mode needs a better place. its overwriting other stuff right now. maybe it should be below the input
 - move the feedback to a line below the input line
+- Final Test Task
+- Final verification task
+- Loop Up/Down keys in Kanban view
+- Loop Up/Down keys in Kanban view
+- Loop Up/Down keys in Kanban view
+- Move focus between boards with Left/Right arrows and move tasks with Alt+Left/Right
+- when you add a new task in the cli it tels you the order number in response
+- the output from action in the kanban view should be in a console output at th bottom below the input line
+- the kanban view should show the auto numbered tasks also
