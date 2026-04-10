@@ -1,4 +1,15 @@
-# clt Command Line Tasks
+  ██████╗██╗  ████████╗
+ ██╔════╝██║  ╚══██╔══╝
+ ██║     ██║     ██║   
+ ██║     ██║     ██║   
+ ╚██████╗███████╗██║   
+  ╚═════╝╚══════╝╚═╝   
+
+  ▸ command line tasks
+  ▸ file-backed · rust · tui
+
+
+# clt is Command Line Tasks
 
 A simple, file-system-backed CLI task management app written in Rust. It uses Markdown files for persistence and provides both a command-line interface and a TUI Kanban board.
 

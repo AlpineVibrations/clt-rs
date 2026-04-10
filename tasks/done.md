@@ -14,3 +14,4 @@
 - the kanban view should show the auto numbered tasks also
 - in the kanban view if your at the left and you press left it should loop and also if at the right and you press right it should loop
 - in kanban view when you have a task selected/focused it should expand it to multiple lines if neeed
+- you should be able to run the cli command of list with the number of the board to get that also ex: clt list 1

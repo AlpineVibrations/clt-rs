@@ -9,7 +9,7 @@ cargo run -- list todo
 echo ""
 
 echo "--- Step 3: Moving task from todo to doing ---"
-cargo run -- status todo doing 1
+cargo run -- status todo 1 doing
 echo ""
 
 echo "--- Step 4: Listing doing tasks ---"

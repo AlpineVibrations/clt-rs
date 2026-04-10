@@ -40,10 +40,10 @@ enum Commands {
     Status {
         /// The source status (e.g., "todo")
         from: String,
-        /// The destination status (e.g., "doing")
-        to: String,
         /// The index of the task to move
         task_index: String,
+        /// The destination status (e.g., "doing")
+        to: String,
     },
     /// Marks a task as done
     Done {
@@ -71,7 +71,7 @@ fn main() -> Result<()> {
             let msg = add_task(&description, metadata)?;
             println!("{}", msg);
         }
-        Commands::Status { from, to, task_index } => {
+        Commands::Status { from, task_index, to } => {
             move_task(&from, &to, &task_index)?;
         }
         Commands::Done { status, task_index } => {
@@ -132,7 +132,14 @@ fn move_task(from: &str, to: &str, task_index_str: &str) -> Result<()> {
     // Remove from source
     let mut new_src_lines = lines.clone();
     new_src_lines.remove(actual_line_idx);
-    fs::write(&src_path, new_src_lines.join("\n") + "\n").context("Failed to update source file")?;
+    let updated_src_content = new_src_lines.join("\n");
+    // Add trailing newline if the file wasn't empty
+    let final_src_content = if updated_src_content.is_empty() {
+        updated_src_content
+    } else {
+        format!("{}\n", updated_src_content)
+    };
+    fs::write(&src_path, final_src_content).context("Failed to update source file")?;
 
     // Ensure the destination file ends with a newline before appending to prevent line merging
     let mut dest_content = fs::read_to_string(&dest_path).context("Failed to read destination file")?;
@@ -140,10 +147,9 @@ fn move_task(from: &str, to: &str, task_index_str: &str) -> Result<()> {
         dest_content.push('\n');
     }
     dest_content.push_str(&task_line_content);
-    dest_content.push('\n');
+    // task_line_content already includes \n from the add_task function or the original file
     fs::write(&dest_path, dest_content).context("Failed to update destination file")?;
 
-    //println!("Task {} moved from {} to {}.", task_index, from, to);
     Ok(())
 }
 
@@ -186,8 +192,15 @@ fn reorder_task(status: &str, from_idx: usize, to_idx: usize) -> Result<()> {
 
 fn list_tasks(filter_status: Option<String>) -> Result<()> {
     if let Some(ref s) = filter_status {
-        let path = get_file_path(s)?;
-        println!("\n--- {} ---", s.to_uppercase());
+        let status = match s.as_str() {
+            "1" => "todo",
+            "2" => "doing",
+            "3" => "done",
+            _ => s.as_str(),
+        };
+
+        let path = get_file_path(status)?;
+        println!("\n--- {} ---", status.to_uppercase());
         let content = fs::read_to_string(&path).context(format!("Failed to read {:?}", path))?;
         let mut index = 1;
         for line in content.lines() {
