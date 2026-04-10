@@ -261,7 +261,7 @@ fn tui_view() -> Result<()> {
 
     let mut current_mode = Mode::View;
     let mut input_buffer = String::new();
-    let mut feedback_buffer = String::from("Welcome to Kanban View! 't/p/d' to switch boards, Arrows to navigate, Ctrl+Up/Down to move task, Left/Right to move tasks, Numbers to reorder, Enter to add, 'q' to quit.");
+    let mut feedback_buffer = String::from("Welcome to Kanban View! Arrows to navigate/focus boards, Alt+Up/Down to reorder, Alt+Left/Right to move tasks, Numbers to reorder, Enter to add, 'q' to quit.");
 
     let mut selected_board = 0; // 0: todo, 1: doing, 2: done
     let mut board_states = [
@@ -342,7 +342,7 @@ fn tui_view() -> Result<()> {
             if let Event::Key(key) = event::read()? {
                 match current_mode {
                     Mode::View => {
-                        if key.modifiers.contains(KeyModifiers::CONTROL) {
+                        if key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::ALT) {
                             match key.code {
                                 KeyCode::Up => {
                                     let state = &mut board_states[selected_board];
@@ -358,22 +358,52 @@ fn tui_view() -> Result<()> {
                                         }
                                     }
                                 }
-                                KeyCode::Down => {
-                                    let state = &mut board_states[selected_board];
-                                    if let Some(idx) = state.selected() {
-                                        let tasks = read_tasks(statuses[selected_board]).unwrap_or_default();
-                                        if idx < tasks.len() - 1 {
-                                            match reorder_task(statuses[selected_board], idx, idx + 1) {
-                                                Ok(_) => feedback_buffer = format!("Moved task down to position {}", idx + 2),
-                                                Err(e) => feedback_buffer = format!("Error: {}", e),
-                                            }
-                                            state.select(Some(idx + 1));
-                                        } else {
-                                            feedback_buffer = "Already at the bottom".to_string();
-                                        }
-                                    }
-                                }
-                                _ => {}
+                                 KeyCode::Down => {
+                                     let state = &mut board_states[selected_board];
+                                     if let Some(idx) = state.selected() {
+                                         let tasks = read_tasks(statuses[selected_board]).unwrap_or_default();
+                                         if idx < tasks.len() - 1 {
+                                             match reorder_task(statuses[selected_board], idx, idx + 1) {
+                                                 Ok(_) => feedback_buffer = format!("Moved task down to position {}", idx + 2),
+                                                 Err(e) => feedback_buffer = format!("Error: {}", e),
+                                             }
+                                             state.select(Some(idx + 1));
+                                         } else {
+                                             feedback_buffer = "Already at the bottom".to_string();
+                                         }
+                                     }
+                                 }
+                                 KeyCode::Left => {
+                                     let state = &mut board_states[selected_board];
+                                     if let Some(idx) = state.selected() {
+                                         if selected_board > 0 {
+                                             let from = statuses[selected_board];
+                                             let to = statuses[selected_board - 1];
+                                             match move_task(&from, &to, &(idx + 1).to_string()) {
+                                                 Ok(_) => feedback_buffer = format!("Moved task to {}", to),
+                                                 Err(e) => feedback_buffer = format!("Error: {}", e),
+                                             }
+                                         } else {
+                                             feedback_buffer = "Already at the first board".to_string();
+                                         }
+                                     }
+                                 }
+                                 KeyCode::Right => {
+                                     let state = &mut board_states[selected_board];
+                                     if let Some(idx) = state.selected() {
+                                         if selected_board < 2 {
+                                             let from = statuses[selected_board];
+                                             let to = statuses[selected_board + 1];
+                                             match move_task(&from, &to, &(idx + 1).to_string()) {
+                                                 Ok(_) => feedback_buffer = format!("Moved task to {}", to),
+                                                 Err(e) => feedback_buffer = format!("Error: {}", e),
+                                             }
+                                         } else {
+                                             feedback_buffer = "Already at the last board".to_string();
+                                         }
+                                     }
+                                 }
+                                 _ => {}
                             }
                         } else {
                             match key.code {
@@ -413,36 +443,22 @@ fn tui_view() -> Result<()> {
                                         state.select(Some(tasks.len().saturating_sub(1)));
                                     }
                                 }
-                                KeyCode::Left => {
-                                    let state = &mut board_states[selected_board];
-                                    if let Some(idx) = state.selected() {
-                                        if selected_board > 0 {
-                                            let from = statuses[selected_board];
-                                            let to = statuses[selected_board - 1];
-                                            match move_task(&from, &to, &(idx + 1).to_string()) {
-                                                Ok(_) => feedback_buffer = format!("Moved task to {}", to),
-                                                Err(e) => feedback_buffer = format!("Error: {}", e),
-                                            }
-                                        } else {
-                                            feedback_buffer = "Already at the first board".to_string();
-                                        }
-                                    }
-                                }
-                                KeyCode::Right => {
-                                    let state = &mut board_states[selected_board];
-                                    if let Some(idx) = state.selected() {
-                                        if selected_board < 2 {
-                                            let from = statuses[selected_board];
-                                            let to = statuses[selected_board + 1];
-                                            match move_task(&from, &to, &(idx + 1).to_string()) {
-                                                Ok(_) => feedback_buffer = format!("Moved task to {}", to),
-                                                Err(e) => feedback_buffer = format!("Error: {}", e),
-                                            }
-                                        } else {
-                                            feedback_buffer = "Already at the last board".to_string();
-                                        }
-                                    }
-                                }
+                                 KeyCode::Left => {
+                                     if selected_board > 0 {
+                                         selected_board -= 1;
+                                         board_states[selected_board].select(Some(0));
+                                     } else {
+                                         feedback_buffer = "Already at the first board".to_string();
+                                     }
+                                 }
+                                 KeyCode::Right => {
+                                     if selected_board < 2 {
+                                         selected_board += 1;
+                                         board_states[selected_board].select(Some(0));
+                                     } else {
+                                         feedback_buffer = "Already at the last board".to_string();
+                                     }
+                                 }
                                 KeyCode::Char(c) if c.is_ascii_digit() => {
                                     let new_pos = (c as u8 - b'0') as usize;
                                     let state = &mut board_states[selected_board];
