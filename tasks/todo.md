@@ -1,3 +1,5 @@
 # To Do Tasks
-- if you are selected on a task in the kanban view you should be able to edit it
+- Test task for status change
+- the cli command to get into view should be the default whith no args
+- we need to support delete a selected task in the kanban and in the cli
 - Test task for status change

@@ -153,6 +153,35 @@ fn move_task(from: &str, to: &str, task_index_str: &str) -> Result<()> {
     Ok(())
 }
 
+fn update_task(status: &str, task_index: usize, new_description: &str) -> Result<()> {
+    let path = get_file_path(status)?;
+    let content = fs::read_to_string(&path).context("Failed to read file")?;
+    let lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+
+    let mut task_count = 0;
+    let mut updated_lines = Vec::new();
+
+    for line in lines {
+        if line.starts_with("- ") {
+            task_count += 1;
+            if task_count == task_index {
+                updated_lines.push(format!("- {}", new_description));
+            } else {
+                updated_lines.push(line);
+            }
+        } else {
+            updated_lines.push(line);
+        }
+    }
+
+    if task_count < task_index {
+        anyhow::bail!("Task index {} out of range", task_index);
+    }
+
+    fs::write(&path, updated_lines.join("\n") + "\n").context("Failed to write file")?;
+    Ok(())
+}
+
 fn reorder_task(status: &str, from_idx: usize, to_idx: usize) -> Result<()> {
     let path = get_file_path(status)?;
     let content = fs::read_to_string(&path).context("Failed to read file")?;
@@ -264,6 +293,7 @@ fn read_tasks(status: &str) -> Result<Vec<String>> {
 enum Mode {
     View,
     Input,
+    Edit,
 }
 
 fn wrap_text(text: &str, width: usize) -> String {
@@ -298,9 +328,10 @@ fn tui_view() -> Result<()> {
 
     let mut current_mode = Mode::View;
     let mut input_buffer = String::new();
-    let mut feedback_buffer = String::from("Kanban View! Arrows to navigate/focus boards, Shift+Arrows or I/K to reorder, Shift+Arrows or J/L to move tasks, Numbers to reorder, Enter to add, 'q' to quit.");
+    let mut feedback_buffer = String::from("Kanban View! Arrows to navigate/focus boards, Shift+Arrows or I/K to reorder, Shift+Arrows or J/L to move tasks, Numbers to reorder, Space to add, Enter to edit, 'q' to quit.");
 
     let mut selected_board = 0; // 0: todo, 1: doing, 2: done
+    let mut editing_task_idx: Option<usize> = None;
     let mut board_states = [
         ListState::default(),
         ListState::default(),
@@ -324,7 +355,7 @@ fn tui_view() -> Result<()> {
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Min(0),
-                    if matches!(current_mode, Mode::Input) { Constraint::Length(3) } else { Constraint::Length(0) },
+                    if matches!(current_mode, Mode::Input) || matches!(current_mode, Mode::Edit) { Constraint::Length(3) } else { Constraint::Length(0) },
                     Constraint::Length(3),
                 ])
                 .split(size);
@@ -370,13 +401,14 @@ fn tui_view() -> Result<()> {
                 f.render_stateful_widget(list, chunks[i], &mut board_states[i]);
             }
 
-            if matches!(current_mode, Mode::Input) {
-                let input_text = format!(" Add Task: {} ", input_buffer);
-                let input_paragraph = Paragraph::new(input_text)
-                    .block(Block::default().borders(Borders::ALL).title("Input Mode (Enter to save, Esc to cancel)"))
-                    .style(Style::default().fg(Color::White));
-                f.render_widget(input_paragraph, main_layout[1]);
-            }
+                if matches!(current_mode, Mode::Input) || matches!(current_mode, Mode::Edit) {
+                    let label = if matches!(current_mode, Mode::Input) { " Add Task: " } else { " Edit Task: " };
+                    let input_text = format!("{}{}", label, input_buffer);
+                    let input_paragraph = Paragraph::new(input_text)
+                        .block(Block::default().borders(Borders::ALL).title("Input Mode (Enter to save, Esc to cancel)"))
+                        .style(Style::default().fg(Color::White));
+                    f.render_widget(input_paragraph, main_layout[1]);
+                }
 
             let feedback_paragraph = Paragraph::new(feedback_buffer.as_str())
                 .block(Block::default().borders(Borders::ALL).title("Console"))
@@ -460,10 +492,22 @@ fn tui_view() -> Result<()> {
                         } else {
                             match key.code {
                                 KeyCode::Char('q') => break,
-                                KeyCode::Enter => {
-                                    current_mode = Mode::Input;
-                                    input_buffer.clear();
-                                }
+                                 KeyCode::Enter => {
+                                     let state = &board_states[selected_board];
+                                     if let Some(idx) = state.selected() {
+                                         current_mode = Mode::Edit;
+                                         editing_task_idx = Some(idx + 1);
+                                         let tasks = read_tasks(statuses[selected_board]).unwrap_or_default();
+                                         input_buffer = tasks[idx].replace("- ", "");
+                                     } else {
+                                         current_mode = Mode::Input;
+                                         input_buffer.clear();
+                                     }
+                                 }
+                                 KeyCode::Char(' ') => {
+                                     current_mode = Mode::Input;
+                                     input_buffer.clear();
+                                 }
                                 KeyCode::Char('1') => {
                                     selected_board = 0;
                                     for state in board_states.iter_mut() { state.select(None); }
@@ -613,6 +657,37 @@ fn tui_view() -> Result<()> {
                             KeyCode::Esc => {
                                 current_mode = Mode::View;
                                 input_buffer.clear();
+                            }
+                            KeyCode::Char(c) => {
+                                input_buffer.push(c);
+                            }
+                            KeyCode::Backspace => {
+                                input_buffer.pop();
+                            }
+                            _ => {}
+                        }
+                    }
+                    Mode::Edit => {
+                        match key.code {
+                            KeyCode::Enter => {
+                                if !input_buffer.trim().is_empty() {
+                                    if let Some(idx) = editing_task_idx {
+                                        match update_task(statuses[selected_board], idx, &input_buffer) {
+                                            Ok(_) => feedback_buffer = format!("Task {} updated successfully.", idx),
+                                            Err(e) => feedback_buffer = format!("Error: {}", e),
+                                        }
+                                    }
+                                } else {
+                                    feedback_buffer = "Task description cannot be empty.".to_string();
+                                }
+                                current_mode = Mode::View;
+                                input_buffer.clear();
+                                editing_task_idx = None;
+                            }
+                            KeyCode::Esc => {
+                                current_mode = Mode::View;
+                                input_buffer.clear();
+                                editing_task_idx = None;
                             }
                             KeyCode::Char(c) => {
                                 input_buffer.push(c);
