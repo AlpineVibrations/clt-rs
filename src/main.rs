@@ -299,7 +299,12 @@ fn list_tasks(filter_status: Option<String>) -> Result<()> {
 }
 
 fn add_task(description: &str, metadata: Option<String>) -> Result<String> {
-    let path = Path::new("tasks/todo.md");
+    insert_task("todo", None, description, metadata)
+        .map(|_| "Task added successfully.".to_string())
+}
+
+fn insert_task(status: &str, index: Option<usize>, description: &str, metadata: Option<String>) -> Result<()> {
+    let path = get_file_path(status)?;
     if !path.exists() {
         anyhow::bail!("Tasks not initialized. Please run 'init' first.");
     }
@@ -309,16 +314,36 @@ fn add_task(description: &str, metadata: Option<String>) -> Result<String> {
         None => "".to_string(),
     };
 
-    let task_line = format!("- {}{}\n", description, metadata_str);
-    
-    let mut file = fs::OpenOptions::new()
-        .append(true)
-        .open(path)
-        .context("Failed to open todo.md for appending")?;
+    let task_line = format!("- {}{}", description, metadata_str);
+    let content = fs::read_to_string(&path).context("Failed to read file")?;
+    let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
 
-    file.write_all(task_line.as_bytes()).context("Failed to write task to todo.md")?;
+    if let Some(idx) = index {
+        // Find the actual line index for the Nth task
+        let task_lines: Vec<usize> = lines.iter().enumerate()
+            .filter(|(_, line)| line.starts_with("- "))
+            .map(|(i, _)| i)
+            .collect();
 
-    Ok("Task added successfully.".to_string())
+        if idx < task_lines.len() {
+            let actual_idx = task_lines[idx] + 1;
+            lines.insert(actual_idx, task_line);
+        } else {
+            lines.push(task_line);
+        }
+    } else {
+        lines.push(task_line);
+    }
+
+    let updated_content = lines.join("\n");
+    let final_content = if updated_content.is_empty() {
+        updated_content
+    } else {
+        format!("{}\n", updated_content)
+    };
+
+    fs::write(&path, final_content).context("Failed to write task to file")?;
+    Ok(())
 }
 
 fn read_tasks(status: &str) -> Result<Vec<String>> {
@@ -430,15 +455,20 @@ fn tui_view() -> Result<()> {
                     })
                     .collect();
 
+                let highlight_style = if matches!(current_mode, Mode::View) {
+                    Style::default().fg(Color::Black).bg(Color::White)
+                } else {
+                    // Use a more subtle highlight when in Input/Edit mode
+                    Style::default().fg(Color::White).bg(Color::Rgb(60, 60, 60))
+                };
+
                 let list = List::new(items)
                     .block(Block::default()
                         .title(format!("{} {}", titles[i], if selected_board == i { "     <<<<<< * >>>>>> " } else { "" }))
                         .borders(Borders::ALL)
                         .border_style(Style::default().fg(colors[i])))
                     .style(Style::default().fg(text_color))
-                    .highlight_style(Style::default().fg(Color::Black).bg(Color::White))
-                   // .highlight_symbol(">> ");
-                   ;
+                    .highlight_style(highlight_style);
 
                 f.render_stateful_widget(list, chunks[i], &mut board_states[i]);
             }
@@ -701,8 +731,10 @@ fn tui_view() -> Result<()> {
                         match key.code {
                             KeyCode::Enter => {
                                 if !input_buffer.trim().is_empty() {
-                                    match add_task(&input_buffer, None) {
-                                        Ok(msg) => feedback_buffer = msg,
+                                    let state = &board_states[selected_board];
+                                    let index = state.selected();
+                                    match insert_task(statuses[selected_board], index, &input_buffer, None) {
+                                        Ok(_) => feedback_buffer = "Task added successfully.".to_string(),
                                         Err(e) => feedback_buffer = format!("Error: {}", e),
                                     }
                                 } else {

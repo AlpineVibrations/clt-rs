@@ -20,3 +20,4 @@
 - Test task for status change- Test delete task 1
 - we need readme instructions for starting the TUI before the cli instructions.
 - Update README usage guide
+- the cli command to get into view should be the default view with no cli args
