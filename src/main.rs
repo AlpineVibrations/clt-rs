@@ -22,7 +22,7 @@ use ratatui::{
 #[command(about = "A simple file-system-backed task management system", long_about = None)]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -63,25 +63,23 @@ enum Commands {
     List {
         status: Option<String>,
     },
-    /// Opens the Kanban TUI view
-    View,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Init => {
+        Some(Commands::Init) => {
             init_tasks()?;
         }
-        Commands::Add { description, metadata } => {
+        Some(Commands::Add { description, metadata }) => {
             let msg = add_task(&description, metadata)?;
             println!("{}", msg);
         }
-        Commands::Status { from, task_index, to } => {
+        Some(Commands::Status { from, task_index, to }) => {
             move_task(&from, &to, &task_index)?;
         }
-        Commands::Done { status, task_index } => {
+        Some(Commands::Done { status, task_index }) => {
             if status == "done" {
                 println!("Task is already done.");
             } else {
@@ -89,14 +87,14 @@ fn main() -> Result<()> {
                 println!("Task {} from {} marked as done.", task_index, status);
             }
         }
-        Commands::Delete { status, task_index } => {
+        Some(Commands::Delete { status, task_index }) => {
             delete_task(&status, &task_index)?;
             println!("Task {} from {} deleted successfully.", task_index, status);
         }
-        Commands::List { status } => {
+        Some(Commands::List { status }) => {
             list_tasks(status)?;
         }
-        Commands::View => {
+        None => {
             tui_view()?;
         }
     }
@@ -372,7 +370,7 @@ fn tui_view() -> Result<()> {
 
     let mut current_mode = Mode::View;
     let mut input_buffer = String::new();
-    let mut feedback_buffer = String::from("Kanban View! Arrows to navigate/focus boards, Shift+Arrows or I/K to reorder, Shift+Arrows or J/L to move tasks, Numbers to reorder, Space to add, Enter to edit, 'd' or Delete to delete, 'q' to quit.");
+    let mut feedback_buffer = String::from("Kanban View! Spacebar to create new Task. Arrows to navigate/focus boards, Shift+Arrows or I/K to reorder, Shift+Arrows or J/L to move tasks, Numbers to reorder, Space to add, Enter to edit, 'd' or Delete to delete, 'q' to quit.");
 
     let mut selected_board = 0; // 0: todo, 1: doing, 2: done
     let mut editing_task_idx: Option<usize> = None;
@@ -434,7 +432,7 @@ fn tui_view() -> Result<()> {
 
                 let list = List::new(items)
                     .block(Block::default()
-                        .title(format!("{} {}", titles[i], if selected_board == i { " <<<<<<<<<<<<<<  " } else { "" }))
+                        .title(format!("{} {}", titles[i], if selected_board == i { "     <<<<<< * >>>>>> " } else { "" }))
                         .borders(Borders::ALL)
                         .border_style(Style::default().fg(colors[i])))
                     .style(Style::default().fg(text_color))
