@@ -1,3 +1,4 @@
+```
   ██████╗██╗  ████████╗
  ██╔════╝██║  ╚══██╔══╝
  ██║     ██║     ██║   
@@ -7,7 +8,7 @@
 
   ▸ command line tasks
   ▸ file-backed · rust · tui
-
+```
 
 # clt is Command Line Tasks
 
