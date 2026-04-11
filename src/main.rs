@@ -16,7 +16,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, ListItem, ListState, Paragraph},
 };
 
 #[derive(Parser)]
@@ -514,7 +514,7 @@ fn tui_view() -> Result<()> {
                 let selected_idx = board_states[i].selected();
                 let col_width = (size.width / 3) as usize;
                 let tasks = read_tasks(status).unwrap_or_default();
-                let items: Vec<ListItem> = tasks.clone()
+                let _items: Vec<ListItem> = tasks.clone()
                     .into_iter()
                     .enumerate()
                     .map(|(idx, t)| {
@@ -584,7 +584,7 @@ fn tui_view() -> Result<()> {
                     let cleaned = t.replace("- ", "");
                     let is_selected = Some(idx) == selected_idx;
                     
-                    let (desc, meta) = if let Some(start) = cleaned.rfind(" (") {
+                    let (desc, _meta) = if let Some(start) = cleaned.rfind(" (") {
                         if cleaned.ends_with(')') {
                             (&cleaned[..start], Some(&cleaned[start + 2..cleaned.len() - 1]))
                         } else {
@@ -607,10 +607,10 @@ fn tui_view() -> Result<()> {
                     };
 
                     let content = format!("{}. {}", idx + 1, text);
-                    let paragraph = Paragraph::new(content)
+                    let _paragraph = Paragraph::new(content)
                         .style(style);
                     
-                    let area = ratatui::layout::Rect {
+                    let _area = ratatui::layout::Rect {
                         x: inner_area.x,
                         y: inner_area.y + current_y as u16,
                         width: inner_area.width,
