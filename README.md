@@ -25,9 +25,7 @@ A simple, file-system-backed CLI task management app written in Rust. It uses Ma
 Ensure you have Rust and Cargo installed.
 
 ```bash
-git clone <repository-url>
-cd cli-task
-cargo build --release
+cargo install clt-rs
 ```
 
 ## Usage
@@ -35,31 +33,41 @@ cargo build --release
 ### Initialization
 Initialize the task directory structure:
 ```bash
-cargo run -- init
+clt init
 ```
 
 ### Adding Tasks
 Add a new task to the To Do list:
 ```bash
-cargo run -- add "My first task" "optional metadata"
+clt add "My first task" "optional metadata"
 ```
 
 ### Moving Tasks
 Change the status of a task using the `source->dest` transition format:
 ```bash
-cargo run -- status todo->doing 1
-cargo run -- status doing->done 1
+clt status todo->doing 1
+clt status doing->done 1
 ```
 
 ### Listing Tasks
 Get a quick overview of all tasks:
 ```bash
-cargo run -- list
+clt list
 ```
 
 ### Kanban View
 Open the interactive TUI Kanban board:
 ```bash
-cargo run -- view
+clt view
 ```
 *(Press 'q' to quit the TUI view)*
+
+## Development
+
+If you want to contribute or build from source:
+
+```bash
+git clone <repository-url>
+cd cli-task
+cargo build --release
+```
