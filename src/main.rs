@@ -392,7 +392,7 @@ fn tui_view() -> Result<()> {
 
     loop {
         terminal.draw(|f| {
-            let size = f.size();
+            let size = f.area();
             
             // Main layout: Kanban board, input area (if active), and feedback console
             let main_layout = Layout::default()
