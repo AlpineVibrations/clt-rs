@@ -309,7 +309,11 @@ fn tui_view() -> Result<()> {
 
     let statuses = ["todo", "doing", "done"];
     let titles = ["To Do", "In Progress", "Done"];
-    let colors = [Color::Yellow, Color::Cyan, Color::Green];
+    let c_1 = Color::Rgb(120, 160, 190);
+    let c_2 = Color::Rgb(130, 170, 130);
+    let c_3 = Color::Rgb(180, 140, 175);
+    let text_color = Color::Rgb(200, 200, 200);
+    let colors = [c_1,c_2,c_3];
 
     loop {
         terminal.draw(|f| {
@@ -355,10 +359,10 @@ fn tui_view() -> Result<()> {
 
                 let list = List::new(items)
                     .block(Block::default()
-                        .title(format!("{} {}", titles[i], if selected_board == i { " <<-****x`" } else { "" }))
+                        .title(format!("{} {}", titles[i], if selected_board == i { " <<<<<<<<<<<<<<  " } else { "" }))
                         .borders(Borders::ALL)
                         .border_style(Style::default().fg(colors[i])))
-                    .style(Style::default().fg(Color::White))
+                    .style(Style::default().fg(text_color))
                     .highlight_style(Style::default().fg(Color::Black).bg(Color::White))
                    // .highlight_symbol(">> ");
                    ;
