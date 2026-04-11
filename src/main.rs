@@ -478,8 +478,8 @@ fn tui_view() -> Result<()> {
     let c_1 = Color::Indexed(110);
     let c_2 = Color::Indexed(108);
     let c_3 = Color::Indexed(139);
-    let text_color = Color::DarkGray;
-    let c_highlight = Color::Indexed(222);
+    let text_color = Color::Indexed(248); //Color::DarkGray;
+    let c_highlight = Color::Indexed(221);
     let colors = [c_1, c_2, c_3];
 
     loop {
@@ -574,7 +574,7 @@ fn tui_view() -> Result<()> {
                             ))
                             // .title(Line::from(vec![Span::raw(" TODO")]))
                             .title(
-                                Line::from(vec![Span::raw(format!("{} tasks ", &items.len()))])
+                                Line::from(vec![Span::raw(format!(" {} ", &items.len()))])
                                     .alignment(Alignment::Right),
                             )
                             .borders(Borders::ALL)
