@@ -23,3 +23,4 @@
 - Update README usage guide
 - the cli command to get into view should be the default view with no cli args
 - "- make the selected task's background in kanban just a little darker" >> tasks/done.md- what happens when you run clt with no init and it hasnt init yet. should it ask you if you wanna init?
+- we need a TUI help popover that shows all the tui commands

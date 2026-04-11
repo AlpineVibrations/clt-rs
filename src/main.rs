@@ -384,6 +384,7 @@ enum Mode {
     View,
     Input,
     Edit,
+    Help,
 }
 
 fn wrap_text(text: &str, width: usize) -> String {
@@ -512,6 +513,42 @@ fn tui_view() -> Result<()> {
             // The feedback area is always the last element of main_layout
             let feedback_area = *main_layout.last().unwrap();
             f.render_widget(feedback_paragraph, feedback_area);
+
+            if matches!(current_mode, Mode::Help) {
+                let help_text = "TUI Commands:\n\n\
+                                 [Space]  - Create new task\n\
+                                 [Enter]  - Edit selected task / Save input\n\
+                                 [d/Del]  - Delete selected task\n\
+                                 [Arrows] - Navigate boards and tasks\n\
+                                 [Shift+Arrows] - Reorder/Move tasks\n\
+                                 [I, K]   - Move task Up/Down\n\
+                                 [J, L]   - Move task Left/Right\n\
+                                 [1, 2, 3]- Switch board focus\n\
+                                 [h / ?]  - Toggle Help\n\
+                                 [q]      - Quit";
+                
+                let area = f.area();
+                let popover_width = 50;
+                let popover_height = 15;
+                let x = (area.width as isize - popover_width as isize) / 2;
+                let y = (area.height as isize - popover_height as isize) / 2;
+                
+                let popover_area = ratatui::layout::Rect {
+                    x: x as u16,
+                    y: y as u16,
+                    width: popover_width as u16,
+                    height: popover_height as u16,
+                };
+
+                let help_paragraph = Paragraph::new(help_text)
+                    .block(Block::default()
+                        .title(" Help ")
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Yellow)))
+                    .style(Style::default().fg(Color::White));
+                
+                f.render_widget(help_paragraph, popover_area);
+            }
         })?;
 
         if event::poll(std::time::Duration::from_millis(100))? {
@@ -692,6 +729,9 @@ fn tui_view() -> Result<()> {
                                           feedback_buffer = "No task selected to delete".to_string();
                                       }
                                   }
+                                  KeyCode::Char('h') | KeyCode::Char('H') | KeyCode::Char('?') => {
+                                      current_mode = Mode::Help;
+                                  }
                                  KeyCode::Up => {
                                      let state = &mut board_states[selected_board];
                                      let tasks = read_tasks(statuses[selected_board]).unwrap_or_default();
@@ -749,8 +789,16 @@ fn tui_view() -> Result<()> {
                                 _ => {}
                             }
                         }
-                    }
-                    Mode::Input => {
+                     }
+                     Mode::Help => {
+                         match key.code {
+                             KeyCode::Enter | KeyCode::Esc | KeyCode::Char('h') | KeyCode::Char('H') | KeyCode::Char('?') => {
+                                 current_mode = Mode::View;
+                             }
+                             _ => {}
+                         }
+                     }
+                     Mode::Input => {
                         match key.code {
                             KeyCode::Enter => {
                                 if !input_buffer.trim().is_empty() {
