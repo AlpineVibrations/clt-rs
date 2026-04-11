@@ -1,7 +1,17 @@
 [package]
-name = "clt"
+name = "clt-rs"
 version = "0.1.0"
 edition = "2024"
+description = "Command Line Tasks, a file-backed CLI task manager with TUI kanban board"
+license = "MIT"
+repository = "https://github.com/AlpineVibrations/clt-rs"
+readme = "README.md"
+keywords = ["cli", "tasks", "kanban", "tui"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "clt"
+path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }

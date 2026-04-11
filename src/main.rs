@@ -52,6 +52,13 @@ enum Commands {
         /// The index of the task to mark as done
         task_index: String,
     },
+    /// Deletes a task
+    Delete {
+        /// The status the task is currently in (todo, doing, done)
+        status: String,
+        /// The index of the task to delete
+        task_index: String,
+    },
     /// Lists tasks. Optional status to filter by (todo, doing, done)
     List {
         status: Option<String>,
@@ -82,6 +89,10 @@ fn main() -> Result<()> {
                 println!("Task {} from {} marked as done.", task_index, status);
             }
         }
+        Commands::Delete { status, task_index } => {
+            delete_task(&status, &task_index)?;
+            println!("Task {} from {} deleted successfully.", task_index, status);
+        }
         Commands::List { status } => {
             list_tasks(status)?;
         }
@@ -104,6 +115,39 @@ fn get_file_path(status: &str) -> Result<std::path::PathBuf> {
 
 // find_task_status is no longer needed for index-based referencing
 // as the user must specify the source list.
+
+fn delete_task(status: &str, task_index_str: &str) -> Result<()> {
+    let path = get_file_path(status)?;
+    let task_index = task_index_str.parse::<usize>().context("Invalid task index. Please provide a number.")?;
+    if task_index == 0 {
+        anyhow::bail!("Task index must be 1 or greater.");
+    }
+
+    let content = fs::read_to_string(&path).context("Failed to read file")?;
+    let lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+    
+    let task_lines: Vec<(usize, &String)> = lines.iter().enumerate()
+        .filter(|(_, line)| line.starts_with("- "))
+        .collect();
+
+    if task_index > task_lines.len() {
+        anyhow::bail!("Task index {} out of range. Only {} tasks found in {}.", task_index, task_lines.len(), status);
+    }
+
+    let (actual_line_idx, _) = task_lines[task_index - 1];
+    let mut new_lines = lines.clone();
+    new_lines.remove(actual_line_idx);
+    
+    let updated_content = new_lines.join("\n");
+    let final_content = if updated_content.is_empty() {
+        updated_content
+    } else {
+        format!("{}\n", updated_content)
+    };
+    
+    fs::write(&path, final_content).context("Failed to update file")?;
+    Ok(())
+}
 
 fn move_task(from: &str, to: &str, task_index_str: &str) -> Result<()> {
     let src_path = get_file_path(from)?;
@@ -328,7 +372,7 @@ fn tui_view() -> Result<()> {
 
     let mut current_mode = Mode::View;
     let mut input_buffer = String::new();
-    let mut feedback_buffer = String::from("Kanban View! Arrows to navigate/focus boards, Shift+Arrows or I/K to reorder, Shift+Arrows or J/L to move tasks, Numbers to reorder, Space to add, Enter to edit, 'q' to quit.");
+    let mut feedback_buffer = String::from("Kanban View! Arrows to navigate/focus boards, Shift+Arrows or I/K to reorder, Shift+Arrows or J/L to move tasks, Numbers to reorder, Space to add, Enter to edit, 'd' or Delete to delete, 'q' to quit.");
 
     let mut selected_board = 0; // 0: todo, 1: doing, 2: done
     let mut editing_task_idx: Option<usize> = None;
@@ -342,7 +386,7 @@ fn tui_view() -> Result<()> {
     let titles = ["To Do", "In Progress", "Done"];
     let c_1 = Color::Rgb(120, 160, 190);
     let c_2 = Color::Rgb(130, 170, 130);
-    let c_3 = Color::Rgb(180, 140, 175);
+    let c_3 = Color::Rgb(180, 140, 155);
     let text_color = Color::Rgb(200, 200, 200);
     let colors = [c_1,c_2,c_3];
 
@@ -567,21 +611,36 @@ fn tui_view() -> Result<()> {
                                          }
                                      }
                                  }
-                                 KeyCode::Char('l') | KeyCode::Char('L') => {
-                                     let state = &mut board_states[selected_board];
-                                     if let Some(idx) = state.selected() {
-                                         if selected_board < 2 {
-                                             let from = statuses[selected_board];
-                                             let to = statuses[selected_board + 1];
-                                             match move_task(&from, &to, &(idx + 1).to_string()) {
-                                                 Ok(_) => feedback_buffer = format!("Moved task to {}", to),
-                                                 Err(e) => feedback_buffer = format!("Error: {}", e),
-                                             }
-                                         } else {
-                                             feedback_buffer = "Already at the last board".to_string();
-                                         }
-                                     }
-                                 }
+                                  KeyCode::Char('l') | KeyCode::Char('L') => {
+                                      let state = &mut board_states[selected_board];
+                                      if let Some(idx) = state.selected() {
+                                          if selected_board < 2 {
+                                              let from = statuses[selected_board];
+                                              let to = statuses[selected_board + 1];
+                                              match move_task(&from, &to, &(idx + 1).to_string()) {
+                                                  Ok(_) => feedback_buffer = format!("Moved task to {}", to),
+                                                  Err(e) => feedback_buffer = format!("Error: {}", e),
+                                              }
+                                          } else {
+                                              feedback_buffer = "Already at the last board".to_string();
+                                          }
+                                      }
+                                  }
+                                  KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Delete => {
+                                      let state = &mut board_states[selected_board];
+                                      if let Some(idx) = state.selected() {
+                                          let status = statuses[selected_board];
+                                          match delete_task(status, &(idx + 1).to_string()) {
+                                              Ok(_) => {
+                                                  feedback_buffer = format!("Deleted task {} from {}", idx + 1, status);
+                                                  state.select(if idx > 0 { Some(idx - 1) } else { None });
+                                              }
+                                              Err(e) => feedback_buffer = format!("Error: {}", e),
+                                          }
+                                      } else {
+                                          feedback_buffer = "No task selected to delete".to_string();
+                                      }
+                                  }
                                  KeyCode::Up => {
                                      let state = &mut board_states[selected_board];
                                      let tasks = read_tasks(statuses[selected_board]).unwrap_or_default();

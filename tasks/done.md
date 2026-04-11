@@ -1,5 +1,4 @@
 # Done Tasks
-- add command for moving a task to done.
 - add sub command to list command to view only a single status like todo
 - the feedback when entering a task in the view mode needs a better place. its overwriting other stuff right now. maybe it should be below the input
 - move the feedback to a line below the input line
@@ -17,3 +16,5 @@
 - you should be able to run the cli command of list with the number of the board to get that also ex: clt list 1
 - new task
 - if you are selected on a task in the kanban view you should be able to edit it
+- we need to support delete a selected task in the kanban and in the cli
+- Test task for status change- Test delete task 1
