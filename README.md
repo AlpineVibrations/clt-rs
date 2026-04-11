@@ -36,31 +36,44 @@ Initialize the task directory structure:
 clt init
 ```
 
-### Adding Tasks
-Add a new task to the To Do list:
-```bash
-clt add "My first task" "optional metadata"
-```
-
-### Moving Tasks
-Change the status of a task using the `source->dest` transition format:
-```bash
-clt status todo->doing 1
-clt status doing->done 1
-```
-
-### Listing Tasks
-Get a quick overview of all tasks:
-```bash
-clt list
-```
-
 ### Kanban View
 Open the interactive TUI Kanban board:
 ```bash
 clt view
 ```
 *(Press 'q' to quit the TUI view)*
+
+### Adding Tasks
+Add a new task to the To Do list:
+```bash
+clt add "My first task"
+```
+
+### Moving Tasks
+Change the status of a task:
+```bash
+clt status todo 1 doing
+clt status doing 1 done
+```
+
+Alternatively, mark a task as done quickly:
+```bash
+clt done 1
+```
+
+### Deleting Tasks
+Remove a task from a specific list:
+```bash
+clt delete todo 1
+```
+
+### Listing Tasks
+Get an overview of all tasks, or filter by status:
+```bash
+clt list
+clt list todo
+```
+
 
 ## Development
 
