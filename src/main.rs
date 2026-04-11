@@ -812,6 +812,11 @@ fn tui_view() -> Result<()> {
                             _ = ();
                         } else {
                             match key.code {
+                                KeyCode::Esc => {
+                                    let state = &mut board_states[selected_board];
+                                    state.select(None);
+                                    feedback_buffer = "Task unselected".to_string();
+                                }
                                 KeyCode::Char('q') => break,
                                 KeyCode::Enter => {
                                     let state = &board_states[selected_board];
