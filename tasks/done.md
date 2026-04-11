@@ -19,3 +19,4 @@
 - we need to support delete a selected task in the kanban and in the cli
 - Test task for status change- Test delete task 1
 - we need readme instructions for starting the TUI before the cli instructions.
+- Update README usage guide
