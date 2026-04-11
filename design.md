@@ -47,3 +47,13 @@ The project has been implemented with the following technical choices:
 - **Persistence**: Direct file I/O using `std::fs` to maintain Markdown compatibility.
 
 **Status**: Updated to Index-Based System.
+
+### 6. Metadata Best Practices
+Metadata is optional. 
+To maintain a scannable and searchable board, metadata should be concise and standardized. Since metadata is stored in parentheses `(metadata)`, the following patterns are recommended:
+
+*   **Tag-Based**: Use short, uppercase tags separated by commas for quick filtering (e.g., `BUG, HIGH, AUTH`).
+*   **ID-Based**: Prefix with a hash for external tracking (e.g., `#124, P1`).
+*   **Owner-Based**: Use handles for assignment (e.g., `@alice, LOW`).
+
+These patterns ensure that agents and humans can easily `grep` or search for specific priorities or categories across the markdown files.

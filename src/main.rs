@@ -1,20 +1,22 @@
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use ratatui::layout::Alignment;
 use std::fs;
 use std::io::{self, Write, stdout};
 use std::path::Path;
-use anyhow::{Context, Result};
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers},
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
+    event::{self, Event, KeyCode, KeyModifiers},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
+    Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Style},
-    widgets::{Block, Borders, List, ListItem, Paragraph, ListState},
-    Terminal,
+    text::{Line, Span},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
 };
 
 #[derive(Parser)]
@@ -35,7 +37,7 @@ enum Commands {
         description: String,
         /// Optional metadata for the task
         metadata: Option<String>,
-    },    
+    },
     /// Changes the status of a task
     Status {
         /// The source status (e.g., "todo")
@@ -60,9 +62,7 @@ enum Commands {
         task_index: String,
     },
     /// Lists tasks. Optional status to filter by (todo, doing, done)
-    List {
-        status: Option<String>,
-    },
+    List { status: Option<String> },
 }
 
 fn main() -> Result<()> {
@@ -72,11 +72,18 @@ fn main() -> Result<()> {
         Some(Commands::Init) => {
             init_tasks()?;
         }
-        Some(Commands::Add { description, metadata }) => {
+        Some(Commands::Add {
+            description,
+            metadata,
+        }) => {
             let msg = add_task(&description, metadata)?;
             println!("{}", msg);
         }
-        Some(Commands::Status { from, task_index, to }) => {
+        Some(Commands::Status {
+            from,
+            task_index,
+            to,
+        }) => {
             move_task(&from, &to, &task_index)?;
         }
         Some(Commands::Done { status, task_index }) => {
@@ -98,14 +105,16 @@ fn main() -> Result<()> {
             if !is_initialized() {
                 print!("Tasks not initialized. Would you like to initialize now? (y/n): ");
                 io::stdout().flush()?;
-                
+
                 let mut response = String::new();
                 io::stdin().read_line(&mut response)?;
-                
+
                 if response.trim().to_lowercase() == "y" {
                     init_tasks()?;
                 } else {
-                    println!("Initialization skipped. Please run 'init' to set up your task lists.");
+                    println!(
+                        "Initialization skipped. Please run 'init' to set up your task lists."
+                    );
                     return Ok(());
                 }
             }
@@ -139,33 +148,42 @@ fn get_file_path(status: &str) -> Result<std::path::PathBuf> {
 
 fn delete_task(status: &str, task_index_str: &str) -> Result<()> {
     let path = get_file_path(status)?;
-    let task_index = task_index_str.parse::<usize>().context("Invalid task index. Please provide a number.")?;
+    let task_index = task_index_str
+        .parse::<usize>()
+        .context("Invalid task index. Please provide a number.")?;
     if task_index == 0 {
         anyhow::bail!("Task index must be 1 or greater.");
     }
 
     let content = fs::read_to_string(&path).context("Failed to read file")?;
     let lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
-    
-    let task_lines: Vec<(usize, &String)> = lines.iter().enumerate()
+
+    let task_lines: Vec<(usize, &String)> = lines
+        .iter()
+        .enumerate()
         .filter(|(_, line)| line.starts_with("- "))
         .collect();
 
     if task_index > task_lines.len() {
-        anyhow::bail!("Task index {} out of range. Only {} tasks found in {}.", task_index, task_lines.len(), status);
+        anyhow::bail!(
+            "Task index {} out of range. Only {} tasks found in {}.",
+            task_index,
+            task_lines.len(),
+            status
+        );
     }
 
     let (actual_line_idx, _) = task_lines[task_index - 1];
     let mut new_lines = lines.clone();
     new_lines.remove(actual_line_idx);
-    
+
     let updated_content = new_lines.join("\n");
     let final_content = if updated_content.is_empty() {
         updated_content
     } else {
         format!("{}\n", updated_content)
     };
-    
+
     fs::write(&path, final_content).context("Failed to update file")?;
     Ok(())
 }
@@ -174,21 +192,30 @@ fn move_task(from: &str, to: &str, task_index_str: &str) -> Result<()> {
     let src_path = get_file_path(from)?;
     let dest_path = get_file_path(to)?;
 
-    let task_index = task_index_str.parse::<usize>().context("Invalid task index. Please provide a number.")?;
+    let task_index = task_index_str
+        .parse::<usize>()
+        .context("Invalid task index. Please provide a number.")?;
     if task_index == 0 {
         anyhow::bail!("Task index must be 1 or greater.");
     }
 
     let content = fs::read_to_string(&src_path).context("Failed to read source file")?;
     let lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
-    
+
     // Filter for task lines only to find the Nth task
-    let task_lines: Vec<(usize, &String)> = lines.iter().enumerate()
+    let task_lines: Vec<(usize, &String)> = lines
+        .iter()
+        .enumerate()
         .filter(|(_, line)| line.starts_with("- "))
         .collect();
 
     if task_index > task_lines.len() {
-        anyhow::bail!("Task index {} out of range. Only {} tasks found in {}.", task_index, task_lines.len(), from);
+        anyhow::bail!(
+            "Task index {} out of range. Only {} tasks found in {}.",
+            task_index,
+            task_lines.len(),
+            from
+        );
     }
 
     let (actual_line_idx, task_line) = task_lines[task_index - 1];
@@ -207,7 +234,8 @@ fn move_task(from: &str, to: &str, task_index_str: &str) -> Result<()> {
     fs::write(&src_path, final_src_content).context("Failed to update source file")?;
 
     // Ensure the destination file ends with a newline before appending to prevent line merging
-    let mut dest_content = fs::read_to_string(&dest_path).context("Failed to read destination file")?;
+    let mut dest_content =
+        fs::read_to_string(&dest_path).context("Failed to read destination file")?;
     if !dest_content.is_empty() && !dest_content.ends_with('\n') {
         dest_content.push('\n');
     }
@@ -252,7 +280,9 @@ fn reorder_task(status: &str, from_idx: usize, to_idx: usize) -> Result<()> {
     let content = fs::read_to_string(&path).context("Failed to read file")?;
     let lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
 
-    let task_indices: Vec<usize> = lines.iter().enumerate()
+    let task_indices: Vec<usize> = lines
+        .iter()
+        .enumerate()
         .filter(|(_, line)| line.starts_with("- "))
         .map(|(i, _)| i)
         .collect();
@@ -268,7 +298,9 @@ fn reorder_task(status: &str, from_idx: usize, to_idx: usize) -> Result<()> {
     new_lines.remove(actual_from_idx);
 
     // Find the new position for the task line
-    let new_task_indices: Vec<usize> = new_lines.iter().enumerate()
+    let new_task_indices: Vec<usize> = new_lines
+        .iter()
+        .enumerate()
         .filter(|(_, line)| line.starts_with("- "))
         .map(|(i, _)| i)
         .collect();
@@ -308,7 +340,8 @@ fn list_tasks(filter_status: Option<String>) -> Result<()> {
         for status in statuses {
             let path = get_file_path(status)?;
             println!("\n--- {} ---", status.to_uppercase());
-            let content = fs::read_to_string(&path).context(format!("Failed to read {:?}", path))?;
+            let content =
+                fs::read_to_string(&path).context(format!("Failed to read {:?}", path))?;
             let mut index = 1;
             for line in content.lines() {
                 if line.starts_with("- ") {
@@ -322,11 +355,15 @@ fn list_tasks(filter_status: Option<String>) -> Result<()> {
 }
 
 fn add_task(description: &str, metadata: Option<String>) -> Result<String> {
-    insert_task("todo", None, description, metadata)
-        .map(|_| "Task added successfully.".to_string())
+    insert_task("todo", None, description, metadata).map(|_| "Task added successfully.".to_string())
 }
 
-fn insert_task(status: &str, index: Option<usize>, description: &str, metadata: Option<String>) -> Result<()> {
+fn insert_task(
+    status: &str,
+    index: Option<usize>,
+    description: &str,
+    metadata: Option<String>,
+) -> Result<()> {
     let path = get_file_path(status)?;
     if !path.exists() {
         anyhow::bail!("Tasks not initialized. Please run 'init' first.");
@@ -343,7 +380,9 @@ fn insert_task(status: &str, index: Option<usize>, description: &str, metadata: 
 
     if let Some(idx) = index {
         // Find the actual line index for the Nth task
-        let task_lines: Vec<usize> = lines.iter().enumerate()
+        let task_lines: Vec<usize> = lines
+            .iter()
+            .enumerate()
             .filter(|(_, line)| line.starts_with("- "))
             .map(|(i, _)| i)
             .collect();
@@ -419,7 +458,9 @@ fn tui_view() -> Result<()> {
 
     let mut current_mode = Mode::View;
     let mut input_buffer = String::new();
-    let mut feedback_buffer = String::from("Kanban View! Spacebar to create new Task. Arrows to navigate/focus boards, Shift+Arrows or I/K to reorder, Shift+Arrows or J/L to move tasks, Numbers to reorder, Space to add, Enter to edit, 'd' or Delete to delete, 'q' to quit.");
+    let mut feedback_buffer = String::from(
+        "Kanban View! Spacebar to create new Task. Arrows to navigate/focus boards, Shift+Arrows or I/K to reorder, Shift+Arrows or J/L to move tasks, Numbers to reorder, Space to add, Enter to edit, 'd' or Delete to delete, 'q' to quit.",
+    );
 
     let mut selected_board = 0; // 0: todo, 1: doing, 2: done
     let mut editing_task_idx: Option<usize> = None;
@@ -430,23 +471,31 @@ fn tui_view() -> Result<()> {
     ];
 
     let statuses = ["todo", "doing", "done"];
-    let titles = ["To Do", "In Progress", "Done"];
-    let c_1 = Color::LightCyan;
-    let c_2 = Color::LightGreen;
-    let c_3 = Color::LightMagenta;
+    let titles = ["To Do", "Doing", "Done"];
+    // let c_1 = Color::LightCyan;
+    // let c_2 = Color::LightGreen;
+    // let c_3 = Color::LightMagenta;
+    let c_1 = Color::Indexed(110);
+    let c_2 = Color::Indexed(108);
+    let c_3 = Color::Indexed(139);
     let text_color = Color::DarkGray;
+    let c_highlight = Color::Indexed(222);
     let colors = [c_1, c_2, c_3];
 
     loop {
         terminal.draw(|f| {
             let size = f.area();
-            
+
             // Main layout: Kanban board, input area (if active), and feedback console
             let main_layout = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Min(0),
-                    if matches!(current_mode, Mode::Input) || matches!(current_mode, Mode::Edit) { Constraint::Length(3) } else { Constraint::Length(0) },
+                    if matches!(current_mode, Mode::Input) || matches!(current_mode, Mode::Edit) {
+                        Constraint::Length(3)
+                    } else {
+                        Constraint::Length(0)
+                    },
                     Constraint::Length(3),
                 ])
                 .split(size);
@@ -470,46 +519,94 @@ fn tui_view() -> Result<()> {
                     .enumerate()
                     .map(|(idx, t)| {
                         let cleaned = t.replace("- ", "");
-                        if Some(idx) == selected_idx {
-                            let wrapped = wrap_text(&cleaned, col_width.saturating_sub(5));
-                            ListItem::new(format!("{}. {}", idx + 1, wrapped))
+
+                        let (desc, meta) = if let Some(start) = cleaned.rfind(" (") {
+                            if cleaned.ends_with(')') {
+                                (
+                                    &cleaned[..start],
+                                    Some(&cleaned[start + 2..cleaned.len() - 1]),
+                                )
+                            } else {
+                                (&cleaned[..], None)
+                            }
                         } else {
-                            ListItem::new(format!("{}. {}", idx + 1, cleaned))
+                            (&cleaned[..], None)
+                        };
+
+                        let mut line = Line::from(vec![
+                            Span::raw(format!("{}. ", idx + 1)),
+                            Span::raw(if Some(idx) == selected_idx {
+                                wrap_text(desc, col_width.saturating_sub(5))
+                            } else {
+                                desc.to_string()
+                            }),
+                        ]);
+
+                        if let Some(m) = meta {
+                            line.spans.push(
+                                Span::raw(format!(" ({})", m))
+                                    .style(Style::default().bg(Color::DarkGray).fg(Color::White)),
+                            );
                         }
+
+                        ListItem::new(line)
                     })
                     .collect();
 
                 let highlight_style = if matches!(current_mode, Mode::View) {
-                    Style::default().fg(Color::Black).bg(Color::Yellow)
+                    Style::default().fg(Color::Black).bg(c_highlight)
                 } else {
                     // Use a more subtle highlight when in Input/Edit mode
                     Style::default().fg(Color::White).bg(Color::DarkGray)
                 };
 
-                let list = List::new(items)
-                    .block(Block::default()
-                        .title(format!("{} {}", titles[i], if selected_board == i { "     <<<<<< * >>>>>> " } else { "" }))
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(colors[i])))
+                let list = List::new(items.clone())
+                    .block(
+                        Block::default()
+                            .title(format!(
+                                "{} {}",
+                                titles[i],
+                                if selected_board == i {
+                                    "  <<<<<< * >>>>>>     "
+                                } else {
+                                    ""
+                                }
+                            ))
+                            // .title(Line::from(vec![Span::raw(" TODO")]))
+                            .title(
+                                Line::from(vec![Span::raw(format!("{} tasks ", &items.len()))])
+                                    .alignment(Alignment::Right),
+                            )
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(colors[i])),
+                    )
                     .style(Style::default().fg(text_color))
                     .highlight_style(highlight_style);
 
                 f.render_stateful_widget(list, chunks[i], &mut board_states[i]);
             }
 
-                if matches!(current_mode, Mode::Input) || matches!(current_mode, Mode::Edit) {
-                    let label = if matches!(current_mode, Mode::Input) { " Add Task: " } else { " Edit Task: " };
-                    let input_text = format!("{}{}", label, input_buffer);
-                    let input_paragraph = Paragraph::new(input_text)
-                        .block(Block::default().borders(Borders::ALL).title("Input Mode (Enter to save, Esc to cancel)"))
-                        .style(Style::default().fg(Color::White));
-                    f.render_widget(input_paragraph, main_layout[1]);
-                }
+            if matches!(current_mode, Mode::Input) || matches!(current_mode, Mode::Edit) {
+                let label = if matches!(current_mode, Mode::Input) {
+                    " Add Task: "
+                } else {
+                    " Edit Task: "
+                };
+                let input_text = format!("{}{}", label, input_buffer);
+                let input_paragraph = Paragraph::new(input_text)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title("Input Mode (Enter to save, Esc to cancel)"),
+                    )
+                    .style(Style::default().fg(Color::White));
+                f.render_widget(input_paragraph, main_layout[1]);
+            }
 
             let feedback_paragraph = Paragraph::new(feedback_buffer.as_str())
                 .block(Block::default().borders(Borders::ALL).title("Console"))
                 .style(Style::default().fg(Color::Gray));
-            
+
             // The feedback area is always the last element of main_layout
             let feedback_area = *main_layout.last().unwrap();
             f.render_widget(feedback_paragraph, feedback_area);
@@ -526,13 +623,13 @@ fn tui_view() -> Result<()> {
                                  [1, 2, 3]- Switch board focus\n\
                                  [h / ?]  - Toggle Help\n\
                                  [q]      - Quit";
-                
+
                 let area = f.area();
                 let popover_width = 50;
                 let popover_height = 15;
                 let x = (area.width as isize - popover_width as isize) / 2;
                 let y = (area.height as isize - popover_height as isize) / 2;
-                
+
                 let popover_area = ratatui::layout::Rect {
                     x: x as u16,
                     y: y as u16,
@@ -541,12 +638,14 @@ fn tui_view() -> Result<()> {
                 };
 
                 let help_paragraph = Paragraph::new(help_text)
-                    .block(Block::default()
-                        .title(" Help ")
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Yellow)))
+                    .block(
+                        Block::default()
+                            .title(" Help ")
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(Color::Yellow)),
+                    )
                     .style(Style::default().fg(Color::White));
-                
+
                 f.render_widget(help_paragraph, popover_area);
             }
         })?;
@@ -561,8 +660,15 @@ fn tui_view() -> Result<()> {
                                     let state = &mut board_states[selected_board];
                                     if let Some(idx) = state.selected() {
                                         if idx > 0 {
-                                            match reorder_task(statuses[selected_board], idx, idx - 1) {
-                                                Ok(_) => feedback_buffer = format!("Moved task up to position {}", idx),
+                                            match reorder_task(
+                                                statuses[selected_board],
+                                                idx,
+                                                idx - 1,
+                                            ) {
+                                                Ok(_) => {
+                                                    feedback_buffer =
+                                                        format!("Moved task up to position {}", idx)
+                                                }
                                                 Err(e) => feedback_buffer = format!("Error: {}", e),
                                             }
                                             state.select(Some(idx - 1));
@@ -574,10 +680,20 @@ fn tui_view() -> Result<()> {
                                 KeyCode::Down => {
                                     let state = &mut board_states[selected_board];
                                     if let Some(idx) = state.selected() {
-                                        let tasks = read_tasks(statuses[selected_board]).unwrap_or_default();
+                                        let tasks = read_tasks(statuses[selected_board])
+                                            .unwrap_or_default();
                                         if idx < tasks.len() - 1 {
-                                            match reorder_task(statuses[selected_board], idx, idx + 1) {
-                                                Ok(_) => feedback_buffer = format!("Moved task down to position {}", idx + 2),
+                                            match reorder_task(
+                                                statuses[selected_board],
+                                                idx,
+                                                idx + 1,
+                                            ) {
+                                                Ok(_) => {
+                                                    feedback_buffer = format!(
+                                                        "Moved task down to position {}",
+                                                        idx + 2
+                                                    )
+                                                }
                                                 Err(e) => feedback_buffer = format!("Error: {}", e),
                                             }
                                             state.select(Some(idx + 1));
@@ -593,11 +709,15 @@ fn tui_view() -> Result<()> {
                                             let from = statuses[selected_board];
                                             let to = statuses[selected_board - 1];
                                             match move_task(&from, &to, &(idx + 1).to_string()) {
-                                                Ok(_) => feedback_buffer = format!("Moved task to {}", to),
+                                                Ok(_) => {
+                                                    feedback_buffer =
+                                                        format!("Moved task to {}", to)
+                                                }
                                                 Err(e) => feedback_buffer = format!("Error: {}", e),
                                             }
                                         } else {
-                                            feedback_buffer = "Already at the first board".to_string();
+                                            feedback_buffer =
+                                                "Already at the first board".to_string();
                                         }
                                     }
                                 }
@@ -608,179 +728,240 @@ fn tui_view() -> Result<()> {
                                             let from = statuses[selected_board];
                                             let to = statuses[selected_board + 1];
                                             match move_task(&from, &to, &(idx + 1).to_string()) {
-                                                Ok(_) => feedback_buffer = format!("Moved task to {}", to),
+                                                Ok(_) => {
+                                                    feedback_buffer =
+                                                        format!("Moved task to {}", to)
+                                                }
                                                 Err(e) => feedback_buffer = format!("Error: {}", e),
                                             }
                                         } else {
-                                            feedback_buffer = "Already at the last board".to_string();
+                                            feedback_buffer =
+                                                "Already at the last board".to_string();
                                         }
                                     }
                                 }
                                 _ => {}
                             }
-                        } else if key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::ALT) {
+                        } else if key.modifiers.contains(KeyModifiers::CONTROL)
+                            || key.modifiers.contains(KeyModifiers::ALT)
+                        {
                             // Alt/Ctrl modifiers no longer used for moving tasks
-                            _ = (); 
+                            _ = ();
                         } else {
                             match key.code {
                                 KeyCode::Char('q') => break,
-                                 KeyCode::Enter => {
-                                     let state = &board_states[selected_board];
-                                     if let Some(idx) = state.selected() {
-                                         current_mode = Mode::Edit;
-                                         editing_task_idx = Some(idx + 1);
-                                         let tasks = read_tasks(statuses[selected_board]).unwrap_or_default();
-                                         input_buffer = tasks[idx].replace("- ", "");
-                                     } else {
-                                         current_mode = Mode::Input;
-                                         input_buffer.clear();
-                                     }
-                                 }
-                                 KeyCode::Char(' ') => {
-                                     current_mode = Mode::Input;
-                                     input_buffer.clear();
-                                 }
+                                KeyCode::Enter => {
+                                    let state = &board_states[selected_board];
+                                    if let Some(idx) = state.selected() {
+                                        current_mode = Mode::Edit;
+                                        editing_task_idx = Some(idx + 1);
+                                        let tasks = read_tasks(statuses[selected_board])
+                                            .unwrap_or_default();
+                                        input_buffer = tasks[idx].replace("- ", "");
+                                    } else {
+                                        current_mode = Mode::Input;
+                                        input_buffer.clear();
+                                    }
+                                }
+                                KeyCode::Char(' ') => {
+                                    current_mode = Mode::Input;
+                                    input_buffer.clear();
+                                }
                                 KeyCode::Char('1') => {
                                     selected_board = 0;
-                                    for state in board_states.iter_mut() { state.select(None); }
-                                         board_states[selected_board].select(Some(0));
+                                    for state in board_states.iter_mut() {
+                                        state.select(None);
+                                    }
+                                    board_states[selected_board].select(Some(0));
                                 }
                                 KeyCode::Char('2') => {
                                     selected_board = 1;
-                                    for state in board_states.iter_mut() { state.select(None); }
-                                         board_states[selected_board].select(Some(0));
+                                    for state in board_states.iter_mut() {
+                                        state.select(None);
+                                    }
+                                    board_states[selected_board].select(Some(0));
                                 }
-                                 KeyCode::Char('3') => {
-                                     selected_board = 2;
-                                     for state in board_states.iter_mut() { state.select(None); }
-                                          board_states[selected_board].select(Some(0));
-                                 }
-                                 KeyCode::Char('i') | KeyCode::Char('I') => {
-                                     let state = &mut board_states[selected_board];
-                                     if let Some(idx) = state.selected() {
-                                         if idx > 0 {
-                                             match reorder_task(statuses[selected_board], idx, idx - 1) {
-                                                 Ok(_) => feedback_buffer = format!("Moved task up to position {}", idx),
-                                                 Err(e) => feedback_buffer = format!("Error: {}", e),
-                                             }
-                                             state.select(Some(idx - 1));
-                                         } else {
-                                             feedback_buffer = "Already at the top".to_string();
-                                         }
-                                     }
-                                 }
-                                 KeyCode::Char('k') | KeyCode::Char('K') => {
-                                     let state = &mut board_states[selected_board];
-                                     if let Some(idx) = state.selected() {
-                                         let tasks = read_tasks(statuses[selected_board]).unwrap_or_default();
-                                         if idx < tasks.len() - 1 {
-                                             match reorder_task(statuses[selected_board], idx, idx + 1) {
-                                                 Ok(_) => feedback_buffer = format!("Moved task down to position {}", idx + 2),
-                                                 Err(e) => feedback_buffer = format!("Error: {}", e),
-                                             }
-                                             state.select(Some(idx + 1));
-                                         } else {
-                                             feedback_buffer = "Already at the bottom".to_string();
-                                         }
-                                     }
-                                 }
-                                 KeyCode::Char('j') | KeyCode::Char('J') => {
-                                     let state = &mut board_states[selected_board];
-                                     if let Some(idx) = state.selected() {
-                                         if selected_board > 0 {
-                                             let from = statuses[selected_board];
-                                             let to = statuses[selected_board - 1];
-                                             match move_task(&from, &to, &(idx + 1).to_string()) {
-                                                 Ok(_) => feedback_buffer = format!("Moved task to {}", to),
-                                                 Err(e) => feedback_buffer = format!("Error: {}", e),
-                                             }
-                                         } else {
-                                             feedback_buffer = "Already at the first board".to_string();
-                                         }
-                                     }
-                                 }
-                                  KeyCode::Char('l') | KeyCode::Char('L') => {
-                                      let state = &mut board_states[selected_board];
-                                      if let Some(idx) = state.selected() {
-                                          if selected_board < 2 {
-                                              let from = statuses[selected_board];
-                                              let to = statuses[selected_board + 1];
-                                              match move_task(&from, &to, &(idx + 1).to_string()) {
-                                                  Ok(_) => feedback_buffer = format!("Moved task to {}", to),
-                                                  Err(e) => feedback_buffer = format!("Error: {}", e),
-                                              }
-                                          } else {
-                                              feedback_buffer = "Already at the last board".to_string();
-                                          }
-                                      }
-                                  }
-                                  KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Delete => {
-                                      let state = &mut board_states[selected_board];
-                                      if let Some(idx) = state.selected() {
-                                          let status = statuses[selected_board];
-                                          match delete_task(status, &(idx + 1).to_string()) {
-                                              Ok(_) => {
-                                                  feedback_buffer = format!("Deleted task {} from {}", idx + 1, status);
-                                                  state.select(if idx > 0 { Some(idx - 1) } else { None });
-                                              }
-                                              Err(e) => feedback_buffer = format!("Error: {}", e),
-                                          }
-                                      } else {
-                                          feedback_buffer = "No task selected to delete".to_string();
-                                      }
-                                  }
-                                  KeyCode::Char('h') | KeyCode::Char('H') | KeyCode::Char('?') => {
-                                      current_mode = Mode::Help;
-                                  }
-                                 KeyCode::Up => {
-                                     let state = &mut board_states[selected_board];
-                                     let tasks = read_tasks(statuses[selected_board]).unwrap_or_default();
-                                     if !tasks.is_empty() {
-                                         let i = state.selected().unwrap_or(0);
-                                         if i > 0 {
-                                             state.select(Some(i - 1));
-                                         } else {
-                                             state.select(Some(tasks.len() - 1));
-                                         }
-                                     }
-                                 }
-                                 KeyCode::Down => {
-                                     let state = &mut board_states[selected_board];
-                                     let tasks = read_tasks(statuses[selected_board]).unwrap_or_default();
-                                     if !tasks.is_empty() {
-                                         let i = state.selected().unwrap_or(0);
-                                         if i < tasks.len() - 1 {
-                                             state.select(Some(i + 1));
-                                         } else {
-                                             state.select(Some(0));
-                                         }
-                                     }
-                                 }
-                                  KeyCode::Left => {
-                                      if selected_board > 0 {
-                                          selected_board -= 1;
-                                      } else {
-                                          selected_board = 2;
-                                      }
-                                      for state in board_states.iter_mut() { state.select(None); }
-                                      board_states[selected_board].select(Some(0));
-                                  }
-                                  KeyCode::Right => {
-                                      if selected_board < 2 {
-                                          selected_board += 1;
-                                      } else {
-                                          selected_board = 0;
-                                      }
-                                      for state in board_states.iter_mut() { state.select(None); }
-                                      board_states[selected_board].select(Some(0));
-                                  }
+                                KeyCode::Char('3') => {
+                                    selected_board = 2;
+                                    for state in board_states.iter_mut() {
+                                        state.select(None);
+                                    }
+                                    board_states[selected_board].select(Some(0));
+                                }
+                                KeyCode::Char('i') | KeyCode::Char('I') => {
+                                    let state = &mut board_states[selected_board];
+                                    if let Some(idx) = state.selected() {
+                                        if idx > 0 {
+                                            match reorder_task(
+                                                statuses[selected_board],
+                                                idx,
+                                                idx - 1,
+                                            ) {
+                                                Ok(_) => {
+                                                    feedback_buffer =
+                                                        format!("Moved task up to position {}", idx)
+                                                }
+                                                Err(e) => feedback_buffer = format!("Error: {}", e),
+                                            }
+                                            state.select(Some(idx - 1));
+                                        } else {
+                                            feedback_buffer = "Already at the top".to_string();
+                                        }
+                                    }
+                                }
+                                KeyCode::Char('k') | KeyCode::Char('K') => {
+                                    let state = &mut board_states[selected_board];
+                                    if let Some(idx) = state.selected() {
+                                        let tasks = read_tasks(statuses[selected_board])
+                                            .unwrap_or_default();
+                                        if idx < tasks.len() - 1 {
+                                            match reorder_task(
+                                                statuses[selected_board],
+                                                idx,
+                                                idx + 1,
+                                            ) {
+                                                Ok(_) => {
+                                                    feedback_buffer = format!(
+                                                        "Moved task down to position {}",
+                                                        idx + 2
+                                                    )
+                                                }
+                                                Err(e) => feedback_buffer = format!("Error: {}", e),
+                                            }
+                                            state.select(Some(idx + 1));
+                                        } else {
+                                            feedback_buffer = "Already at the bottom".to_string();
+                                        }
+                                    }
+                                }
+                                KeyCode::Char('j') | KeyCode::Char('J') => {
+                                    let state = &mut board_states[selected_board];
+                                    if let Some(idx) = state.selected() {
+                                        if selected_board > 0 {
+                                            let from = statuses[selected_board];
+                                            let to = statuses[selected_board - 1];
+                                            match move_task(&from, &to, &(idx + 1).to_string()) {
+                                                Ok(_) => {
+                                                    feedback_buffer =
+                                                        format!("Moved task to {}", to)
+                                                }
+                                                Err(e) => feedback_buffer = format!("Error: {}", e),
+                                            }
+                                        } else {
+                                            feedback_buffer =
+                                                "Already at the first board".to_string();
+                                        }
+                                    }
+                                }
+                                KeyCode::Char('l') | KeyCode::Char('L') => {
+                                    let state = &mut board_states[selected_board];
+                                    if let Some(idx) = state.selected() {
+                                        if selected_board < 2 {
+                                            let from = statuses[selected_board];
+                                            let to = statuses[selected_board + 1];
+                                            match move_task(&from, &to, &(idx + 1).to_string()) {
+                                                Ok(_) => {
+                                                    feedback_buffer =
+                                                        format!("Moved task to {}", to)
+                                                }
+                                                Err(e) => feedback_buffer = format!("Error: {}", e),
+                                            }
+                                        } else {
+                                            feedback_buffer =
+                                                "Already at the last board".to_string();
+                                        }
+                                    }
+                                }
+                                KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Delete => {
+                                    let state = &mut board_states[selected_board];
+                                    if let Some(idx) = state.selected() {
+                                        let status = statuses[selected_board];
+                                        match delete_task(status, &(idx + 1).to_string()) {
+                                            Ok(_) => {
+                                                feedback_buffer = format!(
+                                                    "Deleted task {} from {}",
+                                                    idx + 1,
+                                                    status
+                                                );
+                                                state.select(if idx > 0 {
+                                                    Some(idx - 1)
+                                                } else {
+                                                    None
+                                                });
+                                            }
+                                            Err(e) => feedback_buffer = format!("Error: {}", e),
+                                        }
+                                    } else {
+                                        feedback_buffer = "No task selected to delete".to_string();
+                                    }
+                                }
+                                KeyCode::Char('h') | KeyCode::Char('H') | KeyCode::Char('?') => {
+                                    current_mode = Mode::Help;
+                                }
+                                KeyCode::Up => {
+                                    let state = &mut board_states[selected_board];
+                                    let tasks =
+                                        read_tasks(statuses[selected_board]).unwrap_or_default();
+                                    if !tasks.is_empty() {
+                                        let i = state.selected().unwrap_or(0);
+                                        if i > 0 {
+                                            state.select(Some(i - 1));
+                                        } else {
+                                            state.select(Some(tasks.len() - 1));
+                                        }
+                                    }
+                                }
+                                KeyCode::Down => {
+                                    let state = &mut board_states[selected_board];
+                                    let tasks =
+                                        read_tasks(statuses[selected_board]).unwrap_or_default();
+                                    if !tasks.is_empty() {
+                                        let i = state.selected().unwrap_or(0);
+                                        if i < tasks.len() - 1 {
+                                            state.select(Some(i + 1));
+                                        } else {
+                                            state.select(Some(0));
+                                        }
+                                    }
+                                }
+                                KeyCode::Left => {
+                                    if selected_board > 0 {
+                                        selected_board -= 1;
+                                    } else {
+                                        selected_board = 2;
+                                    }
+                                    for state in board_states.iter_mut() {
+                                        state.select(None);
+                                    }
+                                    board_states[selected_board].select(Some(0));
+                                }
+                                KeyCode::Right => {
+                                    if selected_board < 2 {
+                                        selected_board += 1;
+                                    } else {
+                                        selected_board = 0;
+                                    }
+                                    for state in board_states.iter_mut() {
+                                        state.select(None);
+                                    }
+                                    board_states[selected_board].select(Some(0));
+                                }
                                 KeyCode::Char(c) if c.is_ascii_digit() => {
                                     let new_pos = (c as u8 - b'0') as usize;
                                     let state = &mut board_states[selected_board];
                                     if let Some(idx) = state.selected() {
                                         if new_pos > 0 {
-                                            match reorder_task(statuses[selected_board], idx, new_pos - 1) {
-                                                Ok(_) => feedback_buffer = format!("Reordered task to position {}", new_pos),
+                                            match reorder_task(
+                                                statuses[selected_board],
+                                                idx,
+                                                new_pos - 1,
+                                            ) {
+                                                Ok(_) => {
+                                                    feedback_buffer = format!(
+                                                        "Reordered task to position {}",
+                                                        new_pos
+                                                    )
+                                                }
                                                 Err(e) => feedback_buffer = format!("Error: {}", e),
                                             }
                                         }
@@ -789,75 +970,84 @@ fn tui_view() -> Result<()> {
                                 _ => {}
                             }
                         }
-                     }
-                     Mode::Help => {
-                         match key.code {
-                             KeyCode::Enter | KeyCode::Esc | KeyCode::Char('h') | KeyCode::Char('H') | KeyCode::Char('?') => {
-                                 current_mode = Mode::View;
-                             }
-                             _ => {}
-                         }
-                     }
-                     Mode::Input => {
-                        match key.code {
-                            KeyCode::Enter => {
-                                if !input_buffer.trim().is_empty() {
-                                    let state = &board_states[selected_board];
-                                    let index = state.selected();
-                                    match insert_task(statuses[selected_board], index, &input_buffer, None) {
-                                        Ok(_) => feedback_buffer = "Task added successfully.".to_string(),
+                    }
+                    Mode::Help => match key.code {
+                        KeyCode::Enter
+                        | KeyCode::Esc
+                        | KeyCode::Char('h')
+                        | KeyCode::Char('H')
+                        | KeyCode::Char('?') => {
+                            current_mode = Mode::View;
+                        }
+                        _ => {}
+                    },
+                    Mode::Input => match key.code {
+                        KeyCode::Enter => {
+                            if !input_buffer.trim().is_empty() {
+                                let state = &board_states[selected_board];
+                                let index = state.selected();
+                                match insert_task(
+                                    statuses[selected_board],
+                                    index,
+                                    &input_buffer,
+                                    None,
+                                ) {
+                                    Ok(_) => {
+                                        feedback_buffer = "Task added successfully.".to_string()
+                                    }
+                                    Err(e) => feedback_buffer = format!("Error: {}", e),
+                                }
+                            } else {
+                                feedback_buffer = "Task description cannot be empty.".to_string();
+                            }
+                            current_mode = Mode::View;
+                            input_buffer.clear();
+                        }
+                        KeyCode::Esc => {
+                            current_mode = Mode::View;
+                            input_buffer.clear();
+                        }
+                        KeyCode::Char(c) => {
+                            input_buffer.push(c);
+                        }
+                        KeyCode::Backspace => {
+                            input_buffer.pop();
+                        }
+                        _ => {}
+                    },
+                    Mode::Edit => match key.code {
+                        KeyCode::Enter => {
+                            if !input_buffer.trim().is_empty() {
+                                if let Some(idx) = editing_task_idx {
+                                    match update_task(statuses[selected_board], idx, &input_buffer)
+                                    {
+                                        Ok(_) => {
+                                            feedback_buffer =
+                                                format!("Task {} updated successfully.", idx)
+                                        }
                                         Err(e) => feedback_buffer = format!("Error: {}", e),
                                     }
-                                } else {
-                                    feedback_buffer = "Task description cannot be empty.".to_string();
                                 }
-                                current_mode = Mode::View;
-                                input_buffer.clear();
+                            } else {
+                                feedback_buffer = "Task description cannot be empty.".to_string();
                             }
-                            KeyCode::Esc => {
-                                current_mode = Mode::View;
-                                input_buffer.clear();
-                            }
-                            KeyCode::Char(c) => {
-                                input_buffer.push(c);
-                            }
-                            KeyCode::Backspace => {
-                                input_buffer.pop();
-                            }
-                            _ => {}
+                            current_mode = Mode::View;
+                            input_buffer.clear();
+                            editing_task_idx = None;
                         }
-                    }
-                    Mode::Edit => {
-                        match key.code {
-                            KeyCode::Enter => {
-                                if !input_buffer.trim().is_empty() {
-                                    if let Some(idx) = editing_task_idx {
-                                        match update_task(statuses[selected_board], idx, &input_buffer) {
-                                            Ok(_) => feedback_buffer = format!("Task {} updated successfully.", idx),
-                                            Err(e) => feedback_buffer = format!("Error: {}", e),
-                                        }
-                                    }
-                                } else {
-                                    feedback_buffer = "Task description cannot be empty.".to_string();
-                                }
-                                current_mode = Mode::View;
-                                input_buffer.clear();
-                                editing_task_idx = None;
-                            }
-                            KeyCode::Esc => {
-                                current_mode = Mode::View;
-                                input_buffer.clear();
-                                editing_task_idx = None;
-                            }
-                            KeyCode::Char(c) => {
-                                input_buffer.push(c);
-                            }
-                            KeyCode::Backspace => {
-                                input_buffer.pop();
-                            }
-                            _ => {}
+                        KeyCode::Esc => {
+                            current_mode = Mode::View;
+                            input_buffer.clear();
+                            editing_task_idx = None;
                         }
-                    }
+                        KeyCode::Char(c) => {
+                            input_buffer.push(c);
+                        }
+                        KeyCode::Backspace => {
+                            input_buffer.pop();
+                        }
+                        _ => {}
+                    },
                 }
             }
         }
@@ -878,16 +1068,18 @@ fn init_tasks() -> Result<()> {
     }
 
     let files = [
-        ("todo.md", "# To Do Tasks\n"),
-        ("doing.md", "# In Progress\n"),
-        ("done.md", "# Completed Tasks\n"),
+        ("todo.md", "\n"),
+        ("doing.md", "\n"),
+        ("done.md", "\n"),
     ];
 
     for (filename, content) in files {
         let path = tasks_dir.join(filename);
         if !path.exists() {
-            let mut file = fs::File::create(&path).context(format!("Failed to create file {:?}", path))?;
-            file.write_all(content.as_bytes()).context(format!("Failed to write to file {:?}", path))?;
+            let mut file =
+                fs::File::create(&path).context(format!("Failed to create file {:?}", path))?;
+            file.write_all(content.as_bytes())
+                .context(format!("Failed to write to file {:?}", path))?;
             println!("Created file: {:?}", path);
         } else {
             println!("File already exists: {:?}", path);

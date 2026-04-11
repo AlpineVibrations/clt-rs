@@ -49,6 +49,11 @@ Add a new task to the To Do list:
 clt add "My first task"
 ```
 
+**Metadata:** You can optionally add metadata (tags, priority, or IDs) which will be stored in parentheses:
+```bash
+clt add "Fix login bug" "BUG, HIGH"
+```
+
 ### Moving Tasks
 Change the status of a task:
 ```bash
