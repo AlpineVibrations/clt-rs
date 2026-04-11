@@ -514,7 +514,7 @@ fn tui_view() -> Result<()> {
                 let selected_idx = board_states[i].selected();
                 let col_width = (size.width / 3) as usize;
                 let tasks = read_tasks(status).unwrap_or_default();
-                let items: Vec<ListItem> = tasks
+                let items: Vec<ListItem> = tasks.clone()
                     .into_iter()
                     .enumerate()
                     .map(|(idx, t)| {
@@ -560,30 +560,93 @@ fn tui_view() -> Result<()> {
                     Style::default().fg(Color::White).bg(Color::DarkGray)
                 };
 
-                let list = List::new(items.clone())
-                    .block(
-                        Block::default()
-                            .title(format!(
-                                "{} {}",
-                                titles[i],
-                                if selected_board == i {
-                                    "  <<<<<< * >>>>>>     "
-                                } else {
-                                    ""
-                                }
-                            ))
-                            // .title(Line::from(vec![Span::raw(" TODO")]))
-                            .title(
-                                Line::from(vec![Span::raw(format!(" {} ", &items.len()))])
-                                    .alignment(Alignment::Right),
-                            )
-                            .borders(Borders::ALL)
-                            .border_style(Style::default().fg(colors[i])),
+                let block = Block::default()
+                    .title(format!(
+                        "{} {}",
+                        titles[i],
+                        if selected_board == i {
+                            "  <<<<<< * >>>>>>     "
+                        } else {
+                            ""
+                        }
+                    ))
+                    .title(
+                        Line::from(vec![Span::raw(format!(" {} ", tasks.len()))])
+                            .alignment(Alignment::Right),
                     )
-                    .style(Style::default().fg(text_color))
-                    .highlight_style(highlight_style);
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(colors[i]));
 
-                f.render_stateful_widget(list, chunks[i], &mut board_states[i]);
+                let inner_area = block.inner(chunks[i]);
+                
+                let mut current_y = 0;
+                for (idx, t) in tasks.iter().enumerate() {
+                    let cleaned = t.replace("- ", "");
+                    let is_selected = Some(idx) == selected_idx;
+                    
+                    let (desc, meta) = if let Some(start) = cleaned.rfind(" (") {
+                        if cleaned.ends_with(')') {
+                            (&cleaned[..start], Some(&cleaned[start + 2..cleaned.len() - 1]))
+                        } else {
+                            (&cleaned[..], None)
+                        }
+                    } else {
+                        (&cleaned[..], None)
+                    };
+
+                    let text = if is_selected {
+                        wrap_text(desc, col_width.saturating_sub(5))
+                    } else {
+                        desc.to_string()
+                    };
+
+                    let style = if is_selected {
+                        highlight_style
+                    } else {
+                        Style::default().fg(text_color)
+                    };
+
+                    let content = format!("{}. {}", idx + 1, text);
+                    let paragraph = Paragraph::new(content)
+                        .style(style);
+                    
+                    let area = ratatui::layout::Rect {
+                        x: inner_area.x,
+                        y: inner_area.y + current_y as u16,
+                        width: inner_area.width,
+                        height: 1, // This is a simplification; we should calculate height based on wrap_text
+                    };
+                    
+                    // To actually support multi-line expansion in a manual loop, 
+                    // we need to render the wrapped text as a Paragraph and increment current_y
+                    // by the number of lines it actually takes.
+                    
+                    let wrapped_content = if is_selected {
+                        wrap_text(desc, col_width.saturating_sub(5))
+                    } else {
+                        desc.to_string()
+                    };
+                    
+                    let line_count = wrapped_content.lines().count();
+                    let item_area = ratatui::layout::Rect {
+                        x: inner_area.x,
+                        y: inner_area.y + current_y as u16,
+                        width: inner_area.width,
+                        height: line_count as u16,
+                    };
+
+                    let item_text = format!("{}. {}", idx + 1, wrapped_content);
+                    f.render_widget(
+                        Paragraph::new(item_text).style(style),
+                        item_area
+                    );
+
+                    current_y += line_count;
+                    if inner_area.y + current_y as u16 >= chunks[i].height {
+                        break;
+                    }
+                }
+                f.render_widget(block, chunks[i]);
             }
 
             if matches!(current_mode, Mode::Input) || matches!(current_mode, Mode::Edit) {
