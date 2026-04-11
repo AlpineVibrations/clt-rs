@@ -10,7 +10,7 @@ The project uses a file-system-backed Kanban system located in the `tasks/` dire
 
 ## Core Workflow
 The agent must adhere to the following state transition pipeline:
-`Todo` $\rightarrow$ `Doing` $\rightarrow$ `Done`
+`Todo` → `Doing` → `Done`
 
 1. **Identify/Create**: Add new requirements or bugs to the `todo` list.
 2. **Activate**: When starting work on a task, move it from `todo` to `doing`.
