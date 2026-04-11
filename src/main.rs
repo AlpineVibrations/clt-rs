@@ -456,7 +456,7 @@ fn tui_view() -> Result<()> {
                     .collect();
 
                 let highlight_style = if matches!(current_mode, Mode::View) {
-                    Style::default().fg(Color::Black).bg(Color::White)
+                    Style::default().fg(Color::Black).bg(Color::Rgb(220, 220, 220))
                 } else {
                     // Use a more subtle highlight when in Input/Edit mode
                     Style::default().fg(Color::White).bg(Color::Rgb(60, 60, 60))

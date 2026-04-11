@@ -1,4 +1,5 @@
 # Done Tasks
+- when you have a task selected an then you hit spacebar to go into  new task mode the selected task should only have a white border and not the full filled in background of white and then the new task when created should go below that selected task
 - add sub command to list command to view only a single status like todo
 - the feedback when entering a task in the view mode needs a better place. its overwriting other stuff right now. maybe it should be below the input
 - move the feedback to a line below the input line
@@ -21,3 +22,4 @@
 - we need readme instructions for starting the TUI before the cli instructions.
 - Update README usage guide
 - the cli command to get into view should be the default view with no cli args
+- "- make the selected task's background in kanban just a little darker" >> tasks/done.md
