@@ -431,11 +431,11 @@ fn tui_view() -> Result<()> {
 
     let statuses = ["todo", "doing", "done"];
     let titles = ["To Do", "In Progress", "Done"];
-    let c_1 = Color::Rgb(120, 160, 190);
-    let c_2 = Color::Rgb(130, 170, 130);
-    let c_3 = Color::Rgb(180, 140, 155);
-    let text_color = Color::Rgb(200, 200, 200);
-    let colors = [c_1,c_2,c_3];
+    let c_1 = Color::LightCyan;
+    let c_2 = Color::LightGreen;
+    let c_3 = Color::LightMagenta;
+    let text_color = Color::DarkGray;
+    let colors = [c_1, c_2, c_3];
 
     loop {
         terminal.draw(|f| {
@@ -480,10 +480,10 @@ fn tui_view() -> Result<()> {
                     .collect();
 
                 let highlight_style = if matches!(current_mode, Mode::View) {
-                    Style::default().fg(Color::Black).bg(Color::Rgb(220, 220, 220))
+                    Style::default().fg(Color::Black).bg(Color::Yellow)
                 } else {
                     // Use a more subtle highlight when in Input/Edit mode
-                    Style::default().fg(Color::White).bg(Color::Rgb(60, 60, 60))
+                    Style::default().fg(Color::White).bg(Color::DarkGray)
                 };
 
                 let list = List::new(items)
