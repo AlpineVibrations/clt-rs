@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use std::fs;
-use std::io::{Write, stdout};
+use std::io::{self, Write, stdout};
 use std::path::Path;
 use anyhow::{Context, Result};
 
@@ -95,11 +95,34 @@ fn main() -> Result<()> {
             list_tasks(status)?;
         }
         None => {
+            if !is_initialized() {
+                print!("Tasks not initialized. Would you like to initialize now? (y/n): ");
+                io::stdout().flush()?;
+                
+                let mut response = String::new();
+                io::stdin().read_line(&mut response)?;
+                
+                if response.trim().to_lowercase() == "y" {
+                    init_tasks()?;
+                } else {
+                    println!("Initialization skipped. Please run 'init' to set up your task lists.");
+                    return Ok(());
+                }
+            }
             tui_view()?;
         }
     }
 
     Ok(())
+}
+
+fn is_initialized() -> bool {
+    let tasks_dir = Path::new("tasks");
+    if !tasks_dir.exists() {
+        return false;
+    }
+    let files = ["todo.md", "doing.md", "done.md"];
+    files.iter().all(|f| tasks_dir.join(f).exists())
 }
 
 fn get_file_path(status: &str) -> Result<std::path::PathBuf> {
