@@ -20,6 +20,7 @@ A simple, file-system-backed CLI task management app written in Rust. It uses Ma
 - **Kanban TUI**: A visual board view powered by `ratatui`.
 - **Simple CLI**: Easy commands to add, move, and list tasks.
 - **Smart Root Detection**: Automatically finds the git repository root to keep tasks centralized, or uses the current directory.
+- **Agent Support**: Includes a `clt-skill.md` file to help AI agents use `clt` for task tracking.
 
 ## Installation
 
