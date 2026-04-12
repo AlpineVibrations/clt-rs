@@ -3,7 +3,7 @@
 This document defines the skills and operational procedures for an agent to manage project tasks using the `clt` (lls-cli-task) tool.
 
 ## Overview
-The project uses a file-system-backed Kanban system located in the `tasks/` directory. Tasks are stored in Markdown files:
+The project uses a file-system-backed Kanban system. By default, the tool automatically detects the git repository root and locates the `tasks/` directory there to keep task management centralized across the project. Tasks are stored in Markdown files:
 - `tasks/todo.md`: Tasks to be started.
 - `tasks/doing.md`: Tasks currently in progress.
 - `tasks/done.md`: Completed tasks.
@@ -22,6 +22,10 @@ The agent must adhere to the following state transition pipeline:
 If the `tasks/` directory is missing, initialize the system:
 ```bash
 clt init
+```
+To force initialization in the current working directory instead of the git root ( not used most the time ), use:
+```bash
+clt --local init
 ```
 
 ### 2. Adding Tasks
@@ -76,6 +80,7 @@ clt delete <status> <index>
 
 ## Operational Guidelines for Agents
 
+- **Root Awareness**: Be aware that `clt` operates relative to the git root by default. If you need to manage tasks in a specific subdirectory that is not the git root, use the `--local` flag.
 - **Verify Indices**: Task indices are dynamic. Always run `clt list <status>` immediately before a `status`, `done`, or `delete` command to avoid modifying the wrong task.
 - **Atomic Transitions**: Only move one task to `doing` at a time to maintain focus and clear project state.
 - **Metadata Usage**: Use the metadata field for tracking issue numbers, priority, or assignees. Use standardized, comma-separated tags for better scannability (e.g., `clt add "Fix memory leak" "BUG, HIGH"`).

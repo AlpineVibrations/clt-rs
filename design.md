@@ -4,8 +4,13 @@
 This CLI application, `lls-cli-task`, will provide a simple, file-system-backed task management system. It operates by initializing a standardized task structure in the current working directory.
 
 ### 2. Directory Structure
-Upon initial execution in any directory (`<current_dir>`), the CLI must:
-1. Create a subdirectory named `tasks/` inside `<current_dir>`.
+The CLI resolves the task root directory as follows:
+1. If the `--local` flag is provided, use the current working directory.
+2. Otherwise, attempt to find the git repository root using `git rev-parse --show-toplevel`.
+3. If not in a git repository, fallback to the current working directory.
+
+Once the root directory (`<root>`) is determined, the CLI must:
+1. Create a subdirectory named `tasks/` inside `<root>`.
 2. Create and initialize three Markdown files inside `tasks/`:
     * `todo.md`: For tasks not yet started.
     * `doing.md`: For tasks currently in progress.
@@ -15,7 +20,8 @@ Upon initial execution in any directory (`<current_dir>`), the CLI must:
 Each markdown file should start with appropriate headers (e.g., `# To Do Tasks`, `# In Progress`, `# Completed Tasks`).
 
 ### 3. Core Functionality (CLI Commands)
-The CLI needs commands to interact with tasks:
+The CLI needs commands to interact with tasks. All commands support the optional `--local` flag to override git root detection.
+
 *   `lls-cli-task init`: Initializes the `tasks/` directory and the three markdown files if they don't exist.
 *   `lls-cli-task add <task_description> [optional_metadata]`: Creates a new task and adds it to `todo.md`.
 *   `lls-cli-task status <transition> <task_index>`: Allows moving a task from one list to another (e.g., `status todo->doing 1`).

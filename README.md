@@ -19,6 +19,7 @@ A simple, file-system-backed CLI task management app written in Rust. It uses Ma
 - **File-based Persistence**: Tasks are stored in `tasks/todo.md`, `tasks/doing.md`, and `tasks/done.md`.
 - **Kanban TUI**: A visual board view powered by `ratatui`.
 - **Simple CLI**: Easy commands to add, move, and list tasks.
+- **Smart Root Detection**: Automatically finds the git repository root to keep tasks centralized, or uses the current directory.
 
 ## Installation
 
@@ -34,6 +35,11 @@ cargo install clt-rs
 Initialize the task directory structure:
 ```bash
 clt init
+```
+
+**Note:** By default, `clt` looks for the root of your git repository to store the `tasks/` folder. To force use of the current directory instead, use the `--local` flag:
+```bash
+clt --local init
 ```
 
 ### Kanban View
