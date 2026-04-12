@@ -23,6 +23,10 @@ use ratatui::{
 #[command(name = "lls-cli-task")]
 #[command(about = "A simple file-system-backed task management system", long_about = None)]
 struct Cli {
+    /// Force use of current directory instead of git root
+    #[arg(long, default_value_t = false)]
+    local: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -67,16 +71,22 @@ enum Commands {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let root = get_task_root(cli.local)?;
+    let cwd = std::env::current_dir()?;
+
+    if root != cwd {
+        println!("Using tasks at: {:?}", root);
+    }
 
     match cli.command {
         Some(Commands::Init) => {
-            init_tasks()?;
+            init_tasks(&root)?;
         }
         Some(Commands::Add {
             description,
             metadata,
         }) => {
-            let msg = add_task(&description, metadata)?;
+            let msg = add_task(&root, &description, metadata)?;
             println!("{}", msg);
         }
         Some(Commands::Status {
@@ -84,25 +94,25 @@ fn main() -> Result<()> {
             task_index,
             to,
         }) => {
-            move_task(&from, &to, &task_index)?;
+            move_task(&root, &from, &to, &task_index)?;
         }
         Some(Commands::Done { status, task_index }) => {
             if status == "done" {
                 println!("Task is already done.");
             } else {
-                move_task(&status, "done", &task_index)?;
+                move_task(&root, &status, "done", &task_index)?;
                 println!("Task {} from {} marked as done.", task_index, status);
             }
         }
         Some(Commands::Delete { status, task_index }) => {
-            delete_task(&status, &task_index)?;
+            delete_task(&root, &status, &task_index)?;
             println!("Task {} from {} deleted successfully.", task_index, status);
         }
         Some(Commands::List { status }) => {
-            list_tasks(status)?;
+            list_tasks(&root, status)?;
         }
         None => {
-            if !is_initialized() {
+            if !is_initialized(&root) {
                 print!("Tasks not initialized. Would you like to initialize now? (y/n): ");
                 io::stdout().flush()?;
 
@@ -110,7 +120,7 @@ fn main() -> Result<()> {
                 io::stdin().read_line(&mut response)?;
 
                 if response.trim().to_lowercase() == "y" {
-                    init_tasks()?;
+                    init_tasks(&root)?;
                 } else {
                     println!(
                         "Initialization skipped. Please run 'init' to set up your task lists."
@@ -118,15 +128,39 @@ fn main() -> Result<()> {
                     return Ok(());
                 }
             }
-            tui_view()?;
+            tui_view(&root)?;
         }
     }
 
     Ok(())
 }
 
-fn is_initialized() -> bool {
-    let tasks_dir = Path::new("tasks");
+fn get_task_root(local: bool) -> Result<std::path::PathBuf> {
+    if local {
+        return Ok(std::env::current_dir()?);
+    }
+
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => {
+            let path_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            Ok(Path::new(&path_str).to_path_buf())
+        }
+        _ => {
+            Ok(std::env::current_dir()?)
+        }
+    }
+}
+
+fn get_tasks_dir(root: &Path) -> std::path::PathBuf {
+    root.join("tasks")
+}
+
+fn is_initialized(root: &Path) -> bool {
+    let tasks_dir = get_tasks_dir(root);
     if !tasks_dir.exists() {
         return false;
     }
@@ -134,11 +168,12 @@ fn is_initialized() -> bool {
     files.iter().all(|f| tasks_dir.join(f).exists())
 }
 
-fn get_file_path(status: &str) -> Result<std::path::PathBuf> {
+fn get_file_path(root: &Path, status: &str) -> Result<std::path::PathBuf> {
+    let tasks_dir = get_tasks_dir(root);
     match status {
-        "todo" => Ok(Path::new("tasks/todo.md").to_path_buf()),
-        "doing" => Ok(Path::new("tasks/doing.md").to_path_buf()),
-        "done" => Ok(Path::new("tasks/done.md").to_path_buf()),
+        "todo" => Ok(tasks_dir.join("todo.md")),
+        "doing" => Ok(tasks_dir.join("doing.md")),
+        "done" => Ok(tasks_dir.join("done.md")),
         _ => anyhow::bail!("Invalid status. Use 'todo', 'doing', or 'done'."),
     }
 }
@@ -146,8 +181,8 @@ fn get_file_path(status: &str) -> Result<std::path::PathBuf> {
 // find_task_status is no longer needed for index-based referencing
 // as the user must specify the source list.
 
-fn delete_task(status: &str, task_index_str: &str) -> Result<()> {
-    let path = get_file_path(status)?;
+fn delete_task(root: &Path, status: &str, task_index_str: &str) -> Result<()> {
+    let path = get_file_path(root, status)?;
     let task_index = task_index_str
         .parse::<usize>()
         .context("Invalid task index. Please provide a number.")?;
@@ -188,9 +223,9 @@ fn delete_task(status: &str, task_index_str: &str) -> Result<()> {
     Ok(())
 }
 
-fn move_task(from: &str, to: &str, task_index_str: &str) -> Result<()> {
-    let src_path = get_file_path(from)?;
-    let dest_path = get_file_path(to)?;
+fn move_task(root: &Path, from: &str, to: &str, task_index_str: &str) -> Result<()> {
+    let src_path = get_file_path(root, from)?;
+    let dest_path = get_file_path(root, to)?;
 
     let task_index = task_index_str
         .parse::<usize>()
@@ -246,8 +281,8 @@ fn move_task(from: &str, to: &str, task_index_str: &str) -> Result<()> {
     Ok(())
 }
 
-fn update_task(status: &str, task_index: usize, new_description: &str) -> Result<()> {
-    let path = get_file_path(status)?;
+fn update_task(root: &Path, status: &str, task_index: usize, new_description: &str) -> Result<()> {
+    let path = get_file_path(root, status)?;
     let content = fs::read_to_string(&path).context("Failed to read file")?;
     let lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
 
@@ -275,8 +310,8 @@ fn update_task(status: &str, task_index: usize, new_description: &str) -> Result
     Ok(())
 }
 
-fn reorder_task(status: &str, from_idx: usize, to_idx: usize) -> Result<()> {
-    let path = get_file_path(status)?;
+fn reorder_task(root: &Path, status: &str, from_idx: usize, to_idx: usize) -> Result<()> {
+    let path = get_file_path(root, status)?;
     let content = fs::read_to_string(&path).context("Failed to read file")?;
     let lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
 
@@ -316,7 +351,7 @@ fn reorder_task(status: &str, from_idx: usize, to_idx: usize) -> Result<()> {
     Ok(())
 }
 
-fn list_tasks(filter_status: Option<String>) -> Result<()> {
+fn list_tasks(root: &Path, filter_status: Option<String>) -> Result<()> {
     if let Some(ref s) = filter_status {
         let status = match s.as_str() {
             "1" => "todo",
@@ -325,7 +360,7 @@ fn list_tasks(filter_status: Option<String>) -> Result<()> {
             _ => s.as_str(),
         };
 
-        let path = get_file_path(status)?;
+        let path = get_file_path(root, status)?;
         println!("\n--- {} ---", status.to_uppercase());
         let content = fs::read_to_string(&path).context(format!("Failed to read {:?}", path))?;
         let mut index = 1;
@@ -338,7 +373,7 @@ fn list_tasks(filter_status: Option<String>) -> Result<()> {
     } else {
         let statuses = ["todo", "doing", "done"];
         for status in statuses {
-            let path = get_file_path(status)?;
+            let path = get_file_path(root, status)?;
             println!("\n--- {} ---", status.to_uppercase());
             let content =
                 fs::read_to_string(&path).context(format!("Failed to read {:?}", path))?;
@@ -354,17 +389,18 @@ fn list_tasks(filter_status: Option<String>) -> Result<()> {
     Ok(())
 }
 
-fn add_task(description: &str, metadata: Option<String>) -> Result<String> {
-    insert_task("todo", None, description, metadata).map(|_| "Task added successfully.".to_string())
+fn add_task(root: &Path, description: &str, metadata: Option<String>) -> Result<String> {
+    insert_task(root, "todo", None, description, metadata).map(|_| "Task added successfully.".to_string())
 }
 
 fn insert_task(
+    root: &Path,
     status: &str,
     index: Option<usize>,
     description: &str,
     metadata: Option<String>,
 ) -> Result<()> {
-    let path = get_file_path(status)?;
+    let path = get_file_path(root, status)?;
     if !path.exists() {
         anyhow::bail!("Tasks not initialized. Please run 'init' first.");
     }
@@ -408,8 +444,8 @@ fn insert_task(
     Ok(())
 }
 
-fn read_tasks(status: &str) -> Result<Vec<String>> {
-    let path = get_file_path(status)?;
+fn read_tasks(root: &Path, status: &str) -> Result<Vec<String>> {
+    let path = get_file_path(root, status)?;
     let content = fs::read_to_string(&path).context(format!("Failed to read {:?}", path))?;
     let tasks = content
         .lines()
@@ -450,7 +486,7 @@ fn wrap_text(text: &str, width: usize) -> String {
     result
 }
 
-fn tui_view() -> Result<()> {
+fn tui_view(root: &Path) -> Result<()> {
     // Setup terminal
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
@@ -513,7 +549,7 @@ fn tui_view() -> Result<()> {
             for (i, status) in statuses.iter().enumerate() {
                 let selected_idx = board_states[i].selected();
                 let col_width = (size.width / 3) as usize;
-                let tasks = read_tasks(status).unwrap_or_default();
+                let tasks = read_tasks(root, status).unwrap_or_default();
                 let _items: Vec<ListItem> = tasks.clone()
                     .into_iter()
                     .enumerate()
@@ -723,11 +759,12 @@ fn tui_view() -> Result<()> {
                                     let state = &mut board_states[selected_board];
                                     if let Some(idx) = state.selected() {
                                         if idx > 0 {
-                                            match reorder_task(
-                                                statuses[selected_board],
-                                                idx,
-                                                idx - 1,
-                                            ) {
+                                  match reorder_task(
+                                      root,
+                                      statuses[selected_board],
+                                      idx,
+                                      idx - 1,
+                                  ) {
                                                 Ok(_) => {
                                                     feedback_buffer =
                                                         format!("Moved task up to position {}", idx)
@@ -743,14 +780,15 @@ fn tui_view() -> Result<()> {
                                 KeyCode::Down => {
                                     let state = &mut board_states[selected_board];
                                     if let Some(idx) = state.selected() {
-                                        let tasks = read_tasks(statuses[selected_board])
-                                            .unwrap_or_default();
+                                    let tasks = read_tasks(root, statuses[selected_board])
+                                        .unwrap_or_default();
                                         if idx < tasks.len() - 1 {
-                                            match reorder_task(
-                                                statuses[selected_board],
-                                                idx,
-                                                idx + 1,
-                                            ) {
+                                  match reorder_task(
+                                      root,
+                                      statuses[selected_board],
+                                      idx,
+                                      idx + 1,
+                                  ) {
                                                 Ok(_) => {
                                                     feedback_buffer = format!(
                                                         "Moved task down to position {}",
@@ -771,7 +809,7 @@ fn tui_view() -> Result<()> {
                                         if selected_board > 0 {
                                             let from = statuses[selected_board];
                                             let to = statuses[selected_board - 1];
-                                            match move_task(&from, &to, &(idx + 1).to_string()) {
+                                            match move_task(root, &from, &to, &(idx + 1).to_string()) {
                                                 Ok(_) => {
                                                     feedback_buffer =
                                                         format!("Moved task to {}", to)
@@ -790,7 +828,7 @@ fn tui_view() -> Result<()> {
                                         if selected_board < 2 {
                                             let from = statuses[selected_board];
                                             let to = statuses[selected_board + 1];
-                                            match move_task(&from, &to, &(idx + 1).to_string()) {
+                                            match move_task(root, &from, &to, &(idx + 1).to_string()) {
                                                 Ok(_) => {
                                                     feedback_buffer =
                                                         format!("Moved task to {}", to)
@@ -823,8 +861,8 @@ fn tui_view() -> Result<()> {
                                     if let Some(idx) = state.selected() {
                                         current_mode = Mode::Edit;
                                         editing_task_idx = Some(idx + 1);
-                                        let tasks = read_tasks(statuses[selected_board])
-                                            .unwrap_or_default();
+                                  let tasks = read_tasks(root, statuses[selected_board])
+                                      .unwrap_or_default();
                                         input_buffer = tasks[idx].replace("- ", "");
                                     } else {
                                         current_mode = Mode::Input;
@@ -861,6 +899,7 @@ fn tui_view() -> Result<()> {
                                     if let Some(idx) = state.selected() {
                                         if idx > 0 {
                                             match reorder_task(
+                                                root,
                                                 statuses[selected_board],
                                                 idx,
                                                 idx - 1,
@@ -880,10 +919,11 @@ fn tui_view() -> Result<()> {
                                 KeyCode::Char('k') | KeyCode::Char('K') => {
                                     let state = &mut board_states[selected_board];
                                     if let Some(idx) = state.selected() {
-                                        let tasks = read_tasks(statuses[selected_board])
-                                            .unwrap_or_default();
+                                  let tasks = read_tasks(root, statuses[selected_board])
+                                      .unwrap_or_default();
                                         if idx < tasks.len() - 1 {
                                             match reorder_task(
+                                                root,
                                                 statuses[selected_board],
                                                 idx,
                                                 idx + 1,
@@ -908,7 +948,7 @@ fn tui_view() -> Result<()> {
                                         if selected_board > 0 {
                                             let from = statuses[selected_board];
                                             let to = statuses[selected_board - 1];
-                                            match move_task(&from, &to, &(idx + 1).to_string()) {
+                                            match move_task(root, &from, &to, &(idx + 1).to_string()) {
                                                 Ok(_) => {
                                                     feedback_buffer =
                                                         format!("Moved task to {}", to)
@@ -927,7 +967,7 @@ fn tui_view() -> Result<()> {
                                         if selected_board < 2 {
                                             let from = statuses[selected_board];
                                             let to = statuses[selected_board + 1];
-                                            match move_task(&from, &to, &(idx + 1).to_string()) {
+                                            match move_task(root, &from, &to, &(idx + 1).to_string()) {
                                                 Ok(_) => {
                                                     feedback_buffer =
                                                         format!("Moved task to {}", to)
@@ -944,7 +984,7 @@ fn tui_view() -> Result<()> {
                                     let state = &mut board_states[selected_board];
                                     if let Some(idx) = state.selected() {
                                         let status = statuses[selected_board];
-                                        match delete_task(status, &(idx + 1).to_string()) {
+                                        match delete_task(root, status, &(idx + 1).to_string()) {
                                             Ok(_) => {
                                                 feedback_buffer = format!(
                                                     "Deleted task {} from {}",
@@ -969,7 +1009,7 @@ fn tui_view() -> Result<()> {
                                 KeyCode::Up => {
                                     let state = &mut board_states[selected_board];
                                     let tasks =
-                                        read_tasks(statuses[selected_board]).unwrap_or_default();
+                                        read_tasks(root, statuses[selected_board]).unwrap_or_default();
                                     if !tasks.is_empty() {
                                         let i = state.selected().unwrap_or(0);
                                         if i > 0 {
@@ -982,7 +1022,7 @@ fn tui_view() -> Result<()> {
                                 KeyCode::Down => {
                                     let state = &mut board_states[selected_board];
                                     let tasks =
-                                        read_tasks(statuses[selected_board]).unwrap_or_default();
+                                        read_tasks(root, statuses[selected_board]).unwrap_or_default();
                                     if !tasks.is_empty() {
                                         let i = state.selected().unwrap_or(0);
                                         if i < tasks.len() - 1 {
@@ -1020,6 +1060,7 @@ fn tui_view() -> Result<()> {
                                     if let Some(idx) = state.selected() {
                                         if new_pos > 0 {
                                             match reorder_task(
+                                                root,
                                                 statuses[selected_board],
                                                 idx,
                                                 new_pos - 1,
@@ -1055,6 +1096,7 @@ fn tui_view() -> Result<()> {
                                 let state = &board_states[selected_board];
                                 let index = state.selected();
                                 match insert_task(
+                                    root,
                                     statuses[selected_board],
                                     index,
                                     &input_buffer,
@@ -1087,7 +1129,7 @@ fn tui_view() -> Result<()> {
                         KeyCode::Enter => {
                             if !input_buffer.trim().is_empty() {
                                 if let Some(idx) = editing_task_idx {
-                                    match update_task(statuses[selected_board], idx, &input_buffer)
+                                    match update_task(root, statuses[selected_board], idx, &input_buffer)
                                     {
                                         Ok(_) => {
                                             feedback_buffer =
@@ -1128,11 +1170,11 @@ fn tui_view() -> Result<()> {
     Ok(())
 }
 
-fn init_tasks() -> Result<()> {
-    let tasks_dir = Path::new("tasks");
+fn init_tasks(root: &Path) -> Result<()> {
+    let tasks_dir = get_tasks_dir(root);
     if !tasks_dir.exists() {
-        fs::create_dir(tasks_dir).context("Failed to create tasks directory")?;
-        println!("Created directory: tasks/");
+        fs::create_dir(&tasks_dir).context("Failed to create tasks directory")?;
+        println!("Created directory: {:?}", tasks_dir);
     }
 
     let files = [
