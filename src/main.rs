@@ -470,16 +470,30 @@ fn wrap_text(text: &str, width: usize) -> String {
     let mut current_line = String::new();
 
     for word in text.split_whitespace() {
+        // Handle words longer than the width by breaking them
+        let mut word_to_add = word;
+        while word_to_add.len() > width {
+            if !current_line.is_empty() {
+                result.push_str(&current_line);
+                result.push('\n');
+                current_line.clear();
+            }
+            let (head, tail) = word_to_add.split_at(width);
+            result.push_str(head);
+            result.push('\n');
+            word_to_add = tail;
+        }
+
         if current_line.is_empty() {
-            current_line.push_str(word);
-        } else if current_line.len() + 1 + word.len() <= width {
+            current_line.push_str(word_to_add);
+        } else if current_line.len() + 1 + word_to_add.len() <= width {
             current_line.push(' ');
-            current_line.push_str(word);
+            current_line.push_str(word_to_add);
         } else {
             result.push_str(&current_line);
             result.push('\n');
             current_line.clear();
-            current_line.push_str(word);
+            current_line.push_str(word_to_add);
         }
     }
     result.push_str(&current_line);
@@ -522,16 +536,26 @@ fn tui_view(root: &Path) -> Result<()> {
         terminal.draw(|f| {
             let size = f.area();
 
+            // Calculate input height if in Input or Edit mode
+            let input_height = if matches!(current_mode, Mode::Input) || matches!(current_mode, Mode::Edit) {
+                let label = if matches!(current_mode, Mode::Input) { " Add Task: " } else { " Edit Task: " };
+                let full_text = format!("{}{}", label, input_buffer);
+                // Subtract 2 for the borders of the block
+                let available_width = size.width.saturating_sub(2) as usize;
+                let wrapped = wrap_text(&full_text, available_width);
+                let lines = wrapped.lines().count();
+                // Height = lines + 2 (for top and bottom borders)
+                (lines + 2).max(3) as u16
+            } else {
+                0
+            };
+
             // Main layout: Kanban board, input area (if active), and feedback console
             let main_layout = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Min(0),
-                    if matches!(current_mode, Mode::Input) || matches!(current_mode, Mode::Edit) {
-                        Constraint::Length(3)
-                    } else {
-                        Constraint::Length(0)
-                    },
+                    Constraint::Length(input_height),
                     Constraint::Length(3),
                 ])
                 .split(size);
@@ -692,7 +716,10 @@ fn tui_view(root: &Path) -> Result<()> {
                     " Edit Task: "
                 };
                 let input_text = format!("{}{}", label, input_buffer);
-                let input_paragraph = Paragraph::new(input_text)
+                // Subtract 2 for the borders of the block
+                let available_width = size.width.saturating_sub(2) as usize;
+                let wrapped_input = wrap_text(&input_text, available_width);
+                let input_paragraph = Paragraph::new(wrapped_input)
                     .block(
                         Block::default()
                             .borders(Borders::ALL)
