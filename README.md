@@ -53,7 +53,7 @@ clt view
 ### Adding Tasks
 Add a new task to the To Do list:
 ```bash
-clt add "My first task"
+clt add My first task
 ```
 
 **Metadata:** You can optionally add metadata (tags, priority, or IDs) which will be stored in parentheses:
