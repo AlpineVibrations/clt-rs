@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use ratatui::layout::Alignment;
+use ratatui::layout::{Alignment, Position};
 use std::fs;
 use std::io::{self, Write, stdout};
 use std::path::Path;
@@ -543,6 +543,25 @@ fn wrap_text(text: &str, width: usize) -> String {
     result
 }
 
+fn input_cursor_offset(wrapped_input: &str, width: usize) -> (u16, u16) {
+    if width == 0 {
+        return (0, 0);
+    }
+
+    let row = wrapped_input.lines().count().saturating_sub(1);
+    let col = wrapped_input
+        .lines()
+        .last()
+        .map(|line| line.len())
+        .unwrap_or(0);
+
+    if col >= width {
+        (0, (row + 1) as u16)
+    } else {
+        (col as u16, row as u16)
+    }
+}
+
 fn tui_view(root: &Path) -> Result<()> {
     // Setup terminal
     enable_raw_mode()?;
@@ -592,8 +611,9 @@ fn tui_view(root: &Path) -> Result<()> {
                     let available_width = size.width.saturating_sub(2) as usize;
                     let wrapped = wrap_text(&full_text, available_width);
                     let lines = wrapped.lines().count();
-                    // Height = lines + 2 (for top and bottom borders)
-                    (lines + 2).max(3) as u16
+                    let cursor_row = input_cursor_offset(&wrapped, available_width).1 as usize;
+                    // Height = content rows + 2 (for top and bottom borders)
+                    (lines.max(cursor_row + 1) + 2).max(3) as u16
                 } else {
                     0
                 };
@@ -767,7 +787,7 @@ fn tui_view(root: &Path) -> Result<()> {
                 // Subtract 2 for the borders of the block
                 let available_width = size.width.saturating_sub(2) as usize;
                 let wrapped_input = wrap_text(&input_text, available_width);
-                let input_paragraph = Paragraph::new(wrapped_input)
+                let input_paragraph = Paragraph::new(wrapped_input.as_str())
                     .block(
                         Block::default()
                             .borders(Borders::ALL)
@@ -775,6 +795,16 @@ fn tui_view(root: &Path) -> Result<()> {
                     )
                     .style(Style::default().fg(Color::White));
                 f.render_widget(input_paragraph, main_layout[1]);
+
+                let (cursor_x, cursor_y) = input_cursor_offset(&wrapped_input, available_width);
+                let input_inner = main_layout[1].inner(ratatui::layout::Margin {
+                    horizontal: 1,
+                    vertical: 1,
+                });
+                f.set_cursor_position(Position::new(
+                    input_inner.x + cursor_x.min(input_inner.width.saturating_sub(1)),
+                    input_inner.y + cursor_y.min(input_inner.height.saturating_sub(1)),
+                ));
             }
 
             let feedback_paragraph = Paragraph::new(feedback_buffer.as_str())
@@ -1378,5 +1408,11 @@ mod tests {
             }
             _ => panic!("expected add command"),
         }
+    }
+
+    #[test]
+    fn input_cursor_offset_wraps_after_full_line() {
+        assert_eq!(input_cursor_offset("Add Task:", 9), (0, 1));
+        assert_eq!(input_cursor_offset("Add Task:\nhello", 9), (5, 1));
     }
 }
