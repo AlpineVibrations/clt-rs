@@ -46,7 +46,7 @@ clt --local init
 ### Kanban View
 Open the interactive TUI Kanban board:
 ```bash
-clt view
+clt
 ```
 *(Press 'q' to quit the TUI view)*
 
@@ -70,7 +70,7 @@ clt status doing 1 done
 
 Alternatively, mark a task as done quickly:
 ```bash
-clt done 1
+clt done doing 1
 ```
 
 ### Deleting Tasks
