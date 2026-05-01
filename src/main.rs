@@ -273,27 +273,25 @@ fn move_task(root: &Path, from: &str, to: &str, task_index_str: &str) -> Result<
     let (actual_line_idx, task_line) = task_lines[task_index - 1];
     let task_line_content = task_line.clone();
 
-    // Remove from source
-    let mut new_src_lines = lines.clone();
-    new_src_lines.remove(actual_line_idx);
-    let updated_src_content = new_src_lines.join("\n");
-    // Add trailing newline if the file wasn't empty
-    let final_src_content = if updated_src_content.is_empty() {
-        updated_src_content
-    } else {
-        format!("{}\n", updated_src_content)
-    };
-    fs::write(&src_path, final_src_content).context("Failed to update source file")?;
-
-    // Ensure the destination file ends with a newline before appending to prevent line merging
+    // Write the destination first so a destination failure cannot remove the task.
     let mut dest_content =
         fs::read_to_string(&dest_path).context("Failed to read destination file")?;
     if !dest_content.is_empty() && !dest_content.ends_with('\n') {
         dest_content.push('\n');
     }
     dest_content.push_str(&task_line_content);
-    // task_line_content already includes \n from the add_task function or the original file
+    dest_content.push('\n');
     fs::write(&dest_path, dest_content).context("Failed to update destination file")?;
+
+    let mut new_src_lines = lines.clone();
+    new_src_lines.remove(actual_line_idx);
+    let updated_src_content = new_src_lines.join("\n");
+    let final_src_content = if updated_src_content.is_empty() {
+        updated_src_content
+    } else {
+        format!("{}\n", updated_src_content)
+    };
+    fs::write(&src_path, final_src_content).context("Failed to update source file")?;
 
     Ok(())
 }
@@ -1458,6 +1456,22 @@ mod tests {
             }
             _ => panic!("expected add command"),
         }
+    }
+
+    #[test]
+    fn move_task_writes_destination_and_removes_source() {
+        let root = temp_root("move");
+
+        add_task(&root, "ship the fix", None).unwrap();
+        move_task(&root, "todo", "doing", "1").unwrap();
+
+        let todo = fs::read_to_string(root.join("tasks/todo.md")).unwrap();
+        let doing = fs::read_to_string(root.join("tasks/doing.md")).unwrap();
+
+        assert_eq!(todo, "# To Do Tasks\n");
+        assert_eq!(doing, "# Doing Tasks\n- ship the fix\n");
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
