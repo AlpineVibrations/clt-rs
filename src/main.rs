@@ -504,6 +504,12 @@ fn select_first_task_if_present(root: &Path, status: &str, state: &mut ListState
     state.select(if has_tasks { Some(0) } else { None });
 }
 
+fn selected_task(root: &Path, status: &str, state: &ListState) -> Option<(usize, String)> {
+    let idx = state.selected()?;
+    let tasks = read_tasks(root, status).ok()?;
+    tasks.get(idx).cloned().map(|task| (idx, task))
+}
+
 enum Mode {
     View,
     Input,
@@ -1001,14 +1007,16 @@ fn tui_view(root: &Path) -> Result<()> {
                                 }
                                 KeyCode::Char('q') => break,
                                 KeyCode::Enter => {
-                                    let state = &board_states[selected_board];
-                                    if let Some(idx) = state.selected() {
+                                    if let Some((idx, task)) = selected_task(
+                                        root,
+                                        statuses[selected_board],
+                                        &board_states[selected_board],
+                                    ) {
                                         current_mode = Mode::Edit;
                                         editing_task_idx = Some(idx + 1);
-                                        let tasks = read_tasks(root, statuses[selected_board])
-                                            .unwrap_or_default();
-                                        input_buffer = tasks[idx].replace("- ", "");
+                                        input_buffer = task.replace("- ", "");
                                     } else {
+                                        board_states[selected_board].select(None);
                                         current_mode = Mode::Input;
                                         input_buffer.clear();
                                     }
@@ -1470,6 +1478,19 @@ mod tests {
 
         assert_eq!(todo, "# To Do Tasks\n");
         assert_eq!(doing, "# Doing Tasks\n- ship the fix\n");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn selected_task_ignores_stale_selection() {
+        let root = temp_root("stale-selection");
+        ensure_task_store(&root).unwrap();
+
+        let mut state = ListState::default();
+        state.select(Some(0));
+
+        assert_eq!(selected_task(&root, "todo", &state), None);
 
         fs::remove_dir_all(root).unwrap();
     }
