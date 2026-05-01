@@ -35,3 +35,5 @@
 - Make task moves resilient to destination write failure so tasks are not lost (BUG, P2)
 - Align README usage examples with the actual CLI command surface (DOCS, P2)
 - Fix TUI add/edit panic when selected board has no tasks (BUG, P1)
+- Fix TUI add panic after moving a task into another board (BUG, P1)
+- add new

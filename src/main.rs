@@ -504,10 +504,44 @@ fn select_first_task_if_present(root: &Path, status: &str, state: &mut ListState
     state.select(if has_tasks { Some(0) } else { None });
 }
 
+fn select_last_task_if_present(root: &Path, status: &str, state: &mut ListState) {
+    let last_idx = read_tasks(root, status)
+        .ok()
+        .and_then(|tasks| tasks.len().checked_sub(1));
+
+    state.select(last_idx);
+}
+
+fn selected_task_index(root: &Path, status: &str, state: &ListState) -> Option<usize> {
+    let idx = state.selected()?;
+    let tasks = read_tasks(root, status).ok()?;
+
+    if idx < tasks.len() { Some(idx) } else { None }
+}
+
 fn selected_task(root: &Path, status: &str, state: &ListState) -> Option<(usize, String)> {
     let idx = state.selected()?;
     let tasks = read_tasks(root, status).ok()?;
     tasks.get(idx).cloned().map(|task| (idx, task))
+}
+
+fn normalize_board_selection(root: &Path, status: &str, state: &mut ListState) {
+    let selected = state.selected();
+    let task_count = read_tasks(root, status)
+        .map(|tasks| tasks.len())
+        .unwrap_or(0);
+
+    match (selected, task_count) {
+        (Some(idx), 0) if idx == 0 => state.select(None),
+        (Some(idx), count) if idx >= count => state.select(count.checked_sub(1)),
+        _ => {}
+    }
+}
+
+fn normalize_board_selections(root: &Path, statuses: &[&str], states: &mut [ListState]) {
+    for (status, state) in statuses.iter().zip(states.iter_mut()) {
+        normalize_board_selection(root, status, state);
+    }
 }
 
 enum Mode {
@@ -627,6 +661,8 @@ fn tui_view(root: &Path) -> Result<()> {
     let colors = [c_1, c_2, c_3];
 
     loop {
+        normalize_board_selections(root, &statuses, &mut board_states);
+
         terminal.draw(|f| {
             let size = f.area();
 
@@ -893,8 +929,11 @@ fn tui_view(root: &Path) -> Result<()> {
                         if key.modifiers.contains(KeyModifiers::SHIFT) {
                             match key.code {
                                 KeyCode::Up => {
-                                    let state = &mut board_states[selected_board];
-                                    if let Some(idx) = state.selected() {
+                                    if let Some(idx) = selected_task_index(
+                                        root,
+                                        statuses[selected_board],
+                                        &board_states[selected_board],
+                                    ) {
                                         if idx > 0 {
                                             match reorder_task(
                                                 root,
@@ -908,19 +947,25 @@ fn tui_view(root: &Path) -> Result<()> {
                                                 }
                                                 Err(e) => feedback_buffer = format!("Error: {}", e),
                                             }
-                                            state.select(Some(idx - 1));
+                                            board_states[selected_board].select(Some(idx - 1));
                                         } else {
                                             feedback_buffer = "Already at the top".to_string();
                                         }
+                                    } else {
+                                        board_states[selected_board].select(None);
+                                        feedback_buffer = "No task selected".to_string();
                                     }
                                 }
                                 KeyCode::Down => {
-                                    let state = &mut board_states[selected_board];
-                                    if let Some(idx) = state.selected() {
+                                    if let Some(idx) = selected_task_index(
+                                        root,
+                                        statuses[selected_board],
+                                        &board_states[selected_board],
+                                    ) {
                                         let tasks = read_tasks(root, statuses[selected_board])
                                             .unwrap_or_default();
                                         if tasks.is_empty() {
-                                            state.select(None);
+                                            board_states[selected_board].select(None);
                                             feedback_buffer = "No task selected".to_string();
                                         } else if idx < tasks.len() - 1 {
                                             match reorder_task(
@@ -937,25 +982,37 @@ fn tui_view(root: &Path) -> Result<()> {
                                                 }
                                                 Err(e) => feedback_buffer = format!("Error: {}", e),
                                             }
-                                            state.select(Some(idx + 1));
+                                            board_states[selected_board].select(Some(idx + 1));
                                         } else {
                                             feedback_buffer = "Already at the bottom".to_string();
                                         }
+                                    } else {
+                                        board_states[selected_board].select(None);
+                                        feedback_buffer = "No task selected".to_string();
                                     }
                                 }
                                 KeyCode::Left => {
-                                    let state = &mut board_states[selected_board];
-                                    if let Some(idx) = state.selected() {
+                                    if let Some(idx) = selected_task_index(
+                                        root,
+                                        statuses[selected_board],
+                                        &board_states[selected_board],
+                                    ) {
                                         if selected_board > 0 {
+                                            let to_board = selected_board - 1;
                                             let from = statuses[selected_board];
-                                            let to = statuses[selected_board - 1];
-                                            match move_task(
-                                                root,
-                                                &from,
-                                                &to,
-                                                &(idx + 1).to_string(),
-                                            ) {
+                                            let to = statuses[to_board];
+                                            match move_task(root, from, to, &(idx + 1).to_string())
+                                            {
                                                 Ok(_) => {
+                                                    selected_board = to_board;
+                                                    for state in board_states.iter_mut() {
+                                                        state.select(None);
+                                                    }
+                                                    select_last_task_if_present(
+                                                        root,
+                                                        to,
+                                                        &mut board_states[selected_board],
+                                                    );
                                                     feedback_buffer =
                                                         format!("Moved task to {}", to)
                                                 }
@@ -965,21 +1022,33 @@ fn tui_view(root: &Path) -> Result<()> {
                                             feedback_buffer =
                                                 "Already at the first board".to_string();
                                         }
+                                    } else {
+                                        board_states[selected_board].select(None);
+                                        feedback_buffer = "No task selected".to_string();
                                     }
                                 }
                                 KeyCode::Right => {
-                                    let state = &mut board_states[selected_board];
-                                    if let Some(idx) = state.selected() {
+                                    if let Some(idx) = selected_task_index(
+                                        root,
+                                        statuses[selected_board],
+                                        &board_states[selected_board],
+                                    ) {
                                         if selected_board < 2 {
+                                            let to_board = selected_board + 1;
                                             let from = statuses[selected_board];
-                                            let to = statuses[selected_board + 1];
-                                            match move_task(
-                                                root,
-                                                &from,
-                                                &to,
-                                                &(idx + 1).to_string(),
-                                            ) {
+                                            let to = statuses[to_board];
+                                            match move_task(root, from, to, &(idx + 1).to_string())
+                                            {
                                                 Ok(_) => {
+                                                    selected_board = to_board;
+                                                    for state in board_states.iter_mut() {
+                                                        state.select(None);
+                                                    }
+                                                    select_last_task_if_present(
+                                                        root,
+                                                        to,
+                                                        &mut board_states[selected_board],
+                                                    );
                                                     feedback_buffer =
                                                         format!("Moved task to {}", to)
                                                 }
@@ -989,6 +1058,9 @@ fn tui_view(root: &Path) -> Result<()> {
                                             feedback_buffer =
                                                 "Already at the last board".to_string();
                                         }
+                                    } else {
+                                        board_states[selected_board].select(None);
+                                        feedback_buffer = "No task selected".to_string();
                                     }
                                 }
                                 _ => {}
@@ -1022,6 +1094,15 @@ fn tui_view(root: &Path) -> Result<()> {
                                     }
                                 }
                                 KeyCode::Char(' ') => {
+                                    if selected_task_index(
+                                        root,
+                                        statuses[selected_board],
+                                        &board_states[selected_board],
+                                    )
+                                    .is_none()
+                                    {
+                                        board_states[selected_board].select(None);
+                                    }
                                     current_mode = Mode::Input;
                                     input_buffer.clear();
                                 }
@@ -1059,8 +1140,11 @@ fn tui_view(root: &Path) -> Result<()> {
                                     );
                                 }
                                 KeyCode::Char('i') | KeyCode::Char('I') => {
-                                    let state = &mut board_states[selected_board];
-                                    if let Some(idx) = state.selected() {
+                                    if let Some(idx) = selected_task_index(
+                                        root,
+                                        statuses[selected_board],
+                                        &board_states[selected_board],
+                                    ) {
                                         if idx > 0 {
                                             match reorder_task(
                                                 root,
@@ -1074,19 +1158,25 @@ fn tui_view(root: &Path) -> Result<()> {
                                                 }
                                                 Err(e) => feedback_buffer = format!("Error: {}", e),
                                             }
-                                            state.select(Some(idx - 1));
+                                            board_states[selected_board].select(Some(idx - 1));
                                         } else {
                                             feedback_buffer = "Already at the top".to_string();
                                         }
+                                    } else {
+                                        board_states[selected_board].select(None);
+                                        feedback_buffer = "No task selected".to_string();
                                     }
                                 }
                                 KeyCode::Char('k') | KeyCode::Char('K') => {
-                                    let state = &mut board_states[selected_board];
-                                    if let Some(idx) = state.selected() {
+                                    if let Some(idx) = selected_task_index(
+                                        root,
+                                        statuses[selected_board],
+                                        &board_states[selected_board],
+                                    ) {
                                         let tasks = read_tasks(root, statuses[selected_board])
                                             .unwrap_or_default();
                                         if tasks.is_empty() {
-                                            state.select(None);
+                                            board_states[selected_board].select(None);
                                             feedback_buffer = "No task selected".to_string();
                                         } else if idx < tasks.len() - 1 {
                                             match reorder_task(
@@ -1103,25 +1193,37 @@ fn tui_view(root: &Path) -> Result<()> {
                                                 }
                                                 Err(e) => feedback_buffer = format!("Error: {}", e),
                                             }
-                                            state.select(Some(idx + 1));
+                                            board_states[selected_board].select(Some(idx + 1));
                                         } else {
                                             feedback_buffer = "Already at the bottom".to_string();
                                         }
+                                    } else {
+                                        board_states[selected_board].select(None);
+                                        feedback_buffer = "No task selected".to_string();
                                     }
                                 }
                                 KeyCode::Char('j') | KeyCode::Char('J') => {
-                                    let state = &mut board_states[selected_board];
-                                    if let Some(idx) = state.selected() {
+                                    if let Some(idx) = selected_task_index(
+                                        root,
+                                        statuses[selected_board],
+                                        &board_states[selected_board],
+                                    ) {
                                         if selected_board > 0 {
+                                            let to_board = selected_board - 1;
                                             let from = statuses[selected_board];
-                                            let to = statuses[selected_board - 1];
-                                            match move_task(
-                                                root,
-                                                &from,
-                                                &to,
-                                                &(idx + 1).to_string(),
-                                            ) {
+                                            let to = statuses[to_board];
+                                            match move_task(root, from, to, &(idx + 1).to_string())
+                                            {
                                                 Ok(_) => {
+                                                    selected_board = to_board;
+                                                    for state in board_states.iter_mut() {
+                                                        state.select(None);
+                                                    }
+                                                    select_last_task_if_present(
+                                                        root,
+                                                        to,
+                                                        &mut board_states[selected_board],
+                                                    );
                                                     feedback_buffer =
                                                         format!("Moved task to {}", to)
                                                 }
@@ -1131,21 +1233,33 @@ fn tui_view(root: &Path) -> Result<()> {
                                             feedback_buffer =
                                                 "Already at the first board".to_string();
                                         }
+                                    } else {
+                                        board_states[selected_board].select(None);
+                                        feedback_buffer = "No task selected".to_string();
                                     }
                                 }
                                 KeyCode::Char('l') | KeyCode::Char('L') => {
-                                    let state = &mut board_states[selected_board];
-                                    if let Some(idx) = state.selected() {
+                                    if let Some(idx) = selected_task_index(
+                                        root,
+                                        statuses[selected_board],
+                                        &board_states[selected_board],
+                                    ) {
                                         if selected_board < 2 {
+                                            let to_board = selected_board + 1;
                                             let from = statuses[selected_board];
-                                            let to = statuses[selected_board + 1];
-                                            match move_task(
-                                                root,
-                                                &from,
-                                                &to,
-                                                &(idx + 1).to_string(),
-                                            ) {
+                                            let to = statuses[to_board];
+                                            match move_task(root, from, to, &(idx + 1).to_string())
+                                            {
                                                 Ok(_) => {
+                                                    selected_board = to_board;
+                                                    for state in board_states.iter_mut() {
+                                                        state.select(None);
+                                                    }
+                                                    select_last_task_if_present(
+                                                        root,
+                                                        to,
+                                                        &mut board_states[selected_board],
+                                                    );
                                                     feedback_buffer =
                                                         format!("Moved task to {}", to)
                                                 }
@@ -1155,11 +1269,17 @@ fn tui_view(root: &Path) -> Result<()> {
                                             feedback_buffer =
                                                 "Already at the last board".to_string();
                                         }
+                                    } else {
+                                        board_states[selected_board].select(None);
+                                        feedback_buffer = "No task selected".to_string();
                                     }
                                 }
                                 KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Delete => {
-                                    let state = &mut board_states[selected_board];
-                                    if let Some(idx) = state.selected() {
+                                    if let Some(idx) = selected_task_index(
+                                        root,
+                                        statuses[selected_board],
+                                        &board_states[selected_board],
+                                    ) {
                                         let status = statuses[selected_board];
                                         match delete_task(root, status, &(idx + 1).to_string()) {
                                             Ok(_) => {
@@ -1168,7 +1288,7 @@ fn tui_view(root: &Path) -> Result<()> {
                                                     idx + 1,
                                                     status
                                                 );
-                                                state.select(if idx > 0 {
+                                                board_states[selected_board].select(if idx > 0 {
                                                     Some(idx - 1)
                                                 } else {
                                                     None
@@ -1177,6 +1297,7 @@ fn tui_view(root: &Path) -> Result<()> {
                                             Err(e) => feedback_buffer = format!("Error: {}", e),
                                         }
                                     } else {
+                                        board_states[selected_board].select(None);
                                         feedback_buffer = "No task selected to delete".to_string();
                                     }
                                 }
@@ -1241,8 +1362,11 @@ fn tui_view(root: &Path) -> Result<()> {
                                 }
                                 KeyCode::Char(c) if c.is_ascii_digit() => {
                                     let new_pos = (c as u8 - b'0') as usize;
-                                    let state = &mut board_states[selected_board];
-                                    if let Some(idx) = state.selected() {
+                                    if let Some(idx) = selected_task_index(
+                                        root,
+                                        statuses[selected_board],
+                                        &board_states[selected_board],
+                                    ) {
                                         if new_pos > 0 {
                                             match reorder_task(
                                                 root,
@@ -1259,6 +1383,9 @@ fn tui_view(root: &Path) -> Result<()> {
                                                 Err(e) => feedback_buffer = format!("Error: {}", e),
                                             }
                                         }
+                                    } else {
+                                        board_states[selected_board].select(None);
+                                        feedback_buffer = "No task selected".to_string();
                                     }
                                 }
                                 _ => {}
@@ -1278,8 +1405,11 @@ fn tui_view(root: &Path) -> Result<()> {
                     Mode::Input => match key.code {
                         KeyCode::Enter => {
                             if !input_buffer.trim().is_empty() {
-                                let state = &board_states[selected_board];
-                                let index = state.selected();
+                                let index = selected_task_index(
+                                    root,
+                                    statuses[selected_board],
+                                    &board_states[selected_board],
+                                );
                                 match insert_task(
                                     root,
                                     statuses[selected_board],
@@ -1491,6 +1621,49 @@ mod tests {
         state.select(Some(0));
 
         assert_eq!(selected_task(&root, "todo", &state), None);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn selected_task_index_ignores_stale_selection() {
+        let root = temp_root("stale-index");
+        add_task(&root, "only task", None).unwrap();
+
+        let mut state = ListState::default();
+        state.select(Some(1));
+
+        assert_eq!(selected_task_index(&root, "todo", &state), None);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn normalize_board_selection_clears_empty_board_selection() {
+        let root = temp_root("normalize-empty");
+        ensure_task_store(&root).unwrap();
+
+        let mut state = ListState::default();
+        state.select(Some(0));
+
+        normalize_board_selection(&root, "todo", &mut state);
+
+        assert_eq!(state.selected(), None);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn normalize_board_selection_clamps_out_of_range_selection() {
+        let root = temp_root("normalize-range");
+        add_task(&root, "only task", None).unwrap();
+
+        let mut state = ListState::default();
+        state.select(Some(4));
+
+        normalize_board_selection(&root, "todo", &mut state);
+
+        assert_eq!(state.selected(), Some(0));
 
         fs::remove_dir_all(root).unwrap();
     }

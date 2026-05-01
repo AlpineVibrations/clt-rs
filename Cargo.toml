@@ -1,6 +1,6 @@
 [package]
 name = "clt-rs"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 description = "Command Line Tasks, a file-backed CLI task manager with TUI kanban board"
 license = "MIT"
