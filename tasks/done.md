@@ -30,3 +30,4 @@
 - sometimes when adding files and stuff in other places the app will crash
 - would it be possible on the cli add funciton to not have to use quotes around the task that follows the word add?
 - show cursor on tui task input
+- Restore terminal raw mode and alternate screen on every TUI error path (BUG, P1)

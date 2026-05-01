@@ -505,6 +505,27 @@ enum Mode {
     Help,
 }
 
+struct TerminalSession;
+
+impl TerminalSession {
+    fn enter() -> Result<Self> {
+        enable_raw_mode()?;
+        if let Err(err) = stdout().execute(EnterAlternateScreen) {
+            let _ = disable_raw_mode();
+            return Err(err.into());
+        }
+
+        Ok(Self)
+    }
+}
+
+impl Drop for TerminalSession {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = stdout().execute(LeaveAlternateScreen);
+    }
+}
+
 fn wrap_text(text: &str, width: usize) -> String {
     if width == 0 {
         return text.to_string();
@@ -564,8 +585,7 @@ fn input_cursor_offset(wrapped_input: &str, width: usize) -> (u16, u16) {
 
 fn tui_view(root: &Path) -> Result<()> {
     // Setup terminal
-    enable_raw_mode()?;
-    stdout().execute(EnterAlternateScreen)?;
+    let _terminal_session = TerminalSession::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
     let mut current_mode = Mode::View;
@@ -1291,10 +1311,6 @@ fn tui_view(root: &Path) -> Result<()> {
             }
         }
     }
-
-    // Restore terminal
-    disable_raw_mode()?;
-    stdout().execute(LeaveAlternateScreen)?;
 
     Ok(())
 }
