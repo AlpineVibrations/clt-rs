@@ -498,6 +498,14 @@ fn read_tasks(root: &Path, status: &str) -> Result<Vec<String>> {
     Ok(tasks)
 }
 
+fn select_first_task_if_present(root: &Path, status: &str, state: &mut ListState) {
+    let has_tasks = read_tasks(root, status)
+        .map(|tasks| !tasks.is_empty())
+        .unwrap_or(false);
+
+    state.select(if has_tasks { Some(0) } else { None });
+}
+
 enum Mode {
     View,
     Input,
@@ -907,7 +915,10 @@ fn tui_view(root: &Path) -> Result<()> {
                                     if let Some(idx) = state.selected() {
                                         let tasks = read_tasks(root, statuses[selected_board])
                                             .unwrap_or_default();
-                                        if idx < tasks.len() - 1 {
+                                        if tasks.is_empty() {
+                                            state.select(None);
+                                            feedback_buffer = "No task selected".to_string();
+                                        } else if idx < tasks.len() - 1 {
                                             match reorder_task(
                                                 root,
                                                 statuses[selected_board],
@@ -1013,21 +1024,33 @@ fn tui_view(root: &Path) -> Result<()> {
                                     for state in board_states.iter_mut() {
                                         state.select(None);
                                     }
-                                    board_states[selected_board].select(Some(0));
+                                    select_first_task_if_present(
+                                        root,
+                                        statuses[selected_board],
+                                        &mut board_states[selected_board],
+                                    );
                                 }
                                 KeyCode::Char('2') => {
                                     selected_board = 1;
                                     for state in board_states.iter_mut() {
                                         state.select(None);
                                     }
-                                    board_states[selected_board].select(Some(0));
+                                    select_first_task_if_present(
+                                        root,
+                                        statuses[selected_board],
+                                        &mut board_states[selected_board],
+                                    );
                                 }
                                 KeyCode::Char('3') => {
                                     selected_board = 2;
                                     for state in board_states.iter_mut() {
                                         state.select(None);
                                     }
-                                    board_states[selected_board].select(Some(0));
+                                    select_first_task_if_present(
+                                        root,
+                                        statuses[selected_board],
+                                        &mut board_states[selected_board],
+                                    );
                                 }
                                 KeyCode::Char('i') | KeyCode::Char('I') => {
                                     let state = &mut board_states[selected_board];
@@ -1056,7 +1079,10 @@ fn tui_view(root: &Path) -> Result<()> {
                                     if let Some(idx) = state.selected() {
                                         let tasks = read_tasks(root, statuses[selected_board])
                                             .unwrap_or_default();
-                                        if idx < tasks.len() - 1 {
+                                        if tasks.is_empty() {
+                                            state.select(None);
+                                            feedback_buffer = "No task selected".to_string();
+                                        } else if idx < tasks.len() - 1 {
                                             match reorder_task(
                                                 root,
                                                 statuses[selected_board],
@@ -1186,7 +1212,11 @@ fn tui_view(root: &Path) -> Result<()> {
                                     for state in board_states.iter_mut() {
                                         state.select(None);
                                     }
-                                    board_states[selected_board].select(Some(0));
+                                    select_first_task_if_present(
+                                        root,
+                                        statuses[selected_board],
+                                        &mut board_states[selected_board],
+                                    );
                                 }
                                 KeyCode::Right => {
                                     if selected_board < 2 {
@@ -1197,7 +1227,11 @@ fn tui_view(root: &Path) -> Result<()> {
                                     for state in board_states.iter_mut() {
                                         state.select(None);
                                     }
-                                    board_states[selected_board].select(Some(0));
+                                    select_first_task_if_present(
+                                        root,
+                                        statuses[selected_board],
+                                        &mut board_states[selected_board],
+                                    );
                                 }
                                 KeyCode::Char(c) if c.is_ascii_digit() => {
                                     let new_pos = (c as u8 - b'0') as usize;
