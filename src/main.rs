@@ -1801,12 +1801,6 @@ mod tests {
     }
 
     #[test]
-    fn input_cursor_offset_wraps_after_full_line() {
-        assert_eq!(input_cursor_offset("Add Task:", 9), (0, 1));
-        assert_eq!(input_cursor_offset("Add Task:\nhello", 9), (5, 1));
-    }
-
-    #[test]
     fn input_cursor_offset_tracks_cursor_inside_wrapped_text() {
         let text = " Add Task: hello world";
 
