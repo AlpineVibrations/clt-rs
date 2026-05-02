@@ -610,25 +610,6 @@ fn wrap_text(text: &str, width: usize) -> String {
     result
 }
 
-fn input_cursor_offset(wrapped_input: &str, width: usize) -> (u16, u16) {
-    if width == 0 {
-        return (0, 0);
-    }
-
-    let row = wrapped_input.lines().count().saturating_sub(1);
-    let col = wrapped_input
-        .lines()
-        .last()
-        .map(|line| line.len())
-        .unwrap_or(0);
-
-    if col >= width {
-        (0, (row + 1) as u16)
-    } else {
-        (col as u16, row as u16)
-    }
-}
-
 fn wrap_input_text(text: &str, width: usize) -> String {
     if width == 0 {
         return text.to_string();
