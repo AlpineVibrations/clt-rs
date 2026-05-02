@@ -629,6 +629,94 @@ fn input_cursor_offset(wrapped_input: &str, width: usize) -> (u16, u16) {
     }
 }
 
+fn wrap_input_text(text: &str, width: usize) -> String {
+    if width == 0 {
+        return text.to_string();
+    }
+
+    let mut result = String::new();
+    let mut col = 0;
+
+    for ch in text.chars() {
+        if ch == '\n' {
+            result.push(ch);
+            col = 0;
+            continue;
+        }
+
+        if col >= width {
+            result.push('\n');
+            col = 0;
+        }
+
+        result.push(ch);
+        col += 1;
+    }
+
+    result
+}
+
+fn input_cursor_offset_at(text: &str, width: usize, cursor_idx: usize) -> (u16, u16) {
+    if width == 0 {
+        return (0, 0);
+    }
+
+    let cursor_idx = clamp_to_char_boundary(text, cursor_idx.min(text.len()));
+    let mut row = 0;
+    let mut col = 0;
+
+    for ch in text[..cursor_idx].chars() {
+        if ch == '\n' {
+            row += 1;
+            col = 0;
+            continue;
+        }
+
+        if col >= width {
+            row += 1;
+            col = 0;
+        }
+
+        col += 1;
+    }
+
+    if col >= width {
+        (0, (row + 1) as u16)
+    } else {
+        (col as u16, row as u16)
+    }
+}
+
+fn clamp_to_char_boundary(text: &str, idx: usize) -> usize {
+    let mut idx = idx.min(text.len());
+    while idx > 0 && !text.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+fn previous_char_boundary(text: &str, idx: usize) -> usize {
+    let idx = clamp_to_char_boundary(text, idx);
+    text[..idx]
+        .char_indices()
+        .last()
+        .map(|(char_idx, _)| char_idx)
+        .unwrap_or(0)
+}
+
+fn next_char_boundary(text: &str, idx: usize) -> usize {
+    let idx = clamp_to_char_boundary(text, idx);
+    if idx >= text.len() {
+        return text.len();
+    }
+
+    text[idx..]
+        .char_indices()
+        .nth(1)
+        .map(|(offset, _)| idx + offset)
+        .unwrap_or(text.len())
+}
+
 fn tui_view(root: &Path) -> Result<()> {
     // Setup terminal
     let _terminal_session = TerminalSession::enter()?;
@@ -636,6 +724,7 @@ fn tui_view(root: &Path) -> Result<()> {
 
     let mut current_mode = Mode::View;
     let mut input_buffer = String::new();
+    let mut input_cursor = 0usize;
     let mut feedback_buffer = String::from(
         "Kanban View! Spacebar to create new Task. Arrows to navigate/focus boards, Shift+Arrows or I/K to reorder, Shift+Arrows or J/L to move tasks, Numbers to reorder, Space to add, Enter to edit, 'd' or Delete to delete, 'q' to quit.",
     );
@@ -667,24 +756,27 @@ fn tui_view(root: &Path) -> Result<()> {
             let size = f.area();
 
             // Calculate input height if in Input or Edit mode
-            let input_height =
-                if matches!(current_mode, Mode::Input) || matches!(current_mode, Mode::Edit) {
-                    let label = if matches!(current_mode, Mode::Input) {
-                        " Add Task: "
-                    } else {
-                        " Edit Task: "
-                    };
-                    let full_text = format!("{}{}", label, input_buffer);
-                    // Subtract 2 for the borders of the block
-                    let available_width = size.width.saturating_sub(2) as usize;
-                    let wrapped = wrap_text(&full_text, available_width);
-                    let lines = wrapped.lines().count();
-                    let cursor_row = input_cursor_offset(&wrapped, available_width).1 as usize;
-                    // Height = content rows + 2 (for top and bottom borders)
-                    (lines.max(cursor_row + 1) + 2).max(3) as u16
+            let input_height = if matches!(current_mode, Mode::Input)
+                || matches!(current_mode, Mode::Edit)
+            {
+                let label = if matches!(current_mode, Mode::Input) {
+                    " Add Task: "
                 } else {
-                    0
+                    " Edit Task: "
                 };
+                let full_text = format!("{}{}", label, input_buffer);
+                // Subtract 2 for the borders of the block
+                let available_width = size.width.saturating_sub(2) as usize;
+                let wrapped = wrap_input_text(&full_text, available_width);
+                let lines = wrapped.lines().count();
+                let cursor_row =
+                    input_cursor_offset_at(&full_text, available_width, label.len() + input_cursor)
+                        .1 as usize;
+                // Height = content rows + 2 (for top and bottom borders)
+                (lines.max(cursor_row + 1) + 2).max(3) as u16
+            } else {
+                0
+            };
 
             // Main layout: Kanban board, input area (if active), and feedback console
             let main_layout = Layout::default()
@@ -854,7 +946,7 @@ fn tui_view(root: &Path) -> Result<()> {
                 let input_text = format!("{}{}", label, input_buffer);
                 // Subtract 2 for the borders of the block
                 let available_width = size.width.saturating_sub(2) as usize;
-                let wrapped_input = wrap_text(&input_text, available_width);
+                let wrapped_input = wrap_input_text(&input_text, available_width);
                 let input_paragraph = Paragraph::new(wrapped_input.as_str())
                     .block(
                         Block::default()
@@ -864,7 +956,11 @@ fn tui_view(root: &Path) -> Result<()> {
                     .style(Style::default().fg(Color::White));
                 f.render_widget(input_paragraph, main_layout[1]);
 
-                let (cursor_x, cursor_y) = input_cursor_offset(&wrapped_input, available_width);
+                let (cursor_x, cursor_y) = input_cursor_offset_at(
+                    &input_text,
+                    available_width,
+                    label.len() + input_cursor,
+                );
                 let input_inner = main_layout[1].inner(ratatui::layout::Margin {
                     horizontal: 1,
                     vertical: 1,
@@ -1087,10 +1183,12 @@ fn tui_view(root: &Path) -> Result<()> {
                                         current_mode = Mode::Edit;
                                         editing_task_idx = Some(idx + 1);
                                         input_buffer = task.replace("- ", "");
+                                        input_cursor = input_buffer.len();
                                     } else {
                                         board_states[selected_board].select(None);
                                         current_mode = Mode::Input;
                                         input_buffer.clear();
+                                        input_cursor = 0;
                                     }
                                 }
                                 KeyCode::Char(' ') => {
@@ -1105,6 +1203,7 @@ fn tui_view(root: &Path) -> Result<()> {
                                     }
                                     current_mode = Mode::Input;
                                     input_buffer.clear();
+                                    input_cursor = 0;
                                 }
                                 KeyCode::Char('1') => {
                                     selected_board = 0;
@@ -1427,16 +1526,42 @@ fn tui_view(root: &Path) -> Result<()> {
                             }
                             current_mode = Mode::View;
                             input_buffer.clear();
+                            input_cursor = 0;
                         }
                         KeyCode::Esc => {
                             current_mode = Mode::View;
                             input_buffer.clear();
+                            input_cursor = 0;
                         }
                         KeyCode::Char(c) => {
-                            input_buffer.push(c);
+                            input_cursor = clamp_to_char_boundary(&input_buffer, input_cursor);
+                            input_buffer.insert(input_cursor, c);
+                            input_cursor += c.len_utf8();
                         }
                         KeyCode::Backspace => {
-                            input_buffer.pop();
+                            if input_cursor > 0 {
+                                let previous = previous_char_boundary(&input_buffer, input_cursor);
+                                input_buffer.drain(previous..input_cursor);
+                                input_cursor = previous;
+                            }
+                        }
+                        KeyCode::Delete => {
+                            if input_cursor < input_buffer.len() {
+                                let next = next_char_boundary(&input_buffer, input_cursor);
+                                input_buffer.drain(input_cursor..next);
+                            }
+                        }
+                        KeyCode::Left => {
+                            input_cursor = previous_char_boundary(&input_buffer, input_cursor);
+                        }
+                        KeyCode::Right => {
+                            input_cursor = next_char_boundary(&input_buffer, input_cursor);
+                        }
+                        KeyCode::Home => {
+                            input_cursor = 0;
+                        }
+                        KeyCode::End => {
+                            input_cursor = input_buffer.len();
                         }
                         _ => {}
                     },
@@ -1462,18 +1587,44 @@ fn tui_view(root: &Path) -> Result<()> {
                             }
                             current_mode = Mode::View;
                             input_buffer.clear();
+                            input_cursor = 0;
                             editing_task_idx = None;
                         }
                         KeyCode::Esc => {
                             current_mode = Mode::View;
                             input_buffer.clear();
+                            input_cursor = 0;
                             editing_task_idx = None;
                         }
                         KeyCode::Char(c) => {
-                            input_buffer.push(c);
+                            input_cursor = clamp_to_char_boundary(&input_buffer, input_cursor);
+                            input_buffer.insert(input_cursor, c);
+                            input_cursor += c.len_utf8();
                         }
                         KeyCode::Backspace => {
-                            input_buffer.pop();
+                            if input_cursor > 0 {
+                                let previous = previous_char_boundary(&input_buffer, input_cursor);
+                                input_buffer.drain(previous..input_cursor);
+                                input_cursor = previous;
+                            }
+                        }
+                        KeyCode::Delete => {
+                            if input_cursor < input_buffer.len() {
+                                let next = next_char_boundary(&input_buffer, input_cursor);
+                                input_buffer.drain(input_cursor..next);
+                            }
+                        }
+                        KeyCode::Left => {
+                            input_cursor = previous_char_boundary(&input_buffer, input_cursor);
+                        }
+                        KeyCode::Right => {
+                            input_cursor = next_char_boundary(&input_buffer, input_cursor);
+                        }
+                        KeyCode::Home => {
+                            input_cursor = 0;
+                        }
+                        KeyCode::End => {
+                            input_cursor = input_buffer.len();
                         }
                         _ => {}
                     },
@@ -1672,5 +1823,29 @@ mod tests {
     fn input_cursor_offset_wraps_after_full_line() {
         assert_eq!(input_cursor_offset("Add Task:", 9), (0, 1));
         assert_eq!(input_cursor_offset("Add Task:\nhello", 9), (5, 1));
+    }
+
+    #[test]
+    fn input_cursor_offset_tracks_cursor_inside_wrapped_text() {
+        let text = " Add Task: hello world";
+
+        assert_eq!(wrap_input_text(text, 10), " Add Task:\n hello wor\nld");
+        assert_eq!(
+            input_cursor_offset_at(text, 10, " Add Task: hello".len()),
+            (6, 1)
+        );
+        assert_eq!(input_cursor_offset_at(text, 10, text.len()), (2, 2));
+    }
+
+    #[test]
+    fn input_cursor_helpers_preserve_utf8_boundaries() {
+        let text = "aéb";
+        let inside_e = 2;
+
+        assert_eq!(clamp_to_char_boundary(text, inside_e), 1);
+        assert_eq!(previous_char_boundary(text, text.len()), 3);
+        assert_eq!(previous_char_boundary(text, 3), 1);
+        assert_eq!(next_char_boundary(text, 1), 3);
+        assert_eq!(next_char_boundary(text, 3), text.len());
     }
 }
