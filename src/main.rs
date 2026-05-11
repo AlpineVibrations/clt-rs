@@ -894,6 +894,7 @@ fn clamp_to_char_boundary(text: &str, idx: usize) -> usize {
     idx
 }
 
+#[cfg(test)]
 fn previous_char_boundary(text: &str, idx: usize) -> usize {
     let idx = clamp_to_char_boundary(text, idx);
     text[..idx]
@@ -903,6 +904,7 @@ fn previous_char_boundary(text: &str, idx: usize) -> usize {
         .unwrap_or(0)
 }
 
+#[cfg(test)]
 fn next_char_boundary(text: &str, idx: usize) -> usize {
     let idx = clamp_to_char_boundary(text, idx);
     if idx >= text.len() {
@@ -1193,28 +1195,31 @@ fn tui_view(root: &Path) -> Result<()> {
 
             if matches!(current_mode, Mode::Help) {
                 let help_text = "TUI Commands:\n\n\
-                                 [Space]  - Create new task\n\
-                                 [Enter]  - Edit selected task / Save input\n\
-                                 [d/Del]  - Delete selected task\n\
-                                 [Arrows] - Navigate boards and tasks\n\
+                                 [Space]        - Create new task\n\
+                                 [Enter]        - Edit selected task / Save input\n\
+                                 [d/Del]        - Delete selected task\n\
+                                 [Arrows]       - Navigate boards and tasks\n\
                                  [Shift+Arrows] - Reorder/Move tasks\n\
-                                 [I, K]   - Move task Up/Down\n\
-                                 [J, L]   - Move task Left/Right\n\
-                                 [1, 2, 3]- Switch board focus\n\
-                                 [h / ?]  - Toggle Help\n\
-                                 [q]      - Quit";
+                                 [I, K]         - Move task Up/Down\n\
+                                 [J, L]         - Move task Left/Right\n\
+                                 [1, 2, 3]      - Switch board focus\n\
+                                 [Input Arrows]         - Move cursor in wrapped input\n\
+                                 [Ctrl/Alt+Left/Right]  - Jump input cursor by word\n\
+                                 [Ctrl+A/E/W/U/K]       - Edit input line\n\
+                                 [h / ?]        - Toggle Help\n\
+                                 [q]            - Quit";
 
                 let area = f.area();
-                let popover_width = 50;
-                let popover_height = 15;
-                let x = (area.width as isize - popover_width as isize) / 2;
-                let y = (area.height as isize - popover_height as isize) / 2;
+                let popover_width = area.width.min(70);
+                let popover_height = area.height.min(18);
+                let x = area.width.saturating_sub(popover_width) / 2;
+                let y = area.height.saturating_sub(popover_height) / 2;
 
                 let popover_area = ratatui::layout::Rect {
-                    x: x as u16,
-                    y: y as u16,
-                    width: popover_width as u16,
-                    height: popover_height as u16,
+                    x,
+                    y,
+                    width: popover_width,
+                    height: popover_height,
                 };
 
                 let help_paragraph = Paragraph::new(help_text)

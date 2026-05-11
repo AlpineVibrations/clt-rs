@@ -20,6 +20,7 @@ Use this section while developing the next release.
 
 - Added scroll handling in TUI task columns so keyboard navigation keeps the selected task visible.
 - Added TUI task editing, deletion, help popover, console feedback, cursor-aware text input, and wrapping for selected long tasks.
+- Added multiline-aware TUI input navigation for wrapped add/edit prompts, including Up/Down row movement, word jumps/deletes, and Ctrl-A/E/U/K/W shortcuts.
 - Added CLI deletion support and single-status task listing.
 - Added support for unquoted multi-word task descriptions in `clt add`.
 - Added `clt-skill.md` guidance for agent task workflows.
