@@ -549,6 +549,72 @@ fn normalize_board_selections(root: &Path, statuses: &[&str], states: &mut [List
     }
 }
 
+fn task_display_height(
+    task: &str,
+    idx: usize,
+    selected_idx: Option<usize>,
+    col_width: usize,
+) -> usize {
+    let cleaned = task.replace("- ", "");
+    let desc = if let Some(start) = cleaned.rfind(" (") {
+        if cleaned.ends_with(')') {
+            &cleaned[..start]
+        } else {
+            &cleaned[..]
+        }
+    } else {
+        &cleaned[..]
+    };
+
+    if Some(idx) == selected_idx {
+        wrap_text(desc, col_width.saturating_sub(5))
+            .lines()
+            .count()
+            .max(1)
+    } else {
+        1
+    }
+}
+
+fn keep_selected_task_visible(
+    tasks: &[String],
+    selected_idx: Option<usize>,
+    scroll_offset: &mut usize,
+    viewport_height: usize,
+    col_width: usize,
+) {
+    if tasks.is_empty() || viewport_height == 0 {
+        *scroll_offset = 0;
+        return;
+    }
+
+    let Some(selected_idx) = selected_idx.filter(|idx| *idx < tasks.len()) else {
+        *scroll_offset = (*scroll_offset).min(tasks.len() - 1);
+        return;
+    };
+
+    if selected_idx < *scroll_offset {
+        *scroll_offset = selected_idx;
+    }
+
+    while *scroll_offset < selected_idx {
+        let visible_height: usize = tasks[*scroll_offset..=selected_idx]
+            .iter()
+            .enumerate()
+            .map(|(offset, task)| {
+                let idx = *scroll_offset + offset;
+                task_display_height(task, idx, Some(selected_idx), col_width)
+            })
+            .sum();
+
+        if visible_height <= viewport_height {
+            break;
+        }
+
+        *scroll_offset += 1;
+    }
+}
+
 enum Mode {
     View,
     Input,
@@ -722,6 +788,7 @@ fn tui_view(root: &Path) -> Result<()> {
         ListState::default(),
         ListState::default(),
     ];
+    let mut board_scroll_offsets = [0usize; 3];
 
     let statuses = ["todo", "doing", "done"];
     let titles = ["To Do", "Doing", "Done"];
@@ -853,9 +920,16 @@ fn tui_view(root: &Path) -> Result<()> {
                     .border_style(Style::default().fg(colors[i]));
 
                 let inner_area = block.inner(chunks[i]);
+                keep_selected_task_visible(
+                    &tasks,
+                    selected_idx,
+                    &mut board_scroll_offsets[i],
+                    inner_area.height as usize,
+                    col_width,
+                );
 
                 let mut current_y = 0;
-                for (idx, t) in tasks.iter().enumerate() {
+                for (idx, t) in tasks.iter().enumerate().skip(board_scroll_offsets[i]) {
                     let cleaned = t.replace("- ", "");
                     let is_selected = Some(idx) == selected_idx;
 
@@ -904,12 +978,18 @@ fn tui_view(root: &Path) -> Result<()> {
                         desc.to_string()
                     };
 
-                    let line_count = wrapped_content.lines().count();
+                    let line_count = wrapped_content.lines().count().max(1);
+                    if current_y >= inner_area.height as usize {
+                        break;
+                    }
+
+                    let visible_height =
+                        (line_count as u16).min(inner_area.height.saturating_sub(current_y as u16));
                     let item_area = ratatui::layout::Rect {
                         x: inner_area.x,
                         y: inner_area.y + current_y as u16,
                         width: inner_area.width,
-                        height: line_count as u16,
+                        height: visible_height,
                     };
 
                     let item_text = format!("{}. {}", idx + 1, wrapped_content);
@@ -1819,6 +1899,35 @@ mod tests {
         assert_eq!(state.selected(), Some(0));
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn keep_selected_task_visible_scrolls_down_to_selection() {
+        let tasks = vec![
+            "- task one".to_string(),
+            "- task two".to_string(),
+            "- task three".to_string(),
+            "- task four".to_string(),
+        ];
+        let mut scroll_offset = 0;
+
+        keep_selected_task_visible(&tasks, Some(3), &mut scroll_offset, 3, 20);
+
+        assert_eq!(scroll_offset, 1);
+    }
+
+    #[test]
+    fn keep_selected_task_visible_scrolls_up_to_selection() {
+        let tasks = vec![
+            "- task one".to_string(),
+            "- task two".to_string(),
+            "- task three".to_string(),
+        ];
+        let mut scroll_offset = 2;
+
+        keep_selected_task_visible(&tasks, Some(0), &mut scroll_offset, 3, 20);
+
+        assert_eq!(scroll_offset, 0);
     }
 
     #[test]
