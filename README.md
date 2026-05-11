@@ -96,3 +96,5 @@ git clone <repository-url>
 cd cli-task
 cargo build --release
 ```
+
+Release notes are tracked in [CHANGELOG.md](CHANGELOG.md). New user-facing features, behavior changes, and bug fixes should be added under `Unreleased` first, then moved into a versioned section when publishing a release.

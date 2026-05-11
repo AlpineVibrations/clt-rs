@@ -18,6 +18,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, ListItem, ListState, Paragraph},
 };
+use tui_input::{Input, InputRequest};
 
 const TASK_FILES: [(&str, &str); 3] = [
     ("todo.md", "# To Do Tasks\n"),
@@ -739,6 +740,152 @@ fn input_cursor_offset_at(text: &str, width: usize, cursor_idx: usize) -> (u16, 
     }
 }
 
+fn byte_index_at_char(text: &str, char_idx: usize) -> usize {
+    text.char_indices()
+        .nth(char_idx)
+        .map(|(idx, _)| idx)
+        .unwrap_or(text.len())
+}
+
+fn input_cursor_offset_at_char(text: &str, width: usize, cursor_chars: usize) -> (usize, usize) {
+    if width == 0 {
+        return (0, 0);
+    }
+
+    let mut row = 0;
+    let mut col = 0;
+
+    for ch in text.chars().take(cursor_chars) {
+        if ch == '\n' {
+            row += 1;
+            col = 0;
+            continue;
+        }
+
+        if col >= width {
+            row += 1;
+            col = 0;
+        }
+
+        col += 1;
+    }
+
+    if col >= width {
+        (0, row + 1)
+    } else {
+        (col, row)
+    }
+}
+
+fn char_index_for_input_offset(
+    text: &str,
+    width: usize,
+    target_row: usize,
+    target_col: usize,
+) -> usize {
+    if width == 0 {
+        return 0;
+    }
+
+    let mut row = 0;
+    let mut col = 0;
+
+    for (char_idx, ch) in text.chars().enumerate() {
+        if row == target_row && col >= target_col {
+            return char_idx;
+        }
+
+        if ch == '\n' {
+            if row == target_row {
+                return char_idx;
+            }
+            row += 1;
+            col = 0;
+            continue;
+        }
+
+        if col >= width {
+            row += 1;
+            col = 0;
+            if row == target_row && col >= target_col {
+                return char_idx;
+            }
+        }
+
+        col += 1;
+    }
+
+    text.chars().count()
+}
+
+fn move_input_cursor_row(input: &mut Input, label: &str, width: usize, row_delta: isize) {
+    if width == 0 {
+        return;
+    }
+
+    let full_text = format!("{}{}", label, input.value());
+    let label_chars = label.chars().count();
+    let input_chars = input.value().chars().count();
+    let cursor_chars = label_chars + input.cursor();
+    let (target_col, current_row) = input_cursor_offset_at_char(&full_text, width, cursor_chars);
+    let target_row = current_row.saturating_add_signed(row_delta);
+
+    let target_chars = char_index_for_input_offset(&full_text, width, target_row, target_col);
+    let input_cursor = target_chars.saturating_sub(label_chars).min(input_chars);
+    input.handle(InputRequest::SetCursor(input_cursor));
+}
+
+fn handle_input_key(input: &mut Input, key: crossterm::event::KeyEvent, label: &str, width: usize) {
+    let word_modifier =
+        key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::ALT);
+
+    let request = match key.code {
+        KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(InputRequest::GoToStart)
+        }
+        KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(InputRequest::GoToEnd)
+        }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(InputRequest::DeleteLine)
+        }
+        KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(InputRequest::DeleteTillEnd)
+        }
+        KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(InputRequest::DeletePrevWord)
+        }
+        KeyCode::Backspace if word_modifier => Some(InputRequest::DeletePrevWord),
+        KeyCode::Delete if word_modifier => Some(InputRequest::DeleteNextWord),
+        KeyCode::Left if word_modifier => Some(InputRequest::GoToPrevWord),
+        KeyCode::Right if word_modifier => Some(InputRequest::GoToNextWord),
+        KeyCode::Left => Some(InputRequest::GoToPrevChar),
+        KeyCode::Right => Some(InputRequest::GoToNextChar),
+        KeyCode::Home => Some(InputRequest::GoToStart),
+        KeyCode::End => Some(InputRequest::GoToEnd),
+        KeyCode::Backspace => Some(InputRequest::DeletePrevChar),
+        KeyCode::Delete => Some(InputRequest::DeleteNextChar),
+        KeyCode::Char(c)
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            Some(InputRequest::InsertChar(c))
+        }
+        _ => None,
+    };
+
+    if let Some(request) = request {
+        input.handle(request);
+        return;
+    }
+
+    match key.code {
+        KeyCode::Up => move_input_cursor_row(input, label, width, -1),
+        KeyCode::Down => move_input_cursor_row(input, label, width, 1),
+        _ => {}
+    }
+}
+
 fn clamp_to_char_boundary(text: &str, idx: usize) -> usize {
     let mut idx = idx.min(text.len());
     while idx > 0 && !text.is_char_boundary(idx) {
@@ -775,8 +922,7 @@ fn tui_view(root: &Path) -> Result<()> {
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
     let mut current_mode = Mode::View;
-    let mut input_buffer = String::new();
-    let mut input_cursor = 0usize;
+    let mut task_input = Input::default();
     let mut feedback_buffer = String::from(
         "Kanban View! Spacebar to create new Task. Arrows to navigate/focus boards, Shift+Arrows or I/K to reorder, Shift+Arrows or J/L to move tasks, Numbers to reorder, Space to add, Enter to edit, 'd' or Delete to delete, 'q' to quit.",
     );
@@ -809,27 +955,27 @@ fn tui_view(root: &Path) -> Result<()> {
             let size = f.area();
 
             // Calculate input height if in Input or Edit mode
-            let input_height = if matches!(current_mode, Mode::Input)
-                || matches!(current_mode, Mode::Edit)
-            {
-                let label = if matches!(current_mode, Mode::Input) {
-                    " Add Task: "
+            let input_height =
+                if matches!(current_mode, Mode::Input) || matches!(current_mode, Mode::Edit) {
+                    let label = if matches!(current_mode, Mode::Input) {
+                        " Add Task: "
+                    } else {
+                        " Edit Task: "
+                    };
+                    let full_text = format!("{}{}", label, task_input.value());
+                    // Subtract 2 for the borders of the block
+                    let available_width = size.width.saturating_sub(2) as usize;
+                    let wrapped = wrap_input_text(&full_text, available_width);
+                    let lines = wrapped.lines().count();
+                    let cursor_idx =
+                        label.len() + byte_index_at_char(task_input.value(), task_input.cursor());
+                    let cursor_row =
+                        input_cursor_offset_at(&full_text, available_width, cursor_idx).1 as usize;
+                    // Height = content rows + 2 (for top and bottom borders)
+                    (lines.max(cursor_row + 1) + 2).max(3) as u16
                 } else {
-                    " Edit Task: "
+                    0
                 };
-                let full_text = format!("{}{}", label, input_buffer);
-                // Subtract 2 for the borders of the block
-                let available_width = size.width.saturating_sub(2) as usize;
-                let wrapped = wrap_input_text(&full_text, available_width);
-                let lines = wrapped.lines().count();
-                let cursor_row =
-                    input_cursor_offset_at(&full_text, available_width, label.len() + input_cursor)
-                        .1 as usize;
-                // Height = content rows + 2 (for top and bottom borders)
-                (lines.max(cursor_row + 1) + 2).max(3) as u16
-            } else {
-                0
-            };
 
             // Main layout: Kanban board, input area (if active), and feedback console
             let main_layout = Layout::default()
@@ -1009,7 +1155,7 @@ fn tui_view(root: &Path) -> Result<()> {
                 } else {
                     " Edit Task: "
                 };
-                let input_text = format!("{}{}", label, input_buffer);
+                let input_text = format!("{}{}", label, task_input.value());
                 // Subtract 2 for the borders of the block
                 let available_width = size.width.saturating_sub(2) as usize;
                 let wrapped_input = wrap_input_text(&input_text, available_width);
@@ -1025,7 +1171,7 @@ fn tui_view(root: &Path) -> Result<()> {
                 let (cursor_x, cursor_y) = input_cursor_offset_at(
                     &input_text,
                     available_width,
-                    label.len() + input_cursor,
+                    label.len() + byte_index_at_char(task_input.value(), task_input.cursor()),
                 );
                 let input_inner = main_layout[1].inner(ratatui::layout::Margin {
                     horizontal: 1,
@@ -1086,6 +1232,7 @@ fn tui_view(root: &Path) -> Result<()> {
 
         if event::poll(std::time::Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
+                let input_available_width = terminal.size()?.width.saturating_sub(2) as usize;
                 match current_mode {
                     Mode::View => {
                         if key.modifiers.contains(KeyModifiers::SHIFT) {
@@ -1248,13 +1395,11 @@ fn tui_view(root: &Path) -> Result<()> {
                                     ) {
                                         current_mode = Mode::Edit;
                                         editing_task_idx = Some(idx + 1);
-                                        input_buffer = task.replace("- ", "");
-                                        input_cursor = input_buffer.len();
+                                        task_input = Input::new(task.replace("- ", ""));
                                     } else {
                                         board_states[selected_board].select(None);
                                         current_mode = Mode::Input;
-                                        input_buffer.clear();
-                                        input_cursor = 0;
+                                        task_input.reset();
                                     }
                                 }
                                 KeyCode::Char(' ') => {
@@ -1268,8 +1413,7 @@ fn tui_view(root: &Path) -> Result<()> {
                                         board_states[selected_board].select(None);
                                     }
                                     current_mode = Mode::Input;
-                                    input_buffer.clear();
-                                    input_cursor = 0;
+                                    task_input.reset();
                                 }
                                 KeyCode::Char('1') => {
                                     selected_board = 0;
@@ -1569,7 +1713,7 @@ fn tui_view(root: &Path) -> Result<()> {
                     },
                     Mode::Input => match key.code {
                         KeyCode::Enter => {
-                            if !input_buffer.trim().is_empty() {
+                            if !task_input.value().trim().is_empty() {
                                 let index = selected_task_index(
                                     root,
                                     statuses[selected_board],
@@ -1579,7 +1723,7 @@ fn tui_view(root: &Path) -> Result<()> {
                                     root,
                                     statuses[selected_board],
                                     index,
-                                    &input_buffer,
+                                    task_input.value(),
                                     None,
                                 ) {
                                     Ok(_) => {
@@ -1591,55 +1735,28 @@ fn tui_view(root: &Path) -> Result<()> {
                                 feedback_buffer = "Task description cannot be empty.".to_string();
                             }
                             current_mode = Mode::View;
-                            input_buffer.clear();
-                            input_cursor = 0;
+                            task_input.reset();
                         }
                         KeyCode::Esc => {
                             current_mode = Mode::View;
-                            input_buffer.clear();
-                            input_cursor = 0;
+                            task_input.reset();
                         }
-                        KeyCode::Char(c) => {
-                            input_cursor = clamp_to_char_boundary(&input_buffer, input_cursor);
-                            input_buffer.insert(input_cursor, c);
-                            input_cursor += c.len_utf8();
-                        }
-                        KeyCode::Backspace => {
-                            if input_cursor > 0 {
-                                let previous = previous_char_boundary(&input_buffer, input_cursor);
-                                input_buffer.drain(previous..input_cursor);
-                                input_cursor = previous;
-                            }
-                        }
-                        KeyCode::Delete => {
-                            if input_cursor < input_buffer.len() {
-                                let next = next_char_boundary(&input_buffer, input_cursor);
-                                input_buffer.drain(input_cursor..next);
-                            }
-                        }
-                        KeyCode::Left => {
-                            input_cursor = previous_char_boundary(&input_buffer, input_cursor);
-                        }
-                        KeyCode::Right => {
-                            input_cursor = next_char_boundary(&input_buffer, input_cursor);
-                        }
-                        KeyCode::Home => {
-                            input_cursor = 0;
-                        }
-                        KeyCode::End => {
-                            input_cursor = input_buffer.len();
-                        }
-                        _ => {}
+                        _ => handle_input_key(
+                            &mut task_input,
+                            key,
+                            " Add Task: ",
+                            input_available_width,
+                        ),
                     },
                     Mode::Edit => match key.code {
                         KeyCode::Enter => {
-                            if !input_buffer.trim().is_empty() {
+                            if !task_input.value().trim().is_empty() {
                                 if let Some(idx) = editing_task_idx {
                                     match update_task(
                                         root,
                                         statuses[selected_board],
                                         idx,
-                                        &input_buffer,
+                                        task_input.value(),
                                     ) {
                                         Ok(_) => {
                                             feedback_buffer =
@@ -1652,47 +1769,20 @@ fn tui_view(root: &Path) -> Result<()> {
                                 feedback_buffer = "Task description cannot be empty.".to_string();
                             }
                             current_mode = Mode::View;
-                            input_buffer.clear();
-                            input_cursor = 0;
+                            task_input.reset();
                             editing_task_idx = None;
                         }
                         KeyCode::Esc => {
                             current_mode = Mode::View;
-                            input_buffer.clear();
-                            input_cursor = 0;
+                            task_input.reset();
                             editing_task_idx = None;
                         }
-                        KeyCode::Char(c) => {
-                            input_cursor = clamp_to_char_boundary(&input_buffer, input_cursor);
-                            input_buffer.insert(input_cursor, c);
-                            input_cursor += c.len_utf8();
-                        }
-                        KeyCode::Backspace => {
-                            if input_cursor > 0 {
-                                let previous = previous_char_boundary(&input_buffer, input_cursor);
-                                input_buffer.drain(previous..input_cursor);
-                                input_cursor = previous;
-                            }
-                        }
-                        KeyCode::Delete => {
-                            if input_cursor < input_buffer.len() {
-                                let next = next_char_boundary(&input_buffer, input_cursor);
-                                input_buffer.drain(input_cursor..next);
-                            }
-                        }
-                        KeyCode::Left => {
-                            input_cursor = previous_char_boundary(&input_buffer, input_cursor);
-                        }
-                        KeyCode::Right => {
-                            input_cursor = next_char_boundary(&input_buffer, input_cursor);
-                        }
-                        KeyCode::Home => {
-                            input_cursor = 0;
-                        }
-                        KeyCode::End => {
-                            input_cursor = input_buffer.len();
-                        }
-                        _ => {}
+                        _ => handle_input_key(
+                            &mut task_input,
+                            key,
+                            " Edit Task: ",
+                            input_available_width,
+                        ),
                     },
                 }
             }
@@ -1952,5 +2042,57 @@ mod tests {
         assert_eq!(previous_char_boundary(text, 3), 1);
         assert_eq!(next_char_boundary(text, 1), 3);
         assert_eq!(next_char_boundary(text, 3), text.len());
+    }
+
+    #[test]
+    fn input_key_handler_moves_and_edits_by_words() {
+        let mut input = Input::new("first second third".to_string());
+
+        handle_input_key(
+            &mut input,
+            crossterm::event::KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL),
+            " Add Task: ",
+            80,
+        );
+        handle_input_key(
+            &mut input,
+            crossterm::event::KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE),
+            " Add Task: ",
+            80,
+        );
+
+        assert_eq!(input.value(), "first second Xthird");
+
+        handle_input_key(
+            &mut input,
+            crossterm::event::KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL),
+            " Add Task: ",
+            80,
+        );
+
+        assert_eq!(input.value(), "first second third");
+    }
+
+    #[test]
+    fn input_key_handler_moves_vertically_through_wrapped_input() {
+        let mut input = Input::new("hello world".to_string());
+
+        handle_input_key(
+            &mut input,
+            crossterm::event::KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+            " Add Task: ",
+            10,
+        );
+
+        assert_eq!(input.cursor(), 1);
+
+        handle_input_key(
+            &mut input,
+            crossterm::event::KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            " Add Task: ",
+            10,
+        );
+
+        assert_eq!(input.cursor(), input.value().chars().count());
     }
 }
