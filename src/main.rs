@@ -274,14 +274,19 @@ fn move_task(root: &Path, from: &str, to: &str, task_index_str: &str) -> Result<
     let task_line_content = task_line.clone();
 
     // Write the destination first so a destination failure cannot remove the task.
-    let mut dest_content =
-        fs::read_to_string(&dest_path).context("Failed to read destination file")?;
-    if !dest_content.is_empty() && !dest_content.ends_with('\n') {
-        dest_content.push('\n');
+    let dest_content = fs::read_to_string(&dest_path).context("Failed to read destination file")?;
+    let mut dest_lines: Vec<String> = dest_content.lines().map(|s| s.to_string()).collect();
+    if to == "done" {
+        let insert_at_idx = dest_lines
+            .iter()
+            .position(|line| line.starts_with("- "))
+            .unwrap_or(dest_lines.len());
+        dest_lines.insert(insert_at_idx, task_line_content);
+    } else {
+        dest_lines.push(task_line_content);
     }
-    dest_content.push_str(&task_line_content);
-    dest_content.push('\n');
-    fs::write(&dest_path, dest_content).context("Failed to update destination file")?;
+    fs::write(&dest_path, dest_lines.join("\n") + "\n")
+        .context("Failed to update destination file")?;
 
     let mut new_src_lines = lines.clone();
     new_src_lines.remove(actual_line_idx);
@@ -1740,6 +1745,22 @@ mod tests {
 
         assert_eq!(todo, "# To Do Tasks\n");
         assert_eq!(doing, "# Doing Tasks\n- ship the fix\n");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn move_task_to_done_adds_to_top() {
+        let root = temp_root("move-done-top");
+
+        add_task(&root, "older done task", None).unwrap();
+        add_task(&root, "newer done task", None).unwrap();
+        move_task(&root, "todo", "done", "1").unwrap();
+        move_task(&root, "todo", "done", "1").unwrap();
+
+        let done = fs::read_to_string(root.join("tasks/done.md")).unwrap();
+
+        assert_eq!(done, "# Done Tasks\n- newer done task\n- older done task\n");
 
         fs::remove_dir_all(root).unwrap();
     }
