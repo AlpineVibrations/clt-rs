@@ -8,7 +8,9 @@ use std::path::Path;
 use crossterm::{
     ExecutableCommand,
     event::{self, Event, KeyCode, KeyModifiers},
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{
+        EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode,
+    },
 };
 use ratatui::{
     Terminal,
@@ -159,6 +161,18 @@ fn get_task_root(local: bool) -> Result<std::path::PathBuf> {
 
 fn get_tasks_dir(root: &Path) -> std::path::PathBuf {
     root.join("tasks")
+}
+
+fn project_display_name(root: &Path) -> String {
+    root.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| root.display().to_string())
+}
+
+fn app_title(root: &Path) -> String {
+    format!("clt | {}", project_display_name(root))
 }
 
 fn is_initialized(root: &Path) -> bool {
@@ -626,9 +640,15 @@ enum Mode {
 struct TerminalSession;
 
 impl TerminalSession {
-    fn enter() -> Result<Self> {
+    fn enter(title: &str) -> Result<Self> {
         enable_raw_mode()?;
-        if let Err(err) = stdout().execute(EnterAlternateScreen) {
+        let mut stdout = stdout();
+        if let Err(err) = stdout.execute(EnterAlternateScreen) {
+            let _ = disable_raw_mode();
+            return Err(err.into());
+        }
+        if let Err(err) = stdout.execute(SetTitle(title)) {
+            let _ = stdout.execute(LeaveAlternateScreen);
             let _ = disable_raw_mode();
             return Err(err.into());
         }
@@ -920,8 +940,10 @@ fn next_char_boundary(text: &str, idx: usize) -> usize {
 
 fn tui_view(root: &Path) -> Result<()> {
     // Setup terminal
-    let _terminal_session = TerminalSession::enter()?;
+    let title = app_title(root);
+    let _terminal_session = TerminalSession::enter(&title)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
+    let console_title = format!("{} Console", project_display_name(root));
 
     let mut current_mode = Mode::View;
     let mut task_input = Input::default();
@@ -1186,7 +1208,11 @@ fn tui_view(root: &Path) -> Result<()> {
             }
 
             let feedback_paragraph = Paragraph::new(feedback_buffer.as_str())
-                .block(Block::default().borders(Borders::ALL).title("Console"))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(console_title.as_str()),
+                )
                 .style(Style::default().fg(Color::Gray));
 
             // The feedback area is always the last element of main_layout
@@ -1906,6 +1932,23 @@ mod tests {
             }
             _ => panic!("expected add command"),
         }
+    }
+
+    #[test]
+    fn project_display_name_uses_folder_name_with_root_fallback() {
+        assert_eq!(
+            project_display_name(Path::new("/Users/pro/code/lls/clt")),
+            "clt"
+        );
+        assert_eq!(project_display_name(Path::new("/")), "/");
+    }
+
+    #[test]
+    fn app_title_includes_project_name() {
+        assert_eq!(
+            app_title(Path::new("/Users/pro/code/lls/example")),
+            "clt | example"
+        );
     }
 
     #[test]
