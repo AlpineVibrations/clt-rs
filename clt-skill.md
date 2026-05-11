@@ -82,6 +82,7 @@ clt delete <status> <index>
 
 - **Root Awareness**: Be aware that `clt` operates relative to the git root by default. If you need to manage tasks in a specific subdirectory that is not the git root, use the `--local` flag.
 - **Verify Indices**: Task indices are dynamic. Always run `clt list <status>` immediately before a `status`, `done`, or `delete` command to avoid modifying the wrong task.
+- **Preserve Existing Tasks**: Never delete, reorder, or rewrite `clt` tasks unless explicitly asked. Other people may add todos while you are working, and those are real tasks, not noise.
 - **Atomic Transitions**: Only move one task to `doing` at a time to maintain focus and clear project state.
 - **Metadata Usage**: Use the metadata field for tracking issue numbers, priority, or assignees. Use standardized, comma-separated tags for better scannability (e.g., `clt add "Fix memory leak" "BUG, HIGH"`).
 - **Consistency**: Ensure every significant change or feature implementation is tracked as a task. If a task is too large, break it into smaller sub-tasks in the `todo` list.
