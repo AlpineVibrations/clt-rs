@@ -1,3 +1,2 @@
 # To Do Tasks
-- fdsfklj
-- thjis is  a new wood d sjjdsjudnfw laarge tasksthjakf dakj mulite tline
+- in the tui if you press a it should show you the archived and a small message to press a again to leave archive view. archive view should be  single panel scrolling list of the archived tasks..
