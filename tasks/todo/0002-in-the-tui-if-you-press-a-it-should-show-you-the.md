@@ -1,0 +1,1 @@
+in the tui if you press a it should show you the archived and a small message to press a again to leave archive view. archive view should be  single panel scrolling list of the archived tasks.. this is the second sentense

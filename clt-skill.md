@@ -3,10 +3,17 @@
 This document defines the skills and operational procedures for an agent to manage project tasks using the `clt` (lls-cli-task) tool.
 
 ## Overview
-The project uses a file-system-backed Kanban system. By default, the tool automatically detects the git repository root and locates the `tasks/` directory there to keep task management centralized across the project. Tasks are stored in Markdown files:
+The project uses a file-system-backed Kanban system. By default, the tool automatically detects the git repository root and locates the `tasks/` directory there to keep task management centralized across the project. Tasks are stored in Markdown status files by default:
 - `tasks/todo.md`: Tasks to be started.
 - `tasks/doing.md`: Tasks currently in progress.
 - `tasks/done.md`: Completed tasks.
+
+Statuses can also be folders instead of Markdown files:
+- `tasks/todo/`: Each direct file or subfolder is one todo task.
+- `tasks/doing/`: Each direct file or subfolder is one active task.
+- `tasks/done/`: Each direct file or subfolder is one completed task.
+
+For folder-backed statuses, `clt` displays the first sentence of each task file while preserving the full file content for longer notes. A task subfolder with its own `todo`, `doing`, and `done` stores is a nested subtask board in the TUI.
 
 ## Core Workflow
 The agent must adhere to the following state transition pipeline:
@@ -23,10 +30,21 @@ If the `tasks/` directory is missing, initialize the system:
 ```bash
 clt init
 ```
+Use the default Markdown-file mode for normal agent task tracking. Only initialize folder-backed statuses when the user explicitly asks for expanded tasks or the project has already adopted that format.
+```bash
+clt init --folders
+```
 To force initialization in the current working directory instead of the git root ( not used most the time ), use:
 ```bash
 clt --local init
 ```
+
+To expand existing Markdown status files into folder-backed task files:
+```bash
+clt expand        # Expand todo.md, doing.md, and done.md
+clt expand todo   # Expand one status
+```
+Expansion preserves the original Markdown file as `status.md.bak`.
 
 ### 2. Adding Tasks
 Add a new task to the `todo` list.
@@ -58,6 +76,8 @@ clt list done     # List only done tasks
 
 Each section lists tasks with a 1-based index scoped to that status. An empty section displays the header with no items beneath it. Always use the index relative to its section — index `1` in `TODO` and index `1` in `DOING` refer to different tasks.
 
+Folder-backed tasks still use the same status-scoped indexes. `clt list` marks folder tasks that contain nested boards with `[subtasks]`.
+
 ### 4. Managing Task Status
 Move tasks between lists using their 1-based index.
 
@@ -83,6 +103,8 @@ clt delete <status> <index>
 - **Root Awareness**: Be aware that `clt` operates relative to the git root by default. If you need to manage tasks in a specific subdirectory that is not the git root, use the `--local` flag.
 - **Verify Indices**: Task indices are dynamic. Always run `clt list <status>` immediately before a `status`, `done`, or `delete` command to avoid modifying the wrong task.
 - **Preserve Existing Tasks**: Never delete, reorder, or rewrite `clt` tasks unless explicitly asked. Other people may add todos while you are working, and those are real tasks, not noise.
+- **Default Storage Mode**: Use regular Markdown-file mode for agent-created task lists unless the user explicitly asks for expanded folder-backed tasks. Do not run `clt init --folders` or `clt expand` just because a task has some detail.
+- **Folder-Backed Tasks**: When a status is already a folder, edit the task file for detailed notes. Keep the first sentence suitable for list and TUI display.
 - **Atomic Transitions**: Only move one task to `doing` at a time to maintain focus and clear project state.
 - **Metadata Usage**: Use the metadata field for tracking issue numbers, priority, or assignees. Use standardized, comma-separated tags for better scannability (e.g., `clt add "Fix memory leak" "BUG, HIGH"`).
 - **Consistency**: Ensure every significant change or feature implementation is tracked as a task. If a task is too large, break it into smaller sub-tasks in the `todo` list.

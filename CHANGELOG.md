@@ -10,7 +10,15 @@ Use this section while developing the next release.
 
 ### Added
 
+- Added folder-backed status support: `tasks/todo/`, `tasks/doing/`, and `tasks/done/` can now contain one task per file or subfolder.
+- Added `clt init --folders` for fresh folder-backed task stores.
+- Added `clt expand [status]` to migrate Markdown status files into folder-backed task files.
+- Added nested subtask board navigation in the TUI for folder tasks that contain their own `todo`, `doing`, and `done` stores.
+- Added first-sentence summaries for long task files while preserving full task content on moves.
+
 ### Changed
+
+- Moving a folder-backed task into a Markdown-backed status now expands the destination status to a folder and preserves the old Markdown file as `status.md.bak`.
 
 ### Fixed
 

@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use ratatui::layout::{Alignment, Position};
 use std::fs;
 use std::io::{self, Write, stdout};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crossterm::{
     ExecutableCommand,
@@ -22,11 +22,42 @@ use ratatui::{
 };
 use tui_input::{Input, InputRequest};
 
-const TASK_FILES: [(&str, &str); 3] = [
-    ("todo.md", "# To Do Tasks\n"),
-    ("doing.md", "# Doing Tasks\n"),
-    ("done.md", "# Done Tasks\n"),
-];
+const TASK_STATUSES: [&str; 3] = ["todo", "doing", "done"];
+const TASK_DETAIL_FILES: [&str; 3] = ["task.md", "README.md", "index.md"];
+
+#[derive(Clone, Debug)]
+struct TaskEntry {
+    source: TaskSource,
+    summary: String,
+    content: String,
+    metadata: Option<String>,
+    has_subtasks: bool,
+}
+
+#[derive(Clone, Debug)]
+enum TaskSource {
+    MarkdownLine { line_index: usize },
+    Path { path: PathBuf, is_dir: bool },
+}
+
+#[derive(Clone, Debug)]
+enum StatusStore {
+    MarkdownFile(PathBuf),
+    Directory(PathBuf),
+}
+
+enum ExpansionSummary {
+    AlreadyDirectory {
+        status: &'static str,
+        dir: PathBuf,
+    },
+    Expanded {
+        status: &'static str,
+        dir: PathBuf,
+        backup: PathBuf,
+        task_count: usize,
+    },
+}
 
 #[derive(Parser)]
 #[command(name = "lls-cli-task")]
@@ -42,8 +73,17 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Initializes the tasks directory and markdown files
-    Init,
+    /// Initializes the tasks directory and status stores
+    Init {
+        /// Create todo/doing/done folders instead of markdown files
+        #[arg(long, default_value_t = false)]
+        folders: bool,
+    },
+    /// Expands markdown status files into folder-backed task files
+    Expand {
+        /// Optional status to expand (todo, doing, done). Expands all statuses if omitted.
+        status: Option<String>,
+    },
     /// Adds a new task to the todo list
     Add {
         /// The description of the task, optionally followed by tag-like metadata
@@ -87,8 +127,11 @@ fn main() -> Result<()> {
     }
 
     match cli.command {
-        Some(Commands::Init) => {
-            init_tasks(&root)?;
+        Some(Commands::Init { folders }) => {
+            init_tasks(&root, folders)?;
+        }
+        Some(Commands::Expand { status }) => {
+            expand_tasks(&root, status)?;
         }
         Some(Commands::Add { task }) => {
             let (description, metadata) = parse_add_task_args(task)?;
@@ -126,7 +169,7 @@ fn main() -> Result<()> {
                 io::stdin().read_line(&mut response)?;
 
                 if response.trim().to_lowercase() == "y" {
-                    init_tasks(&root)?;
+                    init_tasks(&root, false)?;
                 } else {
                     println!(
                         "Initialization skipped. Please run 'init' to set up your task lists."
@@ -180,41 +223,307 @@ fn is_initialized(root: &Path) -> bool {
     if !tasks_dir.exists() {
         return false;
     }
-    let files = ["todo.md", "doing.md", "done.md"];
-    files.iter().all(|f| tasks_dir.join(f).exists())
-}
-
-fn get_file_path(root: &Path, status: &str) -> Result<std::path::PathBuf> {
-    let tasks_dir = get_tasks_dir(root);
-    let filename = match status {
-        "todo" => "todo.md",
-        "doing" => "doing.md",
-        "done" => "done.md",
-        _ => anyhow::bail!("Invalid status. Use 'todo', 'doing', or 'done'."),
-    };
-    ensure_task_store(root)?;
-    Ok(tasks_dir.join(filename))
+    TASK_STATUSES
+        .iter()
+        .all(|status| status_store_exists(&tasks_dir, status))
 }
 
 fn ensure_task_store(root: &Path) -> Result<()> {
-    let tasks_dir = get_tasks_dir(root);
-    fs::create_dir_all(&tasks_dir).context("Failed to create tasks directory")?;
+    ensure_board_store(&get_tasks_dir(root))
+}
 
-    for (filename, content) in TASK_FILES {
-        let path = tasks_dir.join(filename);
-        if !path.exists() {
-            fs::write(&path, content).context(format!("Failed to create file {:?}", path))?;
+fn status_filename(status: &str) -> Result<&'static str> {
+    match status {
+        "todo" => Ok("todo.md"),
+        "doing" => Ok("doing.md"),
+        "done" => Ok("done.md"),
+        _ => anyhow::bail!("Invalid status. Use 'todo', 'doing', or 'done'."),
+    }
+}
+
+fn normalize_status_arg(status: &str) -> Result<&'static str> {
+    match status {
+        "1" | "todo" => Ok("todo"),
+        "2" | "doing" => Ok("doing"),
+        "3" | "done" => Ok("done"),
+        _ => anyhow::bail!("Invalid status. Use 'todo', 'doing', or 'done'."),
+    }
+}
+
+fn status_header(status: &str) -> Result<&'static str> {
+    match status {
+        "todo" => Ok("# To Do Tasks\n"),
+        "doing" => Ok("# Doing Tasks\n"),
+        "done" => Ok("# Done Tasks\n"),
+        _ => anyhow::bail!("Invalid status. Use 'todo', 'doing', or 'done'."),
+    }
+}
+
+fn status_store_exists(board_dir: &Path, status: &str) -> bool {
+    board_dir.join(status).is_dir()
+        || status_filename(status)
+            .map(|filename| board_dir.join(filename).is_file())
+            .unwrap_or(false)
+}
+
+fn ensure_board_store(board_dir: &Path) -> Result<()> {
+    fs::create_dir_all(board_dir).context("Failed to create tasks directory")?;
+    let directory_mode = TASK_STATUSES
+        .iter()
+        .any(|status| board_dir.join(status).is_dir());
+
+    for status in TASK_STATUSES {
+        let dir_path = board_dir.join(status);
+        let file_path = board_dir.join(status_filename(status)?);
+        if dir_path.is_dir() || file_path.exists() {
+            continue;
+        }
+
+        if directory_mode {
+            fs::create_dir_all(&dir_path)
+                .context(format!("Failed to create directory {:?}", dir_path))?;
+        } else {
+            fs::write(&file_path, status_header(status)?)
+                .context(format!("Failed to create file {:?}", file_path))?;
         }
     }
 
     Ok(())
 }
 
+fn get_status_store(board_dir: &Path, status: &str) -> Result<StatusStore> {
+    status_filename(status)?;
+    ensure_board_store(board_dir)?;
+
+    let dir_path = board_dir.join(status);
+    if dir_path.is_dir() {
+        return Ok(StatusStore::Directory(dir_path));
+    }
+
+    Ok(StatusStore::MarkdownFile(
+        board_dir.join(status_filename(status)?),
+    ))
+}
+
 // find_task_status is no longer needed for index-based referencing
 // as the user must specify the source list.
 
-fn delete_task(root: &Path, status: &str, task_index_str: &str) -> Result<()> {
-    let path = get_file_path(root, status)?;
+fn read_task_entries(board_dir: &Path, status: &str) -> Result<Vec<TaskEntry>> {
+    match get_status_store(board_dir, status)? {
+        StatusStore::MarkdownFile(path) => read_markdown_entries(&path),
+        StatusStore::Directory(path) => read_directory_entries(&path),
+    }
+}
+
+fn read_markdown_entries(path: &Path) -> Result<Vec<TaskEntry>> {
+    let content = fs::read_to_string(path).context(format!("Failed to read {:?}", path))?;
+    let entries = content
+        .lines()
+        .enumerate()
+        .filter_map(|(line_index, line)| {
+            let task_text = line.strip_prefix("- ")?;
+            Some(task_entry_from_text(
+                TaskSource::MarkdownLine { line_index },
+                task_text,
+                task_text,
+                false,
+            ))
+        })
+        .collect();
+
+    Ok(entries)
+}
+
+fn read_directory_entries(path: &Path) -> Result<Vec<TaskEntry>> {
+    let mut paths = directory_task_paths(path)?;
+    paths.sort_by_key(|path| {
+        path.file_name()
+            .map(|name| name.to_string_lossy().to_lowercase())
+            .unwrap_or_default()
+    });
+
+    paths
+        .into_iter()
+        .map(|path| {
+            let is_dir = path.is_dir();
+            let fallback = title_from_path(&path);
+            let content = if is_dir {
+                read_directory_task_content(&path).unwrap_or_else(|| fallback.clone())
+            } else {
+                fs::read_to_string(&path)
+                    .with_context(|| format!("Failed to read task file {:?}", path))?
+            };
+            let summary = first_sentence(&content).unwrap_or(fallback);
+            let (description, metadata) = split_description_metadata(&summary);
+            let has_subtasks = is_dir && board_has_any_status_store(&path);
+
+            Ok(TaskEntry {
+                source: TaskSource::Path { path, is_dir },
+                summary: description.to_string(),
+                content,
+                metadata: metadata.map(str::to_string),
+                has_subtasks,
+            })
+        })
+        .collect()
+}
+
+fn task_entry_from_text(
+    source: TaskSource,
+    text: &str,
+    content: &str,
+    has_subtasks: bool,
+) -> TaskEntry {
+    let summary = first_sentence(text).unwrap_or_else(|| text.trim().to_string());
+    let (description, metadata) = split_description_metadata(&summary);
+
+    TaskEntry {
+        source,
+        summary: description.to_string(),
+        content: content.to_string(),
+        metadata: metadata.map(str::to_string),
+        has_subtasks,
+    }
+}
+
+fn board_has_any_status_store(board_dir: &Path) -> bool {
+    TASK_STATUSES
+        .iter()
+        .any(|status| status_store_exists(board_dir, status))
+}
+
+fn directory_task_paths(path: &Path) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+
+    if !path.exists() {
+        return Ok(paths);
+    }
+
+    for entry in
+        fs::read_dir(path).with_context(|| format!("Failed to read directory {:?}", path))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+
+        if file_name.starts_with('.') {
+            continue;
+        }
+
+        let file_type = entry.file_type()?;
+        if file_type.is_file() || file_type.is_dir() {
+            paths.push(path);
+        }
+    }
+
+    paths.sort_by_key(|path| {
+        path.file_name()
+            .map(|name| name.to_string_lossy().to_lowercase())
+            .unwrap_or_default()
+    });
+
+    Ok(paths)
+}
+
+fn read_directory_task_content(path: &Path) -> Option<String> {
+    TASK_DETAIL_FILES.iter().find_map(|filename| {
+        let detail_path = path.join(filename);
+        fs::read_to_string(detail_path).ok()
+    })
+}
+
+fn directory_task_detail_path(path: &Path) -> PathBuf {
+    TASK_DETAIL_FILES
+        .iter()
+        .map(|filename| path.join(filename))
+        .find(|path| path.exists())
+        .unwrap_or_else(|| path.join(TASK_DETAIL_FILES[0]))
+}
+
+fn title_from_path(path: &Path) -> String {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("task");
+    let name = strip_order_prefix(name);
+    let stem = Path::new(name)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(name);
+    let title = stem.replace(['-', '_'], " ");
+
+    if title.trim().is_empty() {
+        "task".to_string()
+    } else {
+        title
+    }
+}
+
+fn strip_order_prefix(name: &str) -> &str {
+    let bytes = name.as_bytes();
+    if bytes.len() > 5 && bytes[..4].iter().all(|byte| byte.is_ascii_digit()) && bytes[4] == b'-' {
+        &name[5..]
+    } else {
+        name
+    }
+}
+
+fn first_sentence(content: &str) -> Option<String> {
+    let normalized = normalize_task_text(content);
+    if normalized.is_empty() {
+        return None;
+    }
+
+    let end_idx = normalized
+        .char_indices()
+        .find(|(_, ch)| matches!(ch, '.' | '!' | '?'))
+        .map(|(idx, ch)| idx + ch.len_utf8())
+        .unwrap_or(normalized.len());
+
+    Some(normalized[..end_idx].trim().to_string())
+}
+
+fn normalize_task_text(content: &str) -> String {
+    content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            line.trim_start_matches('#')
+                .trim_start()
+                .strip_prefix("- ")
+                .unwrap_or_else(|| {
+                    line.trim_start_matches('#')
+                        .trim_start()
+                        .strip_prefix("* ")
+                        .unwrap_or(line)
+                })
+                .trim()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn split_description_metadata(value: &str) -> (&str, Option<&str>) {
+    if let Some(start) = value.rfind(" (") {
+        if value.ends_with(')') {
+            return (&value[..start], Some(&value[start + 2..value.len() - 1]));
+        }
+    }
+
+    (value, None)
+}
+
+fn task_display_text(entry: &TaskEntry) -> String {
+    match &entry.metadata {
+        Some(metadata) => format!("{} ({})", entry.summary, metadata),
+        None => entry.summary.clone(),
+    }
+}
+
+fn parse_one_based_task_index(task_index_str: &str) -> Result<usize> {
     let task_index = task_index_str
         .parse::<usize>()
         .context("Invalid task index. Please provide a number.")?;
@@ -222,133 +531,497 @@ fn delete_task(root: &Path, status: &str, task_index_str: &str) -> Result<()> {
         anyhow::bail!("Task index must be 1 or greater.");
     }
 
-    let content = fs::read_to_string(&path).context("Failed to read file")?;
-    let lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+    Ok(task_index)
+}
 
-    let task_lines: Vec<(usize, &String)> = lines
-        .iter()
-        .enumerate()
-        .filter(|(_, line)| line.starts_with("- "))
-        .collect();
-
-    if task_index > task_lines.len() {
-        anyhow::bail!(
+fn task_entry_at(board_dir: &Path, status: &str, task_index: usize) -> Result<TaskEntry> {
+    let entries = read_task_entries(board_dir, status)?;
+    entries.get(task_index - 1).cloned().ok_or_else(|| {
+        anyhow::anyhow!(
             "Task index {} out of range. Only {} tasks found in {}.",
             task_index,
-            task_lines.len(),
+            entries.len(),
             status
-        );
-    }
+        )
+    })
+}
 
-    let (actual_line_idx, _) = task_lines[task_index - 1];
-    let mut new_lines = lines.clone();
-    new_lines.remove(actual_line_idx);
-
-    let updated_content = new_lines.join("\n");
+fn write_lines(path: &Path, lines: &[String]) -> Result<()> {
+    let updated_content = lines.join("\n");
     let final_content = if updated_content.is_empty() {
         updated_content
     } else {
         format!("{}\n", updated_content)
     };
 
-    fs::write(&path, final_content).context("Failed to update file")?;
+    fs::write(path, final_content).context("Failed to update file")?;
     Ok(())
 }
 
-fn move_task(root: &Path, from: &str, to: &str, task_index_str: &str) -> Result<()> {
-    let src_path = get_file_path(root, from)?;
-    let dest_path = get_file_path(root, to)?;
+fn remove_task_entry(board_dir: &Path, status: &str, entry: &TaskEntry) -> Result<()> {
+    match &entry.source {
+        TaskSource::MarkdownLine { line_index } => {
+            let StatusStore::MarkdownFile(path) = get_status_store(board_dir, status)? else {
+                anyhow::bail!("Task storage changed while removing task.");
+            };
+            let content = fs::read_to_string(&path).context("Failed to read file")?;
+            let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
 
-    let task_index = task_index_str
-        .parse::<usize>()
-        .context("Invalid task index. Please provide a number.")?;
-    if task_index == 0 {
-        anyhow::bail!("Task index must be 1 or greater.");
-    }
-
-    let content = fs::read_to_string(&src_path).context("Failed to read source file")?;
-    let lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
-
-    // Filter for task lines only to find the Nth task
-    let task_lines: Vec<(usize, &String)> = lines
-        .iter()
-        .enumerate()
-        .filter(|(_, line)| line.starts_with("- "))
-        .collect();
-
-    if task_index > task_lines.len() {
-        anyhow::bail!(
-            "Task index {} out of range. Only {} tasks found in {}.",
-            task_index,
-            task_lines.len(),
-            from
-        );
-    }
-
-    let (actual_line_idx, task_line) = task_lines[task_index - 1];
-    let task_line_content = task_line.clone();
-
-    // Write the destination first so a destination failure cannot remove the task.
-    let dest_content = fs::read_to_string(&dest_path).context("Failed to read destination file")?;
-    let mut dest_lines: Vec<String> = dest_content.lines().map(|s| s.to_string()).collect();
-    if to == "done" {
-        let insert_at_idx = dest_lines
-            .iter()
-            .position(|line| line.starts_with("- "))
-            .unwrap_or(dest_lines.len());
-        dest_lines.insert(insert_at_idx, task_line_content);
-    } else {
-        dest_lines.push(task_line_content);
-    }
-    fs::write(&dest_path, dest_lines.join("\n") + "\n")
-        .context("Failed to update destination file")?;
-
-    let mut new_src_lines = lines.clone();
-    new_src_lines.remove(actual_line_idx);
-    let updated_src_content = new_src_lines.join("\n");
-    let final_src_content = if updated_src_content.is_empty() {
-        updated_src_content
-    } else {
-        format!("{}\n", updated_src_content)
-    };
-    fs::write(&src_path, final_src_content).context("Failed to update source file")?;
-
-    Ok(())
-}
-
-fn update_task(root: &Path, status: &str, task_index: usize, new_description: &str) -> Result<()> {
-    let path = get_file_path(root, status)?;
-    let content = fs::read_to_string(&path).context("Failed to read file")?;
-    let lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
-
-    let mut task_count = 0;
-    let mut updated_lines = Vec::new();
-
-    for line in lines {
-        if line.starts_with("- ") {
-            task_count += 1;
-            if task_count == task_index {
-                updated_lines.push(format!("- {}", new_description));
-            } else {
-                updated_lines.push(line);
+            if *line_index >= lines.len() {
+                anyhow::bail!("Task storage changed while removing task.");
             }
-        } else {
-            updated_lines.push(line);
+
+            lines.remove(*line_index);
+            write_lines(&path, &lines)?;
+        }
+        TaskSource::Path { path, is_dir } => {
+            if *is_dir {
+                fs::remove_dir_all(path)
+                    .with_context(|| format!("Failed to remove task directory {:?}", path))?;
+            } else {
+                fs::remove_file(path)
+                    .with_context(|| format!("Failed to remove task file {:?}", path))?;
+            }
+
+            if let Some(parent) = path.parent() {
+                normalize_directory_order(parent)?;
+            }
         }
     }
 
-    if task_count < task_index {
-        anyhow::bail!("Task index {} out of range", task_index);
-    }
-
-    fs::write(&path, updated_lines.join("\n") + "\n").context("Failed to write file")?;
     Ok(())
 }
 
-fn reorder_task(root: &Path, status: &str, from_idx: usize, to_idx: usize) -> Result<()> {
-    let path = get_file_path(root, status)?;
-    let content = fs::read_to_string(&path).context("Failed to read file")?;
-    let lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+fn content_with_metadata(description: &str, metadata: Option<String>) -> String {
+    match metadata {
+        Some(metadata) => format!("{} ({})", description, metadata),
+        None => description.to_string(),
+    }
+}
+
+fn insert_task_content(
+    board_dir: &Path,
+    status: &str,
+    index: Option<usize>,
+    content: &str,
+) -> Result<()> {
+    match get_status_store(board_dir, status)? {
+        StatusStore::MarkdownFile(path) => insert_content_into_markdown(&path, index, content),
+        StatusStore::Directory(path) => insert_content_into_directory(&path, index, content),
+    }
+}
+
+fn insert_content_into_markdown(path: &Path, index: Option<usize>, content: &str) -> Result<()> {
+    let task_line = format!("- {}", single_line_content(content));
+    let file_content = fs::read_to_string(path).context("Failed to read file")?;
+    let mut lines: Vec<String> = file_content.lines().map(str::to_string).collect();
+
+    if let Some(idx) = index {
+        let task_lines: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.starts_with("- "))
+            .map(|(i, _)| i)
+            .collect();
+
+        if idx < task_lines.len() {
+            let actual_idx = task_lines[idx];
+            lines.insert(actual_idx, task_line);
+        } else {
+            lines.push(task_line);
+        }
+    } else {
+        lines.push(task_line);
+    }
+
+    write_lines(path, &lines)
+}
+
+fn insert_content_into_directory(path: &Path, index: Option<usize>, content: &str) -> Result<()> {
+    fs::create_dir_all(path).with_context(|| format!("Failed to create directory {:?}", path))?;
+    let preferred_name = format!(
+        "{:04}-{}.md",
+        directory_task_paths(path)?.len() + 1,
+        slugify(&first_sentence(content).unwrap_or_else(|| "task".to_string()))
+    );
+    let task_path = unique_child_path(path, &preferred_name);
+    fs::write(&task_path, format!("{}\n", content.trim_end()))
+        .with_context(|| format!("Failed to write task file {:?}", task_path))?;
+
+    if let Some(idx) = index {
+        reorder_path_in_directory(path, &task_path, idx)?;
+    } else {
+        normalize_directory_order(path)?;
+    }
+
+    Ok(())
+}
+
+fn single_line_content(content: &str) -> String {
+    normalize_task_text(content)
+}
+
+fn slugify(value: &str) -> String {
+    let mut slug = String::new();
+    let mut last_was_dash = false;
+
+    for ch in value.chars().flat_map(char::to_lowercase) {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch);
+            last_was_dash = false;
+        } else if !last_was_dash && !slug.is_empty() {
+            slug.push('-');
+            last_was_dash = true;
+        }
+
+        if slug.len() >= 48 {
+            break;
+        }
+    }
+
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+
+    if slug.is_empty() {
+        "task".to_string()
+    } else {
+        slug
+    }
+}
+
+fn unique_child_path(parent: &Path, preferred_name: &str) -> PathBuf {
+    let preferred = parent.join(preferred_name);
+    if !preferred.exists() {
+        return preferred;
+    }
+
+    let preferred_path = Path::new(preferred_name);
+    let stem = preferred_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(preferred_name);
+    let extension = preferred_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| format!(".{}", extension))
+        .unwrap_or_default();
+
+    for idx in 2.. {
+        let candidate = parent.join(format!("{}-{}{}", stem, idx, extension));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+
+    unreachable!("unique path search is unbounded")
+}
+
+fn normalize_directory_order(path: &Path) -> Result<()> {
+    let paths = directory_task_paths(path)?;
+    if paths.is_empty() {
+        return Ok(());
+    }
+
+    let mut temp_paths = Vec::new();
+    for (idx, task_path) in paths.iter().enumerate() {
+        let original_name = task_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("task");
+        let temp_path = unique_child_path(path, &format!(".clt-reorder-{}-{}", idx, original_name));
+        fs::rename(task_path, &temp_path).with_context(|| {
+            format!(
+                "Failed to prepare task {:?} for directory order update",
+                task_path
+            )
+        })?;
+        temp_paths.push((temp_path, original_name.to_string()));
+    }
+
+    for (idx, (temp_path, original_name)) in temp_paths.into_iter().enumerate() {
+        let final_name = format!("{:04}-{}", idx + 1, strip_order_prefix(&original_name));
+        let final_path = path.join(final_name);
+        fs::rename(&temp_path, &final_path).with_context(|| {
+            format!(
+                "Failed to finish task {:?} directory order update",
+                temp_path
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+fn reorder_path_in_directory(path: &Path, task_path: &Path, to_idx: usize) -> Result<()> {
+    let mut paths = directory_task_paths(path)?;
+    let Some(from_idx) = paths.iter().position(|path| path == task_path) else {
+        anyhow::bail!("Task file disappeared while reordering.");
+    };
+    let task_path = paths.remove(from_idx);
+    let to_idx = to_idx.min(paths.len());
+    paths.insert(to_idx, task_path);
+
+    rewrite_directory_order(path, paths)
+}
+
+fn rewrite_directory_order(path: &Path, ordered_paths: Vec<PathBuf>) -> Result<()> {
+    if ordered_paths.is_empty() {
+        return Ok(());
+    }
+
+    let mut temp_paths = Vec::new();
+    for (idx, task_path) in ordered_paths.iter().enumerate() {
+        let original_name = task_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("task");
+        let temp_path = unique_child_path(path, &format!(".clt-reorder-{}-{}", idx, original_name));
+        fs::rename(task_path, &temp_path).with_context(|| {
+            format!(
+                "Failed to prepare task {:?} for directory order update",
+                task_path
+            )
+        })?;
+        temp_paths.push((temp_path, original_name.to_string()));
+    }
+
+    for (idx, (temp_path, original_name)) in temp_paths.into_iter().enumerate() {
+        let final_name = format!("{:04}-{}", idx + 1, strip_order_prefix(&original_name));
+        let final_path = path.join(final_name);
+        fs::rename(&temp_path, &final_path).with_context(|| {
+            format!(
+                "Failed to finish task {:?} directory order update",
+                temp_path
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+fn move_path_into_directory(
+    source_path: &Path,
+    dest_dir: &Path,
+    index: Option<usize>,
+) -> Result<PathBuf> {
+    fs::create_dir_all(dest_dir)
+        .with_context(|| format!("Failed to create destination directory {:?}", dest_dir))?;
+
+    let original_name = source_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("task.md");
+    let preferred_name = format!(
+        "{:04}-{}",
+        directory_task_paths(dest_dir)?.len() + 1,
+        strip_order_prefix(original_name)
+    );
+    let dest_path = unique_child_path(dest_dir, &preferred_name);
+    fs::rename(source_path, &dest_path).with_context(|| {
+        format!(
+            "Failed to move task {:?} into directory {:?}",
+            source_path, dest_dir
+        )
+    })?;
+
+    if let Some(source_parent) = source_path.parent() {
+        normalize_directory_order(source_parent)?;
+    }
+
+    if let Some(idx) = index {
+        reorder_path_in_directory(dest_dir, &dest_path, idx)?;
+    } else {
+        normalize_directory_order(dest_dir)?;
+    }
+
+    Ok(dest_path)
+}
+
+fn convert_status_to_directory(board_dir: &Path, status: &str) -> Result<PathBuf> {
+    let dir_path = board_dir.join(status);
+    if dir_path.is_dir() {
+        return Ok(dir_path);
+    }
+
+    let file_path = board_dir.join(status_filename(status)?);
+    fs::create_dir_all(&dir_path)
+        .with_context(|| format!("Failed to create directory {:?}", dir_path))?;
+
+    if file_path.exists() {
+        let entries = read_markdown_entries(&file_path)?;
+        for entry in entries {
+            insert_content_into_directory(&dir_path, None, &entry.content)?;
+        }
+
+        let backup_name = format!("{}.bak", status_filename(status)?);
+        let backup_path = unique_child_path(board_dir, &backup_name);
+        fs::rename(&file_path, &backup_path).with_context(|| {
+            format!(
+                "Failed to preserve markdown status file as {:?}",
+                backup_path
+            )
+        })?;
+    }
+
+    Ok(dir_path)
+}
+
+fn expand_status_for_command(board_dir: &Path, status: &'static str) -> Result<ExpansionSummary> {
+    ensure_board_store(board_dir)?;
+
+    let dir_path = board_dir.join(status);
+    if dir_path.is_dir() {
+        return Ok(ExpansionSummary::AlreadyDirectory {
+            status,
+            dir: dir_path,
+        });
+    }
+
+    let file_path = board_dir.join(status_filename(status)?);
+    let entries = read_markdown_entries(&file_path)?;
+    let task_count = entries.len();
+    fs::create_dir_all(&dir_path)
+        .with_context(|| format!("Failed to create directory {:?}", dir_path))?;
+
+    for entry in entries {
+        insert_content_into_directory(&dir_path, None, &entry.content)?;
+    }
+
+    let backup_name = format!("{}.bak", status_filename(status)?);
+    let backup_path = unique_child_path(board_dir, &backup_name);
+    fs::rename(&file_path, &backup_path).with_context(|| {
+        format!(
+            "Failed to preserve markdown status file as {:?}",
+            backup_path
+        )
+    })?;
+
+    Ok(ExpansionSummary::Expanded {
+        status,
+        dir: dir_path,
+        backup: backup_path,
+        task_count,
+    })
+}
+
+fn expand_tasks(root: &Path, filter_status: Option<String>) -> Result<()> {
+    let board_dir = get_tasks_dir(root);
+    let statuses: Vec<&'static str> = match filter_status {
+        Some(status) => vec![normalize_status_arg(&status)?],
+        None => TASK_STATUSES.to_vec(),
+    };
+
+    for status in statuses {
+        match expand_status_for_command(&board_dir, status)? {
+            ExpansionSummary::AlreadyDirectory { status, dir } => {
+                println!("{} is already folder-backed at {:?}", status, dir);
+            }
+            ExpansionSummary::Expanded {
+                status,
+                dir,
+                backup,
+                task_count,
+            } => {
+                println!(
+                    "Expanded {} to {:?} with {} task file(s). Backup: {:?}",
+                    status, dir, task_count, backup
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn delete_task(root: &Path, status: &str, task_index_str: &str) -> Result<()> {
+    delete_task_in_board(&get_tasks_dir(root), status, task_index_str)
+}
+
+fn delete_task_in_board(board_dir: &Path, status: &str, task_index_str: &str) -> Result<()> {
+    let task_index = parse_one_based_task_index(task_index_str)?;
+    let entry = task_entry_at(board_dir, status, task_index)?;
+    remove_task_entry(board_dir, status, &entry)
+}
+
+fn move_task(root: &Path, from: &str, to: &str, task_index_str: &str) -> Result<()> {
+    move_task_in_board(&get_tasks_dir(root), from, to, task_index_str)
+}
+
+fn move_task_in_board(board_dir: &Path, from: &str, to: &str, task_index_str: &str) -> Result<()> {
+    let task_index = parse_one_based_task_index(task_index_str)?;
+    let entry = task_entry_at(board_dir, from, task_index)?;
+    let dest_index = if to == "done" { Some(0) } else { None };
+
+    match (&entry.source, get_status_store(board_dir, to)?) {
+        (TaskSource::Path { path, .. }, StatusStore::Directory(dest_dir)) => {
+            move_path_into_directory(path, &dest_dir, dest_index)?;
+        }
+        (TaskSource::Path { path, .. }, StatusStore::MarkdownFile(_)) => {
+            let dest_dir = convert_status_to_directory(board_dir, to)?;
+            move_path_into_directory(path, &dest_dir, dest_index)?;
+        }
+        (TaskSource::MarkdownLine { .. }, _) => {
+            insert_task_content(board_dir, to, dest_index, &entry.content)?;
+            remove_task_entry(board_dir, from, &entry)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn update_task_in_board(
+    board_dir: &Path,
+    status: &str,
+    task_index: usize,
+    new_description: &str,
+) -> Result<()> {
+    let entry = task_entry_at(board_dir, status, task_index)?;
+
+    match entry.source {
+        TaskSource::MarkdownLine { line_index } => {
+            let StatusStore::MarkdownFile(path) = get_status_store(board_dir, status)? else {
+                anyhow::bail!("Task storage changed while updating task.");
+            };
+            let content = fs::read_to_string(&path).context("Failed to read file")?;
+            let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
+
+            if line_index >= lines.len() {
+                anyhow::bail!("Task index {} out of range", task_index);
+            }
+
+            lines[line_index] = format!("- {}", new_description);
+            write_lines(&path, &lines)?;
+        }
+        TaskSource::Path { path, is_dir } => {
+            let target_path = if is_dir {
+                directory_task_detail_path(&path)
+            } else {
+                path
+            };
+            fs::write(&target_path, format!("{}\n", new_description.trim_end()))
+                .with_context(|| format!("Failed to write task file {:?}", target_path))?;
+        }
+    }
+
+    Ok(())
+}
+
+fn reorder_task_in_board(
+    board_dir: &Path,
+    status: &str,
+    from_idx: usize,
+    to_idx: usize,
+) -> Result<()> {
+    match get_status_store(board_dir, status)? {
+        StatusStore::MarkdownFile(path) => reorder_markdown_task(&path, from_idx, to_idx),
+        StatusStore::Directory(path) => reorder_directory_task(&path, from_idx, to_idx),
+    }
+}
+
+fn reorder_markdown_task(path: &Path, from_idx: usize, to_idx: usize) -> Result<()> {
+    let content = fs::read_to_string(path).context("Failed to read file")?;
+    let lines: Vec<String> = content.lines().map(str::to_string).collect();
 
     let task_indices: Vec<usize> = lines
         .iter()
@@ -367,7 +1040,6 @@ fn reorder_task(root: &Path, status: &str, from_idx: usize, to_idx: usize) -> Re
     let mut new_lines = lines.clone();
     new_lines.remove(actual_from_idx);
 
-    // Find the new position for the task line
     let new_task_indices: Vec<usize> = new_lines
         .iter()
         .enumerate()
@@ -382,11 +1054,30 @@ fn reorder_task(root: &Path, status: &str, from_idx: usize, to_idx: usize) -> Re
     };
 
     new_lines.insert(insert_at_idx, task_line);
-    fs::write(&path, new_lines.join("\n") + "\n").context("Failed to write file")?;
-    Ok(())
+    write_lines(path, &new_lines)
+}
+
+fn reorder_directory_task(path: &Path, from_idx: usize, to_idx: usize) -> Result<()> {
+    let mut paths = directory_task_paths(path)?;
+    paths.sort_by_key(|path| {
+        path.file_name()
+            .map(|name| name.to_string_lossy().to_lowercase())
+            .unwrap_or_default()
+    });
+
+    if from_idx >= paths.len() {
+        anyhow::bail!("Task index out of range");
+    }
+
+    let task_path = paths.remove(from_idx);
+    let to_idx = to_idx.min(paths.len());
+    paths.insert(to_idx, task_path);
+    rewrite_directory_order(path, paths)
 }
 
 fn list_tasks(root: &Path, filter_status: Option<String>) -> Result<()> {
+    let board_dir = get_tasks_dir(root);
+
     if let Some(ref s) = filter_status {
         let status = match s.as_str() {
             "1" => "todo",
@@ -395,29 +1086,33 @@ fn list_tasks(root: &Path, filter_status: Option<String>) -> Result<()> {
             _ => s.as_str(),
         };
 
-        let path = get_file_path(root, status)?;
         println!("\n--- {} ---", status.to_uppercase());
-        let content = fs::read_to_string(&path).context(format!("Failed to read {:?}", path))?;
-        let mut index = 1;
-        for line in content.lines() {
-            if line.starts_with("- ") {
-                println!("{}. {}", index, &line[2..]);
-                index += 1;
-            }
+        for (index, entry) in read_task_entries(&board_dir, status)?.iter().enumerate() {
+            println!(
+                "{}. {}{}",
+                index + 1,
+                task_display_text(entry),
+                if entry.has_subtasks {
+                    " [subtasks]"
+                } else {
+                    ""
+                }
+            );
         }
     } else {
-        let statuses = ["todo", "doing", "done"];
-        for status in statuses {
-            let path = get_file_path(root, status)?;
+        for status in TASK_STATUSES {
             println!("\n--- {} ---", status.to_uppercase());
-            let content =
-                fs::read_to_string(&path).context(format!("Failed to read {:?}", path))?;
-            let mut index = 1;
-            for line in content.lines() {
-                if line.starts_with("- ") {
-                    println!("{}. {}", index, &line[2..]);
-                    index += 1;
-                }
+            for (index, entry) in read_task_entries(&board_dir, status)?.iter().enumerate() {
+                println!(
+                    "{}. {}{}",
+                    index + 1,
+                    task_display_text(entry),
+                    if entry.has_subtasks {
+                        " [subtasks]"
+                    } else {
+                        ""
+                    }
+                );
             }
         }
     }
@@ -464,68 +1159,41 @@ fn insert_task(
     description: &str,
     metadata: Option<String>,
 ) -> Result<()> {
-    let path = get_file_path(root, status)?;
+    insert_task_in_board(&get_tasks_dir(root), status, index, description, metadata)
+}
 
-    let metadata_str = match metadata {
-        Some(m) => format!(" ({})", m),
-        None => "".to_string(),
-    };
-
-    let task_line = format!("- {}{}", description, metadata_str);
-    let content = fs::read_to_string(&path).context("Failed to read file")?;
-    let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
-
-    if let Some(idx) = index {
-        // Find the actual line index for the Nth task
-        let task_lines: Vec<usize> = lines
-            .iter()
-            .enumerate()
-            .filter(|(_, line)| line.starts_with("- "))
-            .map(|(i, _)| i)
-            .collect();
-
-        if idx < task_lines.len() {
-            let actual_idx = task_lines[idx] + 1;
-            lines.insert(actual_idx, task_line);
-        } else {
-            lines.push(task_line);
-        }
-    } else {
-        lines.push(task_line);
-    }
-
-    let updated_content = lines.join("\n");
-    let final_content = if updated_content.is_empty() {
-        updated_content
-    } else {
-        format!("{}\n", updated_content)
-    };
-
-    fs::write(&path, final_content).context("Failed to write task to file")?;
-    Ok(())
+fn insert_task_in_board(
+    board_dir: &Path,
+    status: &str,
+    index: Option<usize>,
+    description: &str,
+    metadata: Option<String>,
+) -> Result<()> {
+    let content = content_with_metadata(description, metadata);
+    insert_task_content(board_dir, status, index, &content)
 }
 
 fn read_tasks(root: &Path, status: &str) -> Result<Vec<String>> {
-    let path = get_file_path(root, status)?;
-    let content = fs::read_to_string(&path).context(format!("Failed to read {:?}", path))?;
-    let tasks = content
-        .lines()
-        .filter(|l| l.starts_with("- "))
-        .map(|l| l.to_string())
-        .collect();
-    Ok(tasks)
+    read_tasks_in_board(&get_tasks_dir(root), status)
 }
 
-fn select_first_task_if_present(root: &Path, status: &str, state: &mut ListState) {
-    let has_tasks = read_tasks(root, status)
+fn read_tasks_in_board(board_dir: &Path, status: &str) -> Result<Vec<String>> {
+    Ok(read_task_entries(board_dir, status)?
+        .iter()
+        .map(|entry| format!("- {}", task_display_text(entry)))
+        .collect())
+}
+
+fn select_first_task_if_present_in_board(board_dir: &Path, status: &str, state: &mut ListState) {
+    let has_tasks = read_tasks_in_board(board_dir, status)
         .map(|tasks| !tasks.is_empty())
         .unwrap_or(false);
 
     state.select(if has_tasks { Some(0) } else { None });
 }
 
-fn select_last_task_if_present(root: &Path, status: &str, state: &mut ListState) {
-    let last_idx = read_tasks(root, status)
+fn select_last_task_if_present_in_board(board_dir: &Path, status: &str, state: &mut ListState) {
+    let last_idx = read_tasks_in_board(board_dir, status)
         .ok()
         .and_then(|tasks| tasks.len().checked_sub(1));
 
@@ -533,21 +1201,51 @@ fn select_last_task_if_present(root: &Path, status: &str, state: &mut ListState)
 }
 
 fn selected_task_index(root: &Path, status: &str, state: &ListState) -> Option<usize> {
+    selected_task_index_in_board(&get_tasks_dir(root), status, state)
+}
+
+fn selected_task_index_in_board(
+    board_dir: &Path,
+    status: &str,
+    state: &ListState,
+) -> Option<usize> {
     let idx = state.selected()?;
-    let tasks = read_tasks(root, status).ok()?;
+    let tasks = read_tasks_in_board(board_dir, status).ok()?;
 
     if idx < tasks.len() { Some(idx) } else { None }
 }
 
 fn selected_task(root: &Path, status: &str, state: &ListState) -> Option<(usize, String)> {
+    selected_task_in_board(&get_tasks_dir(root), status, state)
+}
+
+fn selected_task_in_board(
+    board_dir: &Path,
+    status: &str,
+    state: &ListState,
+) -> Option<(usize, String)> {
     let idx = state.selected()?;
-    let tasks = read_tasks(root, status).ok()?;
+    let tasks = read_tasks_in_board(board_dir, status).ok()?;
+    tasks.get(idx).cloned().map(|task| (idx, task))
+}
+
+fn selected_task_entry_in_board(
+    board_dir: &Path,
+    status: &str,
+    state: &ListState,
+) -> Option<(usize, TaskEntry)> {
+    let idx = state.selected()?;
+    let tasks = read_task_entries(board_dir, status).ok()?;
     tasks.get(idx).cloned().map(|task| (idx, task))
 }
 
 fn normalize_board_selection(root: &Path, status: &str, state: &mut ListState) {
+    normalize_board_selection_in_board(&get_tasks_dir(root), status, state);
+}
+
+fn normalize_board_selection_in_board(board_dir: &Path, status: &str, state: &mut ListState) {
     let selected = state.selected();
-    let task_count = read_tasks(root, status)
+    let task_count = read_tasks_in_board(board_dir, status)
         .map(|tasks| tasks.len())
         .unwrap_or(0);
 
@@ -558,9 +1256,13 @@ fn normalize_board_selection(root: &Path, status: &str, state: &mut ListState) {
     }
 }
 
-fn normalize_board_selections(root: &Path, statuses: &[&str], states: &mut [ListState]) {
+fn normalize_board_selections_in_board(
+    board_dir: &Path,
+    statuses: &[&str],
+    states: &mut [ListState],
+) {
     for (status, state) in statuses.iter().zip(states.iter_mut()) {
-        normalize_board_selection(root, status, state);
+        normalize_board_selection_in_board(board_dir, status, state);
     }
 }
 
@@ -938,17 +1640,44 @@ fn next_char_boundary(text: &str, idx: usize) -> usize {
         .unwrap_or(text.len())
 }
 
+fn board_display_name(root: &Path, board_dir: &Path) -> String {
+    let tasks_dir = get_tasks_dir(root);
+    if board_dir == tasks_dir {
+        return project_display_name(root);
+    }
+
+    let relative = board_dir.strip_prefix(&tasks_dir).unwrap_or(board_dir);
+    let parts: Vec<String> = relative
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(name) => name.to_str().map(|name| {
+                title_from_path(Path::new(strip_order_prefix(name)))
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            }),
+            _ => None,
+        })
+        .collect();
+
+    if parts.is_empty() {
+        project_display_name(root)
+    } else {
+        format!("{} / {}", project_display_name(root), parts.join(" / "))
+    }
+}
+
 fn tui_view(root: &Path) -> Result<()> {
     // Setup terminal
     let title = app_title(root);
     let _terminal_session = TerminalSession::enter(&title)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
-    let console_title = format!("{} Console", project_display_name(root));
+    let mut board_stack = vec![get_tasks_dir(root)];
 
     let mut current_mode = Mode::View;
     let mut task_input = Input::default();
     let mut feedback_buffer = String::from(
-        "Kanban View! Spacebar to create new Task. Arrows to navigate/focus boards, Shift+Arrows or I/K to reorder, Shift+Arrows or J/L to move tasks, Numbers to reorder, Space to add, Enter to edit, 'd' or Delete to delete, 'q' to quit.",
+        "Kanban View! Enter opens subtasks or edits, Backspace returns to parent, Space creates a task, Shift+Arrows or I/K reorder, Shift+Arrows or J/L move tasks, 'd' deletes, 'q' quits.",
     );
 
     let mut selected_board = 0; // 0: todo, 1: doing, 2: done
@@ -960,7 +1689,7 @@ fn tui_view(root: &Path) -> Result<()> {
     ];
     let mut board_scroll_offsets = [0usize; 3];
 
-    let statuses = ["todo", "doing", "done"];
+    let statuses = TASK_STATUSES;
     let titles = ["To Do", "Doing", "Done"];
     // let c_1 = Color::LightCyan;
     // let c_2 = Color::LightGreen;
@@ -973,10 +1702,15 @@ fn tui_view(root: &Path) -> Result<()> {
     let colors = [c_1, c_2, c_3];
 
     loop {
-        normalize_board_selections(root, &statuses, &mut board_states);
+        let board_dir = board_stack
+            .last()
+            .cloned()
+            .unwrap_or_else(|| get_tasks_dir(root));
+        normalize_board_selections_in_board(&board_dir, &statuses, &mut board_states);
 
         terminal.draw(|f| {
             let size = f.area();
+            let console_title = format!("{} Console", board_display_name(root, &board_dir));
 
             // Calculate input height if in Input or Edit mode
             let input_height =
@@ -1024,7 +1758,11 @@ fn tui_view(root: &Path) -> Result<()> {
             for (i, status) in statuses.iter().enumerate() {
                 let selected_idx = board_states[i].selected();
                 let col_width = (size.width / 3) as usize;
-                let tasks = read_tasks(root, status).unwrap_or_default();
+                let entries = read_task_entries(&board_dir, status).unwrap_or_default();
+                let tasks: Vec<String> = entries
+                    .iter()
+                    .map(|entry| format!("- {}", task_display_text(entry)))
+                    .collect();
                 let _items: Vec<ListItem> = tasks
                     .clone()
                     .into_iter()
@@ -1099,7 +1837,12 @@ fn tui_view(root: &Path) -> Result<()> {
                 );
 
                 let mut current_y = 0;
-                for (idx, t) in tasks.iter().enumerate().skip(board_scroll_offsets[i]) {
+                for (idx, (t, entry)) in tasks
+                    .iter()
+                    .zip(entries.iter())
+                    .enumerate()
+                    .skip(board_scroll_offsets[i])
+                {
                     let cleaned = t.replace("- ", "");
                     let is_selected = Some(idx) == selected_idx;
 
@@ -1142,11 +1885,14 @@ fn tui_view(root: &Path) -> Result<()> {
                     // we need to render the wrapped text as a Paragraph and increment current_y
                     // by the number of lines it actually takes.
 
-                    let wrapped_content = if is_selected {
+                    let mut wrapped_content = if is_selected {
                         wrap_text(desc, col_width.saturating_sub(5))
                     } else {
                         desc.to_string()
                     };
+                    if entry.has_subtasks {
+                        wrapped_content.push_str(" >");
+                    }
 
                     let line_count = wrapped_content.lines().count().max(1);
                     if current_y >= inner_area.height as usize {
@@ -1222,7 +1968,9 @@ fn tui_view(root: &Path) -> Result<()> {
             if matches!(current_mode, Mode::Help) {
                 let help_text = "TUI Commands:\n\n\
                                  [Space]        - Create new task\n\
-                                 [Enter]        - Edit selected task / Save input\n\
+                                 [Enter]        - Open subtasks or edit selected task / Save input\n\
+                                 [e]            - Edit selected task\n\
+                                 [Backspace]    - Return to parent board\n\
                                  [d/Del]        - Delete selected task\n\
                                  [Arrows]       - Navigate boards and tasks\n\
                                  [Shift+Arrows] - Reorder/Move tasks\n\
@@ -1269,14 +2017,14 @@ fn tui_view(root: &Path) -> Result<()> {
                         if key.modifiers.contains(KeyModifiers::SHIFT) {
                             match key.code {
                                 KeyCode::Up => {
-                                    if let Some(idx) = selected_task_index(
-                                        root,
+                                    if let Some(idx) = selected_task_index_in_board(
+                                        &board_dir,
                                         statuses[selected_board],
                                         &board_states[selected_board],
                                     ) {
                                         if idx > 0 {
-                                            match reorder_task(
-                                                root,
+                                            match reorder_task_in_board(
+                                                &board_dir,
                                                 statuses[selected_board],
                                                 idx,
                                                 idx - 1,
@@ -1297,19 +2045,22 @@ fn tui_view(root: &Path) -> Result<()> {
                                     }
                                 }
                                 KeyCode::Down => {
-                                    if let Some(idx) = selected_task_index(
-                                        root,
+                                    if let Some(idx) = selected_task_index_in_board(
+                                        &board_dir,
                                         statuses[selected_board],
                                         &board_states[selected_board],
                                     ) {
-                                        let tasks = read_tasks(root, statuses[selected_board])
-                                            .unwrap_or_default();
+                                        let tasks = read_tasks_in_board(
+                                            &board_dir,
+                                            statuses[selected_board],
+                                        )
+                                        .unwrap_or_default();
                                         if tasks.is_empty() {
                                             board_states[selected_board].select(None);
                                             feedback_buffer = "No task selected".to_string();
                                         } else if idx < tasks.len() - 1 {
-                                            match reorder_task(
-                                                root,
+                                            match reorder_task_in_board(
+                                                &board_dir,
                                                 statuses[selected_board],
                                                 idx,
                                                 idx + 1,
@@ -1332,8 +2083,8 @@ fn tui_view(root: &Path) -> Result<()> {
                                     }
                                 }
                                 KeyCode::Left => {
-                                    if let Some(idx) = selected_task_index(
-                                        root,
+                                    if let Some(idx) = selected_task_index_in_board(
+                                        &board_dir,
                                         statuses[selected_board],
                                         &board_states[selected_board],
                                     ) {
@@ -1341,15 +2092,19 @@ fn tui_view(root: &Path) -> Result<()> {
                                             let to_board = selected_board - 1;
                                             let from = statuses[selected_board];
                                             let to = statuses[to_board];
-                                            match move_task(root, from, to, &(idx + 1).to_string())
-                                            {
+                                            match move_task_in_board(
+                                                &board_dir,
+                                                from,
+                                                to,
+                                                &(idx + 1).to_string(),
+                                            ) {
                                                 Ok(_) => {
                                                     selected_board = to_board;
                                                     for state in board_states.iter_mut() {
                                                         state.select(None);
                                                     }
-                                                    select_last_task_if_present(
-                                                        root,
+                                                    select_last_task_if_present_in_board(
+                                                        &board_dir,
                                                         to,
                                                         &mut board_states[selected_board],
                                                     );
@@ -1368,8 +2123,8 @@ fn tui_view(root: &Path) -> Result<()> {
                                     }
                                 }
                                 KeyCode::Right => {
-                                    if let Some(idx) = selected_task_index(
-                                        root,
+                                    if let Some(idx) = selected_task_index_in_board(
+                                        &board_dir,
                                         statuses[selected_board],
                                         &board_states[selected_board],
                                     ) {
@@ -1377,15 +2132,19 @@ fn tui_view(root: &Path) -> Result<()> {
                                             let to_board = selected_board + 1;
                                             let from = statuses[selected_board];
                                             let to = statuses[to_board];
-                                            match move_task(root, from, to, &(idx + 1).to_string())
-                                            {
+                                            match move_task_in_board(
+                                                &board_dir,
+                                                from,
+                                                to,
+                                                &(idx + 1).to_string(),
+                                            ) {
                                                 Ok(_) => {
                                                     selected_board = to_board;
                                                     for state in board_states.iter_mut() {
                                                         state.select(None);
                                                     }
-                                                    select_last_task_if_present(
-                                                        root,
+                                                    select_last_task_if_present_in_board(
+                                                        &board_dir,
                                                         to,
                                                         &mut board_states[selected_board],
                                                     );
@@ -1418,24 +2177,82 @@ fn tui_view(root: &Path) -> Result<()> {
                                     feedback_buffer = "Task unselected".to_string();
                                 }
                                 KeyCode::Char('q') => break,
+                                KeyCode::Backspace => {
+                                    if board_stack.len() > 1 {
+                                        board_stack.pop();
+                                        selected_board = 0;
+                                        for state in board_states.iter_mut() {
+                                            state.select(None);
+                                        }
+                                        let parent_board = board_stack
+                                            .last()
+                                            .cloned()
+                                            .unwrap_or_else(|| get_tasks_dir(root));
+                                        select_first_task_if_present_in_board(
+                                            &parent_board,
+                                            statuses[selected_board],
+                                            &mut board_states[selected_board],
+                                        );
+                                        feedback_buffer = "Returned to parent board".to_string();
+                                    } else {
+                                        feedback_buffer = "Already at the top board".to_string();
+                                    }
+                                }
                                 KeyCode::Enter => {
-                                    if let Some((idx, task)) = selected_task(
-                                        root,
+                                    if let Some((idx, entry)) = selected_task_entry_in_board(
+                                        &board_dir,
                                         statuses[selected_board],
                                         &board_states[selected_board],
                                     ) {
-                                        current_mode = Mode::Edit;
-                                        editing_task_idx = Some(idx + 1);
-                                        task_input = Input::new(task.replace("- ", ""));
+                                        match &entry.source {
+                                            TaskSource::Path { path, is_dir: true }
+                                                if entry.has_subtasks =>
+                                            {
+                                                ensure_board_store(path)?;
+                                                board_stack.push(path.clone());
+                                                selected_board = 0;
+                                                for state in board_states.iter_mut() {
+                                                    state.select(None);
+                                                }
+                                                select_first_task_if_present_in_board(
+                                                    path,
+                                                    statuses[selected_board],
+                                                    &mut board_states[selected_board],
+                                                );
+                                                feedback_buffer =
+                                                    "Opened subtask board".to_string();
+                                            }
+                                            _ => {
+                                                current_mode = Mode::Edit;
+                                                editing_task_idx = Some(idx + 1);
+                                                task_input = Input::new(
+                                                    entry.content.trim_end().to_string(),
+                                                );
+                                            }
+                                        }
                                     } else {
                                         board_states[selected_board].select(None);
                                         current_mode = Mode::Input;
                                         task_input.reset();
                                     }
                                 }
+                                KeyCode::Char('e') | KeyCode::Char('E') => {
+                                    if let Some((idx, entry)) = selected_task_entry_in_board(
+                                        &board_dir,
+                                        statuses[selected_board],
+                                        &board_states[selected_board],
+                                    ) {
+                                        current_mode = Mode::Edit;
+                                        editing_task_idx = Some(idx + 1);
+                                        task_input =
+                                            Input::new(entry.content.trim_end().to_string());
+                                    } else {
+                                        feedback_buffer = "No task selected".to_string();
+                                    }
+                                }
                                 KeyCode::Char(' ') => {
-                                    if selected_task_index(
-                                        root,
+                                    if selected_task_index_in_board(
+                                        &board_dir,
                                         statuses[selected_board],
                                         &board_states[selected_board],
                                     )
@@ -1451,8 +2268,8 @@ fn tui_view(root: &Path) -> Result<()> {
                                     for state in board_states.iter_mut() {
                                         state.select(None);
                                     }
-                                    select_first_task_if_present(
-                                        root,
+                                    select_first_task_if_present_in_board(
+                                        &board_dir,
                                         statuses[selected_board],
                                         &mut board_states[selected_board],
                                     );
@@ -1462,8 +2279,8 @@ fn tui_view(root: &Path) -> Result<()> {
                                     for state in board_states.iter_mut() {
                                         state.select(None);
                                     }
-                                    select_first_task_if_present(
-                                        root,
+                                    select_first_task_if_present_in_board(
+                                        &board_dir,
                                         statuses[selected_board],
                                         &mut board_states[selected_board],
                                     );
@@ -1473,21 +2290,21 @@ fn tui_view(root: &Path) -> Result<()> {
                                     for state in board_states.iter_mut() {
                                         state.select(None);
                                     }
-                                    select_first_task_if_present(
-                                        root,
+                                    select_first_task_if_present_in_board(
+                                        &board_dir,
                                         statuses[selected_board],
                                         &mut board_states[selected_board],
                                     );
                                 }
                                 KeyCode::Char('i') | KeyCode::Char('I') => {
-                                    if let Some(idx) = selected_task_index(
-                                        root,
+                                    if let Some(idx) = selected_task_index_in_board(
+                                        &board_dir,
                                         statuses[selected_board],
                                         &board_states[selected_board],
                                     ) {
                                         if idx > 0 {
-                                            match reorder_task(
-                                                root,
+                                            match reorder_task_in_board(
+                                                &board_dir,
                                                 statuses[selected_board],
                                                 idx,
                                                 idx - 1,
@@ -1508,19 +2325,22 @@ fn tui_view(root: &Path) -> Result<()> {
                                     }
                                 }
                                 KeyCode::Char('k') | KeyCode::Char('K') => {
-                                    if let Some(idx) = selected_task_index(
-                                        root,
+                                    if let Some(idx) = selected_task_index_in_board(
+                                        &board_dir,
                                         statuses[selected_board],
                                         &board_states[selected_board],
                                     ) {
-                                        let tasks = read_tasks(root, statuses[selected_board])
-                                            .unwrap_or_default();
+                                        let tasks = read_tasks_in_board(
+                                            &board_dir,
+                                            statuses[selected_board],
+                                        )
+                                        .unwrap_or_default();
                                         if tasks.is_empty() {
                                             board_states[selected_board].select(None);
                                             feedback_buffer = "No task selected".to_string();
                                         } else if idx < tasks.len() - 1 {
-                                            match reorder_task(
-                                                root,
+                                            match reorder_task_in_board(
+                                                &board_dir,
                                                 statuses[selected_board],
                                                 idx,
                                                 idx + 1,
@@ -1543,8 +2363,8 @@ fn tui_view(root: &Path) -> Result<()> {
                                     }
                                 }
                                 KeyCode::Char('j') | KeyCode::Char('J') => {
-                                    if let Some(idx) = selected_task_index(
-                                        root,
+                                    if let Some(idx) = selected_task_index_in_board(
+                                        &board_dir,
                                         statuses[selected_board],
                                         &board_states[selected_board],
                                     ) {
@@ -1552,15 +2372,19 @@ fn tui_view(root: &Path) -> Result<()> {
                                             let to_board = selected_board - 1;
                                             let from = statuses[selected_board];
                                             let to = statuses[to_board];
-                                            match move_task(root, from, to, &(idx + 1).to_string())
-                                            {
+                                            match move_task_in_board(
+                                                &board_dir,
+                                                from,
+                                                to,
+                                                &(idx + 1).to_string(),
+                                            ) {
                                                 Ok(_) => {
                                                     selected_board = to_board;
                                                     for state in board_states.iter_mut() {
                                                         state.select(None);
                                                     }
-                                                    select_last_task_if_present(
-                                                        root,
+                                                    select_last_task_if_present_in_board(
+                                                        &board_dir,
                                                         to,
                                                         &mut board_states[selected_board],
                                                     );
@@ -1579,8 +2403,8 @@ fn tui_view(root: &Path) -> Result<()> {
                                     }
                                 }
                                 KeyCode::Char('l') | KeyCode::Char('L') => {
-                                    if let Some(idx) = selected_task_index(
-                                        root,
+                                    if let Some(idx) = selected_task_index_in_board(
+                                        &board_dir,
                                         statuses[selected_board],
                                         &board_states[selected_board],
                                     ) {
@@ -1588,15 +2412,19 @@ fn tui_view(root: &Path) -> Result<()> {
                                             let to_board = selected_board + 1;
                                             let from = statuses[selected_board];
                                             let to = statuses[to_board];
-                                            match move_task(root, from, to, &(idx + 1).to_string())
-                                            {
+                                            match move_task_in_board(
+                                                &board_dir,
+                                                from,
+                                                to,
+                                                &(idx + 1).to_string(),
+                                            ) {
                                                 Ok(_) => {
                                                     selected_board = to_board;
                                                     for state in board_states.iter_mut() {
                                                         state.select(None);
                                                     }
-                                                    select_last_task_if_present(
-                                                        root,
+                                                    select_last_task_if_present_in_board(
+                                                        &board_dir,
                                                         to,
                                                         &mut board_states[selected_board],
                                                     );
@@ -1615,13 +2443,17 @@ fn tui_view(root: &Path) -> Result<()> {
                                     }
                                 }
                                 KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Delete => {
-                                    if let Some(idx) = selected_task_index(
-                                        root,
+                                    if let Some(idx) = selected_task_index_in_board(
+                                        &board_dir,
                                         statuses[selected_board],
                                         &board_states[selected_board],
                                     ) {
                                         let status = statuses[selected_board];
-                                        match delete_task(root, status, &(idx + 1).to_string()) {
+                                        match delete_task_in_board(
+                                            &board_dir,
+                                            status,
+                                            &(idx + 1).to_string(),
+                                        ) {
                                             Ok(_) => {
                                                 feedback_buffer = format!(
                                                     "Deleted task {} from {}",
@@ -1646,8 +2478,9 @@ fn tui_view(root: &Path) -> Result<()> {
                                 }
                                 KeyCode::Up => {
                                     let state = &mut board_states[selected_board];
-                                    let tasks = read_tasks(root, statuses[selected_board])
-                                        .unwrap_or_default();
+                                    let tasks =
+                                        read_tasks_in_board(&board_dir, statuses[selected_board])
+                                            .unwrap_or_default();
                                     if !tasks.is_empty() {
                                         let i = state.selected().unwrap_or(0);
                                         if i > 0 {
@@ -1659,8 +2492,9 @@ fn tui_view(root: &Path) -> Result<()> {
                                 }
                                 KeyCode::Down => {
                                     let state = &mut board_states[selected_board];
-                                    let tasks = read_tasks(root, statuses[selected_board])
-                                        .unwrap_or_default();
+                                    let tasks =
+                                        read_tasks_in_board(&board_dir, statuses[selected_board])
+                                            .unwrap_or_default();
                                     if !tasks.is_empty() {
                                         let i = state.selected().unwrap_or(0);
                                         if i < tasks.len() - 1 {
@@ -1679,8 +2513,8 @@ fn tui_view(root: &Path) -> Result<()> {
                                     for state in board_states.iter_mut() {
                                         state.select(None);
                                     }
-                                    select_first_task_if_present(
-                                        root,
+                                    select_first_task_if_present_in_board(
+                                        &board_dir,
                                         statuses[selected_board],
                                         &mut board_states[selected_board],
                                     );
@@ -1694,22 +2528,22 @@ fn tui_view(root: &Path) -> Result<()> {
                                     for state in board_states.iter_mut() {
                                         state.select(None);
                                     }
-                                    select_first_task_if_present(
-                                        root,
+                                    select_first_task_if_present_in_board(
+                                        &board_dir,
                                         statuses[selected_board],
                                         &mut board_states[selected_board],
                                     );
                                 }
                                 KeyCode::Char(c) if c.is_ascii_digit() => {
                                     let new_pos = (c as u8 - b'0') as usize;
-                                    if let Some(idx) = selected_task_index(
-                                        root,
+                                    if let Some(idx) = selected_task_index_in_board(
+                                        &board_dir,
                                         statuses[selected_board],
                                         &board_states[selected_board],
                                     ) {
                                         if new_pos > 0 {
-                                            match reorder_task(
-                                                root,
+                                            match reorder_task_in_board(
+                                                &board_dir,
                                                 statuses[selected_board],
                                                 idx,
                                                 new_pos - 1,
@@ -1745,13 +2579,14 @@ fn tui_view(root: &Path) -> Result<()> {
                     Mode::Input => match key.code {
                         KeyCode::Enter => {
                             if !task_input.value().trim().is_empty() {
-                                let index = selected_task_index(
-                                    root,
+                                let index = selected_task_index_in_board(
+                                    &board_dir,
                                     statuses[selected_board],
                                     &board_states[selected_board],
-                                );
-                                match insert_task(
-                                    root,
+                                )
+                                .map(|idx| idx + 1);
+                                match insert_task_in_board(
+                                    &board_dir,
                                     statuses[selected_board],
                                     index,
                                     task_input.value(),
@@ -1783,8 +2618,8 @@ fn tui_view(root: &Path) -> Result<()> {
                         KeyCode::Enter => {
                             if !task_input.value().trim().is_empty() {
                                 if let Some(idx) = editing_task_idx {
-                                    match update_task(
-                                        root,
+                                    match update_task_in_board(
+                                        &board_dir,
                                         statuses[selected_board],
                                         idx,
                                         task_input.value(),
@@ -1823,23 +2658,35 @@ fn tui_view(root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn init_tasks(root: &Path) -> Result<()> {
+fn init_tasks(root: &Path, folders: bool) -> Result<()> {
     let tasks_dir = get_tasks_dir(root);
     if !tasks_dir.exists() {
         fs::create_dir_all(&tasks_dir).context("Failed to create tasks directory")?;
         println!("Created directory: {:?}", tasks_dir);
     }
 
-    for (filename, content) in TASK_FILES {
-        let path = tasks_dir.join(filename);
-        if !path.exists() {
-            let mut file =
-                fs::File::create(&path).context(format!("Failed to create file {:?}", path))?;
-            file.write_all(content.as_bytes())
-                .context(format!("Failed to write to file {:?}", path))?;
-            println!("Created file: {:?}", path);
+    let directory_mode = folders
+        || TASK_STATUSES
+            .iter()
+            .any(|status| tasks_dir.join(status).is_dir());
+
+    for status in TASK_STATUSES {
+        let dir_path = tasks_dir.join(status);
+        let file_path = tasks_dir.join(status_filename(status)?);
+        if dir_path.is_dir() {
+            println!("Directory already exists: {:?}", dir_path);
+        } else if file_path.exists() {
+            println!("File already exists: {:?}", file_path);
+        } else if directory_mode {
+            fs::create_dir_all(&dir_path)
+                .context(format!("Failed to create directory {:?}", dir_path))?;
+            println!("Created directory: {:?}", dir_path);
         } else {
-            println!("File already exists: {:?}", path);
+            let mut file = fs::File::create(&file_path)
+                .context(format!("Failed to create file {:?}", file_path))?;
+            file.write_all(status_header(status)?.as_bytes())
+                .context(format!("Failed to write to file {:?}", file_path))?;
+            println!("Created file: {:?}", file_path);
         }
     }
 
@@ -1880,6 +2727,20 @@ mod tests {
     }
 
     #[test]
+    fn init_tasks_can_create_folder_backed_statuses() {
+        let root = temp_root("init-folders");
+
+        init_tasks(&root, true).unwrap();
+
+        assert!(root.join("tasks/todo").is_dir());
+        assert!(root.join("tasks/doing").is_dir());
+        assert!(root.join("tasks/done").is_dir());
+        assert!(!root.join("tasks/todo.md").exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn ensure_task_store_preserves_existing_files() {
         let root = temp_root("preserve");
         let tasks_dir = root.join("tasks");
@@ -1895,6 +2756,50 @@ mod tests {
         assert_eq!(todo, "# Custom Todo\n- keep me\n");
         assert_eq!(doing, "# Doing Tasks\n");
         assert_eq!(done, "# Done Tasks\n");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn expand_tasks_can_expand_one_markdown_status_to_folder() {
+        let root = temp_root("expand-one");
+        let tasks_dir = root.join("tasks");
+        fs::create_dir_all(&tasks_dir).unwrap();
+        fs::write(
+            tasks_dir.join("todo.md"),
+            "# To Do Tasks\n- first task\n- second task\n",
+        )
+        .unwrap();
+        fs::write(tasks_dir.join("doing.md"), "# Doing Tasks\n").unwrap();
+        fs::write(tasks_dir.join("done.md"), "# Done Tasks\n").unwrap();
+
+        expand_tasks(&root, Some("todo".to_string())).unwrap();
+
+        assert!(tasks_dir.join("todo").is_dir());
+        assert!(tasks_dir.join("todo.md.bak").exists());
+        assert!(tasks_dir.join("doing.md").exists());
+        let entries = read_task_entries(&tasks_dir, "todo").unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].summary, "first task");
+        assert_eq!(entries[1].summary, "second task");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn expand_tasks_without_status_expands_all_statuses() {
+        let root = temp_root("expand-all");
+        add_task(&root, "todo task", None).unwrap();
+        move_task(&root, "todo", "doing", "1").unwrap();
+
+        expand_tasks(&root, None).unwrap();
+
+        assert!(root.join("tasks/todo").is_dir());
+        assert!(root.join("tasks/doing").is_dir());
+        assert!(root.join("tasks/done").is_dir());
+        assert!(root.join("tasks/todo.md.bak").exists());
+        assert!(root.join("tasks/doing.md.bak").exists());
+        assert!(root.join("tasks/done.md.bak").exists());
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -1979,6 +2884,105 @@ mod tests {
         let done = fs::read_to_string(root.join("tasks/done.md")).unwrap();
 
         assert_eq!(done, "# Done Tasks\n- newer done task\n- older done task\n");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn folder_backed_status_reads_task_files_as_first_sentence() {
+        let root = temp_root("folder-read");
+        let todo_dir = root.join("tasks/todo");
+        fs::create_dir_all(&todo_dir).unwrap();
+        fs::write(
+            todo_dir.join("write-launch-plan.md"),
+            "Write launch plan. Include rollout details and owners.\n\nAdd links later.\n",
+        )
+        .unwrap();
+
+        let tasks = read_tasks(&root, "todo").unwrap();
+
+        assert_eq!(tasks, vec!["- Write launch plan."]);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn moving_folder_backed_task_preserves_long_file_content() {
+        let root = temp_root("folder-move");
+        let todo_dir = root.join("tasks/todo");
+        fs::create_dir_all(&todo_dir).unwrap();
+        fs::write(
+            todo_dir.join("research-api.md"),
+            "Research the API migration. This file keeps the longer task notes.\n\n- Audit callers\n- Draft rollout\n",
+        )
+        .unwrap();
+
+        move_task(&root, "todo", "doing", "1").unwrap();
+
+        assert!(directory_task_paths(&todo_dir).unwrap().is_empty());
+        let doing_entries = read_task_entries(&root.join("tasks"), "doing").unwrap();
+        assert_eq!(doing_entries.len(), 1);
+        assert_eq!(doing_entries[0].summary, "Research the API migration.");
+        assert!(doing_entries[0].content.contains("Audit callers"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn moving_folder_task_converts_markdown_destination_to_directory() {
+        let root = temp_root("folder-convert-dest");
+        let tasks_dir = root.join("tasks");
+        fs::create_dir_all(tasks_dir.join("todo")).unwrap();
+        fs::write(
+            tasks_dir.join("todo/long-task.md"),
+            "Move this rich task. Preserve all follow-up detail.\n\nSecond paragraph.\n",
+        )
+        .unwrap();
+        fs::write(
+            tasks_dir.join("doing.md"),
+            "# Doing Tasks\n- existing task\n",
+        )
+        .unwrap();
+
+        move_task(&root, "todo", "doing", "1").unwrap();
+
+        assert!(tasks_dir.join("doing").is_dir());
+        assert!(tasks_dir.join("doing.md.bak").exists());
+        let doing_entries = read_task_entries(&tasks_dir, "doing").unwrap();
+        assert_eq!(doing_entries.len(), 2);
+        assert!(
+            doing_entries
+                .iter()
+                .any(|entry| entry.summary == "existing task")
+        );
+        assert!(
+            doing_entries
+                .iter()
+                .any(|entry| entry.content.contains("Second paragraph."))
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn folder_task_with_status_stores_is_detected_as_subtask_board() {
+        let root = temp_root("folder-subtasks");
+        let epic_dir = root.join("tasks/doing/ship-epic");
+        fs::create_dir_all(&epic_dir).unwrap();
+        fs::write(epic_dir.join("task.md"), "Ship epic. Parent task detail.\n").unwrap();
+        fs::write(epic_dir.join("todo.md"), "# To Do Tasks\n- draft spec\n").unwrap();
+        fs::write(epic_dir.join("doing.md"), "# Doing Tasks\n").unwrap();
+        fs::write(epic_dir.join("done.md"), "# Done Tasks\n").unwrap();
+
+        let entries = read_task_entries(&root.join("tasks"), "doing").unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].summary, "Ship epic.");
+        assert!(entries[0].has_subtasks);
+        assert_eq!(
+            read_tasks_in_board(&epic_dir, "todo").unwrap(),
+            vec!["- draft spec"]
+        );
 
         fs::remove_dir_all(root).unwrap();
     }

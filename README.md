@@ -12,11 +12,13 @@
 
 # clt
 
-A simple, file-system-backed CLI task management app written in Rust. It uses Markdown files for persistence and provides both a command-line interface and a TUI Kanban board.
+A simple, file-system-backed CLI task management app written in Rust. It uses Markdown files or task folders for persistence and provides both a command-line interface and a TUI Kanban board.
 
 ## Features
 
-- **File-based Persistence**: Tasks are stored in `tasks/todo.md`, `tasks/doing.md`, and `tasks/done.md`.
+- **File-based Persistence**: Tasks are stored in `tasks/todo.md`, `tasks/doing.md`, and `tasks/done.md`, or in status folders such as `tasks/todo/`.
+- **Long Task Files**: In a status folder, each direct file is a task. `clt` displays the first sentence and preserves the full file content.
+- **Nested Boards**: A task subfolder can contain its own `todo`, `doing`, and `done` files or folders. The TUI can open those as subtask boards.
 - **Kanban TUI**: A visual board view powered by `ratatui`.
 - **Simple CLI**: Easy commands to add, move, and list tasks.
 - **Smart Root Detection**: Automatically finds the git repository root to keep tasks centralized, or uses the current directory.
@@ -38,6 +40,11 @@ Initialize the task directory structure:
 clt init
 ```
 
+Create folder-backed statuses from the start:
+```bash
+clt init --folders
+```
+
 **Note:** By default, `clt` looks for the root of your git repository to store the `tasks/` folder. To force use of the current directory instead, use the `--local` flag:
 ```bash
 clt --local init
@@ -48,7 +55,7 @@ Open the interactive TUI Kanban board:
 ```bash
 clt
 ```
-*(Press 'q' to quit the TUI view)*
+Press `Enter` to open a folder task with subtasks, `e` to edit the selected task, `Backspace` to return to the parent board, and `q` to quit.
 
 ### Adding Tasks
 Add a new task to the To Do list:
@@ -85,6 +92,40 @@ Get an overview of all tasks, or filter by status:
 clt list
 clt list todo
 ```
+
+### Folder-Backed Tasks
+You can create folder-backed statuses during init or expand an existing markdown list:
+```bash
+clt init --folders
+clt expand todo
+clt expand
+```
+
+`clt expand todo` migrates only `todo.md`. `clt expand` migrates `todo.md`, `doing.md`, and `done.md`. The original Markdown files are preserved as `.bak` files.
+
+A folder-backed status looks like this:
+```text
+tasks/
+  todo/
+    0001-write-release-plan.md
+  doing.md
+  done.md
+```
+
+Each file in `tasks/todo/` is one task. The CLI and TUI show the first sentence, while the file can hold longer notes, checklists, and links. If a folder-backed task moves into a Markdown-backed status, `clt` expands that destination status to a folder and preserves the old Markdown file as `status.md.bak`.
+
+Task folders become navigable subtask boards when they contain status stores:
+```text
+tasks/
+  doing/
+    0001-ship-dashboard/
+      task.md
+      todo.md
+      doing.md
+      done.md
+```
+
+The folder's `task.md` provides the parent task text. Inside the TUI, selecting that task and pressing `Enter` opens its nested board.
 
 
 ## Development
