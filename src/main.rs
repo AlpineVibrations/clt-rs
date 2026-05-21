@@ -228,6 +228,7 @@ fn is_initialized(root: &Path) -> bool {
         .all(|status| status_store_exists(&tasks_dir, status))
 }
 
+#[cfg(test)]
 fn ensure_task_store(root: &Path) -> Result<()> {
     ensure_board_store(&get_tasks_dir(root))
 }
@@ -1173,6 +1174,7 @@ fn insert_task_in_board(
     insert_task_content(board_dir, status, index, &content)
 }
 
+#[cfg(test)]
 fn read_tasks(root: &Path, status: &str) -> Result<Vec<String>> {
     read_tasks_in_board(&get_tasks_dir(root), status)
 }
@@ -1200,6 +1202,7 @@ fn select_last_task_if_present_in_board(board_dir: &Path, status: &str, state: &
     state.select(last_idx);
 }
 
+#[cfg(test)]
 fn selected_task_index(root: &Path, status: &str, state: &ListState) -> Option<usize> {
     selected_task_index_in_board(&get_tasks_dir(root), status, state)
 }
@@ -1215,10 +1218,12 @@ fn selected_task_index_in_board(
     if idx < tasks.len() { Some(idx) } else { None }
 }
 
+#[cfg(test)]
 fn selected_task(root: &Path, status: &str, state: &ListState) -> Option<(usize, String)> {
     selected_task_in_board(&get_tasks_dir(root), status, state)
 }
 
+#[cfg(test)]
 fn selected_task_in_board(
     board_dir: &Path,
     status: &str,
@@ -1239,6 +1244,7 @@ fn selected_task_entry_in_board(
     tasks.get(idx).cloned().map(|task| (idx, task))
 }
 
+#[cfg(test)]
 fn normalize_board_selection(root: &Path, status: &str, state: &mut ListState) {
     normalize_board_selection_in_board(&get_tasks_dir(root), status, state);
 }
