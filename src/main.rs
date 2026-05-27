@@ -1600,6 +1600,12 @@ fn handle_input_key(input: &mut Input, key: crossterm::event::KeyEvent, label: &
         KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             Some(InputRequest::DeletePrevWord)
         }
+        KeyCode::Char('b' | 'B') if key.modifiers.contains(KeyModifiers::ALT) => {
+            Some(InputRequest::GoToPrevWord)
+        }
+        KeyCode::Char('f' | 'F') if key.modifiers.contains(KeyModifiers::ALT) => {
+            Some(InputRequest::GoToNextWord)
+        }
         KeyCode::Backspace if word_modifier => Some(InputRequest::DeletePrevWord),
         KeyCode::Delete if word_modifier => Some(InputRequest::DeleteNextWord),
         KeyCode::Left if word_modifier => Some(InputRequest::GoToPrevWord),
@@ -3159,6 +3165,38 @@ mod tests {
         );
 
         assert_eq!(input.value(), "first second third");
+    }
+
+    #[test]
+    fn input_key_handler_supports_alt_b_and_alt_f_word_jumps() {
+        let mut input = Input::new("first second third".to_string());
+
+        handle_input_key(
+            &mut input,
+            crossterm::event::KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT),
+            " Add Task: ",
+            80,
+        );
+        handle_input_key(
+            &mut input,
+            crossterm::event::KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE),
+            " Add Task: ",
+            80,
+        );
+        handle_input_key(
+            &mut input,
+            crossterm::event::KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT),
+            " Add Task: ",
+            80,
+        );
+        handle_input_key(
+            &mut input,
+            crossterm::event::KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE),
+            " Add Task: ",
+            80,
+        );
+
+        assert_eq!(input.value(), "first second Xthird!");
     }
 
     #[test]
