@@ -524,6 +524,23 @@ fn task_display_text(entry: &TaskEntry) -> String {
     }
 }
 
+fn task_full_display_text(entry: &TaskEntry) -> String {
+    let content = normalize_task_text(&entry.content);
+    if content.is_empty() {
+        task_display_text(entry)
+    } else {
+        content
+    }
+}
+
+fn task_tui_display_text(entry: &TaskEntry, is_selected: bool) -> String {
+    if is_selected {
+        task_full_display_text(entry)
+    } else {
+        task_display_text(entry)
+    }
+}
+
 fn parse_one_based_task_index(task_index_str: &str) -> Result<usize> {
     let task_index = task_index_str
         .parse::<usize>()
@@ -1769,6 +1786,16 @@ fn tui_view(root: &Path) -> Result<()> {
                     .iter()
                     .map(|entry| format!("- {}", task_display_text(entry)))
                     .collect();
+                let display_tasks: Vec<String> = entries
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, entry)| {
+                        format!(
+                            "- {}",
+                            task_tui_display_text(entry, Some(idx) == selected_idx)
+                        )
+                    })
+                    .collect();
                 let _items: Vec<ListItem> = tasks
                     .clone()
                     .into_iter()
@@ -1835,7 +1862,7 @@ fn tui_view(root: &Path) -> Result<()> {
 
                 let inner_area = block.inner(chunks[i]);
                 keep_selected_task_visible(
-                    &tasks,
+                    &display_tasks,
                     selected_idx,
                     &mut board_scroll_offsets[i],
                     inner_area.height as usize,
@@ -1843,32 +1870,19 @@ fn tui_view(root: &Path) -> Result<()> {
                 );
 
                 let mut current_y = 0;
-                for (idx, (t, entry)) in tasks
+                for (idx, (t, entry)) in display_tasks
                     .iter()
                     .zip(entries.iter())
                     .enumerate()
                     .skip(board_scroll_offsets[i])
                 {
-                    let cleaned = t.replace("- ", "");
+                    let cleaned = t.strip_prefix("- ").unwrap_or(t);
                     let is_selected = Some(idx) == selected_idx;
 
-                    let (desc, _meta) = if let Some(start) = cleaned.rfind(" (") {
-                        if cleaned.ends_with(')') {
-                            (
-                                &cleaned[..start],
-                                Some(&cleaned[start + 2..cleaned.len() - 1]),
-                            )
-                        } else {
-                            (&cleaned[..], None)
-                        }
-                    } else {
-                        (&cleaned[..], None)
-                    };
-
                     let text = if is_selected {
-                        wrap_text(desc, col_width.saturating_sub(5))
+                        wrap_text(cleaned, col_width.saturating_sub(5))
                     } else {
-                        desc.to_string()
+                        cleaned.to_string()
                     };
 
                     let style = if is_selected {
@@ -1892,9 +1906,9 @@ fn tui_view(root: &Path) -> Result<()> {
                     // by the number of lines it actually takes.
 
                     let mut wrapped_content = if is_selected {
-                        wrap_text(desc, col_width.saturating_sub(5))
+                        wrap_text(cleaned, col_width.saturating_sub(5))
                     } else {
-                        desc.to_string()
+                        cleaned.to_string()
                     };
                     if entry.has_subtasks {
                         wrapped_content.push_str(" >");
@@ -2991,6 +3005,22 @@ mod tests {
         );
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn selected_tui_task_text_uses_full_task_content() {
+        let entry = task_entry_from_text(
+            TaskSource::MarkdownLine { line_index: 1 },
+            "Write launch plan. This is hidden in summary.",
+            "Write launch plan. This is hidden in summary.\n\n- Add rollout notes",
+            false,
+        );
+
+        assert_eq!(task_tui_display_text(&entry, false), "Write launch plan.");
+        assert_eq!(
+            task_tui_display_text(&entry, true),
+            "Write launch plan. This is hidden in summary. Add rollout notes"
+        );
     }
 
     #[test]
