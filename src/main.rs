@@ -4441,35 +4441,50 @@ struct TuiAgentProject {
     scan: AgentProjectScan,
 }
 
+struct TuiCurrentProjectRegistration {
+    path: PathBuf,
+    name: String,
+}
+
+enum TuiAgentPanelRow<'a> {
+    RegisterCurrentProject(&'a TuiCurrentProjectRegistration),
+    Project(&'a TuiAgentProject),
+}
+
 struct TuiAgentPanel {
     projects: Vec<TuiAgentProject>,
+    current_project_registration: Option<TuiCurrentProjectRegistration>,
     state: ListState,
     scroll_offset: usize,
     last_error: Option<String>,
 }
 
 impl TuiAgentPanel {
-    fn new() -> Self {
+    fn new(active_root: &Path) -> Self {
         let mut panel = Self {
             projects: Vec::new(),
+            current_project_registration: None,
             state: ListState::default(),
             scroll_offset: 0,
             last_error: None,
         };
-        panel.refresh();
+        panel.refresh(active_root);
         panel
     }
 
-    fn refresh(&mut self) {
-        let selected_project_id = self.selected_project_id();
-        match load_tui_agent_projects() {
+    fn refresh(&mut self, active_root: &Path) {
+        let selected_row = self.selected_row_identity();
+        match load_tui_agent_projects(active_root) {
             Ok(projects) => {
                 self.projects = projects;
+                self.current_project_registration =
+                    current_project_registration(active_root, &self.projects);
                 self.last_error = None;
-                self.restore_or_normalize_selection(selected_project_id);
+                self.restore_or_normalize_selection(selected_row);
             }
             Err(err) => {
                 self.projects.clear();
+                self.current_project_registration = None;
                 self.state.select(None);
                 self.scroll_offset = 0;
                 self.last_error = Some(err.to_string());
@@ -4477,43 +4492,97 @@ impl TuiAgentPanel {
         }
     }
 
-    fn selected_project_id(&self) -> Option<i64> {
-        self.selected_project().map(|project| project.project.id)
+    fn row_count(&self) -> usize {
+        self.projects.len() + usize::from(self.current_project_registration.is_some())
+    }
+
+    fn project_start_index(&self) -> usize {
+        usize::from(self.current_project_registration.is_some())
+    }
+
+    fn selected_row_identity(&self) -> Option<TuiAgentPanelRowIdentity> {
+        match self.selected_row()? {
+            TuiAgentPanelRow::RegisterCurrentProject(registration) => Some(
+                TuiAgentPanelRowIdentity::RegisterCurrentProject(registration.path.clone()),
+            ),
+            TuiAgentPanelRow::Project(project) => {
+                Some(TuiAgentPanelRowIdentity::Project(project.project.id))
+            }
+        }
+    }
+
+    fn selected_row(&self) -> Option<TuiAgentPanelRow<'_>> {
+        let idx = self.state.selected()?;
+        if let Some(registration) = self.current_project_registration.as_ref() {
+            if idx == 0 {
+                return Some(TuiAgentPanelRow::RegisterCurrentProject(registration));
+            }
+        }
+
+        self.projects
+            .get(idx.checked_sub(self.project_start_index())?)
+            .map(TuiAgentPanelRow::Project)
     }
 
     fn selected_project(&self) -> Option<&TuiAgentProject> {
-        let idx = self.state.selected()?;
-        self.projects.get(idx)
+        match self.selected_row()? {
+            TuiAgentPanelRow::Project(project) => Some(project),
+            TuiAgentPanelRow::RegisterCurrentProject(_) => None,
+        }
     }
 
-    fn restore_or_normalize_selection(&mut self, selected_project_id: Option<i64>) {
-        if self.projects.is_empty() {
+    fn selected_current_project_registration(&self) -> Option<&TuiCurrentProjectRegistration> {
+        match self.selected_row()? {
+            TuiAgentPanelRow::RegisterCurrentProject(registration) => Some(registration),
+            TuiAgentPanelRow::Project(_) => None,
+        }
+    }
+
+    fn restore_or_normalize_selection(&mut self, selected_row: Option<TuiAgentPanelRowIdentity>) {
+        let row_count = self.row_count();
+        if row_count == 0 {
             self.state.select(None);
             self.scroll_offset = 0;
             return;
         }
 
-        if let Some(project_id) = selected_project_id {
-            if let Some(idx) = self
-                .projects
-                .iter()
-                .position(|project| project.project.id == project_id)
-            {
-                self.state.select(Some(idx));
-                return;
+        if let Some(selected_row) = selected_row {
+            match selected_row {
+                TuiAgentPanelRowIdentity::RegisterCurrentProject(path) => {
+                    if self
+                        .current_project_registration
+                        .as_ref()
+                        .is_some_and(|registration| registration.path == path)
+                    {
+                        self.state.select(Some(0));
+                        return;
+                    }
+                }
+                TuiAgentPanelRowIdentity::Project(project_id) => {
+                    if let Some(project_idx) = self
+                        .projects
+                        .iter()
+                        .position(|project| project.project.id == project_id)
+                    {
+                        self.state
+                            .select(Some(self.project_start_index() + project_idx));
+                        return;
+                    }
+                }
             }
         }
 
         let idx = self
             .state
             .selected()
-            .filter(|idx| *idx < self.projects.len())
+            .filter(|idx| *idx < row_count)
             .unwrap_or(0);
         self.state.select(Some(idx));
     }
 
     fn select_previous(&mut self) {
-        if self.projects.is_empty() {
+        let row_count = self.row_count();
+        if row_count == 0 {
             self.state.select(None);
             self.scroll_offset = 0;
             return;
@@ -4523,19 +4592,20 @@ impl TuiAgentPanel {
         if idx > 0 {
             self.state.select(Some(idx - 1));
         } else {
-            self.state.select(Some(self.projects.len() - 1));
+            self.state.select(Some(row_count - 1));
         }
     }
 
     fn select_next(&mut self) {
-        if self.projects.is_empty() {
+        let row_count = self.row_count();
+        if row_count == 0 {
             self.state.select(None);
             self.scroll_offset = 0;
             return;
         }
 
         let idx = self.state.selected().unwrap_or(0);
-        if idx + 1 < self.projects.len() {
+        if idx + 1 < row_count {
             self.state.select(Some(idx + 1));
         } else {
             self.state.select(Some(0));
@@ -4543,17 +4613,14 @@ impl TuiAgentPanel {
     }
 
     fn keep_selection_visible(&mut self, viewport_height: usize) {
-        if self.projects.is_empty() || viewport_height == 0 {
+        let row_count = self.row_count();
+        if row_count == 0 || viewport_height == 0 {
             self.scroll_offset = 0;
             return;
         }
 
-        let Some(selected_idx) = self
-            .state
-            .selected()
-            .filter(|idx| *idx < self.projects.len())
-        else {
-            self.scroll_offset = self.scroll_offset.min(self.projects.len() - 1);
+        let Some(selected_idx) = self.state.selected().filter(|idx| *idx < row_count) else {
+            self.scroll_offset = self.scroll_offset.min(row_count - 1);
             return;
         };
 
@@ -4570,7 +4637,13 @@ impl TuiAgentPanel {
     }
 }
 
-fn load_tui_agent_projects() -> Result<Vec<TuiAgentProject>> {
+#[derive(Clone)]
+enum TuiAgentPanelRowIdentity {
+    RegisterCurrentProject(PathBuf),
+    Project(i64),
+}
+
+fn load_tui_agent_projects(_active_root: &Path) -> Result<Vec<TuiAgentProject>> {
     let store = open_agent_store()?;
     let projects = store.list_projects_blocking()?;
 
@@ -4583,7 +4656,59 @@ fn load_tui_agent_projects() -> Result<Vec<TuiAgentProject>> {
         .collect())
 }
 
-fn toggle_selected_tui_agent_project(panel: &mut TuiAgentPanel) -> Result<String> {
+fn current_project_registration(
+    active_root: &Path,
+    projects: &[TuiAgentProject],
+) -> Option<TuiCurrentProjectRegistration> {
+    if projects
+        .iter()
+        .any(|project| project.project.path == active_root)
+    {
+        return None;
+    }
+
+    Some(TuiCurrentProjectRegistration {
+        path: active_root.to_path_buf(),
+        name: project_display_name(active_root),
+    })
+}
+
+fn register_selected_current_project(
+    panel: &mut TuiAgentPanel,
+    active_root: &Path,
+) -> Result<String> {
+    let Some(registration) = panel
+        .selected_current_project_registration()
+        .map(|registration| (registration.path.clone(), registration.name.clone()))
+    else {
+        return Ok("No current project registration row selected".to_string());
+    };
+
+    if !is_initialized(&registration.0) {
+        return Ok(format!(
+            "Project is not initialized: {}",
+            registration.0.display()
+        ));
+    }
+
+    let store = open_agent_store()?;
+    let created = store.register_project_blocking(&registration.0, &registration.1)?;
+    panel.refresh(active_root);
+
+    if created {
+        Ok(format!("Registered current project: {}", registration.1))
+    } else {
+        Ok(format!(
+            "Project already registered: {}",
+            registration.0.display()
+        ))
+    }
+}
+
+fn toggle_selected_tui_agent_project(
+    panel: &mut TuiAgentPanel,
+    active_root: &Path,
+) -> Result<String> {
     let Some(project) = panel.selected_project().map(|entry| entry.project.clone()) else {
         return Ok("No registered project selected".to_string());
     };
@@ -4591,7 +4716,7 @@ fn toggle_selected_tui_agent_project(panel: &mut TuiAgentPanel) -> Result<String
     let enabled = !project.enabled;
     let store = open_agent_store()?;
     let changed = store.set_project_enabled_blocking(project.id, enabled)?;
-    panel.refresh();
+    panel.refresh(active_root);
 
     if changed {
         let action = if enabled { "Turned on" } else { "Turned off" };
@@ -4609,7 +4734,7 @@ fn tui_agent_panel_refresh_interval() -> Duration {
 }
 
 fn tui_agent_panel_instructions() -> &'static str {
-    "Agent projects pane. Up/Down selects, Enter opens board, Space toggles ON/OFF."
+    "Agent projects pane. Up/Down selects, Enter opens board/adds current project, Space toggles ON/OFF or adds current project."
 }
 
 fn truncate_to_width(value: &str, width: usize) -> String {
@@ -4717,6 +4842,60 @@ fn format_agent_project_table_row(
     )
 }
 
+fn format_current_project_registration_row(
+    registration: &TuiCurrentProjectRegistration,
+    width: usize,
+) -> String {
+    if width < 80 {
+        return truncate_to_width(
+            &format!(
+                "{} {} {} {} {} {}  {}",
+                fit_cell("+", 1),
+                fit_cell_right("", 3),
+                fit_cell("ADD", 6),
+                fit_cell(&registration.name, 22),
+                fit_cell_right("-", 4),
+                fit_cell_right("-", 5),
+                fit_cell("Enter/Space", 11)
+            ),
+            width,
+        );
+    }
+
+    let marker_width = 1;
+    let number_width = 4;
+    let state_width = 6;
+    let todo_width = 4;
+    let doing_width = 5;
+    let last_run_width = 11;
+    let gap_count = 8;
+    let fixed_width = number_width
+        + marker_width
+        + state_width
+        + todo_width
+        + doing_width
+        + last_run_width
+        + gap_count;
+    let variable_width = width.saturating_sub(fixed_width);
+    let project_width = ((variable_width * 2) / 5).clamp(18, 32);
+    let path_width = variable_width.saturating_sub(project_width);
+
+    truncate_to_width(
+        &format!(
+            "{} {} {} {} {} {}  {} {}",
+            fit_cell("+", marker_width),
+            fit_cell_right("", number_width),
+            fit_cell("ADD", state_width),
+            fit_cell(&registration.name, project_width),
+            fit_cell_right("-", todo_width),
+            fit_cell_right("-", doing_width),
+            fit_cell("Enter/Space", last_run_width),
+            fit_cell(&registration.path.display().to_string(), path_width)
+        ),
+        width,
+    )
+}
+
 fn format_agent_project_table_header(width: usize) -> String {
     if width < 80 {
         return truncate_to_width(
@@ -4782,6 +4961,7 @@ fn render_tui_agent_panel(
         .iter()
         .filter(|item| item.project.enabled)
         .count();
+    let row_count = panel.row_count();
     let title = if focused {
         " Agent Projects  <<<<<< * >>>>>> "
     } else {
@@ -4822,7 +5002,7 @@ fn render_tui_agent_panel(
         return;
     }
 
-    if panel.projects.is_empty() {
+    if row_count == 0 {
         f.render_widget(
             Paragraph::new("No registered projects. Run: clt agent register .")
                 .style(Style::default().fg(Color::Indexed(244))),
@@ -4871,26 +5051,54 @@ fn render_tui_agent_panel(
         Style::default().fg(Color::White).bg(Color::DarkGray)
     };
 
-    for (row, (idx, item)) in panel
-        .projects
-        .iter()
-        .enumerate()
+    for (row, idx) in (0..row_count)
         .skip(panel.scroll_offset)
         .take(row_viewport_height)
         .enumerate()
     {
-        let text = format_agent_project_table_row(
-            idx,
-            item,
-            table_width,
-            item.project.path == active_root,
-        );
+        let (text, row_style) = if idx == 0 {
+            if let Some(registration) = panel.current_project_registration.as_ref() {
+                (
+                    format_current_project_registration_row(registration, table_width),
+                    Style::default().fg(Color::LightGreen),
+                )
+            } else {
+                let item = &panel.projects[idx];
+                (
+                    format_agent_project_table_row(
+                        idx,
+                        item,
+                        table_width,
+                        item.project.path == active_root,
+                    ),
+                    if item.project.enabled {
+                        Style::default().fg(text_color)
+                    } else {
+                        Style::default().fg(Color::Indexed(244))
+                    },
+                )
+            }
+        } else {
+            let project_idx = idx - panel.project_start_index();
+            let item = &panel.projects[project_idx];
+            (
+                format_agent_project_table_row(
+                    project_idx,
+                    item,
+                    table_width,
+                    item.project.path == active_root,
+                ),
+                if item.project.enabled {
+                    Style::default().fg(text_color)
+                } else {
+                    Style::default().fg(Color::Indexed(244))
+                },
+            )
+        };
         let style = if Some(idx) == selected_idx {
             highlight_style
-        } else if item.project.enabled {
-            Style::default().fg(text_color)
         } else {
-            Style::default().fg(Color::Indexed(244))
+            row_style
         };
         let item_area = Rect {
             x: inner_area.x,
@@ -5251,7 +5459,7 @@ fn tui_view(root: &Path) -> Result<()> {
     );
     let mut archive_view = false;
     let mut current_pane = TuiPane::Tasks;
-    let mut agent_panel = TuiAgentPanel::new();
+    let mut agent_panel = TuiAgentPanel::new(&active_root);
     let mut last_agent_panel_refresh = Instant::now();
 
     let mut selected_board = 0; // 0: todo, 1: doing, 2: done
@@ -5279,7 +5487,7 @@ fn tui_view(root: &Path) -> Result<()> {
 
     loop {
         if last_agent_panel_refresh.elapsed() >= tui_agent_panel_refresh_interval() {
-            agent_panel.refresh();
+            agent_panel.refresh(&active_root);
             last_agent_panel_refresh = Instant::now();
         }
 
@@ -5705,7 +5913,7 @@ fn tui_view(root: &Path) -> Result<()> {
                     Mode::View => {
                         if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
                             current_pane = if current_pane == TuiPane::Tasks {
-                                agent_panel.refresh();
+                                agent_panel.refresh(&active_root);
                                 last_agent_panel_refresh = Instant::now();
                                 TuiPane::AgentProjects
                             } else {
@@ -5727,6 +5935,23 @@ fn tui_view(root: &Path) -> Result<()> {
                                     current_mode = Mode::Help;
                                 }
                                 KeyCode::Enter => {
+                                    if agent_panel
+                                        .selected_current_project_registration()
+                                        .is_some()
+                                    {
+                                        match register_selected_current_project(
+                                            &mut agent_panel,
+                                            &active_root,
+                                        ) {
+                                            Ok(message) => {
+                                                last_agent_panel_refresh = Instant::now();
+                                                feedback_buffer = message;
+                                            }
+                                            Err(e) => feedback_buffer = format!("Error: {}", e),
+                                        }
+                                        continue;
+                                    }
+
                                     let Some(project) = agent_panel
                                         .selected_project()
                                         .map(|entry| entry.project.clone())
@@ -5791,7 +6016,27 @@ fn tui_view(root: &Path) -> Result<()> {
                                     }
                                 }
                                 KeyCode::Char(' ') => {
-                                    match toggle_selected_tui_agent_project(&mut agent_panel) {
+                                    if agent_panel
+                                        .selected_current_project_registration()
+                                        .is_some()
+                                    {
+                                        match register_selected_current_project(
+                                            &mut agent_panel,
+                                            &active_root,
+                                        ) {
+                                            Ok(message) => {
+                                                last_agent_panel_refresh = Instant::now();
+                                                feedback_buffer = message;
+                                            }
+                                            Err(e) => feedback_buffer = format!("Error: {}", e),
+                                        }
+                                        continue;
+                                    }
+
+                                    match toggle_selected_tui_agent_project(
+                                        &mut agent_panel,
+                                        &active_root,
+                                    ) {
                                         Ok(message) => {
                                             last_agent_panel_refresh = Instant::now();
                                             feedback_buffer = message;
@@ -6626,13 +6871,14 @@ mod tests {
                 tui_agent_project_for_test(3, "gamma"),
                 tui_agent_project_for_test(4, "delta"),
             ],
+            current_project_registration: None,
             state: ListState::default(),
             scroll_offset: 0,
             last_error: None,
         };
         panel.state.select(Some(2));
 
-        panel.restore_or_normalize_selection(Some(3));
+        panel.restore_or_normalize_selection(Some(TuiAgentPanelRowIdentity::Project(3)));
 
         assert_eq!(panel.state.selected(), Some(2));
         assert_eq!(panel.scroll_offset, 0);
@@ -6646,6 +6892,63 @@ mod tests {
         );
         assert!(!tui_agent_panel_instructions().contains("Auto-refreshes"));
         assert!(!tui_agent_panel_instructions().contains("r refresh"));
+    }
+
+    #[test]
+    fn current_project_registration_is_present_only_when_active_project_is_unregistered() {
+        let active_root = PathBuf::from("/tmp/current");
+        let other_project = tui_agent_project_for_test(1, "other");
+
+        let registration = current_project_registration(&active_root, &[other_project]).unwrap();
+
+        assert_eq!(registration.path, active_root);
+        assert_eq!(registration.name, "current");
+
+        let mut current_project = tui_agent_project_for_test(2, "current");
+        current_project.project.path = registration.path.clone();
+
+        assert!(current_project_registration(&registration.path, &[current_project]).is_none());
+    }
+
+    #[test]
+    fn tui_agent_panel_selects_current_project_registration_before_projects() {
+        let mut panel = TuiAgentPanel {
+            projects: vec![
+                tui_agent_project_for_test(1, "alpha"),
+                tui_agent_project_for_test(2, "beta"),
+            ],
+            current_project_registration: Some(TuiCurrentProjectRegistration {
+                path: PathBuf::from("/tmp/current"),
+                name: "current".to_string(),
+            }),
+            state: ListState::default(),
+            scroll_offset: 0,
+            last_error: None,
+        };
+        panel.state.select(Some(0));
+
+        assert!(panel.selected_current_project_registration().is_some());
+        assert!(panel.selected_project().is_none());
+
+        panel.select_next();
+        assert_eq!(panel.selected_project().unwrap().project.name, "alpha");
+
+        panel.select_previous();
+        assert!(panel.selected_current_project_registration().is_some());
+    }
+
+    #[test]
+    fn current_project_registration_row_prompts_enter_or_space() {
+        let registration = TuiCurrentProjectRegistration {
+            path: PathBuf::from("/tmp/current"),
+            name: "current".to_string(),
+        };
+
+        let row = format_current_project_registration_row(&registration, 100);
+
+        assert!(row.contains("ADD"));
+        assert!(row.contains("current"));
+        assert!(row.contains("Enter/Space"));
     }
 
     #[test]
