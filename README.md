@@ -129,6 +129,7 @@ Useful runtime tuning variables are:
 - `CLT_AGENT_LEASE_TIMEOUT_SECONDS`: active lease expiry, default `3600`.
 - `CLT_AGENT_FAILURE_BACKOFF_SECONDS`: delay after a failed project run, default `300`.
 - `CLT_AGENT_SUCCESS_COOLDOWN_SECONDS`: delay after a successful project run, default `5`.
+- `CLT_AGENT_CODEX_PATH`: Codex executable path. `clt agent start` resolves and stores this for the background service so launchd/systemd does not depend on an interactive shell `PATH`.
 - `CLT_AGENT_HEARTBEAT_TAIL`: print a short stderr tail on still-running heartbeats when set to `1`, `true`, `yes`, or `on`; default `false`.
 
 ### Adding Tasks

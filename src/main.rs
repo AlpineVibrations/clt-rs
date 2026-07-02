@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Local, Utc};
 use clap::{Parser, Subcommand};
 use ratatui::layout::{Alignment, Position, Rect};
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, Write, stdout};
 use std::path::{Path, PathBuf};
@@ -45,6 +46,7 @@ const AGENT_MAX_GLOBAL_JOBS_ENV: &str = "CLT_AGENT_MAX_GLOBAL_JOBS";
 const AGENT_POLL_INTERVAL_SECONDS_ENV: &str = "CLT_AGENT_POLL_INTERVAL_SECONDS";
 const AGENT_RUN_TIMEOUT_SECONDS_ENV: &str = "CLT_AGENT_RUN_TIMEOUT_SECONDS";
 const AGENT_DAEMON_MODE_ENV: &str = "CLT_AGENT_DAEMON_MODE";
+const AGENT_CODEX_PATH_ENV: &str = "CLT_AGENT_CODEX_PATH";
 const AGENT_SUCCESS_COOLDOWN_SECONDS_ENV: &str = "CLT_AGENT_SUCCESS_COOLDOWN_SECONDS";
 const AGENT_DEFAULT_MAX_GLOBAL_JOBS: usize = 12;
 const AGENT_DEFAULT_FAILURE_BACKOFF_SECONDS: u64 = 5 * 60;
@@ -132,6 +134,12 @@ enum AgentPlatform {
 enum AgentServiceAction {
     Start,
     Stop,
+}
+
+#[derive(Clone, Debug)]
+struct AgentServiceEnvironment {
+    codex_path: PathBuf,
+    path: OsString,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -716,12 +724,16 @@ fn manage_launchd_agent(
 
     match action {
         AgentServiceAction::Start => {
+            let service_env = resolve_agent_service_environment()?;
             if let Some(parent) = plist_path.parent() {
                 fs::create_dir_all(parent)
                     .with_context(|| format!("Failed to create launchd directory {:?}", parent))?;
             }
-            fs::write(&plist_path, launchd_plist_content(executable, state_dir))
-                .with_context(|| format!("Failed to write launchd plist {:?}", plist_path))?;
+            fs::write(
+                &plist_path,
+                launchd_plist_content(executable, state_dir, &service_env),
+            )
+            .with_context(|| format!("Failed to write launchd plist {:?}", plist_path))?;
 
             if run_service_command_optional("launchctl", &["print", &service_target])? {
                 run_service_command(
@@ -779,13 +791,17 @@ fn manage_systemd_agent(
 
     match action {
         AgentServiceAction::Start => {
+            let service_env = resolve_agent_service_environment()?;
             if let Some(parent) = unit_path.parent() {
                 fs::create_dir_all(parent).with_context(|| {
                     format!("Failed to create systemd user unit directory {:?}", parent)
                 })?;
             }
-            fs::write(&unit_path, systemd_unit_content(executable, state_dir))
-                .with_context(|| format!("Failed to write systemd unit {:?}", unit_path))?;
+            fs::write(
+                &unit_path,
+                systemd_unit_content(executable, state_dir, &service_env),
+            )
+            .with_context(|| format!("Failed to write systemd unit {:?}", unit_path))?;
 
             run_service_command("systemctl", &["--user", "daemon-reload"])?;
             run_service_command(
@@ -865,11 +881,18 @@ fn launchd_plist_path(home: &Path) -> PathBuf {
         .join(format!("{AGENT_LAUNCHD_LABEL}.plist"))
 }
 
-fn launchd_plist_content(executable: &Path, state_dir: &Path) -> String {
+fn launchd_plist_content(
+    executable: &Path,
+    state_dir: &Path,
+    service_env: &AgentServiceEnvironment,
+) -> String {
     let executable = xml_escape(&executable.display().to_string());
     let stdout_path = xml_escape(&state_dir_service_log_path(state_dir, "out"));
     let stderr_path = xml_escape(&state_dir_service_log_path(state_dir, "err"));
     let state_dir = xml_escape(&state_dir.display().to_string());
+    let codex_path = xml_escape(&service_env.codex_path.display().to_string());
+    let path = service_env.path.to_string_lossy();
+    let path = xml_escape(path.as_ref());
 
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -890,6 +913,10 @@ fn launchd_plist_content(executable: &Path, state_dir: &Path) -> String {
     <string>{state_dir}</string>
     <key>{AGENT_DAEMON_MODE_ENV}</key>
     <string>service</string>
+    <key>{AGENT_CODEX_PATH_ENV}</key>
+    <string>{codex_path}</string>
+    <key>PATH</key>
+    <string>{path}</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>
@@ -916,7 +943,11 @@ fn systemd_user_unit_path(
     Ok(config_home.join("systemd/user").join(AGENT_SYSTEMD_UNIT))
 }
 
-fn systemd_unit_content(executable: &Path, state_dir: &Path) -> String {
+fn systemd_unit_content(
+    executable: &Path,
+    state_dir: &Path,
+    service_env: &AgentServiceEnvironment,
+) -> String {
     format!(
         "[Unit]\n\
 Description=CLT Codex agent\n\
@@ -927,6 +958,8 @@ Type=simple\n\
 ExecStart={} agent daemon\n\
 Environment={}\n\
 Environment={}\n\
+Environment={}\n\
+Environment={}\n\
 Restart=on-failure\n\
 RestartSec=10\n\
 \n\
@@ -934,8 +967,215 @@ RestartSec=10\n\
 WantedBy=default.target\n",
         systemd_quote_arg(&executable.display().to_string()),
         systemd_env_assignment(AGENT_STATE_DIR_ENV, &state_dir.display().to_string()),
-        systemd_env_assignment(AGENT_DAEMON_MODE_ENV, "service")
+        systemd_env_assignment(AGENT_DAEMON_MODE_ENV, "service"),
+        systemd_env_assignment(
+            AGENT_CODEX_PATH_ENV,
+            &service_env.codex_path.display().to_string()
+        ),
+        systemd_env_assignment("PATH", service_env.path.to_string_lossy().as_ref())
     )
+}
+
+fn resolve_agent_service_environment() -> Result<AgentServiceEnvironment> {
+    let path = agent_service_path_env();
+    let codex_path = resolve_agent_codex_path_for_service(&path)?;
+    validate_agent_codex_path(&codex_path, &path)?;
+
+    Ok(AgentServiceEnvironment { codex_path, path })
+}
+
+fn agent_service_path_env() -> OsString {
+    std::env::var_os("PATH")
+        .filter(|path| !os_value_is_blank(path.as_os_str()))
+        .unwrap_or_else(|| {
+            OsString::from("/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+        })
+}
+
+fn resolve_agent_codex_path_for_service(path_env: &OsStr) -> Result<PathBuf> {
+    if let Some(configured) = agent_codex_path_env() {
+        let resolved =
+            resolve_agent_command_candidate(&configured, path_env).with_context(|| {
+                format!(
+                    "Failed to resolve {}={}",
+                    AGENT_CODEX_PATH_ENV,
+                    configured.display()
+                )
+            })?;
+        return Ok(prefer_packaged_native_codex_binary(&resolved));
+    }
+
+    let codex = find_executable_on_path("codex", path_env).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Failed to find `codex` in PATH while installing the agent service. Install the Codex CLI, start the service from a shell where `codex --version` works, or set {AGENT_CODEX_PATH_ENV} to the Codex executable path."
+        )
+    })?;
+    Ok(prefer_packaged_native_codex_binary(&codex))
+}
+
+fn agent_codex_command() -> PathBuf {
+    agent_codex_path_env().unwrap_or_else(|| PathBuf::from("codex"))
+}
+
+fn agent_codex_path_env() -> Option<PathBuf> {
+    std::env::var_os(AGENT_CODEX_PATH_ENV)
+        .filter(|value| !os_value_is_blank(value.as_os_str()))
+        .map(PathBuf::from)
+}
+
+fn resolve_agent_command_candidate(candidate: &Path, path_env: &OsStr) -> Result<PathBuf> {
+    if candidate.is_absolute() || path_has_separator(candidate) {
+        if agent_command_is_executable(candidate) {
+            return Ok(candidate.to_path_buf());
+        }
+
+        anyhow::bail!("{} is not an executable file", candidate.display());
+    }
+
+    let program = candidate.to_string_lossy();
+    find_executable_on_path(program.as_ref(), path_env)
+        .ok_or_else(|| anyhow::anyhow!("{} was not found in PATH", candidate.display()))
+}
+
+fn path_has_separator(path: &Path) -> bool {
+    path.components().count() > 1
+}
+
+fn find_executable_on_path(program: &str, path_env: &OsStr) -> Option<PathBuf> {
+    if program.is_empty() {
+        return None;
+    }
+
+    std::env::split_paths(path_env)
+        .map(|dir| dir.join(program))
+        .find(|candidate| agent_command_is_executable(candidate))
+}
+
+fn agent_command_is_executable(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        metadata.permissions().mode() & 0o111 != 0
+    }
+
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn prefer_packaged_native_codex_binary(command: &Path) -> PathBuf {
+    let Ok(canonical_command) = fs::canonicalize(command) else {
+        return command.to_path_buf();
+    };
+    if canonical_command.file_name() != Some(OsStr::new("codex.js")) {
+        return command.to_path_buf();
+    }
+
+    let Some((platform_package, target_triple, binary_name)) = codex_native_package() else {
+        return command.to_path_buf();
+    };
+    let Some(codex_package_dir) = canonical_command.parent().and_then(Path::parent) else {
+        return command.to_path_buf();
+    };
+    let Some(node_modules_dir) = codex_package_dir.parent().and_then(Path::parent) else {
+        return command.to_path_buf();
+    };
+
+    let native_binary = node_modules_dir
+        .join("@openai")
+        .join(platform_package)
+        .join("vendor")
+        .join(target_triple)
+        .join("bin")
+        .join(binary_name);
+    if agent_command_is_executable(&native_binary) {
+        native_binary
+    } else {
+        command.to_path_buf()
+    }
+}
+
+fn codex_native_package() -> Option<(&'static str, &'static str, &'static str)> {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        Some(("codex-darwin-arm64", "aarch64-apple-darwin", "codex"))
+    }
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    {
+        Some(("codex-darwin-x64", "x86_64-apple-darwin", "codex"))
+    }
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    {
+        Some(("codex-linux-arm64", "aarch64-unknown-linux-musl", "codex"))
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        Some(("codex-linux-x64", "x86_64-unknown-linux-musl", "codex"))
+    }
+    #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+    {
+        Some(("codex-win32-arm64", "aarch64-pc-windows-msvc", "codex.exe"))
+    }
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    {
+        Some(("codex-win32-x64", "x86_64-pc-windows-msvc", "codex.exe"))
+    }
+    #[cfg(not(any(
+        all(target_os = "macos", target_arch = "aarch64"),
+        all(target_os = "macos", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "aarch64"),
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "windows", target_arch = "aarch64"),
+        all(target_os = "windows", target_arch = "x86_64")
+    )))]
+    {
+        None
+    }
+}
+
+fn validate_agent_codex_path(codex_path: &Path, path_env: &OsStr) -> Result<()> {
+    let output = Command::new(codex_path)
+        .arg("--version")
+        .env("PATH", path_env)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| {
+            format!(
+                "Failed to validate Codex executable {}",
+                codex_path.display()
+            )
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        let detail = if stderr.is_empty() {
+            String::new()
+        } else {
+            format!(": {stderr}")
+        };
+        anyhow::bail!(
+            "Codex executable {} failed `--version` with status {}{detail}",
+            codex_path.display(),
+            output.status
+        );
+    }
+
+    Ok(())
+}
+
+fn os_value_is_blank(value: &OsStr) -> bool {
+    value.to_string_lossy().trim().is_empty()
 }
 
 fn state_dir_service_log_path(state_dir: &Path, extension: &str) -> String {
@@ -1889,7 +2129,7 @@ impl CodexAgentRunner {
             state_dir,
             timeout: agent_run_timeout()?,
             heartbeat_interval: agent_poll_interval()?,
-            command: PathBuf::from("codex"),
+            command: agent_codex_command(),
         })
     }
 
@@ -1938,14 +2178,19 @@ impl AgentRunner for CodexAgentRunner {
         let mut child = match spawn_result {
             Ok(child) => child,
             Err(err) => {
-                append_agent_log_line(&stderr_path, &format!("Failed to start Codex: {err}"))?;
+                let summary = format!(
+                    "Failed to start Codex command {} in {}: {err}",
+                    self.command.display(),
+                    project.path.display()
+                );
+                append_agent_log_line(&stderr_path, &summary)?;
                 return Ok(AgentRunResult {
                     status: "failure",
                     exit_code: None,
                     log_dir,
                     stdout_path,
                     stderr_path,
-                    summary: format!("Failed to start Codex: {err}"),
+                    summary,
                 });
             }
         };
@@ -7848,9 +8093,14 @@ mod tests {
 
     #[test]
     fn launchd_plist_runs_agent_daemon_with_state_dir() {
+        let service_env = AgentServiceEnvironment {
+            codex_path: PathBuf::from("/Users/alex/bin/Codex & Tools/codex"),
+            path: OsString::from("/Users/alex/bin:/usr/bin:/bin"),
+        };
         let plist = launchd_plist_content(
             Path::new("/Applications/CLT & Tools/clt"),
             Path::new("/Users/alex/Library/Application Support/clt"),
+            &service_env,
         );
 
         assert!(plist.contains("<string>com.alpinevibrations.clt.agent</string>"));
@@ -7861,6 +8111,10 @@ mod tests {
         assert!(plist.contains("<string>/Users/alex/Library/Application Support/clt</string>"));
         assert!(plist.contains("<key>CLT_AGENT_DAEMON_MODE</key>"));
         assert!(plist.contains("<string>service</string>"));
+        assert!(plist.contains("<key>CLT_AGENT_CODEX_PATH</key>"));
+        assert!(plist.contains("<string>/Users/alex/bin/Codex &amp; Tools/codex</string>"));
+        assert!(plist.contains("<key>PATH</key>"));
+        assert!(plist.contains("<string>/Users/alex/bin:/usr/bin:/bin</string>"));
         assert!(plist.contains(
             "<string>/Users/alex/Library/Application Support/clt/agent-service.out</string>"
         ));
@@ -7893,17 +8147,60 @@ mod tests {
 
     #[test]
     fn systemd_unit_runs_agent_daemon_with_state_dir() {
+        let service_env = AgentServiceEnvironment {
+            codex_path: PathBuf::from("/home/alex/bin/codex with spaces"),
+            path: OsString::from("/home/alex/bin:/usr/bin:/bin"),
+        };
         let unit = systemd_unit_content(
             Path::new("/home/alex/bin/clt with spaces"),
             Path::new("/home/alex/.local/state/clt"),
+            &service_env,
         );
 
         assert!(unit.contains("Description=CLT Codex agent"));
         assert!(unit.contains("ExecStart=\"/home/alex/bin/clt with spaces\" agent daemon"));
         assert!(unit.contains("Environment=\"CLT_AGENT_STATE_DIR=/home/alex/.local/state/clt\""));
         assert!(unit.contains("Environment=\"CLT_AGENT_DAEMON_MODE=service\""));
+        assert!(
+            unit.contains("Environment=\"CLT_AGENT_CODEX_PATH=/home/alex/bin/codex with spaces\"")
+        );
+        assert!(unit.contains("Environment=\"PATH=/home/alex/bin:/usr/bin:/bin\""));
         assert!(unit.contains("Restart=on-failure"));
         assert!(unit.contains("WantedBy=default.target"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn packaged_native_codex_binary_is_preferred_over_npm_shim() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let Some((platform_package, target_triple, binary_name)) = codex_native_package() else {
+            return;
+        };
+
+        let root = temp_root("agent-native-codex");
+        let codex_js = root.join("node_modules/@openai/codex/bin/codex.js");
+        let native_codex = root
+            .join("node_modules/@openai")
+            .join(platform_package)
+            .join("vendor")
+            .join(target_triple)
+            .join("bin")
+            .join(binary_name);
+        fs::create_dir_all(codex_js.parent().unwrap()).unwrap();
+        fs::create_dir_all(native_codex.parent().unwrap()).unwrap();
+        fs::write(&codex_js, "#!/usr/bin/env node\n").unwrap();
+        fs::write(&native_codex, "#!/bin/sh\n").unwrap();
+        let mut permissions = fs::metadata(&native_codex).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&native_codex, permissions).unwrap();
+
+        assert_eq!(
+            prefer_packaged_native_codex_binary(&codex_js),
+            fs::canonicalize(&native_codex).unwrap()
+        );
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
