@@ -44,6 +44,7 @@ const AGENT_LEASE_TIMEOUT_SECONDS_ENV: &str = "CLT_AGENT_LEASE_TIMEOUT_SECONDS";
 const AGENT_MAX_GLOBAL_JOBS_ENV: &str = "CLT_AGENT_MAX_GLOBAL_JOBS";
 const AGENT_POLL_INTERVAL_SECONDS_ENV: &str = "CLT_AGENT_POLL_INTERVAL_SECONDS";
 const AGENT_RUN_TIMEOUT_SECONDS_ENV: &str = "CLT_AGENT_RUN_TIMEOUT_SECONDS";
+const AGENT_DAEMON_MODE_ENV: &str = "CLT_AGENT_DAEMON_MODE";
 const AGENT_SUCCESS_COOLDOWN_SECONDS_ENV: &str = "CLT_AGENT_SUCCESS_COOLDOWN_SECONDS";
 const AGENT_DEFAULT_MAX_GLOBAL_JOBS: usize = 12;
 const AGENT_DEFAULT_FAILURE_BACKOFF_SECONDS: u64 = 5 * 60;
@@ -54,8 +55,10 @@ const AGENT_DAEMON_DATABASE_LOCK_RETRY_ATTEMPTS: usize = 20;
 const AGENT_DAEMON_DATABASE_LOCK_RETRY_MILLIS: u64 = 5;
 const AGENT_DEFAULT_RUN_TIMEOUT_SECONDS: u64 = 45 * 60;
 const AGENT_DEFAULT_SUCCESS_COOLDOWN_SECONDS: u64 = 5;
+const AGENT_DAEMON_CHECKIN_STALE_SECONDS: u64 = 45;
 const AGENT_NO_TASKS_LEFT_MARKER: &str = "NO_TASKS_LEFT";
 const TUI_AGENT_PANEL_REFRESH_SECONDS: u64 = 2;
+const TUI_AGENT_TABLE_DOING_LAST_RUN_GAP: &str = "   ";
 const AGENT_LAUNCHD_LABEL: &str = "com.alpinevibrations.clt.agent";
 const AGENT_SYSTEMD_UNIT: &str = "clt-agent.service";
 const AGENT_CODEX_PROMPT: &str = r#"You are working in this repo.
@@ -185,6 +188,13 @@ struct AgentDaemonRun {
     project_name: String,
     project_path: PathBuf,
     handle: tokio::task::JoinHandle<Result<AgentRunCompletion>>,
+}
+
+#[derive(Clone)]
+struct AgentDaemonCheckinSource {
+    holder: String,
+    mode: String,
+    started_at: String,
 }
 
 type AgentShutdownSignal = Arc<AtomicBool>;
@@ -542,6 +552,13 @@ fn show_agent_status(store: &agent_store::TursoAgentStore) -> Result<()> {
     let projects = store.list_projects_blocking()?;
     let active_leases = store.list_active_leases_blocking(&agent_timestamp())?;
     let recent_runs = store.list_recent_runs_blocking(5)?;
+    let daemon_checkins = store.list_daemon_checkins_blocking()?;
+    let service_status = agent_service_status(&state_dir);
+    let daemon_status = format_agent_daemon_runtime_status(
+        &service_status,
+        &daemon_checkins,
+        agent_timestamp_seconds(),
+    );
     let enabled_count = projects.iter().filter(|project| project.enabled).count();
     let scans: Vec<_> = projects
         .iter()
@@ -555,7 +572,8 @@ fn show_agent_status(store: &agent_store::TursoAgentStore) -> Result<()> {
     println!("Agent status:");
     println!("state_dir={}", state_dir.display());
     println!("database={}", state_dir.join(AGENT_DB_FILE).display());
-    println!("service={}", agent_service_status(&state_dir));
+    println!("service={}", service_status);
+    println!("daemon={}", daemon_status);
     println!(
         "registered_projects={} enabled={} pending={} active_leases={}",
         projects.len(),
@@ -867,6 +885,8 @@ fn launchd_plist_content(executable: &Path, state_dir: &Path) -> String {
   <dict>
     <key>{AGENT_STATE_DIR_ENV}</key>
     <string>{state_dir}</string>
+    <key>{AGENT_DAEMON_MODE_ENV}</key>
+    <string>service</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>
@@ -903,13 +923,15 @@ After=default.target\n\
 Type=simple\n\
 ExecStart={} agent daemon\n\
 Environment={}\n\
+Environment={}\n\
 Restart=on-failure\n\
 RestartSec=10\n\
 \n\
 [Install]\n\
 WantedBy=default.target\n",
         systemd_quote_arg(&executable.display().to_string()),
-        systemd_env_assignment(AGENT_STATE_DIR_ENV, &state_dir.display().to_string())
+        systemd_env_assignment(AGENT_STATE_DIR_ENV, &state_dir.display().to_string()),
+        systemd_env_assignment(AGENT_DAEMON_MODE_ENV, "service")
     )
 }
 
@@ -1127,6 +1149,7 @@ async fn run_agent_daemon_loop_async(
     max_passes: Option<usize>,
     shutdown: AgentShutdownSignal,
 ) -> Result<()> {
+    let daemon_checkin = AgentDaemonCheckinSource::current();
     let mut scheduled_passes = 0;
     let mut active_passes: Vec<tokio::task::JoinHandle<Result<AgentSchedulerStart>>> = Vec::new();
     let mut active_runs: Vec<AgentDaemonRun> = Vec::new();
@@ -1181,17 +1204,24 @@ async fn run_agent_daemon_loop_async(
 
         if shutdown.load(Ordering::SeqCst) {
             if active_passes.is_empty() && active_runs.is_empty() {
+                clear_agent_daemon_checkin_best_effort(&state_dir, &daemon_checkin.holder).await;
                 return Ok(());
             }
         } else if max_passes.is_some_and(|max_passes| scheduled_passes >= max_passes) {
             if active_passes.is_empty() && active_runs.is_empty() {
+                clear_agent_daemon_checkin_best_effort(&state_dir, &daemon_checkin.holder).await;
                 return Ok(());
             }
         } else {
             let task_state_dir = state_dir.clone();
             let active_project_ids = active_runs.iter().map(|run| run.project_id).collect();
+            let task_daemon_checkin = daemon_checkin.clone();
             active_passes.push(tokio::task::spawn_blocking(move || {
-                run_agent_daemon_scheduler_pass_with_active(&task_state_dir, active_project_ids)
+                run_agent_daemon_scheduler_pass_with_active_and_checkin(
+                    &task_state_dir,
+                    active_project_ids,
+                    Some(&task_daemon_checkin),
+                )
             }));
             scheduled_passes += 1;
         }
@@ -1271,13 +1301,32 @@ fn run_agent_daemon_scheduler_pass(state_dir: &Path) -> Result<AgentSchedulerSta
     run_agent_daemon_scheduler_pass_with_active(state_dir, Vec::new())
 }
 
+#[cfg(test)]
 fn run_agent_daemon_scheduler_pass_with_active(
     state_dir: &Path,
     active_project_ids: Vec<i64>,
 ) -> Result<AgentSchedulerStart> {
+    let daemon_checkin = AgentDaemonCheckinSource::current();
+    run_agent_daemon_scheduler_pass_with_active_and_checkin(
+        state_dir,
+        active_project_ids,
+        Some(&daemon_checkin),
+    )
+}
+
+fn run_agent_daemon_scheduler_pass_with_active_and_checkin(
+    state_dir: &Path,
+    active_project_ids: Vec<i64>,
+    daemon_checkin: Option<&AgentDaemonCheckinSource>,
+) -> Result<AgentSchedulerStart> {
     let mut attempts = 0;
     loop {
-        match run_agent_scheduler_pass(state_dir, false, &active_project_ids) {
+        match run_agent_scheduler_pass_with_daemon_checkin(
+            state_dir,
+            false,
+            &active_project_ids,
+            daemon_checkin,
+        ) {
             Ok(start) => return Ok(start),
             Err(err)
                 if agent_error_is_database_locked(&err)
@@ -1307,11 +1356,26 @@ fn run_agent_scheduler_pass(
     reclaim_current_process_leases: bool,
     active_project_ids: &[i64],
 ) -> Result<AgentSchedulerStart> {
+    run_agent_scheduler_pass_with_daemon_checkin(
+        state_dir,
+        reclaim_current_process_leases,
+        active_project_ids,
+        None,
+    )
+}
+
+fn run_agent_scheduler_pass_with_daemon_checkin(
+    state_dir: &Path,
+    reclaim_current_process_leases: bool,
+    active_project_ids: &[i64],
+    daemon_checkin: Option<&AgentDaemonCheckinSource>,
+) -> Result<AgentSchedulerStart> {
     run_agent_scheduler_pass_with_max_global_jobs(
         state_dir,
         reclaim_current_process_leases,
         active_project_ids,
         agent_max_global_jobs()?,
+        daemon_checkin,
     )
 }
 
@@ -1320,6 +1384,7 @@ fn run_agent_scheduler_pass_with_max_global_jobs(
     reclaim_current_process_leases: bool,
     active_project_ids: &[i64],
     max_global_jobs: usize,
+    daemon_checkin: Option<&AgentDaemonCheckinSource>,
 ) -> Result<AgentSchedulerStart> {
     if max_global_jobs == 0 {
         anyhow::bail!("{AGENT_MAX_GLOBAL_JOBS_ENV} must be greater than zero");
@@ -1341,7 +1406,12 @@ fn run_agent_scheduler_pass_with_max_global_jobs(
     };
     let mut jobs = Vec::new();
 
-    let projects = with_agent_store_at(state_dir, |store| store.list_projects_blocking())?;
+    let projects = with_agent_store_at(state_dir, |store| {
+        if let Some(checkin) = daemon_checkin {
+            record_agent_daemon_checkin(store, checkin)?;
+        }
+        store.list_projects_blocking()
+    })?;
 
     for project in projects {
         if !project.enabled {
@@ -2170,6 +2240,51 @@ fn agent_lease_holder() -> String {
     format!("clt-agent-{}", std::process::id())
 }
 
+impl AgentDaemonCheckinSource {
+    fn current() -> Self {
+        Self {
+            holder: agent_lease_holder(),
+            mode: agent_daemon_mode(),
+            started_at: agent_timestamp(),
+        }
+    }
+}
+
+fn agent_daemon_mode() -> String {
+    std::env::var(AGENT_DAEMON_MODE_ENV)
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "cli".to_string())
+}
+
+fn record_agent_daemon_checkin(
+    store: &agent_store::TursoAgentStore,
+    checkin: &AgentDaemonCheckinSource,
+) -> Result<()> {
+    let checked_in_at = agent_timestamp();
+    let expires_at = agent_timestamp_after(AGENT_DAEMON_CHECKIN_STALE_SECONDS);
+    store.record_daemon_checkin_blocking(
+        &checkin.holder,
+        &checkin.mode,
+        &checkin.started_at,
+        &checked_in_at,
+        &expires_at,
+    )
+}
+
+async fn clear_agent_daemon_checkin_best_effort(state_dir: &Path, holder: &str) {
+    let state_dir = state_dir.to_path_buf();
+    let holder = holder.to_string();
+    let _ = tokio::task::spawn_blocking(move || {
+        with_agent_store_at(&state_dir, |store| {
+            store.clear_daemon_checkin_blocking(&holder)?;
+            Ok(())
+        })
+    })
+    .await;
+}
+
 fn agent_max_global_jobs() -> Result<usize> {
     match std::env::var(AGENT_MAX_GLOBAL_JOBS_ENV) {
         Ok(raw) => parse_agent_positive_usize(AGENT_MAX_GLOBAL_JOBS_ENV, &raw),
@@ -2446,14 +2561,15 @@ mod agent_store {
         statements: &'static [&'static str],
     }
 
-    const AGENT_MIGRATIONS: &[AgentMigration] = &[AgentMigration {
-        version: 1,
-        statements: &[
-            "CREATE TABLE IF NOT EXISTS schema_migrations (
+    const AGENT_MIGRATIONS: &[AgentMigration] = &[
+        AgentMigration {
+            version: 1,
+            statements: &[
+                "CREATE TABLE IF NOT EXISTS schema_migrations (
                 version INTEGER PRIMARY KEY,
                 applied_at TEXT NOT NULL
             )",
-            "CREATE TABLE IF NOT EXISTS projects (
+                "CREATE TABLE IF NOT EXISTS projects (
                 id INTEGER PRIMARY KEY,
                 path TEXT NOT NULL UNIQUE,
                 name TEXT NOT NULL,
@@ -2466,7 +2582,7 @@ mod agent_store {
                 last_failure_at TEXT,
                 failure_count INTEGER NOT NULL DEFAULT 0
             )",
-            "CREATE TABLE IF NOT EXISTS runs (
+                "CREATE TABLE IF NOT EXISTS runs (
                 id INTEGER PRIMARY KEY,
                 project_id INTEGER NOT NULL REFERENCES projects(id),
                 status TEXT NOT NULL,
@@ -2478,14 +2594,25 @@ mod agent_store {
                 stderr_path TEXT,
                 summary TEXT
             )",
-            "CREATE TABLE IF NOT EXISTS leases (
+                "CREATE TABLE IF NOT EXISTS leases (
                 project_id INTEGER PRIMARY KEY REFERENCES projects(id),
                 holder TEXT NOT NULL,
                 acquired_at TEXT NOT NULL,
                 expires_at TEXT NOT NULL
             )",
-        ],
-    }];
+            ],
+        },
+        AgentMigration {
+            version: 2,
+            statements: &["CREATE TABLE IF NOT EXISTS daemon_checkins (
+                holder TEXT PRIMARY KEY,
+                mode TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                checked_in_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
+            )"],
+        },
+    ];
 
     pub(crate) struct TursoAgentStore {
         #[cfg_attr(not(test), allow(dead_code))]
@@ -2539,6 +2666,18 @@ mod agent_store {
         pub(crate) stdout_path: Option<String>,
         pub(crate) stderr_path: Option<String>,
         pub(crate) summary: Option<String>,
+    }
+
+    #[derive(Clone, Debug)]
+    pub(crate) struct AgentDaemonCheckin {
+        #[cfg_attr(not(test), allow(dead_code))]
+        pub(crate) holder: String,
+        pub(crate) mode: String,
+        #[cfg_attr(not(test), allow(dead_code))]
+        pub(crate) started_at: String,
+        #[cfg_attr(not(test), allow(dead_code))]
+        pub(crate) checked_in_at: String,
+        pub(crate) expires_at: String,
     }
 
     impl TursoAgentStore {
@@ -2901,6 +3040,112 @@ mod agent_store {
             }
 
             Ok(runs)
+        }
+
+        pub(crate) fn record_daemon_checkin_blocking(
+            &self,
+            holder: &str,
+            mode: &str,
+            started_at: &str,
+            checked_in_at: &str,
+            expires_at: &str,
+        ) -> Result<()> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(self.record_daemon_checkin(
+                    holder,
+                    mode,
+                    started_at,
+                    checked_in_at,
+                    expires_at,
+                ))
+        }
+
+        async fn record_daemon_checkin(
+            &self,
+            holder: &str,
+            mode: &str,
+            started_at: &str,
+            checked_in_at: &str,
+            expires_at: &str,
+        ) -> Result<()> {
+            let conn = self
+                .db
+                .connect()
+                .context("Failed to connect to agent database")?;
+
+            conn.execute(
+                "INSERT INTO daemon_checkins (holder, mode, started_at, checked_in_at, expires_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(holder) DO UPDATE SET
+                    mode = excluded.mode,
+                    started_at = excluded.started_at,
+                    checked_in_at = excluded.checked_in_at,
+                    expires_at = excluded.expires_at",
+                params![holder, mode, started_at, checked_in_at, expires_at],
+            )
+            .await
+            .with_context(|| format!("Failed to record daemon check-in for {holder}"))?;
+
+            Ok(())
+        }
+
+        pub(crate) fn clear_daemon_checkin_blocking(&self, holder: &str) -> Result<bool> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(self.clear_daemon_checkin(holder))
+        }
+
+        async fn clear_daemon_checkin(&self, holder: &str) -> Result<bool> {
+            let conn = self
+                .db
+                .connect()
+                .context("Failed to connect to agent database")?;
+            let removed = conn
+                .execute("DELETE FROM daemon_checkins WHERE holder = ?1", [holder])
+                .await
+                .with_context(|| format!("Failed to clear daemon check-in for {holder}"))?;
+
+            Ok(removed > 0)
+        }
+
+        pub(crate) fn list_daemon_checkins_blocking(&self) -> Result<Vec<AgentDaemonCheckin>> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(self.list_daemon_checkins())
+        }
+
+        async fn list_daemon_checkins(&self) -> Result<Vec<AgentDaemonCheckin>> {
+            let conn = self
+                .db
+                .connect()
+                .context("Failed to connect to agent database")?;
+            let mut rows = conn
+                .query(
+                    "SELECT holder, mode, started_at, checked_in_at, expires_at
+                     FROM daemon_checkins
+                     ORDER BY CAST(checked_in_at AS INTEGER) DESC, holder",
+                    (),
+                )
+                .await
+                .context("Failed to list daemon check-ins")?;
+            let mut checkins = Vec::new();
+
+            while let Some(row) = rows
+                .next()
+                .await
+                .context("Failed to read daemon check-in row")?
+            {
+                checkins.push(AgentDaemonCheckin {
+                    holder: row_text(&row, 0, "holder")?,
+                    mode: row_text(&row, 1, "mode")?,
+                    started_at: row_text(&row, 2, "started_at")?,
+                    checked_in_at: row_text(&row, 3, "checked_in_at")?,
+                    expires_at: row_text(&row, 4, "expires_at")?,
+                });
+            }
+
+            Ok(checkins)
         }
 
         #[cfg(test)]
@@ -4441,6 +4686,11 @@ struct TuiAgentProject {
     scan: AgentProjectScan,
 }
 
+struct TuiAgentPanelSnapshot {
+    projects: Vec<TuiAgentProject>,
+    daemon_status: String,
+}
+
 struct TuiCurrentProjectRegistration {
     path: PathBuf,
     name: String,
@@ -4454,6 +4704,7 @@ enum TuiAgentPanelRow<'a> {
 struct TuiAgentPanel {
     projects: Vec<TuiAgentProject>,
     current_project_registration: Option<TuiCurrentProjectRegistration>,
+    daemon_status: String,
     state: ListState,
     scroll_offset: usize,
     last_error: Option<String>,
@@ -4464,6 +4715,7 @@ impl TuiAgentPanel {
         let mut panel = Self {
             projects: Vec::new(),
             current_project_registration: None,
+            daemon_status: "unknown".to_string(),
             state: ListState::default(),
             scroll_offset: 0,
             last_error: None,
@@ -4474,9 +4726,10 @@ impl TuiAgentPanel {
 
     fn refresh(&mut self, active_root: &Path) {
         let selected_row = self.selected_row_identity();
-        match load_tui_agent_projects(active_root) {
-            Ok(projects) => {
-                self.projects = projects;
+        match load_tui_agent_panel_snapshot(active_root) {
+            Ok(snapshot) => {
+                self.projects = snapshot.projects;
+                self.daemon_status = snapshot.daemon_status;
                 self.current_project_registration =
                     current_project_registration(active_root, &self.projects);
                 self.last_error = None;
@@ -4485,6 +4738,7 @@ impl TuiAgentPanel {
             Err(err) => {
                 self.projects.clear();
                 self.current_project_registration = None;
+                self.daemon_status = "unknown".to_string();
                 self.state.select(None);
                 self.scroll_offset = 0;
                 self.last_error = Some(err.to_string());
@@ -4643,17 +4897,98 @@ enum TuiAgentPanelRowIdentity {
     Project(i64),
 }
 
-fn load_tui_agent_projects(_active_root: &Path) -> Result<Vec<TuiAgentProject>> {
-    let store = open_agent_store()?;
+fn load_tui_agent_panel_snapshot(_active_root: &Path) -> Result<TuiAgentPanelSnapshot> {
+    let state_dir = agent_state_dir()?;
+    let service_status = agent_service_status(&state_dir);
+    let store = open_agent_store_at(&state_dir)?;
+    let checkins = store.list_daemon_checkins_blocking()?;
+    let daemon_status =
+        format_agent_daemon_runtime_status(&service_status, &checkins, agent_timestamp_seconds());
     let projects = store.list_projects_blocking()?;
 
-    Ok(projects
+    let projects = projects
         .into_iter()
         .map(|project| {
             let scan = scan_agent_project(&project.path);
             TuiAgentProject { project, scan }
         })
-        .collect())
+        .collect();
+
+    Ok(TuiAgentPanelSnapshot {
+        projects,
+        daemon_status,
+    })
+}
+
+fn format_agent_daemon_runtime_status(
+    service_status: &str,
+    checkins: &[agent_store::AgentDaemonCheckin],
+    now: u64,
+) -> String {
+    let (fresh, stale): (Vec<_>, Vec<_>) = checkins
+        .iter()
+        .partition(|checkin| daemon_checkin_is_fresh(checkin, now));
+
+    if !fresh.is_empty() {
+        let active = format_daemon_checkin_modes(&fresh, "active");
+        let has_service_checkin = fresh.iter().any(|checkin| checkin.mode == "service");
+        if service_status == "running" && !has_service_checkin {
+            return format!("{active}; service no-check-in");
+        }
+        return active;
+    }
+
+    if !stale.is_empty() {
+        return format_daemon_checkin_modes(&stale, "stale");
+    }
+
+    match service_status {
+        "running" => "service active (no check-in)".to_string(),
+        "installed" => "service disabled".to_string(),
+        "not-installed" => "disabled".to_string(),
+        "unsupported" => "unsupported".to_string(),
+        status if status.starts_with("unknown") => "unknown".to_string(),
+        status => status.to_string(),
+    }
+}
+
+fn daemon_checkin_is_fresh(checkin: &agent_store::AgentDaemonCheckin, now: u64) -> bool {
+    checkin
+        .expires_at
+        .parse::<u64>()
+        .map(|expires_at| expires_at > now)
+        .unwrap_or(false)
+}
+
+fn format_daemon_checkin_modes(
+    checkins: &[&agent_store::AgentDaemonCheckin],
+    suffix: &str,
+) -> String {
+    let service_count = checkins
+        .iter()
+        .filter(|checkin| checkin.mode == "service")
+        .count();
+    let cli_count = checkins
+        .iter()
+        .filter(|checkin| checkin.mode == "cli")
+        .count();
+    let other_count = checkins.len().saturating_sub(service_count + cli_count);
+
+    let label = match (service_count > 0, cli_count > 0, other_count > 0) {
+        (true, true, _) => "service+cli",
+        (true, false, false) => "service",
+        (false, true, false) => "cli",
+        (true, false, true) => "service+other",
+        (false, true, true) => "cli+other",
+        (false, false, true) => "daemon",
+        (false, false, false) => "daemon",
+    };
+
+    if checkins.len() > 1 {
+        format!("{label} {suffix} ({})", checkins.len())
+    } else {
+        format!("{label} {suffix}")
+    }
 }
 
 fn current_project_registration(
@@ -4737,6 +5072,14 @@ fn tui_agent_panel_instructions() -> &'static str {
     "Agent projects pane. Up/Down selects, Enter opens board/adds current project, Space toggles ON/OFF or adds current project."
 }
 
+fn format_tui_agent_panel_top_status(
+    daemon_status: &str,
+    project_count: usize,
+    active_count: usize,
+) -> String {
+    format!(" daemon status: {daemon_status}  {project_count} projects  {active_count} enabled ")
+}
+
 fn truncate_to_width(value: &str, width: usize) -> String {
     let len = value.chars().count();
     if len <= width {
@@ -4795,13 +5138,14 @@ fn format_agent_project_table_row(
     if width < 80 {
         return truncate_to_width(
             &format!(
-                "{} {} {} {} {} {}  {}",
+                "{} {} {} {} {} {}{}{}",
                 fit_cell(marker, 1),
                 fit_cell_right(&(idx + 1).to_string(), 3),
                 fit_cell(state, 6),
                 fit_cell(&item.project.name, 22),
                 fit_cell_right(&todo, 4),
                 fit_cell_right(&doing, 5),
+                TUI_AGENT_TABLE_DOING_LAST_RUN_GAP,
                 fit_cell(&last_run, 11)
             ),
             width,
@@ -4814,7 +5158,7 @@ fn format_agent_project_table_row(
     let todo_width = 4;
     let doing_width = 5;
     let last_run_width = 11;
-    let gap_count = 8;
+    let gap_count = 6 + TUI_AGENT_TABLE_DOING_LAST_RUN_GAP.len();
     let fixed_width = number_width
         + marker_width
         + state_width
@@ -4828,13 +5172,14 @@ fn format_agent_project_table_row(
 
     truncate_to_width(
         &format!(
-            "{} {} {} {} {} {}  {} {}",
+            "{} {} {} {} {} {}{}{} {}",
             fit_cell(marker, marker_width),
             fit_cell_right(&(idx + 1).to_string(), number_width),
             fit_cell(state, state_width),
             fit_cell(&item.project.name, project_width),
             fit_cell_right(&todo, todo_width),
             fit_cell_right(&doing, doing_width),
+            TUI_AGENT_TABLE_DOING_LAST_RUN_GAP,
             fit_cell(&last_run, last_run_width),
             fit_cell(&item.project.path.display().to_string(), path_width)
         ),
@@ -4849,13 +5194,14 @@ fn format_current_project_registration_row(
     if width < 80 {
         return truncate_to_width(
             &format!(
-                "{} {} {} {} {} {}  {}",
+                "{} {} {} {} {} {}{}{}",
                 fit_cell("+", 1),
                 fit_cell_right("", 3),
                 fit_cell("ADD", 6),
                 fit_cell(&registration.name, 22),
                 fit_cell_right("-", 4),
                 fit_cell_right("-", 5),
+                TUI_AGENT_TABLE_DOING_LAST_RUN_GAP,
                 fit_cell("Enter/Space", 11)
             ),
             width,
@@ -4868,7 +5214,7 @@ fn format_current_project_registration_row(
     let todo_width = 4;
     let doing_width = 5;
     let last_run_width = 11;
-    let gap_count = 8;
+    let gap_count = 6 + TUI_AGENT_TABLE_DOING_LAST_RUN_GAP.len();
     let fixed_width = number_width
         + marker_width
         + state_width
@@ -4882,13 +5228,14 @@ fn format_current_project_registration_row(
 
     truncate_to_width(
         &format!(
-            "{} {} {} {} {} {}  {} {}",
+            "{} {} {} {} {} {}{}{} {}",
             fit_cell("+", marker_width),
             fit_cell_right("", number_width),
             fit_cell("ADD", state_width),
             fit_cell(&registration.name, project_width),
             fit_cell_right("-", todo_width),
             fit_cell_right("-", doing_width),
+            TUI_AGENT_TABLE_DOING_LAST_RUN_GAP,
             fit_cell("Enter/Space", last_run_width),
             fit_cell(&registration.path.display().to_string(), path_width)
         ),
@@ -4900,13 +5247,14 @@ fn format_agent_project_table_header(width: usize) -> String {
     if width < 80 {
         return truncate_to_width(
             &format!(
-                "{} {} {} {} {} {}  {}",
+                "{} {} {} {} {} {}{}{}",
                 fit_cell("", 1),
                 fit_cell_right("#", 3),
                 fit_cell("STATUS", 6),
                 fit_cell("PROJECT", 22),
                 fit_cell_right("TODO", 4),
                 fit_cell_right("DOING", 5),
+                TUI_AGENT_TABLE_DOING_LAST_RUN_GAP,
                 fit_cell("LAST RUN", 11)
             ),
             width,
@@ -4919,7 +5267,7 @@ fn format_agent_project_table_header(width: usize) -> String {
     let todo_width = 4;
     let doing_width = 5;
     let last_run_width = 11;
-    let gap_count = 8;
+    let gap_count = 6 + TUI_AGENT_TABLE_DOING_LAST_RUN_GAP.len();
     let fixed_width = number_width
         + marker_width
         + state_width
@@ -4933,13 +5281,14 @@ fn format_agent_project_table_header(width: usize) -> String {
 
     truncate_to_width(
         &format!(
-            "{} {} {} {} {} {}  {} {}",
+            "{} {} {} {} {} {}{}{} {}",
             fit_cell("", marker_width),
             fit_cell_right("#", number_width),
             fit_cell("STATUS", state_width),
             fit_cell("PROJECT", project_width),
             fit_cell_right("TODO", todo_width),
             fit_cell_right("DOING", doing_width),
+            TUI_AGENT_TABLE_DOING_LAST_RUN_GAP,
             fit_cell("LAST RUN", last_run_width),
             fit_cell("PATH", path_width)
         ),
@@ -4970,10 +5319,10 @@ fn render_tui_agent_panel(
     let block = Block::default()
         .title(title)
         .title(
-            Line::from(vec![Span::raw(format!(
-                " {} projects  {} enabled ",
+            Line::from(vec![Span::raw(format_tui_agent_panel_top_status(
+                &panel.daemon_status,
                 panel.projects.len(),
-                active_count
+                active_count,
             ))])
             .alignment(Alignment::Right),
         )
@@ -6872,6 +7221,7 @@ mod tests {
                 tui_agent_project_for_test(4, "delta"),
             ],
             current_project_registration: None,
+            daemon_status: "not-installed".to_string(),
             state: ListState::default(),
             scroll_offset: 0,
             last_error: None,
@@ -6892,6 +7242,15 @@ mod tests {
         );
         assert!(!tui_agent_panel_instructions().contains("Auto-refreshes"));
         assert!(!tui_agent_panel_instructions().contains("r refresh"));
+    }
+
+    #[test]
+    fn tui_agent_panel_top_status_includes_daemon_status() {
+        let status = format_tui_agent_panel_top_status("running", 3, 2);
+
+        assert!(status.contains("daemon status: running"));
+        assert!(status.contains("3 projects"));
+        assert!(status.contains("2 enabled"));
     }
 
     #[test]
@@ -6921,6 +7280,7 @@ mod tests {
                 path: PathBuf::from("/tmp/current"),
                 name: "current".to_string(),
             }),
+            daemon_status: "running".to_string(),
             state: ListState::default(),
             scroll_offset: 0,
             last_error: None,
@@ -6961,10 +7321,10 @@ mod tests {
         let wide_header = format_agent_project_table_header(100);
         let wide_row = format_agent_project_table_row(0, &project, 100, false);
 
-        assert!(compact_header.contains("DOING  LAST RUN"));
-        assert!(wide_header.contains("DOING  LAST RUN"));
-        assert!(compact_row.contains("    3  -"));
-        assert!(wide_row.contains("    3  -"));
+        assert!(compact_header.contains("DOING   LAST RUN"));
+        assert!(wide_header.contains("DOING   LAST RUN"));
+        assert!(compact_row.contains("    3   -"));
+        assert!(wide_row.contains("    3   -"));
     }
 
     #[test]
@@ -7467,6 +7827,8 @@ mod tests {
         assert!(plist.contains("<string>daemon</string>"));
         assert!(plist.contains("<key>CLT_AGENT_STATE_DIR</key>"));
         assert!(plist.contains("<string>/Users/alex/Library/Application Support/clt</string>"));
+        assert!(plist.contains("<key>CLT_AGENT_DAEMON_MODE</key>"));
+        assert!(plist.contains("<string>service</string>"));
         assert!(plist.contains(
             "<string>/Users/alex/Library/Application Support/clt/agent-service.out</string>"
         ));
@@ -7485,6 +7847,7 @@ mod tests {
         assert!(unit.contains("Description=CLT Codex agent"));
         assert!(unit.contains("ExecStart=\"/home/alex/bin/clt with spaces\" agent daemon"));
         assert!(unit.contains("Environment=\"CLT_AGENT_STATE_DIR=/home/alex/.local/state/clt\""));
+        assert!(unit.contains("Environment=\"CLT_AGENT_DAEMON_MODE=service\""));
         assert!(unit.contains("Restart=on-failure"));
         assert!(unit.contains("WantedBy=default.target"));
     }
@@ -7522,7 +7885,13 @@ mod tests {
 
         assert_eq!(store.db_path(), state_dir.join(AGENT_DB_FILE));
         assert!(store.db_path().is_file());
-        for table in ["schema_migrations", "projects", "runs", "leases"] {
+        for table in [
+            "schema_migrations",
+            "projects",
+            "runs",
+            "leases",
+            "daemon_checkins",
+        ] {
             assert!(
                 store.table_exists_blocking(table).unwrap(),
                 "missing table {table}"
@@ -7731,6 +8100,77 @@ mod tests {
     }
 
     #[test]
+    fn agent_store_records_and_clears_daemon_checkins() {
+        let root = temp_root("agent-daemon-checkin-store");
+        let state_dir = root.join("state/clt");
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+
+        store
+            .record_daemon_checkin_blocking("clt-agent-1", "cli", "100", "110", "155")
+            .unwrap();
+        let checkins = store.list_daemon_checkins_blocking().unwrap();
+
+        assert_eq!(checkins.len(), 1);
+        assert_eq!(checkins[0].holder, "clt-agent-1");
+        assert_eq!(checkins[0].mode, "cli");
+        assert_eq!(checkins[0].started_at, "100");
+        assert_eq!(checkins[0].checked_in_at, "110");
+        assert_eq!(checkins[0].expires_at, "155");
+
+        assert!(store.clear_daemon_checkin_blocking("clt-agent-1").unwrap());
+        assert!(store.list_daemon_checkins_blocking().unwrap().is_empty());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_daemon_runtime_status_prefers_fresh_checkins() {
+        let fresh_cli = agent_store::AgentDaemonCheckin {
+            holder: "clt-agent-1".to_string(),
+            mode: "cli".to_string(),
+            started_at: "100".to_string(),
+            checked_in_at: "120".to_string(),
+            expires_at: "200".to_string(),
+        };
+        let fresh_service = agent_store::AgentDaemonCheckin {
+            holder: "clt-agent-2".to_string(),
+            mode: "service".to_string(),
+            started_at: "100".to_string(),
+            checked_in_at: "120".to_string(),
+            expires_at: "200".to_string(),
+        };
+        let stale_cli = agent_store::AgentDaemonCheckin {
+            expires_at: "150".to_string(),
+            ..fresh_cli.clone()
+        };
+
+        assert_eq!(
+            format_agent_daemon_runtime_status("installed", &[fresh_cli.clone()], 160),
+            "cli active"
+        );
+        assert_eq!(
+            format_agent_daemon_runtime_status("running", &[fresh_cli], 160),
+            "cli active; service no-check-in"
+        );
+        assert_eq!(
+            format_agent_daemon_runtime_status("running", &[fresh_service], 160),
+            "service active"
+        );
+        assert_eq!(
+            format_agent_daemon_runtime_status("installed", &[stale_cli], 160),
+            "cli stale"
+        );
+        assert_eq!(
+            format_agent_daemon_runtime_status("installed", &[], 160),
+            "service disabled"
+        );
+        assert_eq!(
+            format_agent_daemon_runtime_status("not-installed", &[], 160),
+            "disabled"
+        );
+    }
+
+    #[test]
     fn agent_run_once_records_pending_projects_up_to_default_capacity() {
         let root = temp_root("agent-run-once");
         let state_dir = root.join("state/clt");
@@ -7889,6 +8329,44 @@ mod tests {
     }
 
     #[test]
+    fn agent_daemon_scheduler_records_checkin_with_registry_lookup() {
+        let root = temp_root("agent-daemon-checkin");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        drop(store);
+
+        let checkin = AgentDaemonCheckinSource {
+            holder: "clt-agent-test".to_string(),
+            mode: "cli".to_string(),
+            started_at: "100".to_string(),
+        };
+        let start = run_agent_daemon_scheduler_pass_with_active_and_checkin(
+            &state_dir,
+            Vec::new(),
+            Some(&checkin),
+        )
+        .unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        let checkins = store.list_daemon_checkins_blocking().unwrap();
+
+        assert_eq!(start.pass.scanned_projects, 1);
+        assert_eq!(checkins.len(), 1);
+        assert_eq!(checkins[0].mode, "cli");
+        assert!(daemon_checkin_is_fresh(
+            &checkins[0],
+            agent_timestamp_seconds()
+        ));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn agent_daemon_scheduler_defers_pending_projects_when_active_jobs_fill_capacity() {
         let root = temp_root("agent-daemon-active-capacity");
         let state_dir = root.join("state/clt");
@@ -7930,6 +8408,7 @@ mod tests {
             false,
             &[active_project_id],
             1,
+            None,
         )
         .unwrap();
         let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
