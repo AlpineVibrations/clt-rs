@@ -5101,7 +5101,7 @@ fn tui_agent_panel_refresh_interval() -> Duration {
 }
 
 fn tui_agent_panel_instructions() -> &'static str {
-    "Agent projects pane. Up/Down selects, Enter opens board/adds current project, Space toggles ON/OFF or adds current project."
+    "Up/Down selects, Enter opens board/adds current project, Space toggles ON/OFF or adds current project."
 }
 
 fn format_tui_agent_panel_top_status(
