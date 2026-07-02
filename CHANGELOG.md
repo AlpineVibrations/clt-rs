@@ -15,10 +15,13 @@ Use this section while developing the next release.
 - Added `clt expand [status]` to migrate Markdown status files into folder-backed task files.
 - Added nested subtask board navigation in the TUI for folder tasks that contain their own `todo`, `doing`, and `done` stores.
 - Added first-sentence summaries for long task files while preserving full task content on moves.
+- Added a multi-project Codex agent registry with `register`, `unregister`, `pause`, `resume`, scheduler, daemon, service, status, and log commands.
+- Added a full-screen TUI agent projects pane for switching between registered project boards, toggling projects `ON` or `OFF`, and seeing `todo`/`doing` counts.
 
 ### Changed
 
 - Moving a folder-backed task into a Markdown-backed status now expands the destination status to a folder and preserves the old Markdown file as `status.md.bak`.
+- Updated the terminal title to show the active project when using the TUI.
 
 ### Fixed
 

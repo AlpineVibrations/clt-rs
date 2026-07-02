@@ -2,11 +2,11 @@
 name = "clt-rs"
 version = "0.1.14"
 edition = "2024"
-description = "Command Line Tasks, a file-backed CLI task manager with TUI kanban board"
+description = "File-backed task manager with a TUI Kanban board and multi-project Codex agent registry"
 license = "MIT"
 repository = "https://github.com/AlpineVibrations/clt-rs"
 readme = "README.md"
-keywords = ["cli", "tasks", "kanban", "tui"]
+keywords = ["cli", "tasks", "kanban", "tui", "agent"]
 categories = ["command-line-utilities"]
 
 [[bin]]
@@ -18,4 +18,7 @@ clap = { version = "4.5", features = ["derive"] }
 ratatui = "0.30"
 crossterm = "0.29"
 anyhow = "1.0"
+chrono = "0.4"
 tui-input = "0.15.3"
+tokio = { version = "1.52", features = ["macros", "rt-multi-thread", "signal", "time"] }
+turso = { version = "=0.7.0-pre.13", default-features = false }
