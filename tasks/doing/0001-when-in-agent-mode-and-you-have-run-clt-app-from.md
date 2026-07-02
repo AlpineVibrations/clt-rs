@@ -1,0 +1,1 @@
+when in agent mode and you have run clt app from a project fodler that is not registered then at the top of the list of registered projects should be line for adding the current project with enter button or space button
