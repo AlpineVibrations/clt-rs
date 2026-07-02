@@ -710,8 +710,8 @@ fn manage_launchd_agent(
     state_dir: &Path,
     executable: &Path,
 ) -> Result<()> {
-    let plist_path = launchd_plist_path(&home_dir()?);
     let domain = launchd_user_domain()?;
+    let plist_path = launchd_plist_path(&home_dir()?);
     let service_target = format!("{domain}/{AGENT_LAUNCHD_LABEL}");
 
     match action {
@@ -723,10 +723,12 @@ fn manage_launchd_agent(
             fs::write(&plist_path, launchd_plist_content(executable, state_dir))
                 .with_context(|| format!("Failed to write launchd plist {:?}", plist_path))?;
 
-            let _ = run_service_command_optional(
-                "launchctl",
-                &["bootout", &domain, plist_path.to_string_lossy().as_ref()],
-            );
+            if run_service_command_optional("launchctl", &["print", &service_target])? {
+                run_service_command(
+                    "launchctl",
+                    &["bootout", &domain, plist_path.to_string_lossy().as_ref()],
+                )?;
+            }
             run_service_command(
                 "launchctl",
                 &["bootstrap", &domain, plist_path.to_string_lossy().as_ref()],
@@ -747,10 +749,11 @@ fn manage_launchd_agent(
                 return Ok(());
             }
 
-            if run_service_command_optional(
-                "launchctl",
-                &["bootout", &domain, plist_path.to_string_lossy().as_ref()],
-            )? {
+            if run_service_command_optional("launchctl", &["print", &service_target])? {
+                run_service_command(
+                    "launchctl",
+                    &["bootout", &domain, plist_path.to_string_lossy().as_ref()],
+                )?;
                 println!("Stopped clt agent launchd service {}", AGENT_LAUNCHD_LABEL);
             } else {
                 println!(
@@ -949,22 +952,47 @@ fn home_dir() -> Result<PathBuf> {
 }
 
 fn launchd_user_domain() -> Result<String> {
-    let uid = match std::env::var("UID") {
-        Ok(uid) if !uid.trim().is_empty() => uid,
-        _ => {
-            let output = Command::new("id")
-                .arg("-u")
-                .output()
-                .context("Failed to determine current user id with id -u")?;
-            if !output.status.success() {
-                anyhow::bail!("id -u failed with status {}", output.status);
-            }
-            String::from_utf8(output.stdout)
-                .context("id -u produced non-UTF-8 output")?
-                .trim()
-                .to_string()
-        }
-    };
+    launchd_user_domain_for_uid(&current_user_id()?)
+}
+
+fn current_user_id() -> Result<String> {
+    let output = Command::new("id")
+        .arg("-u")
+        .output()
+        .context("Failed to determine current user id with id -u")?;
+    if !output.status.success() {
+        anyhow::bail!("id -u failed with status {}", output.status);
+    }
+
+    let uid = String::from_utf8(output.stdout)
+        .context("id -u produced non-UTF-8 output")?
+        .trim()
+        .to_string();
+    if uid.is_empty() {
+        anyhow::bail!("id -u produced an empty user id");
+    }
+
+    Ok(uid)
+}
+
+fn launchd_user_domain_for_uid(uid: &str) -> Result<String> {
+    let uid = uid.trim();
+    if uid.is_empty() {
+        anyhow::bail!("id -u produced an empty user id");
+    }
+    if !uid.chars().all(|ch| ch.is_ascii_digit()) {
+        anyhow::bail!("id -u produced an invalid user id: {uid}");
+    }
+    if uid == "0" {
+        let sudo_user = std::env::var("SUDO_USER")
+            .ok()
+            .filter(|user| !user.trim().is_empty())
+            .map(|user| format!(" for sudo user {user}"))
+            .unwrap_or_default();
+        anyhow::bail!(
+            "Refusing to manage the macOS launchd user agent as root{sudo_user}. Run `clt agent start` or `clt agent stop` without sudo from the logged-in macOS user session."
+        );
+    }
 
     Ok(format!("gui/{uid}"))
 }
@@ -986,8 +1014,12 @@ fn run_service_command(program: &str, args: &[&str]) -> Result<()> {
 }
 
 fn run_service_command_optional(program: &str, args: &[&str]) -> Result<bool> {
+    // Status probes are called from the TUI refresh path, so child output must
+    // never inherit the terminal and overwrite the alternate screen.
     let status = Command::new(program)
         .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .with_context(|| format!("Failed to run {}", service_command_display(program, args)))?;
 
@@ -7835,6 +7867,28 @@ mod tests {
         assert!(plist.contains(
             "<string>/Users/alex/Library/Application Support/clt/agent-service.err</string>"
         ));
+    }
+
+    #[test]
+    fn launchd_user_domain_uses_non_root_uid() {
+        assert_eq!(launchd_user_domain_for_uid(" 501\n").unwrap(), "gui/501");
+    }
+
+    #[test]
+    fn launchd_user_domain_rejects_root_uid() {
+        let err = launchd_user_domain_for_uid("0").unwrap_err().to_string();
+
+        assert!(err.contains("Refusing to manage the macOS launchd user agent as root"));
+        assert!(err.contains("without sudo"));
+    }
+
+    #[test]
+    fn launchd_user_domain_rejects_invalid_uid() {
+        let err = launchd_user_domain_for_uid("not-a-uid")
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("invalid user id"));
     }
 
     #[test]

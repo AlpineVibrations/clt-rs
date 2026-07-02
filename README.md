@@ -105,6 +105,8 @@ clt agent stop
 
 On macOS, `start` installs a user `launchd` service named `com.alpinevibrations.clt.agent`. On Linux, it installs a user `systemd` service named `clt-agent.service`. Other platforms can still use `clt agent run --once` or `clt agent daemon`, but `start` and `stop` are unsupported.
 
+Run `clt agent start` and `clt agent stop` as your normal user, not with `sudo`; these commands manage per-user services.
+
 Inspect agent state and recent output:
 ```bash
 clt agent status
