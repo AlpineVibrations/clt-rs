@@ -61,9 +61,11 @@ const AGENT_DAEMON_CHECKIN_STALE_SECONDS: u64 = 45;
 const AGENT_NO_TASKS_LEFT_MARKER: &str = "NO_TASKS_LEFT";
 const TUI_AGENT_PANEL_REFRESH_SECONDS: u64 = 2;
 const TUI_AGENT_TABLE_DOING_LAST_RUN_GAP: &str = "   ";
+const TUI_NO_ACTIVE_BOARD_MESSAGE: &str =
+    "No active board. Open an initialized registered project from the agent projects pane.";
 const AGENT_LAUNCHD_LABEL: &str = "com.alpinevibrations.clt.agent";
 const AGENT_SYSTEMD_UNIT: &str = "clt-agent.service";
-const AGENT_CODEX_PROMPT: &str = r#"You are working in this repo.
+const AGENT_CODEX_PROMPT_BASE: &str = r#"You are working in this repo.
 
 Use the existing task-management CLI tooling: clt.
 
@@ -87,6 +89,13 @@ Safety rules:
 - Do not overwrite unrelated user changes.
 - Before making edits, inspect the current repo state.
 - If the task is blocked or cannot be completed safely, update the task with a concise blocked note instead of forcing it.
+"#;
+const AGENT_GIT_COMMIT_PROMPT_APPENDIX: &str = r#"
+
+Git commit:
+- After completing and verifying the task, use the $git-commit skill to create one git commit for the completed work.
+- Include the code changes and related task-board updates in the commit when they are part of the same logical change.
+- Do not commit when there are no tasks left, the task is blocked, checks fail, or the work cannot be completed safely.
 "#;
 
 #[derive(Clone, Debug)]
@@ -338,6 +347,11 @@ enum AgentCommands {
         /// Project path to resume. Defaults to the current directory.
         path: Option<PathBuf>,
     },
+    /// Configures the git-commit skill for a registered project
+    GitCommit {
+        #[command(subcommand)]
+        command: AgentGitCommitCommands,
+    },
     /// Lists registered projects
     Projects,
     /// Runs the scheduler
@@ -358,6 +372,20 @@ enum AgentCommands {
     Logs,
     /// Clears stored agent failures, run history, and agent log files
     Clean,
+}
+
+#[derive(Subcommand)]
+enum AgentGitCommitCommands {
+    /// Adds a git-commit skill instruction to this project's agent prompt
+    Enable {
+        /// Project path to update. Defaults to the current directory.
+        path: Option<PathBuf>,
+    },
+    /// Removes the git-commit skill instruction from this project's agent prompt
+    Disable {
+        /// Project path to update. Defaults to the current directory.
+        path: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -417,9 +445,7 @@ fn main() -> Result<()> {
                 if response.trim().to_lowercase() == "y" {
                     init_tasks(&root, false)?;
                 } else {
-                    println!(
-                        "Initialization skipped. Please run 'init' to set up your task lists."
-                    );
+                    tui_view_without_active_board(&root)?;
                     return Ok(());
                 }
             }
@@ -453,6 +479,29 @@ fn handle_agent_command(command: AgentCommands, local: bool, default_root: &Path
         AgentCommands::Resume { path } => {
             let store = open_agent_store()?;
             set_agent_project_enabled(&store, path.as_deref(), local, default_root, true)?;
+        }
+        AgentCommands::GitCommit { command } => {
+            let store = open_agent_store()?;
+            match command {
+                AgentGitCommitCommands::Enable { path } => {
+                    set_agent_project_git_commit_enabled(
+                        &store,
+                        path.as_deref(),
+                        local,
+                        default_root,
+                        true,
+                    )?;
+                }
+                AgentGitCommitCommands::Disable { path } => {
+                    set_agent_project_git_commit_enabled(
+                        &store,
+                        path.as_deref(),
+                        local,
+                        default_root,
+                        false,
+                    )?;
+                }
+            }
         }
         AgentCommands::Projects => {
             let store = open_agent_store()?;
@@ -544,6 +593,28 @@ fn set_agent_project_enabled(
     if store.set_project_enabled_for_path_blocking(&project_root, enabled)? {
         let action = if enabled { "Resumed" } else { "Paused" };
         println!("{} project: {}", action, project_root.display());
+    } else {
+        println!("Project was not registered: {}", project_root.display());
+    }
+
+    Ok(())
+}
+
+fn set_agent_project_git_commit_enabled(
+    store: &agent_store::TursoAgentStore,
+    path: Option<&Path>,
+    local: bool,
+    default_root: &Path,
+    enabled: bool,
+) -> Result<()> {
+    let project_root = resolve_agent_project_root(path, local, default_root)?;
+    if store.set_project_git_commit_enabled_for_path_blocking(&project_root, enabled)? {
+        let action = if enabled { "Enabled" } else { "Disabled" };
+        println!(
+            "{} git-commit skill for project: {}",
+            action,
+            project_root.display()
+        );
     } else {
         println!("Project was not registered: {}", project_root.display());
     }
@@ -660,6 +731,11 @@ fn format_agent_project_summary(
     last_scan_at: Option<&str>,
 ) -> String {
     let state = if project.enabled { "enabled" } else { "paused" };
+    let git_commit = if project.git_commit_enabled {
+        "enabled"
+    } else {
+        "disabled"
+    };
     let mut lines = vec![
         format!("{}. {} [{}]", project.id, project.name, state),
         format!(
@@ -692,6 +768,7 @@ fn format_agent_project_summary(
             "             failure:   {}",
             format_optional_agent_timestamp(project.last_failure_at.as_deref())
         ),
+        format!("   settings  git commit: {}", git_commit),
         format!("   health    failures: {}", project.failure_count),
         format!("   path      {}", project.path.display()),
     ]);
@@ -2227,6 +2304,14 @@ impl CodexAgentRunner {
     }
 }
 
+fn agent_codex_prompt(project: &agent_store::AgentProject) -> String {
+    let mut prompt = AGENT_CODEX_PROMPT_BASE.to_string();
+    if project.git_commit_enabled {
+        prompt.push_str(AGENT_GIT_COMMIT_PROMPT_APPENDIX);
+    }
+    prompt
+}
+
 impl AgentRunner for CodexAgentRunner {
     fn run_project(
         &self,
@@ -2250,7 +2335,7 @@ impl AgentRunner for CodexAgentRunner {
             .arg("exec")
             .arg("--sandbox")
             .arg("workspace-write")
-            .arg(AGENT_CODEX_PROMPT)
+            .arg(agent_codex_prompt(project))
             .current_dir(&project.path)
             .stdout(Stdio::from(stdout_file))
             .stderr(Stdio::from(stderr_file));
@@ -2972,6 +3057,12 @@ mod agent_store {
                 expires_at TEXT NOT NULL
             )"],
         },
+        AgentMigration {
+            version: 3,
+            statements: &[
+                "ALTER TABLE projects ADD COLUMN git_commit_enabled INTEGER NOT NULL DEFAULT 0",
+            ],
+        },
     ];
 
     pub(crate) struct TursoAgentStore {
@@ -2986,6 +3077,7 @@ mod agent_store {
         pub(crate) path: PathBuf,
         pub(crate) name: String,
         pub(crate) enabled: bool,
+        pub(crate) git_commit_enabled: bool,
         pub(crate) last_scan_at: Option<String>,
         pub(crate) last_run_at: Option<String>,
         pub(crate) last_success_at: Option<String>,
@@ -3144,8 +3236,8 @@ mod agent_store {
                 .context("Failed to connect to agent database")?;
             let mut rows = conn
                 .query(
-                    "SELECT id, path, name, enabled, last_scan_at, last_run_at, last_success_at,
-                            last_failure_at, failure_count
+                    "SELECT id, path, name, enabled, git_commit_enabled, last_scan_at, last_run_at,
+                            last_success_at, last_failure_at, failure_count
                      FROM projects
                      ORDER BY name COLLATE NOCASE, path COLLATE NOCASE",
                     (),
@@ -3163,17 +3255,19 @@ mod agent_store {
                 let path = PathBuf::from(row_text(&row, 1, "path")?);
                 let name = row_text(&row, 2, "name")?;
                 let enabled = row_integer(&row, 3, "enabled")? != 0;
-                let last_scan_at = row_optional_text(&row, 4, "last_scan_at")?;
-                let last_run_at = row_optional_text(&row, 5, "last_run_at")?;
-                let last_success_at = row_optional_text(&row, 6, "last_success_at")?;
-                let last_failure_at = row_optional_text(&row, 7, "last_failure_at")?;
-                let failure_count = row_integer(&row, 8, "failure_count")?;
+                let git_commit_enabled = row_integer(&row, 4, "git_commit_enabled")? != 0;
+                let last_scan_at = row_optional_text(&row, 5, "last_scan_at")?;
+                let last_run_at = row_optional_text(&row, 6, "last_run_at")?;
+                let last_success_at = row_optional_text(&row, 7, "last_success_at")?;
+                let last_failure_at = row_optional_text(&row, 8, "last_failure_at")?;
+                let failure_count = row_integer(&row, 9, "failure_count")?;
 
                 projects.push(AgentProject {
                     id,
                     path,
                     name,
                     enabled,
+                    git_commit_enabled,
                     last_scan_at,
                     last_run_at,
                     last_success_at,
@@ -3672,6 +3766,77 @@ mod agent_store {
                 )
                 .await
                 .with_context(|| format!("Failed to set project {} enabled state", path))?;
+
+            Ok(changed > 0)
+        }
+
+        pub(crate) fn set_project_git_commit_enabled_blocking(
+            &self,
+            project_id: i64,
+            enabled: bool,
+        ) -> Result<bool> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(self.set_project_git_commit_enabled(project_id, enabled))
+        }
+
+        async fn set_project_git_commit_enabled(
+            &self,
+            project_id: i64,
+            enabled: bool,
+        ) -> Result<bool> {
+            let conn = self
+                .db
+                .connect()
+                .context("Failed to connect to agent database")?;
+            let changed = conn
+                .execute(
+                    "UPDATE projects SET git_commit_enabled = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![
+                        if enabled { 1_i64 } else { 0_i64 },
+                        agent_timestamp(),
+                        project_id
+                    ],
+                )
+                .await
+                .with_context(|| {
+                    format!("Failed to set project {} git-commit state", project_id)
+                })?;
+
+            Ok(changed > 0)
+        }
+
+        pub(crate) fn set_project_git_commit_enabled_for_path_blocking(
+            &self,
+            project_root: &Path,
+            enabled: bool,
+        ) -> Result<bool> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(self.set_project_git_commit_enabled_for_path(project_root, enabled))
+        }
+
+        async fn set_project_git_commit_enabled_for_path(
+            &self,
+            project_root: &Path,
+            enabled: bool,
+        ) -> Result<bool> {
+            let conn = self
+                .db
+                .connect()
+                .context("Failed to connect to agent database")?;
+            let path = project_root.display().to_string();
+            let changed = conn
+                .execute(
+                    "UPDATE projects SET git_commit_enabled = ?1, updated_at = ?2 WHERE path = ?3",
+                    params![
+                        if enabled { 1_i64 } else { 0_i64 },
+                        agent_timestamp(),
+                        path.as_str()
+                    ],
+                )
+                .await
+                .with_context(|| format!("Failed to set project {} git-commit state", path))?;
 
             Ok(changed > 0)
         }
@@ -5094,6 +5259,30 @@ enum TuiPane {
     AgentProjects,
 }
 
+struct TuiStartState {
+    active_board: bool,
+    current_pane: TuiPane,
+    feedback_buffer: String,
+}
+
+fn tui_start_state(active_board: bool) -> TuiStartState {
+    if active_board {
+        TuiStartState {
+            active_board,
+            current_pane: TuiPane::Tasks,
+            feedback_buffer: String::from(
+                "Kanban View! Tab switches to the agent projects pane, Enter opens a selected project there, Space toggles it ON/OFF, g toggles git-commit, Backspace returns to parent, Space creates a task on the board, 'a' opens archive view, Shift+Arrows or I/K reorder, Shift+Arrows or J/L move tasks, 'd' deletes, 'q' quits.",
+            ),
+        }
+    } else {
+        TuiStartState {
+            active_board,
+            current_pane: TuiPane::AgentProjects,
+            feedback_buffer: String::from(TUI_NO_ACTIVE_BOARD_MESSAGE),
+        }
+    }
+}
+
 struct TuiAgentProject {
     project: agent_store::AgentProject,
     scan: AgentProjectScan,
@@ -5477,12 +5666,36 @@ fn toggle_selected_tui_agent_project(
     }
 }
 
+fn toggle_selected_tui_agent_project_git_commit(
+    panel: &mut TuiAgentPanel,
+    active_root: &Path,
+) -> Result<String> {
+    let Some(project) = panel.selected_project().map(|entry| entry.project.clone()) else {
+        return Ok("No registered project selected".to_string());
+    };
+
+    let enabled = !project.git_commit_enabled;
+    let store = open_agent_store()?;
+    let changed = store.set_project_git_commit_enabled_blocking(project.id, enabled)?;
+    panel.refresh(active_root);
+
+    if changed {
+        let action = if enabled { "Enabled" } else { "Disabled" };
+        Ok(format!("{} git-commit skill: {}", action, project.name))
+    } else {
+        Ok(format!(
+            "Project is no longer registered: {}",
+            project.path.display()
+        ))
+    }
+}
+
 fn tui_agent_panel_refresh_interval() -> Duration {
     Duration::from_secs(TUI_AGENT_PANEL_REFRESH_SECONDS)
 }
 
 fn tui_agent_panel_instructions() -> &'static str {
-    "Up/Down selects, Enter opens board/adds current project, Space toggles ON/OFF or adds current project."
+    "Up/Down selects, Enter opens board/adds current project, Space toggles ON/OFF or adds current project, g toggles git-commit."
 }
 
 fn format_tui_agent_panel_top_status(
@@ -5544,6 +5757,11 @@ fn format_agent_project_table_row(
 ) -> String {
     let marker = active_board_marker(is_current_board);
     let state = if item.project.enabled { "ON" } else { "OFF" };
+    let git = if item.project.git_commit_enabled {
+        "ON"
+    } else {
+        "OFF"
+    };
     let todo = item.scan.todo_count.to_string();
     let doing = item.scan.doing_count.to_string();
     let last_run = format_agent_table_last_run(&item.project);
@@ -5551,10 +5769,11 @@ fn format_agent_project_table_row(
     if width < 80 {
         return truncate_to_width(
             &format!(
-                "{} {} {} {} {} {}{}{}",
+                "{} {} {} {} {} {} {}{}{}",
                 fit_cell(marker, 1),
                 fit_cell_right(&(idx + 1).to_string(), 3),
                 fit_cell(state, 6),
+                fit_cell(git, 4),
                 fit_cell(&item.project.name, 22),
                 fit_cell_right(&todo, 4),
                 fit_cell_right(&doing, 5),
@@ -5568,13 +5787,15 @@ fn format_agent_project_table_row(
     let marker_width = 1;
     let number_width = 4;
     let state_width = 6;
+    let git_width = 4;
     let todo_width = 4;
     let doing_width = 5;
     let last_run_width = 11;
-    let gap_count = 6 + TUI_AGENT_TABLE_DOING_LAST_RUN_GAP.len();
+    let gap_count = 7 + TUI_AGENT_TABLE_DOING_LAST_RUN_GAP.len();
     let fixed_width = number_width
         + marker_width
         + state_width
+        + git_width
         + todo_width
         + doing_width
         + last_run_width
@@ -5585,10 +5806,11 @@ fn format_agent_project_table_row(
 
     truncate_to_width(
         &format!(
-            "{} {} {} {} {} {}{}{} {}",
+            "{} {} {} {} {} {} {}{}{} {}",
             fit_cell(marker, marker_width),
             fit_cell_right(&(idx + 1).to_string(), number_width),
             fit_cell(state, state_width),
+            fit_cell(git, git_width),
             fit_cell(&item.project.name, project_width),
             fit_cell_right(&todo, todo_width),
             fit_cell_right(&doing, doing_width),
@@ -5607,10 +5829,11 @@ fn format_current_project_registration_row(
     if width < 80 {
         return truncate_to_width(
             &format!(
-                "{} {} {} {} {} {}{}{}",
+                "{} {} {} {} {} {} {}{}{}",
                 fit_cell("+", 1),
                 fit_cell_right("", 3),
                 fit_cell("ADD", 6),
+                fit_cell("-", 6),
                 fit_cell(&registration.name, 22),
                 fit_cell_right("-", 4),
                 fit_cell_right("-", 5),
@@ -5624,13 +5847,15 @@ fn format_current_project_registration_row(
     let marker_width = 1;
     let number_width = 4;
     let state_width = 6;
+    let git_width = 4;
     let todo_width = 4;
     let doing_width = 5;
     let last_run_width = 11;
-    let gap_count = 6 + TUI_AGENT_TABLE_DOING_LAST_RUN_GAP.len();
+    let gap_count = 7 + TUI_AGENT_TABLE_DOING_LAST_RUN_GAP.len();
     let fixed_width = number_width
         + marker_width
         + state_width
+        + git_width
         + todo_width
         + doing_width
         + last_run_width
@@ -5641,10 +5866,11 @@ fn format_current_project_registration_row(
 
     truncate_to_width(
         &format!(
-            "{} {} {} {} {} {}{}{} {}",
+            "{} {} {} {} {} {} {}{}{} {}",
             fit_cell("+", marker_width),
             fit_cell_right("", number_width),
             fit_cell("ADD", state_width),
+            fit_cell("-", git_width),
             fit_cell(&registration.name, project_width),
             fit_cell_right("-", todo_width),
             fit_cell_right("-", doing_width),
@@ -5660,10 +5886,11 @@ fn format_agent_project_table_header(width: usize) -> String {
     if width < 80 {
         return truncate_to_width(
             &format!(
-                "{} {} {} {} {} {}{}{}",
+                "{} {} {} {} {} {} {}{}{}",
                 fit_cell("", 1),
                 fit_cell_right("#", 3),
                 fit_cell("STATUS", 6),
+                fit_cell("GIT", 4),
                 fit_cell("PROJECT", 22),
                 fit_cell_right("TODO", 4),
                 fit_cell_right("DOING", 5),
@@ -5677,13 +5904,15 @@ fn format_agent_project_table_header(width: usize) -> String {
     let marker_width = 1;
     let number_width = 4;
     let state_width = 6;
+    let git_width = 4;
     let todo_width = 4;
     let doing_width = 5;
     let last_run_width = 11;
-    let gap_count = 6 + TUI_AGENT_TABLE_DOING_LAST_RUN_GAP.len();
+    let gap_count = 7 + TUI_AGENT_TABLE_DOING_LAST_RUN_GAP.len();
     let fixed_width = number_width
         + marker_width
         + state_width
+        + git_width
         + todo_width
         + doing_width
         + last_run_width
@@ -5694,10 +5923,11 @@ fn format_agent_project_table_header(width: usize) -> String {
 
     truncate_to_width(
         &format!(
-            "{} {} {} {} {} {}{}{} {}",
+            "{} {} {} {} {} {} {}{}{} {}",
             fit_cell("", marker_width),
             fit_cell_right("#", number_width),
             fit_cell("STATUS", state_width),
+            fit_cell("GIT", git_width),
             fit_cell("PROJECT", project_width),
             fit_cell_right("TODO", todo_width),
             fit_cell_right("DOING", doing_width),
@@ -6207,20 +6437,32 @@ fn board_display_name(root: &Path, board_dir: &Path) -> String {
 }
 
 fn tui_view(root: &Path) -> Result<()> {
+    tui_view_with_active_board(root, true)
+}
+
+fn tui_view_without_active_board(root: &Path) -> Result<()> {
+    tui_view_with_active_board(root, false)
+}
+
+fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Result<()> {
     // Setup terminal
     let title = app_title(root);
     let _terminal_session = TerminalSession::enter(&title)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
     let mut active_root = root.to_path_buf();
-    let mut board_stack = vec![get_tasks_dir(&active_root)];
+    let mut board_stack = if start_with_active_board {
+        vec![get_tasks_dir(&active_root)]
+    } else {
+        Vec::new()
+    };
 
+    let start_state = tui_start_state(start_with_active_board);
+    let mut active_board = start_state.active_board;
     let mut current_mode = Mode::View;
     let mut task_input = Input::default();
-    let mut feedback_buffer = String::from(
-        "Kanban View! Tab switches to the agent projects pane, Enter opens a selected project there, Space toggles it ON/OFF, Backspace returns to parent, Space creates a task on the board, 'a' opens archive view, Shift+Arrows or I/K reorder, Shift+Arrows or J/L move tasks, 'd' deletes, 'q' quits.",
-    );
+    let mut feedback_buffer = start_state.feedback_buffer;
     let mut archive_view = false;
-    let mut current_pane = TuiPane::Tasks;
+    let mut current_pane = start_state.current_pane;
     let mut agent_panel = TuiAgentPanel::new(&active_root);
     let mut last_agent_panel_refresh = Instant::now();
 
@@ -6253,19 +6495,30 @@ fn tui_view(root: &Path) -> Result<()> {
             last_agent_panel_refresh = Instant::now();
         }
 
+        if !active_board && current_pane == TuiPane::Tasks {
+            current_pane = TuiPane::AgentProjects;
+            archive_view = false;
+        }
+
         let board_dir = board_stack
             .last()
             .cloned()
             .unwrap_or_else(|| get_tasks_dir(&active_root));
-        if archive_view {
-            normalize_archive_selection_in_board(&board_dir, &mut archive_state);
-        } else {
-            normalize_board_selections_in_board(&board_dir, &statuses, &mut board_states);
+        if active_board {
+            if archive_view {
+                normalize_archive_selection_in_board(&board_dir, &mut archive_state);
+            } else {
+                normalize_board_selections_in_board(&board_dir, &statuses, &mut board_states);
+            }
         }
 
         terminal.draw(|f| {
             let size = f.area();
-            let board_title = board_display_name(&active_root, &board_dir);
+            let board_title = if active_board {
+                board_display_name(&active_root, &board_dir)
+            } else {
+                "No Active Board".to_string()
+            };
             let console_title = if current_pane == TuiPane::AgentProjects {
                 "Agent Projects Console".to_string()
             } else if archive_view {
@@ -6627,6 +6880,7 @@ fn tui_view(root: &Path) -> Result<()> {
                                  [Space]        - Create new task / toggle selected agent project\n\
                                  [Enter]        - Open subtasks, edit selected task, or open selected agent project\n\
                                  [e]            - Edit selected task\n\
+                                 [g]            - Toggle git-commit for selected agent project\n\
                                  [a]            - Toggle archive view\n\
                                  [Backspace]    - Return to parent board\n\
                                  [d/Del]        - Delete selected task\n\
@@ -6674,14 +6928,20 @@ fn tui_view(root: &Path) -> Result<()> {
                 match current_mode {
                     Mode::View => {
                         if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+                            let no_active_board =
+                                current_pane == TuiPane::AgentProjects && !active_board;
                             current_pane = if current_pane == TuiPane::Tasks {
                                 agent_panel.refresh(&active_root);
                                 last_agent_panel_refresh = Instant::now();
                                 TuiPane::AgentProjects
-                            } else {
+                            } else if active_board {
                                 TuiPane::Tasks
+                            } else {
+                                TuiPane::AgentProjects
                             };
-                            feedback_buffer = if current_pane == TuiPane::AgentProjects {
+                            feedback_buffer = if no_active_board {
+                                TUI_NO_ACTIVE_BOARD_MESSAGE.to_string()
+                            } else if current_pane == TuiPane::AgentProjects {
                                 tui_agent_panel_instructions().to_string()
                             } else {
                                 "Task board pane.".to_string()
@@ -6689,8 +6949,12 @@ fn tui_view(root: &Path) -> Result<()> {
                         } else if current_pane == TuiPane::AgentProjects {
                             match key.code {
                                 KeyCode::Esc => {
-                                    current_pane = TuiPane::Tasks;
-                                    feedback_buffer = "Task board pane.".to_string();
+                                    if active_board {
+                                        current_pane = TuiPane::Tasks;
+                                        feedback_buffer = "Task board pane.".to_string();
+                                    } else {
+                                        feedback_buffer = TUI_NO_ACTIVE_BOARD_MESSAGE.to_string();
+                                    }
                                 }
                                 KeyCode::Char('q') => break,
                                 KeyCode::Char('h') | KeyCode::Char('H') | KeyCode::Char('?') => {
@@ -6734,6 +6998,7 @@ fn tui_view(root: &Path) -> Result<()> {
                                     match std::env::set_current_dir(&project.path) {
                                         Ok(_) => {
                                             active_root = project.path.clone();
+                                            active_board = true;
                                             board_stack.clear();
                                             board_stack.push(get_tasks_dir(&active_root));
                                             selected_board = 0;
@@ -6796,6 +7061,28 @@ fn tui_view(root: &Path) -> Result<()> {
                                     }
 
                                     match toggle_selected_tui_agent_project(
+                                        &mut agent_panel,
+                                        &active_root,
+                                    ) {
+                                        Ok(message) => {
+                                            last_agent_panel_refresh = Instant::now();
+                                            feedback_buffer = message;
+                                        }
+                                        Err(e) => feedback_buffer = format!("Error: {}", e),
+                                    }
+                                }
+                                KeyCode::Char('g') | KeyCode::Char('G') => {
+                                    if agent_panel
+                                        .selected_current_project_registration()
+                                        .is_some()
+                                    {
+                                        feedback_buffer =
+                                            "Register current project before toggling git-commit"
+                                                .to_string();
+                                        continue;
+                                    }
+
+                                    match toggle_selected_tui_agent_project_git_commit(
                                         &mut agent_panel,
                                         &active_root,
                                     ) {
@@ -7614,6 +7901,7 @@ mod tests {
                 path: PathBuf::from(format!("/tmp/{name}")),
                 name: name.to_string(),
                 enabled: true,
+                git_commit_enabled: false,
                 last_scan_at: None,
                 last_run_at: None,
                 last_success_at: None,
@@ -7880,6 +8168,24 @@ mod tests {
     }
 
     #[test]
+    fn tui_start_state_with_active_board_opens_task_pane() {
+        let state = tui_start_state(true);
+
+        assert!(state.active_board);
+        assert_eq!(state.current_pane, TuiPane::Tasks);
+        assert!(state.feedback_buffer.contains("Kanban View"));
+    }
+
+    #[test]
+    fn tui_start_state_without_active_board_opens_agent_pane() {
+        let state = tui_start_state(false);
+
+        assert!(!state.active_board);
+        assert_eq!(state.current_pane, TuiPane::AgentProjects);
+        assert_eq!(state.feedback_buffer, TUI_NO_ACTIVE_BOARD_MESSAGE);
+    }
+
+    #[test]
     fn agent_register_command_accepts_optional_path() {
         let cli = Cli::try_parse_from(["clt", "agent", "register", "."]).unwrap();
 
@@ -7938,6 +8244,36 @@ mod tests {
                 assert_eq!(path, None);
             }
             _ => panic!("expected agent resume command"),
+        }
+    }
+
+    #[test]
+    fn agent_git_commit_commands_accept_optional_path() {
+        let enable_cli =
+            Cli::try_parse_from(["clt", "agent", "git-commit", "enable", "/tmp/project"]).unwrap();
+        match enable_cli.command {
+            Some(Commands::Agent {
+                command:
+                    AgentCommands::GitCommit {
+                        command: AgentGitCommitCommands::Enable { path },
+                    },
+            }) => {
+                assert_eq!(path, Some(PathBuf::from("/tmp/project")));
+            }
+            _ => panic!("expected agent git-commit enable command"),
+        }
+
+        let disable_cli = Cli::try_parse_from(["clt", "agent", "git-commit", "disable"]).unwrap();
+        match disable_cli.command {
+            Some(Commands::Agent {
+                command:
+                    AgentCommands::GitCommit {
+                        command: AgentGitCommitCommands::Disable { path },
+                    },
+            }) => {
+                assert_eq!(path, None);
+            }
+            _ => panic!("expected agent git-commit disable command"),
         }
     }
 
@@ -8051,6 +8387,7 @@ mod tests {
             path: PathBuf::from("/tmp/demo-project"),
             name: "demo-project".to_string(),
             enabled: true,
+            git_commit_enabled: false,
             last_scan_at: None,
             last_run_at: Some("last-run".to_string()),
             last_success_at: Some("last-success".to_string()),
@@ -8068,6 +8405,7 @@ mod tests {
             "             last run:  last-run",
             "             success:   last-success",
             "             failure:   -",
+            "   settings  git commit: disabled",
             "   health    failures: 3",
             "   path      /tmp/demo-project",
         ]
@@ -8184,6 +8522,7 @@ mod tests {
             path: PathBuf::from("/tmp/project"),
             name: "project".to_string(),
             enabled: true,
+            git_commit_enabled: false,
             last_scan_at: None,
             last_run_at: None,
             last_success_at: Some("100".to_string()),
@@ -8483,6 +8822,40 @@ mod tests {
         );
         let project = store.list_projects_blocking().unwrap().remove(0);
         assert!(project.enabled);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_store_can_enable_and_disable_git_commit_for_registered_project() {
+        let root = temp_root("agent-git-commit");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert!(!project.git_commit_enabled);
+
+        assert!(
+            store
+                .set_project_git_commit_enabled_for_path_blocking(&project_root, true)
+                .unwrap()
+        );
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert!(project.git_commit_enabled);
+
+        assert!(
+            store
+                .set_project_git_commit_enabled_blocking(project.id, false)
+                .unwrap()
+        );
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert!(!project.git_commit_enabled);
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -9300,6 +9673,31 @@ mod tests {
         assert_eq!(tail_lines(content, 10), vec!["one", "two", "three", "four"]);
     }
 
+    #[test]
+    fn agent_codex_prompt_includes_git_commit_only_when_enabled() {
+        let mut project = agent_store::AgentProject {
+            id: 1,
+            path: PathBuf::from("/tmp/project"),
+            name: "project".to_string(),
+            enabled: true,
+            git_commit_enabled: false,
+            last_scan_at: None,
+            last_run_at: None,
+            last_success_at: None,
+            last_failure_at: None,
+            failure_count: 0,
+        };
+
+        let base_prompt = agent_codex_prompt(&project);
+        assert!(base_prompt.contains("Use the existing task-management CLI tooling: clt."));
+        assert!(!base_prompt.contains("$git-commit"));
+
+        project.git_commit_enabled = true;
+        let commit_prompt = agent_codex_prompt(&project);
+        assert!(commit_prompt.contains("$git-commit"));
+        assert!(commit_prompt.contains("Do not commit when there are no tasks left"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn wait_for_child_with_timeout_emits_heartbeats() {
@@ -9381,6 +9779,7 @@ mod tests {
             path: project_root,
             name: "Project With Spaces".to_string(),
             enabled: true,
+            git_commit_enabled: false,
             last_scan_at: None,
             last_run_at: None,
             last_success_at: None,
@@ -9431,6 +9830,7 @@ mod tests {
             path: project_root,
             name: "Shutdown Project".to_string(),
             enabled: true,
+            git_commit_enabled: false,
             last_scan_at: None,
             last_run_at: None,
             last_success_at: None,

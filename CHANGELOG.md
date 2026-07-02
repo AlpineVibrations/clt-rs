@@ -17,13 +17,18 @@ Use this section while developing the next release.
 - Added first-sentence summaries for long task files while preserving full task content on moves.
 - Added a multi-project Codex agent registry with `register`, `unregister`, `pause`, `resume`, scheduler, daemon, service, status, and log commands.
 - Added a full-screen TUI agent projects pane for switching between registered project boards, toggling projects `ON` or `OFF`, and seeing `todo`/`doing` counts.
+- Added per-project `git-commit` skill toggles for Codex agent runs through `clt agent git-commit enable|disable` and the TUI agent projects pane.
+- Added `skill-git-commit.md` guidance for safe agent-driven Git commits.
 
 ### Changed
 
 - Moving a folder-backed task into a Markdown-backed status now expands the destination status to a folder and preserves the old Markdown file as `status.md.bak`.
 - Updated the terminal title to show the active project when using the TUI.
+- Renamed the agent task workflow guide from `clt-skill.md` to `skill-clt.md`.
 
 ### Fixed
+
+- Declining the no-board initialization prompt now opens the TUI in the agent projects pane without creating an active task board.
 
 ## [0.1.10] - 2026-05-11
 
@@ -34,7 +39,7 @@ Use this section while developing the next release.
 - Added multiline-aware TUI input navigation for wrapped add/edit prompts, including Up/Down row movement, word jumps/deletes, and Ctrl-A/E/U/K/W shortcuts.
 - Added CLI deletion support and single-status task listing.
 - Added support for unquoted multi-word task descriptions in `clt add`.
-- Added `clt-skill.md` guidance for agent task workflows.
+- Added agent task workflow guidance, now published as `skill-clt.md`.
 
 ### Changed
 

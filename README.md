@@ -22,9 +22,9 @@ A file-system-backed task manager written in Rust. `clt` stores work in Markdown
 - **Kanban TUI**: A visual board view powered by `ratatui`, with nested board navigation and a full-screen registered-projects pane.
 - **Simple CLI**: Easy commands to add, move, and list tasks.
 - **Smart Root Detection**: Automatically finds the git repository root to keep tasks centralized, or uses the current directory.
-- **Agent Registry**: Register many projects, toggle them on or off, inspect `todo`/`doing` counts, and open any registered task board from the TUI.
+- **Agent Registry**: Register many projects, toggle them on or off, inspect `todo`/`doing` counts, toggle per-project git commits, and open any registered task board from the TUI.
 - **Codex Automation**: Run one Codex task at a time per enabled project, either in the foreground or through a background service.
-- **Agent Support Files**: Includes `clt-skill.md` guidance to help AI agents use `clt` safely for task tracking.
+- **Agent Support Files**: Includes `skill-clt.md` for task-board workflows and `skill-git-commit.md` for safe commit workflows.
 
 ## Installation
 
@@ -59,7 +59,7 @@ clt
 ```
 Press `Enter` to open a folder task with subtasks, `e` to edit the selected task, `Space` to create a task, `Backspace` to return to the parent board, and `q` to quit.
 
-Press `Tab` to switch to the full-screen agent projects pane. There, Up/Down selects a registered project, `Enter` opens that project's task board, and `Space` toggles the project `ON` or `OFF`. The currently open project is marked with `*`, and the terminal title updates to the active project.
+Press `Tab` to switch to the full-screen agent projects pane. There, Up/Down selects a registered project, `Enter` opens that project's task board, `Space` toggles the project `ON` or `OFF`, and `g` toggles the `GIT` column, which controls whether that project's agent prompt asks Codex to use the `git-commit` skill after a completed task. The currently open project is marked with `*`, and the terminal title updates to the active project.
 
 ### Codex Agent
 `clt agent` can run Codex against enabled registered projects that have pending `todo` tasks. Each project keeps its own repo-local `tasks/` board, while the agent stores cross-project runtime state in one central state directory.
@@ -84,6 +84,18 @@ clt agent resume ~/code/project-a
 ```
 
 In the TUI agent pane, the same state appears as `OFF` or `ON`.
+
+Enable or disable the optional `git-commit` skill instruction per project:
+```bash
+clt agent git-commit enable ~/code/project-a
+clt agent git-commit disable ~/code/project-a
+```
+
+When enabled, the scheduler appends a prompt section that tells Codex to use the `$git-commit` skill after completing and verifying a task. The instruction is skipped for projects where the setting is disabled. In the TUI, this setting appears in the `GIT` column.
+
+Agent-facing workflow files are included at the repo root:
+- `skill-clt.md`: task-board workflow guidance for using `clt`.
+- `skill-git-commit.md`: git commit and optional push workflow guidance.
 
 Run one foreground scheduler pass:
 ```bash

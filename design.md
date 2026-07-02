@@ -43,6 +43,36 @@ Tasks within each column must display their description.
 *   **Task Identification**: Tasks are identified by their 1-based index within their current list. This allows for a clean markdown format without stored IDs.
 *   **Markdown Parsing**: The CLI must reliably parse tasks from Markdown content (lines starting with `- `).
 
+### 5.1 Codex Agent Registry
+The `clt agent` command group coordinates Codex automation across many registered project roots. Each project keeps task state in its own repository-local `tasks/` board, while agent runtime state lives in the shared agent registry database.
+
+Registered projects must store:
+*   Project path, display name, and enabled state.
+*   Last scan/run/success/failure timestamps and failure count.
+*   A per-project `git_commit_enabled` setting.
+
+Agent scheduling must:
+*   Run at most one Codex task per project at a time.
+*   Skip paused projects, projects without pending `todo` work, and projects with active leases.
+*   Prompt Codex to inspect the task board, move one task to `doing`, complete it, run relevant checks, update the task, mark it done when completed, and stop after one task.
+*   Append the `$git-commit` skill instruction only when `git_commit_enabled` is true for that project.
+
+The agent CLI must expose:
+*   `clt agent pause [path]` and `clt agent resume [path]` for the project enabled state.
+*   `clt agent git-commit enable [path]` and `clt agent git-commit disable [path]` for the per-project commit prompt setting.
+
+The TUI agent projects pane must show:
+*   A project enabled column toggled with `Space`.
+*   A `GIT` column toggled with `g`.
+*   `ON`/`OFF` values for both toggles.
+
+### 5.2 Agent Support Files
+Repo-root agent guidance files use the `skill-*.md` naming pattern so users can easily hand them to coding agents.
+
+Current support files:
+*   `skill-clt.md`: task-board workflow guidance for using `clt` safely.
+*   `skill-git-commit.md`: Git commit and optional push workflow guidance.
+
 ---
 ### Implementation Summary
 The project has been implemented with the following technical choices:

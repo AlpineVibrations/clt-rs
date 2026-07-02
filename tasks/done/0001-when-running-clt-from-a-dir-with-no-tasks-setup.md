@@ -1,0 +1,3 @@
+when running clt from a dir with no tasks setup and it asks us if we want to init the fodler. and we say no. it currently exits. it should just start up anyways and have no active board and start in agent pane view.
+
+Completed: Declining the no-board initialization prompt now launches the TUI with no active task board and focuses the agent projects pane. Added guards so inactive boards are not normalized/read into existence, enabled opening a registered initialized project to activate a board, documented the fix in CHANGELOG, and covered the startup state with tests. Checks: cargo fmt; cargo test tui_start_state; cargo test.
