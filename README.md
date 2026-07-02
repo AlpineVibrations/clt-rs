@@ -111,10 +111,13 @@ Inspect agent state and recent output:
 ```bash
 clt agent status
 clt agent logs
+clt agent clean
 clt agent pause .
 clt agent resume .
 clt agent unregister .
 ```
+
+`clt agent clean` resets stored failure state, deletes recorded run history, removes agent run logs, and truncates background service logs. It keeps registered projects and task boards intact, and refuses to run while active Codex leases exist.
 
 By default, agent state is stored at `~/Library/Application Support/clt` on macOS, `$XDG_STATE_HOME/clt` on Linux when `XDG_STATE_HOME` is set, or `~/.local/state/clt` otherwise. The state directory contains `agent.db`, scheduler run logs, and background service logs such as `agent-service.out` and `agent-service.err`. Override it with:
 ```bash

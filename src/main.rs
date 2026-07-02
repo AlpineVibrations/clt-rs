@@ -143,6 +143,16 @@ struct AgentServiceEnvironment {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct AgentCleanSummary {
+    projects_reset: u64,
+    runs_deleted: u64,
+    leases_deleted: u64,
+    daemon_checkins_deleted: u64,
+    run_log_dirs_removed: u64,
+    service_logs_truncated: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct AgentProjectScan {
     status: AgentProjectScanStatus,
     todo_count: usize,
@@ -346,6 +356,8 @@ enum AgentCommands {
     Status,
     /// Shows recent agent logs
     Logs,
+    /// Clears stored agent failures, run history, and agent log files
+    Clean,
 }
 
 fn main() -> Result<()> {
@@ -464,6 +476,11 @@ fn handle_agent_command(command: AgentCommands, local: bool, default_root: &Path
         AgentCommands::Logs => {
             let store = open_agent_store()?;
             show_agent_logs(&store)?;
+        }
+        AgentCommands::Clean => {
+            let state_dir = ensure_agent_state_dir()?;
+            let store = open_agent_store_at(&state_dir)?;
+            clean_agent_state(&store, &state_dir)?;
         }
         AgentCommands::Start | AgentCommands::Stop => unreachable!("handled before store open"),
     }
@@ -698,6 +715,72 @@ fn show_agent_logs(store: &agent_store::TursoAgentStore) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn clean_agent_state(store: &agent_store::TursoAgentStore, state_dir: &Path) -> Result<()> {
+    let active_leases = store.list_active_leases_blocking(&agent_timestamp())?;
+    if !active_leases.is_empty() {
+        anyhow::bail!(
+            "Refusing to clean agent state while {} active lease(s) exist. Wait for active Codex runs to finish or stop the service first.",
+            active_leases.len()
+        );
+    }
+
+    let mut summary = store.clean_agent_history_blocking(&agent_timestamp())?;
+    summary.run_log_dirs_removed = remove_agent_run_logs(state_dir)?;
+    summary.service_logs_truncated = truncate_agent_service_logs(state_dir)?;
+
+    println!("Cleaned agent state:");
+    println!("  projects reset: {}", summary.projects_reset);
+    println!("  run records deleted: {}", summary.runs_deleted);
+    println!("  stale leases deleted: {}", summary.leases_deleted);
+    println!(
+        "  daemon check-ins deleted: {}",
+        summary.daemon_checkins_deleted
+    );
+    println!(
+        "  run log directories removed: {}",
+        summary.run_log_dirs_removed
+    );
+    println!(
+        "  service logs truncated: {}",
+        summary.service_logs_truncated
+    );
+
+    Ok(())
+}
+
+fn remove_agent_run_logs(state_dir: &Path) -> Result<u64> {
+    let runs_dir = state_dir.join("runs");
+    if !runs_dir.exists() {
+        fs::create_dir_all(&runs_dir)
+            .with_context(|| format!("Failed to create agent run log directory {:?}", runs_dir))?;
+        return Ok(0);
+    }
+
+    let removed = fs::read_dir(&runs_dir)
+        .with_context(|| format!("Failed to read agent run log directory {:?}", runs_dir))?
+        .count() as u64;
+    fs::remove_dir_all(&runs_dir)
+        .with_context(|| format!("Failed to remove agent run log directory {:?}", runs_dir))?;
+    fs::create_dir_all(&runs_dir)
+        .with_context(|| format!("Failed to recreate agent run log directory {:?}", runs_dir))?;
+
+    Ok(removed)
+}
+
+fn truncate_agent_service_logs(state_dir: &Path) -> Result<u64> {
+    let mut truncated = 0;
+    for extension in ["out", "err"] {
+        let path = PathBuf::from(state_dir_service_log_path(state_dir, extension));
+        if path.exists() {
+            fs::File::create(&path)
+                .with_context(|| format!("Failed to truncate agent service log {:?}", path))?;
+            truncated += 1;
+        }
+    }
+
+    Ok(truncated)
 }
 
 fn manage_agent_service(action: AgentServiceAction) -> Result<()> {
@@ -3425,6 +3508,55 @@ mod agent_store {
             Ok(checkins)
         }
 
+        pub(crate) fn clean_agent_history_blocking(
+            &self,
+            cleaned_at: &str,
+        ) -> Result<AgentCleanSummary> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(self.clean_agent_history(cleaned_at))
+        }
+
+        async fn clean_agent_history(&self, cleaned_at: &str) -> Result<AgentCleanSummary> {
+            let conn = self
+                .db
+                .connect()
+                .context("Failed to connect to agent database")?;
+
+            let projects_reset = conn
+                .execute(
+                    "UPDATE projects
+                     SET failure_count = 0,
+                         last_failure_at = NULL,
+                         updated_at = ?1
+                     WHERE failure_count <> 0 OR last_failure_at IS NOT NULL",
+                    [cleaned_at],
+                )
+                .await
+                .context("Failed to reset agent project failure state")?;
+            let runs_deleted = conn
+                .execute("DELETE FROM runs", ())
+                .await
+                .context("Failed to delete agent run records")?;
+            let leases_deleted = conn
+                .execute("DELETE FROM leases", ())
+                .await
+                .context("Failed to delete agent leases")?;
+            let daemon_checkins_deleted = conn
+                .execute("DELETE FROM daemon_checkins", ())
+                .await
+                .context("Failed to delete agent daemon check-ins")?;
+
+            Ok(AgentCleanSummary {
+                projects_reset,
+                runs_deleted,
+                leases_deleted,
+                daemon_checkins_deleted,
+                run_log_dirs_removed: 0,
+                service_logs_truncated: 0,
+            })
+        }
+
         #[cfg(test)]
         pub(crate) fn db_path(&self) -> &Path {
             &self.db_path
@@ -3555,7 +3687,11 @@ mod agent_store {
             "success" | "idle" => {
                 conn.execute(
                     "UPDATE projects
-                     SET last_run_at = ?1, last_success_at = ?1, failure_count = 0, updated_at = ?1
+                     SET last_run_at = ?1,
+                         last_success_at = ?1,
+                         last_failure_at = NULL,
+                         failure_count = 0,
+                         updated_at = ?1
                      WHERE id = ?2",
                     params![finished_at, outcome.project_id],
                 )
@@ -7822,7 +7958,7 @@ mod tests {
     #[test]
     fn agent_top_level_subcommands_parse() {
         for subcommand in [
-            "projects", "daemon", "start", "stop", "status", "logs", "pause", "resume",
+            "projects", "daemon", "start", "stop", "status", "logs", "clean", "pause", "resume",
         ] {
             let cli = Cli::try_parse_from(["clt", "agent", subcommand]).unwrap();
 
@@ -9050,6 +9186,108 @@ mod tests {
         assert_eq!(runs[0].stdout_path.as_deref(), Some("/tmp/logs/run.out"));
         assert_eq!(runs[0].stderr_path.as_deref(), Some("/tmp/logs/run.err"));
         assert_eq!(runs[0].summary.as_deref(), Some("completed"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn successful_agent_run_clears_previous_failure_timestamp() {
+        let root = temp_root("agent-success-clears-failure");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+
+        store
+            .record_run_outcome_blocking(agent_store::AgentRunOutcome {
+                project_id: project.id,
+                status: "failure",
+                started_at: "100",
+                finished_at: Some("101"),
+                exit_code: None,
+                log_dir: None,
+                stdout_path: None,
+                stderr_path: None,
+                summary: Some("failed"),
+            })
+            .unwrap();
+        store
+            .record_run_outcome_blocking(agent_store::AgentRunOutcome {
+                project_id: project.id,
+                status: "success",
+                started_at: "200",
+                finished_at: Some("201"),
+                exit_code: Some(0),
+                log_dir: None,
+                stdout_path: None,
+                stderr_path: None,
+                summary: Some("completed"),
+            })
+            .unwrap();
+
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert_eq!(project.failure_count, 0);
+        assert_eq!(project.last_failure_at, None);
+        assert_eq!(project.last_success_at.as_deref(), Some("201"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_clean_resets_failures_and_removes_logs() {
+        let root = temp_root("agent-clean-state");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+
+        store
+            .record_run_outcome_blocking(agent_store::AgentRunOutcome {
+                project_id: project.id,
+                status: "failure",
+                started_at: "100",
+                finished_at: Some("101"),
+                exit_code: None,
+                log_dir: Some("/tmp/logs"),
+                stdout_path: Some("/tmp/logs/run.out"),
+                stderr_path: Some("/tmp/logs/run.err"),
+                summary: Some("failed"),
+            })
+            .unwrap();
+        store
+            .record_daemon_checkin_blocking("stale-daemon", "service", "90", "95", "99")
+            .unwrap();
+        fs::create_dir_all(state_dir.join("runs/project/run-1")).unwrap();
+        fs::write(state_dir.join("runs/project/run-1/stdout.log"), "old run").unwrap();
+        fs::write(state_dir.join("agent-service.out"), "service out").unwrap();
+        fs::write(state_dir.join("agent-service.err"), "service err").unwrap();
+
+        clean_agent_state(&store, &state_dir).unwrap();
+
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert_eq!(project.failure_count, 0);
+        assert_eq!(project.last_failure_at, None);
+        assert_eq!(store.run_count_blocking().unwrap(), 0);
+        assert!(store.list_daemon_checkins_blocking().unwrap().is_empty());
+        assert_eq!(fs::read_dir(state_dir.join("runs")).unwrap().count(), 0);
+        assert_eq!(
+            fs::read_to_string(state_dir.join("agent-service.out")).unwrap(),
+            ""
+        );
+        assert_eq!(
+            fs::read_to_string(state_dir.join("agent-service.err")).unwrap(),
+            ""
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
