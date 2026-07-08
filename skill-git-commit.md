@@ -49,6 +49,8 @@ If a repo doc or the user names a required branch:
 - If the branch does not exist, create it from the current base with `git switch -c <branch>`.
 - Do not invent a feature branch name when no branch is specified.
 
+If a branch is not specified in some way, then it should be done on master or main branch.
+
 If uncommitted work already exists on a different branch, inspect status first. Switch only when the move is clearly safe; otherwise ask before moving work across branches.
 
 Watch especially for:
