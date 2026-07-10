@@ -5286,6 +5286,28 @@ fn tui_start_state(active_board: bool) -> TuiStartState {
 struct TuiAgentProject {
     project: agent_store::AgentProject,
     scan: AgentProjectScan,
+    runtime_state: TuiAgentRuntimeState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TuiAgentRuntimeState {
+    Idle,
+    Running,
+    Stale,
+}
+
+impl TuiAgentRuntimeState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Idle => "IDLE",
+            Self::Running => "RUNNING",
+            Self::Stale => "STALE",
+        }
+    }
+
+    fn is_running(self) -> bool {
+        self == Self::Running
+    }
 }
 
 struct TuiAgentPanelSnapshot {
@@ -5507,12 +5529,18 @@ fn load_tui_agent_panel_snapshot(_active_root: &Path) -> Result<TuiAgentPanelSna
     let daemon_status =
         format_agent_daemon_runtime_status(&service_status, &checkins, agent_timestamp_seconds());
     let projects = store.list_projects_blocking()?;
+    let active_leases = store.list_active_leases_blocking(&agent_timestamp())?;
 
     let projects = projects
         .into_iter()
         .map(|project| {
             let scan = scan_agent_project(&project.path);
-            TuiAgentProject { project, scan }
+            let runtime_state = tui_agent_runtime_state(project.id, &active_leases);
+            TuiAgentProject {
+                project,
+                scan,
+                runtime_state,
+            }
         })
         .collect();
 
@@ -5520,6 +5548,25 @@ fn load_tui_agent_panel_snapshot(_active_root: &Path) -> Result<TuiAgentPanelSna
         projects,
         daemon_status,
     })
+}
+
+fn tui_agent_runtime_state(
+    project_id: i64,
+    active_leases: &[agent_store::AgentLeaseRecord],
+) -> TuiAgentRuntimeState {
+    let Some(lease) = active_leases
+        .iter()
+        .find(|lease| lease.project_id == project_id)
+    else {
+        return TuiAgentRuntimeState::Idle;
+    };
+
+    match agent_lease_holder_liveness(&lease.holder) {
+        AgentLeaseHolderLiveness::Dead => TuiAgentRuntimeState::Stale,
+        AgentLeaseHolderLiveness::CurrentProcess
+        | AgentLeaseHolderLiveness::Alive
+        | AgentLeaseHolderLiveness::Unknown => TuiAgentRuntimeState::Running,
+    }
 }
 
 fn format_agent_daemon_runtime_status(
@@ -5701,9 +5748,12 @@ fn tui_agent_panel_instructions() -> &'static str {
 fn format_tui_agent_panel_top_status(
     daemon_status: &str,
     project_count: usize,
-    active_count: usize,
+    enabled_count: usize,
+    running_count: usize,
 ) -> String {
-    format!(" daemon status: {daemon_status}  {project_count} projects  {active_count} enabled ")
+    format!(
+        " daemon status: {daemon_status}  {project_count} projects  {enabled_count} enabled  {running_count} running "
+    )
 }
 
 fn truncate_to_width(value: &str, width: usize) -> String {
@@ -5757,6 +5807,7 @@ fn format_agent_project_table_row(
 ) -> String {
     let marker = active_board_marker(is_current_board);
     let state = if item.project.enabled { "ON" } else { "OFF" };
+    let runtime_state = item.runtime_state.label();
     let git = if item.project.git_commit_enabled {
         "ON"
     } else {
@@ -5769,10 +5820,11 @@ fn format_agent_project_table_row(
     if width < 80 {
         return truncate_to_width(
             &format!(
-                "{} {} {} {} {} {} {}{}{}",
+                "{} {} {} {} {} {} {} {}{}{}",
                 fit_cell(marker, 1),
                 fit_cell_right(&(idx + 1).to_string(), 3),
                 fit_cell(state, 6),
+                fit_cell(runtime_state, 7),
                 fit_cell(git, 4),
                 fit_cell(&item.project.name, 22),
                 fit_cell_right(&todo, 4),
@@ -5787,14 +5839,16 @@ fn format_agent_project_table_row(
     let marker_width = 1;
     let number_width = 4;
     let state_width = 6;
+    let runtime_width = 7;
     let git_width = 4;
     let todo_width = 4;
     let doing_width = 5;
     let last_run_width = 11;
-    let gap_count = 7 + TUI_AGENT_TABLE_DOING_LAST_RUN_GAP.len();
+    let gap_count = 8 + TUI_AGENT_TABLE_DOING_LAST_RUN_GAP.len();
     let fixed_width = number_width
         + marker_width
         + state_width
+        + runtime_width
         + git_width
         + todo_width
         + doing_width
@@ -5806,10 +5860,11 @@ fn format_agent_project_table_row(
 
     truncate_to_width(
         &format!(
-            "{} {} {} {} {} {} {}{}{} {}",
+            "{} {} {} {} {} {} {} {}{}{} {}",
             fit_cell(marker, marker_width),
             fit_cell_right(&(idx + 1).to_string(), number_width),
             fit_cell(state, state_width),
+            fit_cell(runtime_state, runtime_width),
             fit_cell(git, git_width),
             fit_cell(&item.project.name, project_width),
             fit_cell_right(&todo, todo_width),
@@ -5829,11 +5884,12 @@ fn format_current_project_registration_row(
     if width < 80 {
         return truncate_to_width(
             &format!(
-                "{} {} {} {} {} {} {}{}{}",
+                "{} {} {} {} {} {} {} {}{}{}",
                 fit_cell("+", 1),
                 fit_cell_right("", 3),
                 fit_cell("ADD", 6),
-                fit_cell("-", 6),
+                fit_cell("-", 7),
+                fit_cell("-", 4),
                 fit_cell(&registration.name, 22),
                 fit_cell_right("-", 4),
                 fit_cell_right("-", 5),
@@ -5847,14 +5903,16 @@ fn format_current_project_registration_row(
     let marker_width = 1;
     let number_width = 4;
     let state_width = 6;
+    let runtime_width = 7;
     let git_width = 4;
     let todo_width = 4;
     let doing_width = 5;
     let last_run_width = 11;
-    let gap_count = 7 + TUI_AGENT_TABLE_DOING_LAST_RUN_GAP.len();
+    let gap_count = 8 + TUI_AGENT_TABLE_DOING_LAST_RUN_GAP.len();
     let fixed_width = number_width
         + marker_width
         + state_width
+        + runtime_width
         + git_width
         + todo_width
         + doing_width
@@ -5866,10 +5924,11 @@ fn format_current_project_registration_row(
 
     truncate_to_width(
         &format!(
-            "{} {} {} {} {} {} {}{}{} {}",
+            "{} {} {} {} {} {} {} {}{}{} {}",
             fit_cell("+", marker_width),
             fit_cell_right("", number_width),
             fit_cell("ADD", state_width),
+            fit_cell("-", runtime_width),
             fit_cell("-", git_width),
             fit_cell(&registration.name, project_width),
             fit_cell_right("-", todo_width),
@@ -5886,10 +5945,11 @@ fn format_agent_project_table_header(width: usize) -> String {
     if width < 80 {
         return truncate_to_width(
             &format!(
-                "{} {} {} {} {} {} {}{}{}",
+                "{} {} {} {} {} {} {} {}{}{}",
                 fit_cell("", 1),
                 fit_cell_right("#", 3),
                 fit_cell("STATUS", 6),
+                fit_cell("AGENT", 7),
                 fit_cell("GIT", 4),
                 fit_cell("PROJECT", 22),
                 fit_cell_right("TODO", 4),
@@ -5904,14 +5964,16 @@ fn format_agent_project_table_header(width: usize) -> String {
     let marker_width = 1;
     let number_width = 4;
     let state_width = 6;
+    let runtime_width = 7;
     let git_width = 4;
     let todo_width = 4;
     let doing_width = 5;
     let last_run_width = 11;
-    let gap_count = 7 + TUI_AGENT_TABLE_DOING_LAST_RUN_GAP.len();
+    let gap_count = 8 + TUI_AGENT_TABLE_DOING_LAST_RUN_GAP.len();
     let fixed_width = number_width
         + marker_width
         + state_width
+        + runtime_width
         + git_width
         + todo_width
         + doing_width
@@ -5923,10 +5985,11 @@ fn format_agent_project_table_header(width: usize) -> String {
 
     truncate_to_width(
         &format!(
-            "{} {} {} {} {} {} {}{}{} {}",
+            "{} {} {} {} {} {} {} {}{}{} {}",
             fit_cell("", marker_width),
             fit_cell_right("#", number_width),
             fit_cell("STATUS", state_width),
+            fit_cell("AGENT", runtime_width),
             fit_cell("GIT", git_width),
             fit_cell("PROJECT", project_width),
             fit_cell_right("TODO", todo_width),
@@ -5948,10 +6011,15 @@ fn render_tui_agent_panel(
     text_color: Color,
     c_highlight: Color,
 ) {
-    let active_count = panel
+    let enabled_count = panel
         .projects
         .iter()
         .filter(|item| item.project.enabled)
+        .count();
+    let running_count = panel
+        .projects
+        .iter()
+        .filter(|item| item.runtime_state.is_running())
         .count();
     let row_count = panel.row_count();
     let title = if focused {
@@ -5965,7 +6033,8 @@ fn render_tui_agent_panel(
             Line::from(vec![Span::raw(format_tui_agent_panel_top_status(
                 &panel.daemon_status,
                 panel.projects.len(),
-                active_count,
+                enabled_count,
+                running_count,
             ))])
             .alignment(Alignment::Right),
         )
@@ -7909,6 +7978,7 @@ mod tests {
                 failure_count: 0,
             },
             scan: AgentProjectScan::empty(),
+            runtime_state: TuiAgentRuntimeState::Idle,
         }
     }
 
@@ -7947,11 +8017,34 @@ mod tests {
 
     #[test]
     fn tui_agent_panel_top_status_includes_daemon_status() {
-        let status = format_tui_agent_panel_top_status("running", 3, 2);
+        let status = format_tui_agent_panel_top_status("running", 3, 2, 1);
 
         assert!(status.contains("daemon status: running"));
         assert!(status.contains("3 projects"));
         assert!(status.contains("2 enabled"));
+        assert!(status.contains("1 running"));
+    }
+
+    #[test]
+    fn tui_agent_runtime_state_distinguishes_running_from_doing_tasks() {
+        let no_leases = Vec::new();
+        assert_eq!(
+            tui_agent_runtime_state(1, &no_leases),
+            TuiAgentRuntimeState::Idle
+        );
+
+        let active_lease = agent_store::AgentLeaseRecord {
+            project_id: 1,
+            project_name: "alpha".to_string(),
+            project_path: PathBuf::from("/tmp/alpha"),
+            holder: agent_lease_holder(),
+            acquired_at: "100".to_string(),
+            expires_at: "200".to_string(),
+        };
+        assert_eq!(
+            tui_agent_runtime_state(1, &[active_lease]),
+            TuiAgentRuntimeState::Running
+        );
     }
 
     #[test]
@@ -8016,12 +8109,15 @@ mod tests {
     fn agent_project_table_pads_doing_before_last_run() {
         let mut project = tui_agent_project_for_test(1, "alpha");
         project.scan = AgentProjectScan::pending_with_doing(12, 3);
+        project.runtime_state = TuiAgentRuntimeState::Running;
 
         let compact_header = format_agent_project_table_header(79);
         let compact_row = format_agent_project_table_row(0, &project, 79, false);
         let wide_header = format_agent_project_table_header(100);
         let wide_row = format_agent_project_table_row(0, &project, 100, false);
 
+        assert!(compact_header.contains("AGENT"));
+        assert!(compact_row.contains("RUNNING"));
         assert!(compact_header.contains("DOING   LAST RUN"));
         assert!(wide_header.contains("DOING   LAST RUN"));
         assert!(compact_row.contains("    3   -"));
