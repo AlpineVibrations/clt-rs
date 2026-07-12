@@ -5824,8 +5824,8 @@ fn format_agent_project_table_row(
                 fit_cell(marker, 1),
                 fit_cell_right(&(idx + 1).to_string(), 3),
                 fit_cell(state, 6),
-                fit_cell(runtime_state, 7),
                 fit_cell(git, 4),
+                fit_cell(runtime_state, 7),
                 fit_cell(&item.project.name, 22),
                 fit_cell_right(&todo, 4),
                 fit_cell_right(&doing, 5),
@@ -5864,8 +5864,8 @@ fn format_agent_project_table_row(
             fit_cell(marker, marker_width),
             fit_cell_right(&(idx + 1).to_string(), number_width),
             fit_cell(state, state_width),
-            fit_cell(runtime_state, runtime_width),
             fit_cell(git, git_width),
+            fit_cell(runtime_state, runtime_width),
             fit_cell(&item.project.name, project_width),
             fit_cell_right(&todo, todo_width),
             fit_cell_right(&doing, doing_width),
@@ -5888,8 +5888,8 @@ fn format_current_project_registration_row(
                 fit_cell("+", 1),
                 fit_cell_right("", 3),
                 fit_cell("ADD", 6),
-                fit_cell("-", 7),
                 fit_cell("-", 4),
+                fit_cell("-", 7),
                 fit_cell(&registration.name, 22),
                 fit_cell_right("-", 4),
                 fit_cell_right("-", 5),
@@ -5928,8 +5928,8 @@ fn format_current_project_registration_row(
             fit_cell("+", marker_width),
             fit_cell_right("", number_width),
             fit_cell("ADD", state_width),
-            fit_cell("-", runtime_width),
             fit_cell("-", git_width),
+            fit_cell("-", runtime_width),
             fit_cell(&registration.name, project_width),
             fit_cell_right("-", todo_width),
             fit_cell_right("-", doing_width),
@@ -5949,8 +5949,8 @@ fn format_agent_project_table_header(width: usize) -> String {
                 fit_cell("", 1),
                 fit_cell_right("#", 3),
                 fit_cell("STATUS", 6),
-                fit_cell("AGENT", 7),
                 fit_cell("GIT", 4),
+                fit_cell("AGENT", 7),
                 fit_cell("PROJECT", 22),
                 fit_cell_right("TODO", 4),
                 fit_cell_right("DOING", 5),
@@ -5989,8 +5989,8 @@ fn format_agent_project_table_header(width: usize) -> String {
             fit_cell("", marker_width),
             fit_cell_right("#", number_width),
             fit_cell("STATUS", state_width),
-            fit_cell("AGENT", runtime_width),
             fit_cell("GIT", git_width),
+            fit_cell("AGENT", runtime_width),
             fit_cell("PROJECT", project_width),
             fit_cell_right("TODO", todo_width),
             fit_cell_right("DOING", doing_width),
@@ -8116,8 +8116,10 @@ mod tests {
         let wide_header = format_agent_project_table_header(100);
         let wide_row = format_agent_project_table_row(0, &project, 100, false);
 
-        assert!(compact_header.contains("AGENT"));
-        assert!(compact_row.contains("RUNNING"));
+        assert!(compact_header.find("GIT").unwrap() < compact_header.find("AGENT").unwrap());
+        assert!(compact_row.find("OFF").unwrap() < compact_row.find("RUNNING").unwrap());
+        assert!(wide_header.find("GIT").unwrap() < wide_header.find("AGENT").unwrap());
+        assert!(wide_row.find("OFF").unwrap() < wide_row.find("RUNNING").unwrap());
         assert!(compact_header.contains("DOING   LAST RUN"));
         assert!(wide_header.contains("DOING   LAST RUN"));
         assert!(compact_row.contains("    3   -"));
