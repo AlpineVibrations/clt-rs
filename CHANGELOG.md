@@ -28,6 +28,7 @@ Use this section while developing the next release.
 
 ### Fixed
 
+- Existing folder- or Markdown-backed boards with one or more missing empty status stores are now detected and repaired instead of prompting for initialization.
 - Declining the no-board initialization prompt now opens the TUI in the agent projects pane without creating an active task board.
 
 ## [0.1.10] - 2026-05-11

@@ -435,7 +435,7 @@ fn main() -> Result<()> {
             handle_agent_command(command, cli.local, &root)?;
         }
         None => {
-            if !is_initialized(&root) {
+            if !ensure_existing_board(&root)? {
                 print!("Tasks not initialized. Would you like to initialize now? (y/n): ");
                 io::stdout().flush()?;
 
@@ -544,7 +544,7 @@ fn register_agent_project(
     default_root: &Path,
 ) -> Result<()> {
     let project_root = resolve_agent_project_root(path, local, default_root)?;
-    if !is_initialized(&project_root) {
+    if !ensure_existing_board(&project_root)? {
         anyhow::bail!(
             "Project {:?} does not have an initialized tasks board. Run 'clt init' there first.",
             project_root
@@ -2450,8 +2450,10 @@ fn scan_agent_project(project_root: &Path) -> AgentProjectScan {
         return AgentProjectScan::missing();
     }
 
-    if !is_initialized(project_root) {
-        return AgentProjectScan::uninitialized();
+    match ensure_existing_board(project_root) {
+        Ok(true) => {}
+        Ok(false) => return AgentProjectScan::uninitialized(),
+        Err(err) => return AgentProjectScan::unavailable(err),
     }
 
     let board_dir = get_tasks_dir(project_root);
@@ -4064,14 +4066,14 @@ fn set_terminal_title(title: &str) -> Result<()> {
     Ok(())
 }
 
-fn is_initialized(root: &Path) -> bool {
+fn ensure_existing_board(root: &Path) -> Result<bool> {
     let tasks_dir = get_tasks_dir(root);
-    if !tasks_dir.exists() {
-        return false;
+    if !tasks_dir.is_dir() || !board_has_any_status_store(&tasks_dir) {
+        return Ok(false);
     }
-    TASK_STATUSES
-        .iter()
-        .all(|status| status_store_exists(&tasks_dir, status))
+
+    ensure_board_store(&tasks_dir)?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -5679,7 +5681,7 @@ fn register_selected_current_project(
         return Ok("No current project registration row selected".to_string());
     };
 
-    if !is_initialized(&registration.0) {
+    if !ensure_existing_board(&registration.0)? {
         return Ok(format!(
             "Project is not initialized: {}",
             registration.0.display()
@@ -7067,12 +7069,23 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                         continue;
                                     };
 
-                                    if !is_initialized(&project.path) {
-                                        feedback_buffer = format!(
-                                            "Project is not initialized: {}",
-                                            project.path.display()
-                                        );
-                                        continue;
+                                    match ensure_existing_board(&project.path) {
+                                        Ok(true) => {}
+                                        Ok(false) => {
+                                            feedback_buffer = format!(
+                                                "Project is not initialized: {}",
+                                                project.path.display()
+                                            );
+                                            continue;
+                                        }
+                                        Err(error) => {
+                                            feedback_buffer = format!(
+                                                "Failed to repair project board {}: {}",
+                                                project.path.display(),
+                                                error
+                                            );
+                                            continue;
+                                        }
                                     }
 
                                     match std::env::set_current_dir(&project.path) {
@@ -8160,6 +8173,65 @@ mod tests {
         assert!(root.join("tasks/doing").is_dir());
         assert!(root.join("tasks/done").is_dir());
         assert!(!root.join("tasks/todo.md").exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn existing_folder_board_repairs_status_directories_missing_after_clone() {
+        let root = temp_root("repair-folder-board");
+        let done_dir = root.join("tasks/done");
+        fs::create_dir_all(&done_dir).unwrap();
+        fs::write(done_dir.join("0001-shipped.md"), "Shipped already.\n").unwrap();
+
+        assert!(ensure_existing_board(&root).unwrap());
+        assert!(root.join("tasks/todo").is_dir());
+        assert!(root.join("tasks/doing").is_dir());
+        assert!(root.join("tasks/done").is_dir());
+        assert!(done_dir.join("0001-shipped.md").is_file());
+        assert!(!root.join("tasks/todo.md").exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn existing_markdown_board_repairs_missing_status_files() {
+        let root = temp_root("repair-markdown-board");
+        let tasks_dir = root.join("tasks");
+        fs::create_dir_all(&tasks_dir).unwrap();
+        fs::write(
+            tasks_dir.join("done.md"),
+            "# Done Tasks\n- shipped already\n",
+        )
+        .unwrap();
+
+        assert!(ensure_existing_board(&root).unwrap());
+        assert_eq!(
+            fs::read_to_string(tasks_dir.join("todo.md")).unwrap(),
+            "# To Do Tasks\n"
+        );
+        assert_eq!(
+            fs::read_to_string(tasks_dir.join("doing.md")).unwrap(),
+            "# Doing Tasks\n"
+        );
+        assert_eq!(
+            fs::read_to_string(tasks_dir.join("done.md")).unwrap(),
+            "# Done Tasks\n- shipped already\n"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tasks_directory_without_status_store_stays_uninitialized() {
+        let root = temp_root("unrecognized-tasks-directory");
+        let tasks_dir = root.join("tasks");
+        fs::create_dir_all(&tasks_dir).unwrap();
+        fs::write(tasks_dir.join("notes.md"), "Not a task board.\n").unwrap();
+
+        assert!(!ensure_existing_board(&root).unwrap());
+        assert!(!tasks_dir.join("todo.md").exists());
+        assert!(!tasks_dir.join("todo").exists());
 
         fs::remove_dir_all(root).unwrap();
     }
