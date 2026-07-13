@@ -99,6 +99,23 @@ git diff --staged
 
 If unrelated changes are present, commit only the requested or coherent set and leave the rest untouched.
 
+## CLT Task Updates
+
+If the work is tracked with `clt`, update the current task through `clt` before staging and include the resulting task-board changes in the same commit as the implementation. Check both supported layouts:
+
+- Markdown files: `tasks/todo.md`, `tasks/doing.md`, and `tasks/done.md`.
+- Task folders: `tasks/todo/`, `tasks/doing/`, and `tasks/done/`.
+
+Inspect the board changes even when implementation files are already staged:
+
+```bash
+git status --short -- tasks/
+git diff -- tasks/
+git diff --staged -- tasks/
+```
+
+Stage the current task's content and status transition, including both sides of a move or deletion. Use `git add -A -- tasks/` only when every task-board change belongs to the same logical commit; otherwise stage the exact task paths and leave unrelated task changes untouched.
+
 ## Commit Message
 
 Prefer the repo's existing style from recent commits.
