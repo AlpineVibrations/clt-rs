@@ -5061,6 +5061,17 @@ fn insert_task_in_board(
     insert_task_content(board_dir, status, index, &content)
 }
 
+fn insert_task_at_selection_in_board(
+    board_dir: &Path,
+    status: &str,
+    state: &ListState,
+    description: &str,
+    metadata: Option<String>,
+) -> Result<()> {
+    let index = selected_task_index_in_board(board_dir, status, state);
+    insert_task_in_board(board_dir, status, index, description, metadata)
+}
+
 #[cfg(test)]
 fn read_tasks(root: &Path, status: &str) -> Result<Vec<String>> {
     read_tasks_in_board(&get_tasks_dir(root), status)
@@ -7791,16 +7802,10 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                     Mode::Input => match key.code {
                         KeyCode::Enter => {
                             if !task_input.value().trim().is_empty() {
-                                let index = selected_task_index_in_board(
+                                match insert_task_at_selection_in_board(
                                     &board_dir,
                                     statuses[selected_board],
                                     &board_states[selected_board],
-                                )
-                                .map(|idx| idx + 1);
-                                match insert_task_in_board(
-                                    &board_dir,
-                                    statuses[selected_board],
-                                    index,
                                     task_input.value(),
                                     None,
                                 ) {
@@ -10176,6 +10181,57 @@ mod tests {
         state.select(Some(1));
 
         assert_eq!(selected_task_index(&root, "todo", &state), None);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tui_add_inserts_above_selected_markdown_task() {
+        let root = temp_root("tui-add-above-markdown");
+        add_task(&root, "first task", None).unwrap();
+        add_task(&root, "selected task", None).unwrap();
+        add_task(&root, "last task", None).unwrap();
+
+        let mut state = ListState::default();
+        state.select(Some(1));
+        insert_task_at_selection_in_board(&root.join("tasks"), "todo", &state, "new task", None)
+            .unwrap();
+
+        assert_eq!(
+            read_tasks(&root, "todo").unwrap(),
+            vec![
+                "- first task",
+                "- new task",
+                "- selected task",
+                "- last task",
+            ]
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tui_add_inserts_above_selected_folder_task() {
+        let root = temp_root("tui-add-above-folder");
+        init_tasks(&root, true).unwrap();
+        add_task(&root, "first task", None).unwrap();
+        add_task(&root, "selected task", None).unwrap();
+        add_task(&root, "last task", None).unwrap();
+
+        let mut state = ListState::default();
+        state.select(Some(1));
+        insert_task_at_selection_in_board(&root.join("tasks"), "todo", &state, "new task", None)
+            .unwrap();
+
+        assert_eq!(
+            read_tasks(&root, "todo").unwrap(),
+            vec![
+                "- first task",
+                "- new task",
+                "- selected task",
+                "- last task",
+            ]
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
