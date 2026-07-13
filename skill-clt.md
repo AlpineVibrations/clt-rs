@@ -105,6 +105,9 @@ clt delete <status> <index>
 - **Preserve Existing Tasks**: Never delete, reorder, or rewrite `clt` tasks unless explicitly asked. Other people may add todos while you are working, and those are real tasks, not noise.
 - **Default Storage Mode**: Use regular Markdown-file mode for agent-created task lists unless the user explicitly asks for expanded folder-backed tasks. Do not run `clt init --folders` or `clt expand` just because a task has some detail.
 - **Folder-Backed Tasks**: When a status is already a folder, edit the task file for detailed notes. Keep the first sentence suitable for list and TUI display.
+- **Outcome Notes**: Before changing a task's status after a work attempt, record the outcome in the task. For a Markdown-backed status, append the note to the task's existing line. For a folder-backed status, preserve the first sentence and add a `Completion note:` or `Blocked note:` section to the task file.
+- **Completion Notes**: Before moving a verified task to `done`, add `COMPLETED YYYY-MM-DD:` followed by a concise summary of what changed and the checks or tests that ran. Do not use a completion note as a substitute for verification.
+- **Blocked Notes**: If a task cannot be completed safely, add `BLOCKED YYYY-MM-DD:` followed by the blocker, what was attempted, and what is needed to continue. Do not move a blocked task to `done`; preserve its current status unless the user or project policy directs another transition.
 - **Atomic Transitions**: Only move one task to `doing` at a time to maintain focus and clear project state.
 - **Metadata Usage**: Use the metadata field for tracking issue numbers, priority, or assignees. Use standardized, comma-separated tags for better scannability (e.g., `clt add "Fix memory leak" "BUG, HIGH"`).
 - **Consistency**: Ensure every significant change or feature implementation is tracked as a task. If a task is too large, break it into smaller sub-tasks in the `todo` list.
@@ -149,12 +152,24 @@ clt list doing
 1. Fix memory leak in parser
 ```
 
-**6. After completing the work, mark it done:**
+**6. After completing and verifying the work, record the outcome in the task:**
+
+For this Markdown-backed example, update the existing line in `tasks/doing.md`:
+```markdown
+- Fix memory leak in parser — COMPLETED 2026-07-13: Corrected parser ownership; checks: `cargo test parser`.
+```
+
+For a folder-backed task, add the same information beneath a `Completion note:` heading in its task file.
+
+**7. List the status again, then mark the confirmed task done:**
+```bash
+clt list doing
+```
 ```bash
 clt done doing 1
 ```
 
-**7. Verify the final state:**
+**8. Verify the final state:**
 ```bash
 clt list
 ```
@@ -164,7 +179,7 @@ clt list
 --- DOING ---
 
 --- DONE ---
-1. Fix memory leak in parser
+1. Fix memory leak in parser — COMPLETED 2026-07-13: Corrected parser ownership; checks: `cargo test parser`.
 ```
 
 ## Interactive View
