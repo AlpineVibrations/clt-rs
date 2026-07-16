@@ -87,7 +87,12 @@ EOF
 
   set +e
 
-  "$TIMEOUT_CMD" "$TIMEOUT" codex exec --sandbox workspace-write "$PROMPT" \
+  # Automated task runs need Git metadata access and cannot pause for approval.
+  # Only run this loop in a trusted checkout or an externally isolated environment.
+  "$TIMEOUT_CMD" "$TIMEOUT" codex \
+    --sandbox danger-full-access \
+    --ask-for-approval never \
+    exec -C "$PWD" "$PROMPT" \
     > >(tee "$OUT_FILE") \
     2> >(tee "$ERR_FILE" >&2)
 

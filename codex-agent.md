@@ -207,8 +207,17 @@ Each project run should execute a prompt equivalent to the current shell script:
 The Rust implementation should invoke Codex with:
 
 ```bash
-codex exec --sandbox workspace-write "<prompt>"
+codex \
+  --sandbox danger-full-access \
+  --ask-for-approval never \
+  exec \
+  -C "<project-path>" \
+  "<prompt>"
 ```
+
+This removes the Codex command sandbox so automated runs can update Git metadata and
+cannot pause waiting for an approval response. Only enable the agent for trusted
+repositories or run it inside an externally isolated container or VM.
 
 The prompt should live in Rust as a template or in a bundled text file. It should be easy to update without touching scheduler logic.
 

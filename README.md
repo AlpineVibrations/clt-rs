@@ -147,6 +147,8 @@ clt agent run --once
 
 The scheduler scans enabled projects, picks projects with pending `todo` tasks, takes an agent lease, and starts one Codex run at a time. Each Codex run is prompted to inspect the board, move one available task to `doing`, complete it, run relevant checks, update the task through `clt`, and stop after that single task.
 
+Automated runs start Codex with `--sandbox danger-full-access --ask-for-approval never` so tasks can update Git metadata without pausing for interactive approval. This removes the Codex command sandbox for the entire run. Register only trusted repositories, or run the agent inside an externally isolated container or VM.
+
 Run the scheduler continuously in the foreground:
 ```bash
 clt agent daemon

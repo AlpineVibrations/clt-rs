@@ -25,6 +25,7 @@ Use this section while developing the next release.
 - Moving a folder-backed task into a Markdown-backed status now expands the destination status to a folder and preserves the old Markdown file as `status.md.bak`.
 - Updated the terminal title to show the active project when using the TUI.
 - Renamed the agent task workflow guide from `clt-skill.md` to `skill-clt.md`.
+- Automated Codex agent runs now use `danger-full-access` with approvals disabled so non-interactive tasks can update Git metadata.
 
 ### Fixed
 

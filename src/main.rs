@@ -1666,17 +1666,14 @@ async fn run_agent_daemon_loop_async(
             }
         }
 
-        if shutdown.load(Ordering::SeqCst) {
-            if active_passes.is_empty() && active_runs.is_empty() {
-                clear_agent_daemon_checkin_best_effort(&state_dir, &daemon_checkin.holder).await;
-                return Ok(());
-            }
-        } else if max_passes.is_some_and(|max_passes| scheduled_passes >= max_passes) {
-            if active_passes.is_empty() && active_runs.is_empty() {
-                clear_agent_daemon_checkin_best_effort(&state_dir, &daemon_checkin.holder).await;
-                return Ok(());
-            }
-        } else {
+        let scheduling_stopped = shutdown.load(Ordering::SeqCst)
+            || max_passes.is_some_and(|max_passes| scheduled_passes >= max_passes);
+        if scheduling_stopped && active_passes.is_empty() && active_runs.is_empty() {
+            clear_agent_daemon_checkin_best_effort(&state_dir, &daemon_checkin.holder).await;
+            return Ok(());
+        }
+
+        if !scheduling_stopped {
             let task_state_dir = state_dir.clone();
             let active_project_ids = active_runs.iter().map(|run| run.project_id).collect();
             let task_daemon_checkin = daemon_checkin.clone();
@@ -1939,27 +1936,22 @@ fn run_agent_scheduler_pass_with_max_global_jobs(
         })?;
         if !acquired {
             let lease = active_agent_lease_for_project(state_dir, project.id)?;
-            if let Some(lease) = lease.as_ref() {
-                if try_reclaim_inactive_agent_lease(
+            if let Some(lease) = lease.as_ref()
+                && try_reclaim_inactive_agent_lease(
                     state_dir,
                     &project,
                     &scan,
                     lease,
                     reclaim_current_process_leases,
-                )? {
-                    let reacquired_at = agent_timestamp();
-                    let reexpires_at = agent_timestamp_after(lease_timeout.as_secs());
-                    acquired_at = reacquired_at;
-                    expires_at = reexpires_at;
-                    acquired = with_agent_store_at(state_dir, |store| {
-                        store.try_acquire_lease_blocking(
-                            project.id,
-                            &holder,
-                            &acquired_at,
-                            &expires_at,
-                        )
-                    })?;
-                }
+                )?
+            {
+                let reacquired_at = agent_timestamp();
+                let reexpires_at = agent_timestamp_after(lease_timeout.as_secs());
+                acquired_at = reacquired_at;
+                expires_at = reexpires_at;
+                acquired = with_agent_store_at(state_dir, |store| {
+                    store.try_acquire_lease_blocking(project.id, &holder, &acquired_at, &expires_at)
+                })?;
             }
 
             if !acquired {
@@ -2364,9 +2356,13 @@ impl AgentRunner for CodexAgentRunner {
 
         let mut command = Command::new(&self.command);
         command
-            .arg("exec")
             .arg("--sandbox")
-            .arg("workspace-write")
+            .arg("danger-full-access")
+            .arg("--ask-for-approval")
+            .arg("never")
+            .arg("exec")
+            .arg("-C")
+            .arg(&project.path)
             .arg(agent_codex_prompt(project))
             .current_dir(&project.path)
             .stdout(Stdio::from(stdout_file))
@@ -2693,7 +2689,7 @@ fn agent_timestamp_after(seconds: u64) -> String {
         .checked_add(std::time::Duration::from_secs(seconds))
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|duration| duration.as_secs().to_string())
-        .unwrap_or_else(|| agent_timestamp())
+        .unwrap_or_else(agent_timestamp)
 }
 
 fn format_agent_timestamp(raw: &str) -> String {
@@ -2860,12 +2856,11 @@ fn agent_project_cooldown_reason(
     success_cooldown: Duration,
     failure_backoff: Duration,
 ) -> Option<String> {
-    if project.failure_count > 0 {
-        if let Some(remaining) =
+    if project.failure_count > 0
+        && let Some(remaining) =
             remaining_agent_delay(project.last_failure_at.as_deref(), now, failure_backoff)
-        {
-            return Some(format!("failure backoff active for {remaining}s"));
-        }
+    {
+        return Some(format!("failure backoff active for {remaining}s"));
     }
 
     remaining_agent_delay(project.last_success_at.as_deref(), now, success_cooldown)
@@ -4463,10 +4458,10 @@ fn normalize_task_text(content: &str) -> String {
 }
 
 fn split_description_metadata(value: &str) -> (&str, Option<&str>) {
-    if let Some(start) = value.rfind(" (") {
-        if value.ends_with(')') {
-            return (&value[..start], Some(&value[start + 2..value.len() - 1]));
-        }
+    if let Some(start) = value.rfind(" (")
+        && value.ends_with(')')
+    {
+        return (&value[..start], Some(&value[start + 2..value.len() - 1]));
     }
 
     (value, None)
@@ -5239,7 +5234,7 @@ fn normalize_board_selection_in_board(board_dir: &Path, status: &str, state: &mu
         .unwrap_or(0);
 
     match (selected, task_count) {
-        (Some(idx), 0) if idx == 0 => state.select(None),
+        (Some(0), 0) => state.select(None),
         (Some(idx), count) if idx >= count => state.select(count.checked_sub(1)),
         _ => {}
     }
@@ -5252,7 +5247,7 @@ fn normalize_archive_selection_in_board(board_dir: &Path, state: &mut ListState)
         .unwrap_or(0);
 
     match (selected, task_count) {
-        (Some(idx), 0) if idx == 0 => state.select(None),
+        (Some(0), 0) => state.select(None),
         (Some(idx), count) if idx >= count => state.select(count.checked_sub(1)),
         _ => {}
     }
@@ -5530,10 +5525,10 @@ impl TuiAgentPanel {
 
     fn selected_row(&self) -> Option<TuiAgentPanelRow<'_>> {
         let idx = self.state.selected()?;
-        if let Some(registration) = self.current_project_registration.as_ref() {
-            if idx == 0 {
-                return Some(TuiAgentPanelRow::RegisterCurrentProject(registration));
-            }
+        if let Some(registration) = self.current_project_registration.as_ref()
+            && idx == 0
+        {
+            return Some(TuiAgentPanelRow::RegisterCurrentProject(registration));
         }
 
         self.projects
@@ -7313,6 +7308,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
             }
         })?;
 
+        #[allow(clippy::collapsible_if)]
         if event::poll(std::time::Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 let input_available_width = terminal.size()?.width.saturating_sub(2) as usize;
@@ -7523,7 +7519,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                                 .is_some()
                                             {
                                                 "Register current project before viewing agent output"
-                                                    .to_string()
+                                                .to_string()
                                             } else {
                                                 "No agent output recorded for selected project"
                                                     .to_string()
@@ -9745,7 +9741,7 @@ mod tests {
         };
 
         assert_eq!(
-            format_agent_daemon_runtime_status("installed", &[fresh_cli.clone()], 160),
+            format_agent_daemon_runtime_status("installed", std::slice::from_ref(&fresh_cli), 160,),
             "cli active"
         );
         assert_eq!(
@@ -10565,7 +10561,7 @@ mod tests {
         let fake_codex = root.join("fake-codex");
         fs::write(
             &fake_codex,
-            "#!/bin/sh\nprintf 'stderr: %s %s %s\\n' \"$1\" \"$2\" \"$3\" >&2\nprintf 'NO_TASKS_LEFT\\n'\n",
+            "#!/bin/sh\nprintf 'arg=%s\\n' \"$@\" >&2\nprintf 'NO_TASKS_LEFT\\n'\n",
         )
         .unwrap();
         let mut permissions = fs::metadata(&fake_codex).unwrap().permissions();
@@ -10574,7 +10570,7 @@ mod tests {
 
         let project = agent_store::AgentProject {
             id: 42,
-            path: project_root,
+            path: project_root.clone(),
             name: "Project With Spaces".to_string(),
             enabled: true,
             git_commit_enabled: false,
@@ -10598,11 +10594,11 @@ mod tests {
                 .unwrap()
                 .contains(AGENT_NO_TASKS_LEFT_MARKER)
         );
-        assert!(
-            fs::read_to_string(&result.stderr_path)
-                .unwrap()
-                .contains("exec --sandbox workspace-write")
-        );
+        let stderr = fs::read_to_string(&result.stderr_path).unwrap();
+        assert!(stderr.contains(
+            "arg=--sandbox\narg=danger-full-access\narg=--ask-for-approval\narg=never\narg=exec\narg=-C\n"
+        ));
+        assert!(stderr.contains(&format!("arg={}\n", project_root.display())));
 
         fs::remove_dir_all(root).unwrap();
     }
