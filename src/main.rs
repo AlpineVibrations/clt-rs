@@ -60,6 +60,7 @@ const AGENT_DEFAULT_SUCCESS_COOLDOWN_SECONDS: u64 = 5;
 const AGENT_DAEMON_CHECKIN_STALE_SECONDS: u64 = 45;
 const AGENT_NO_TASKS_LEFT_MARKER: &str = "NO_TASKS_LEFT";
 const TUI_AGENT_PANEL_REFRESH_SECONDS: u64 = 2;
+const TUI_AGENT_LOG_REFRESH_MILLIS: u64 = 500;
 const TUI_AGENT_TABLE_DOING_LAST_RUN_GAP: &str = "   ";
 const TUI_NO_ACTIVE_BOARD_MESSAGE: &str =
     "No active board. Open an initialized registered project from the agent projects pane.";
@@ -3530,6 +3531,57 @@ mod agent_store {
             Ok(runs)
         }
 
+        pub(crate) fn latest_run_for_project_blocking(
+            &self,
+            project_id: i64,
+        ) -> Result<Option<AgentRunRecord>> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(self.latest_run_for_project(project_id))
+        }
+
+        async fn latest_run_for_project(&self, project_id: i64) -> Result<Option<AgentRunRecord>> {
+            let conn = self
+                .db
+                .connect()
+                .context("Failed to connect to agent database")?;
+            let mut rows = conn
+                .query(
+                    "SELECT r.id, r.project_id, p.name, p.path, r.status, r.started_at,
+                            r.finished_at, r.exit_code, r.stdout_path, r.stderr_path, r.summary
+                     FROM runs r
+                     JOIN projects p ON p.id = r.project_id
+                     WHERE r.project_id = ?1
+                     ORDER BY r.id DESC
+                     LIMIT 1",
+                    [project_id],
+                )
+                .await
+                .with_context(|| format!("Failed to find latest run for project {project_id}"))?;
+
+            let Some(row) = rows
+                .next()
+                .await
+                .context("Failed to read latest agent run row")?
+            else {
+                return Ok(None);
+            };
+
+            Ok(Some(AgentRunRecord {
+                id: row_integer(&row, 0, "id")?,
+                project_id: row_integer(&row, 1, "project_id")?,
+                project_name: row_text(&row, 2, "name")?,
+                project_path: PathBuf::from(row_text(&row, 3, "path")?),
+                status: row_text(&row, 4, "status")?,
+                started_at: row_text(&row, 5, "started_at")?,
+                finished_at: row_optional_text(&row, 6, "finished_at")?,
+                exit_code: row_optional_integer(&row, 7, "exit_code")?,
+                stdout_path: row_optional_text(&row, 8, "stdout_path")?,
+                stderr_path: row_optional_text(&row, 9, "stderr_path")?,
+                summary: row_optional_text(&row, 10, "summary")?,
+            }))
+        }
+
         pub(crate) fn record_daemon_checkin_blocking(
             &self,
             holder: &str,
@@ -5379,6 +5431,46 @@ struct TuiAgentPanel {
     last_error: Option<String>,
 }
 
+struct TuiAgentLogView {
+    project_name: String,
+    path: Option<PathBuf>,
+    content: String,
+}
+
+impl TuiAgentLogView {
+    fn new(project_name: String, path: PathBuf) -> Result<Self> {
+        let mut view = Self {
+            project_name,
+            path: Some(path),
+            content: String::new(),
+        };
+        view.refresh()?;
+        Ok(view)
+    }
+
+    fn message(project_name: String, content: String) -> Self {
+        Self {
+            project_name,
+            path: None,
+            content,
+        }
+    }
+
+    fn refresh(&mut self) -> Result<()> {
+        let Some(path) = self.path.as_ref() else {
+            return Ok(());
+        };
+        let bytes =
+            fs::read(path).with_context(|| format!("Failed to read agent output log {path:?}"))?;
+        self.content = if bytes.is_empty() {
+            "Waiting for agent output...".to_string()
+        } else {
+            String::from_utf8_lossy(&bytes).into_owned()
+        };
+        Ok(())
+    }
+}
+
 impl TuiAgentPanel {
     fn new(active_root: &Path) -> Self {
         let mut panel = Self {
@@ -5786,8 +5878,135 @@ fn tui_agent_panel_refresh_interval() -> Duration {
     Duration::from_secs(TUI_AGENT_PANEL_REFRESH_SECONDS)
 }
 
+fn tui_agent_log_refresh_interval() -> Duration {
+    Duration::from_millis(TUI_AGENT_LOG_REFRESH_MILLIS)
+}
+
 fn tui_agent_panel_instructions() -> &'static str {
-    "Up/Down selects, Enter opens board/adds current project, Space toggles ON/OFF or adds current project, g toggles git-commit."
+    "Up/Down selects, Enter opens board/adds current project, Space toggles ON/OFF or adds current project, g toggles git-commit, l shows output log."
+}
+
+fn latest_agent_stdout_path(log_dir: &Path) -> Result<Option<PathBuf>> {
+    if !log_dir.exists() {
+        return Ok(None);
+    }
+
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(log_dir)
+        .with_context(|| format!("Failed to read agent log directory {:?}", log_dir))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_file() && path.extension() == Some(OsStr::new("out")) {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    Ok(paths.pop())
+}
+
+fn selected_tui_agent_log_view(panel: &TuiAgentPanel) -> Result<Option<TuiAgentLogView>> {
+    let state_dir = agent_state_dir()?;
+    selected_tui_agent_log_view_at(panel, &state_dir)
+}
+
+fn selected_tui_agent_log_view_at(
+    panel: &TuiAgentPanel,
+    state_dir: &Path,
+) -> Result<Option<TuiAgentLogView>> {
+    let Some(selected) = panel.selected_project() else {
+        return Ok(None);
+    };
+
+    let live_path = if selected.runtime_state.is_running() {
+        latest_agent_stdout_path(&agent_project_run_log_dir(state_dir, &selected.project)?)?
+    } else {
+        None
+    };
+
+    let path = match live_path {
+        Some(path) => Some(path),
+        None => {
+            let store = open_agent_store_at(state_dir)?;
+            store
+                .latest_run_for_project_blocking(selected.project.id)?
+                .and_then(|run| run.stdout_path.map(PathBuf::from))
+        }
+    };
+
+    path.map(|path| TuiAgentLogView::new(selected.project.name.clone(), path))
+        .transpose()
+}
+
+fn sync_open_tui_agent_log_view(panel: &TuiAgentPanel, log_view: &mut Option<TuiAgentLogView>) {
+    if log_view.is_none() {
+        return;
+    }
+
+    let selected_view =
+        agent_state_dir().and_then(|state_dir| selected_tui_agent_log_view_at(panel, &state_dir));
+    replace_open_tui_agent_log_view(panel, log_view, selected_view);
+}
+
+#[cfg(test)]
+fn sync_open_tui_agent_log_view_at(
+    panel: &TuiAgentPanel,
+    log_view: &mut Option<TuiAgentLogView>,
+    state_dir: &Path,
+) {
+    if log_view.is_none() {
+        return;
+    }
+
+    let selected_view = selected_tui_agent_log_view_at(panel, state_dir);
+    replace_open_tui_agent_log_view(panel, log_view, selected_view);
+}
+
+fn replace_open_tui_agent_log_view(
+    panel: &TuiAgentPanel,
+    log_view: &mut Option<TuiAgentLogView>,
+    selected_view: Result<Option<TuiAgentLogView>>,
+) {
+    let project_name = panel
+        .selected_project()
+        .map(|selected| selected.project.name.clone())
+        .or_else(|| {
+            panel
+                .selected_current_project_registration()
+                .map(|registration| registration.name.clone())
+        })
+        .unwrap_or_else(|| "No Project Selected".to_string());
+
+    *log_view = Some(match selected_view {
+        Ok(Some(view)) => view,
+        Ok(None) => {
+            let content = if panel.selected_current_project_registration().is_some() {
+                "Register this project before viewing agent output".to_string()
+            } else if panel.selected_project().is_some() {
+                "No agent output recorded for selected project".to_string()
+            } else {
+                "No registered project selected".to_string()
+            };
+            TuiAgentLogView::message(project_name, content)
+        }
+        Err(err) => {
+            TuiAgentLogView::message(project_name, format!("Error loading agent output: {err}"))
+        }
+    });
+}
+
+fn tui_feedback_console_height(total_height: u16, agent_log_open: bool) -> u16 {
+    if agent_log_open {
+        (total_height / 2).max(3).min(total_height)
+    } else {
+        3.min(total_height)
+    }
+}
+
+fn tui_log_scroll_offset(content: &str, viewport_height: u16) -> u16 {
+    let line_count = content.lines().count().max(1);
+    let offset = line_count.saturating_sub(viewport_height as usize);
+    offset.min(u16::MAX as usize) as u16
 }
 
 fn format_tui_agent_panel_top_status(
@@ -6579,6 +6798,8 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
     let mut current_pane = start_state.current_pane;
     let mut agent_panel = TuiAgentPanel::new(&active_root);
     let mut last_agent_panel_refresh = Instant::now();
+    let mut agent_log_view: Option<TuiAgentLogView> = None;
+    let mut last_agent_log_refresh = Instant::now();
 
     let mut selected_board = 0; // 0: todo, 1: doing, 2: done
     let mut editing_task_idx: Option<usize> = None;
@@ -6606,7 +6827,16 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
     loop {
         if last_agent_panel_refresh.elapsed() >= tui_agent_panel_refresh_interval() {
             agent_panel.refresh(&active_root);
+            sync_open_tui_agent_log_view(&agent_panel, &mut agent_log_view);
             last_agent_panel_refresh = Instant::now();
+        }
+        if last_agent_log_refresh.elapsed() >= tui_agent_log_refresh_interval() {
+            if let Some(log_view) = agent_log_view.as_mut()
+                && let Err(err) = log_view.refresh()
+            {
+                log_view.content = format!("Error refreshing agent output: {err}");
+            }
+            last_agent_log_refresh = Instant::now();
         }
 
         if !active_board && current_pane == TuiPane::Tasks {
@@ -6633,7 +6863,11 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
             } else {
                 "No Active Board".to_string()
             };
-            let console_title = if current_pane == TuiPane::AgentProjects {
+            let console_title = if let Some(log_view) = agent_log_view.as_ref()
+                && current_pane == TuiPane::AgentProjects
+            {
+                format!("Agent Output: {} (l/Esc closes)", log_view.project_name)
+            } else if current_pane == TuiPane::AgentProjects {
                 "Agent Projects Console".to_string()
             } else if archive_view {
                 format!("{board_title} Archive Console")
@@ -6670,7 +6904,10 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                 .constraints([
                     Constraint::Min(0),
                     Constraint::Length(input_height),
-                    Constraint::Length(3),
+                    Constraint::Length(tui_feedback_console_height(
+                        size.height,
+                        agent_log_view.is_some() && current_pane == TuiPane::AgentProjects,
+                    )),
                 ])
                 .split(size);
 
@@ -6977,16 +7214,25 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                 ));
             }
 
-            let feedback_paragraph = Paragraph::new(feedback_buffer.as_str())
+            let console_content = agent_log_view
+                .as_ref()
+                .filter(|_| current_pane == TuiPane::AgentProjects)
+                .map(|view| view.content.as_str())
+                .unwrap_or(feedback_buffer.as_str());
+            let feedback_area = *main_layout.last().unwrap();
+            let feedback_paragraph = Paragraph::new(console_content)
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
                         .title(console_title.as_str()),
                 )
-                .style(Style::default().fg(Color::Gray));
+                .style(Style::default().fg(Color::Gray))
+                .scroll((
+                    tui_log_scroll_offset(console_content, feedback_area.height.saturating_sub(2)),
+                    0,
+                ));
 
             // The feedback area is always the last element of main_layout
-            let feedback_area = *main_layout.last().unwrap();
             f.render_widget(feedback_paragraph, feedback_area);
 
             if matches!(current_mode, Mode::Help) {
@@ -6995,6 +7241,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                  [Enter]        - Open subtasks, edit selected task, or open selected agent project\n\
                                  [e]            - Edit selected task\n\
                                  [g]            - Toggle git-commit for selected agent project\n\
+                                 [l]            - Toggle selected agent project's output log\n\
                                  [a]            - Toggle archive view\n\
                                  [Backspace]    - Return to parent board\n\
                                  [d/Del]        - Delete selected task\n\
@@ -7012,7 +7259,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
 
                 let area = f.area();
                 let popover_width = area.width.min(70);
-                let popover_height = area.height.min(21);
+                let popover_height = area.height.min(22);
                 let x = area.width.saturating_sub(popover_width) / 2;
                 let y = area.height.saturating_sub(popover_height) / 2;
 
@@ -7063,7 +7310,9 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                         } else if current_pane == TuiPane::AgentProjects {
                             match key.code {
                                 KeyCode::Esc => {
-                                    if active_board {
+                                    if agent_log_view.take().is_some() {
+                                        feedback_buffer = "Closed agent output log".to_string();
+                                    } else if active_board {
                                         current_pane = TuiPane::Tasks;
                                         feedback_buffer = "Task board pane.".to_string();
                                     } else {
@@ -7218,11 +7467,45 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                         Err(e) => feedback_buffer = format!("Error: {}", e),
                                     }
                                 }
+                                KeyCode::Char('l') | KeyCode::Char('L') => {
+                                    if agent_log_view.take().is_some() {
+                                        feedback_buffer = "Closed agent output log".to_string();
+                                        continue;
+                                    }
+
+                                    match selected_tui_agent_log_view(&agent_panel) {
+                                        Ok(Some(log_view)) => {
+                                            feedback_buffer = format!(
+                                                "Showing agent output for {}",
+                                                log_view.project_name
+                                            );
+                                            agent_log_view = Some(log_view);
+                                            last_agent_log_refresh = Instant::now();
+                                        }
+                                        Ok(None) => {
+                                            feedback_buffer = if agent_panel
+                                                .selected_current_project_registration()
+                                                .is_some()
+                                            {
+                                                "Register current project before viewing agent output"
+                                                    .to_string()
+                                            } else {
+                                                "No agent output recorded for selected project"
+                                                    .to_string()
+                                            };
+                                        }
+                                        Err(e) => feedback_buffer = format!("Error: {}", e),
+                                    }
+                                }
                                 KeyCode::Up => {
                                     agent_panel.select_previous();
+                                    sync_open_tui_agent_log_view(&agent_panel, &mut agent_log_view);
+                                    last_agent_log_refresh = Instant::now();
                                 }
                                 KeyCode::Down => {
                                     agent_panel.select_next();
+                                    sync_open_tui_agent_log_view(&agent_panel, &mut agent_log_view);
+                                    last_agent_log_refresh = Instant::now();
                                 }
                                 _ => {
                                     feedback_buffer = tui_agent_panel_instructions().to_string();
@@ -8063,6 +8346,94 @@ mod tests {
         );
         assert!(!tui_agent_panel_instructions().contains("Auto-refreshes"));
         assert!(!tui_agent_panel_instructions().contains("r refresh"));
+        assert!(tui_agent_panel_instructions().contains("l shows output log"));
+    }
+
+    #[test]
+    fn agent_log_console_expands_and_scrolls_to_latest_output() {
+        assert_eq!(tui_feedback_console_height(40, false), 3);
+        assert_eq!(tui_feedback_console_height(40, true), 20);
+        assert_eq!(tui_log_scroll_offset("one\ntwo\nthree\nfour", 2), 2);
+    }
+
+    #[test]
+    fn latest_agent_stdout_path_uses_newest_output_file() {
+        let root = temp_root("agent-latest-stdout");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("100-000-p1-1.out"), "older").unwrap();
+        fs::write(root.join("200-000-p1-1.out"), "newer").unwrap();
+        fs::write(root.join("300-000-p1-1.err"), "ignore stderr").unwrap();
+
+        assert_eq!(
+            latest_agent_stdout_path(&root).unwrap(),
+            Some(root.join("200-000-p1-1.out"))
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn open_agent_log_follows_the_highlighted_project() {
+        let root = temp_root("agent-log-follows-selection");
+        let state_dir = root.join("state/clt");
+        let alpha_root = root.join("alpha");
+        let beta_root = root.join("beta");
+        init_tasks(&alpha_root, false).unwrap();
+        init_tasks(&beta_root, false).unwrap();
+        let alpha_root = fs::canonicalize(alpha_root).unwrap();
+        let beta_root = fs::canonicalize(beta_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&alpha_root, "alpha")
+            .unwrap();
+        store.register_project_blocking(&beta_root, "beta").unwrap();
+
+        let projects = store.list_projects_blocking().unwrap();
+        for project in &projects {
+            let stdout_path = root.join(format!("{}.out", project.name));
+            fs::write(&stdout_path, format!("{} output", project.name)).unwrap();
+            store
+                .record_run_outcome_blocking(agent_store::AgentRunOutcome {
+                    project_id: project.id,
+                    status: "success",
+                    started_at: "100",
+                    finished_at: Some("100"),
+                    exit_code: Some(0),
+                    log_dir: Some(root.to_str().unwrap()),
+                    stdout_path: Some(stdout_path.to_str().unwrap()),
+                    stderr_path: None,
+                    summary: Some("completed"),
+                })
+                .unwrap();
+        }
+
+        let mut panel = TuiAgentPanel {
+            projects: projects
+                .into_iter()
+                .map(|project| TuiAgentProject {
+                    project,
+                    scan: AgentProjectScan::empty(),
+                    runtime_state: TuiAgentRuntimeState::Idle,
+                })
+                .collect(),
+            current_project_registration: None,
+            daemon_status: "not-installed".to_string(),
+            state: ListState::default(),
+            scroll_offset: 0,
+            last_error: None,
+        };
+        panel.state.select(Some(0));
+        let mut log_view = selected_tui_agent_log_view_at(&panel, &state_dir).unwrap();
+
+        panel.select_next();
+        sync_open_tui_agent_log_view_at(&panel, &mut log_view, &state_dir);
+
+        let selected_name = &panel.selected_project().unwrap().project.name;
+        let log_view = log_view.unwrap();
+        assert_eq!(&log_view.project_name, selected_name);
+        assert_eq!(log_view.content, format!("{selected_name} output"));
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -9824,6 +10195,64 @@ mod tests {
         assert_eq!(runs[0].stdout_path.as_deref(), Some("/tmp/logs/run.out"));
         assert_eq!(runs[0].stderr_path.as_deref(), Some("/tmp/logs/run.err"));
         assert_eq!(runs[0].summary.as_deref(), Some("completed"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_store_finds_latest_run_for_selected_project() {
+        let root = temp_root("agent-latest-project-run");
+        let state_dir = root.join("state/clt");
+        let first_root = root.join("first");
+        let second_root = root.join("second");
+        init_tasks(&first_root, false).unwrap();
+        init_tasks(&second_root, false).unwrap();
+        let first_root = fs::canonicalize(first_root).unwrap();
+        let second_root = fs::canonicalize(second_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&first_root, "first")
+            .unwrap();
+        store
+            .register_project_blocking(&second_root, "second")
+            .unwrap();
+        let projects = store.list_projects_blocking().unwrap();
+        let first = projects
+            .iter()
+            .find(|project| project.name == "first")
+            .unwrap();
+        let second = projects
+            .iter()
+            .find(|project| project.name == "second")
+            .unwrap();
+
+        for (project_id, started_at, stdout_path) in [
+            (first.id, "100", "/tmp/first-old.out"),
+            (first.id, "200", "/tmp/first-new.out"),
+            (second.id, "300", "/tmp/second-newest.out"),
+        ] {
+            store
+                .record_run_outcome_blocking(agent_store::AgentRunOutcome {
+                    project_id,
+                    status: "success",
+                    started_at,
+                    finished_at: Some(started_at),
+                    exit_code: Some(0),
+                    log_dir: Some("/tmp"),
+                    stdout_path: Some(stdout_path),
+                    stderr_path: None,
+                    summary: Some("completed"),
+                })
+                .unwrap();
+        }
+
+        let latest = store
+            .latest_run_for_project_blocking(first.id)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(latest.project_id, first.id);
+        assert_eq!(latest.stdout_path.as_deref(), Some("/tmp/first-new.out"));
 
         fs::remove_dir_all(root).unwrap();
     }
