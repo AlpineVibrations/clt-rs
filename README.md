@@ -24,7 +24,7 @@ A file-system-backed task manager written in Rust. `clt` stores work in Markdown
 - **Smart Root Detection**: Automatically finds the git repository root to keep tasks centralized, or uses the current directory.
 - **Agent Registry**: Register many projects, toggle them on or off, inspect `todo`/`doing` counts, toggle per-project git commits, and open any registered task board from the TUI.
 - **Codex Automation**: Run one Codex task at a time per enabled project, either in the foreground or through a background service.
-- **Agent Support Files**: Includes `skill-clt.md` for task-board workflows and `skill-git-commit.md` for safe commit workflows.
+- **Agent Skills**: Includes installable `clt-task-management` and `git-commit` skill folders for task-board and safe commit workflows.
 
 ## Installation
 
@@ -33,6 +33,15 @@ Ensure you have Rust and Cargo installed.
 ```bash
 cargo install clt-rs
 ```
+
+To install the bundled agent skills, clone this repository and copy the skill folders into the `skills` directory inside your home `.agents` directory. From the repository root, run:
+
+```bash
+mkdir -p ~/.agents/skills
+cp -R skills/clt-task-management skills/git-commit ~/.agents/skills/
+```
+
+Each copied folder contains the skill's `SKILL.md` file. Restart your agent after copying the folders so it can discover the new skills.
 
 ## Usage
 
@@ -124,9 +133,12 @@ clt agent git-commit disable ~/code/project-a
 
 When enabled, the scheduler appends a prompt section that tells Codex to use the `$git-commit` skill after completing and verifying a task. The instruction is skipped for projects where the setting is disabled. In the TUI, this setting appears in the `GIT` column.
 
-Agent-facing workflow files are included at the repo root:
-- `skill-clt.md`: task-board workflow guidance for using `clt`.
-- `skill-git-commit.md`: git commit and optional push workflow guidance.
+Agent-facing workflow skills are included in the repository's `skills/` directory:
+
+- `skills/clt-task-management/`: task-board workflow guidance for using `clt`.
+- `skills/git-commit/`: git commit and optional push workflow guidance.
+
+Copy these folders into `~/.agents/skills/` using the commands in [Installation](#installation) before asking Codex to use them.
 
 Run one foreground scheduler pass:
 ```bash
