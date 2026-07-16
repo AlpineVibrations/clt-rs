@@ -5548,6 +5548,26 @@ impl TuiAgentPanel {
         self.state.select(Some(idx));
     }
 
+    fn select_project_for_path(&mut self, path: &Path) {
+        if self
+            .current_project_registration
+            .as_ref()
+            .is_some_and(|registration| registration.path == path)
+        {
+            self.state.select(Some(0));
+            return;
+        }
+
+        if let Some(project_idx) = self
+            .projects
+            .iter()
+            .position(|project| project.project.path == path)
+        {
+            self.state
+                .select(Some(self.project_start_index() + project_idx));
+        }
+    }
+
     fn select_previous(&mut self) {
         let row_count = self.row_count();
         if row_count == 0 {
@@ -7275,6 +7295,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                 current_pane == TuiPane::AgentProjects && !active_board;
                             current_pane = if current_pane == TuiPane::Tasks {
                                 agent_panel.refresh(&active_root);
+                                agent_panel.select_project_for_path(&active_root);
                                 last_agent_panel_refresh = Instant::now();
                                 TuiPane::AgentProjects
                             } else if active_board {
@@ -8323,6 +8344,51 @@ mod tests {
 
         assert_eq!(panel.state.selected(), Some(2));
         assert_eq!(panel.scroll_offset, 0);
+    }
+
+    #[test]
+    fn tui_agent_panel_selects_the_active_project_by_path() {
+        let mut panel = TuiAgentPanel {
+            projects: vec![
+                tui_agent_project_for_test(1, "alpha"),
+                tui_agent_project_for_test(2, "beta"),
+                tui_agent_project_for_test(3, "gamma"),
+            ],
+            current_project_registration: None,
+            daemon_status: "not-installed".to_string(),
+            state: ListState::default(),
+            scroll_offset: 0,
+            last_error: None,
+        };
+        panel.state.select(Some(0));
+        let active_path = panel.projects[2].project.path.clone();
+
+        panel.select_project_for_path(&active_path);
+
+        assert_eq!(panel.state.selected(), Some(2));
+        assert_eq!(panel.selected_project().unwrap().project.name, "gamma");
+    }
+
+    #[test]
+    fn tui_agent_panel_selects_the_current_project_registration_by_path() {
+        let active_path = PathBuf::from("/tmp/current");
+        let mut panel = TuiAgentPanel {
+            projects: vec![tui_agent_project_for_test(1, "alpha")],
+            current_project_registration: Some(TuiCurrentProjectRegistration {
+                path: active_path.clone(),
+                name: "current".to_string(),
+            }),
+            daemon_status: "not-installed".to_string(),
+            state: ListState::default(),
+            scroll_offset: 0,
+            last_error: None,
+        };
+        panel.state.select(Some(1));
+
+        panel.select_project_for_path(&active_path);
+
+        assert_eq!(panel.state.selected(), Some(0));
+        assert!(panel.selected_current_project_registration().is_some());
     }
 
     #[test]
