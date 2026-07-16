@@ -5440,7 +5440,20 @@ impl TuiAgentPanel {
 
     fn refresh(&mut self, active_root: &Path) {
         let selected_row = self.selected_row_identity();
-        match load_tui_agent_panel_snapshot(active_root) {
+        self.apply_refresh_result(
+            active_root,
+            selected_row,
+            load_tui_agent_panel_snapshot(active_root),
+        );
+    }
+
+    fn apply_refresh_result(
+        &mut self,
+        active_root: &Path,
+        selected_row: Option<TuiAgentPanelRowIdentity>,
+        result: Result<TuiAgentPanelSnapshot>,
+    ) {
+        match result {
             Ok(snapshot) => {
                 self.projects = snapshot.projects;
                 self.daemon_status = snapshot.daemon_status;
@@ -5450,12 +5463,7 @@ impl TuiAgentPanel {
                 self.restore_or_normalize_selection(selected_row);
             }
             Err(err) => {
-                self.projects.clear();
-                self.current_project_registration = None;
-                self.daemon_status = "unknown".to_string();
-                self.state.select(None);
-                self.scroll_offset = 0;
-                self.last_error = Some(err.to_string());
+                self.last_error = Some(format!("Agent registry unavailable: {err}"));
             }
         }
     }
@@ -6316,18 +6324,6 @@ fn render_tui_agent_panel(
         return;
     }
 
-    if let Some(error) = panel.last_error.as_deref() {
-        let text = truncate_to_width(
-            &format!("Agent registry unavailable: {error}"),
-            inner_area.width as usize,
-        );
-        f.render_widget(
-            Paragraph::new(text).style(Style::default().fg(Color::Red)),
-            inner_area,
-        );
-        return;
-    }
-
     if row_count == 0 {
         f.render_widget(
             Paragraph::new("No registered projects. Run: clt agent register .")
@@ -6434,6 +6430,24 @@ fn render_tui_agent_panel(
         };
         f.render_widget(Paragraph::new(text).style(style), item_area);
     }
+}
+
+fn tui_console_content<'a>(
+    agent_pane: bool,
+    panel: &'a TuiAgentPanel,
+    log_view: Option<&'a TuiAgentLogView>,
+    feedback: &'a str,
+) -> (&'a str, Color) {
+    if agent_pane {
+        if let Some(error) = panel.last_error.as_deref() {
+            return (error, Color::Red);
+        }
+        if let Some(log_view) = log_view {
+            return (&log_view.content, Color::Gray);
+        }
+    }
+
+    (feedback, Color::Gray)
 }
 
 struct TerminalSession;
@@ -7215,11 +7229,12 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                 ));
             }
 
-            let console_content = agent_log_view
-                .as_ref()
-                .filter(|_| current_pane == TuiPane::AgentProjects)
-                .map(|view| view.content.as_str())
-                .unwrap_or(feedback_buffer.as_str());
+            let (console_content, console_color) = tui_console_content(
+                current_pane == TuiPane::AgentProjects,
+                &agent_panel,
+                agent_log_view.as_ref(),
+                feedback_buffer.as_str(),
+            );
             let feedback_area = *main_layout.last().unwrap();
             let feedback_paragraph = Paragraph::new(console_content)
                 .block(
@@ -7227,7 +7242,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                         .borders(Borders::ALL)
                         .title(console_title.as_str()),
                 )
-                .style(Style::default().fg(Color::Gray))
+                .style(Style::default().fg(console_color))
                 .scroll((
                     tui_log_scroll_offset(console_content, feedback_area.height.saturating_sub(2)),
                     0,
@@ -8344,6 +8359,54 @@ mod tests {
 
         assert_eq!(panel.state.selected(), Some(2));
         assert_eq!(panel.scroll_offset, 0);
+    }
+
+    #[test]
+    fn tui_agent_panel_refresh_error_preserves_the_last_snapshot() {
+        let mut panel = TuiAgentPanel {
+            projects: vec![
+                tui_agent_project_for_test(1, "alpha"),
+                tui_agent_project_for_test(2, "beta"),
+            ],
+            current_project_registration: None,
+            daemon_status: "running".to_string(),
+            state: ListState::default(),
+            scroll_offset: 1,
+            last_error: None,
+        };
+        panel.state.select(Some(1));
+        let selected_row = panel.selected_row_identity();
+        let refresh_error = std::io::Error::other("database locked").into();
+
+        panel.apply_refresh_result(Path::new("/tmp/alpha"), selected_row, Err(refresh_error));
+
+        assert_eq!(panel.projects.len(), 2);
+        assert_eq!(panel.daemon_status, "running");
+        assert_eq!(panel.state.selected(), Some(1));
+        assert_eq!(panel.scroll_offset, 1);
+        assert_eq!(
+            panel.last_error.as_deref(),
+            Some("Agent registry unavailable: database locked")
+        );
+    }
+
+    #[test]
+    fn tui_agent_panel_refresh_error_uses_the_red_console() {
+        let panel = TuiAgentPanel {
+            projects: vec![tui_agent_project_for_test(1, "alpha")],
+            current_project_registration: None,
+            daemon_status: "running".to_string(),
+            state: ListState::default(),
+            scroll_offset: 0,
+            last_error: Some("Agent registry unavailable: database locked".to_string()),
+        };
+        let log_view = TuiAgentLogView::message("alpha".to_string(), "latest log".to_string());
+
+        let (content, color) =
+            tui_console_content(true, &panel, Some(&log_view), "Agent pane instructions");
+
+        assert_eq!(content, "Agent registry unavailable: database locked");
+        assert_eq!(color, Color::Red);
     }
 
     #[test]
