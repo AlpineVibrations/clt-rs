@@ -1,0 +1,1 @@
+on the agent pane a selected project should have a hotkey l for showing the output log of the currently running agent or if not running the last run for that project. it should show it in the console view at the botom and it shold expand the console view and shrink the agent list. l again toggles it off or esc.
