@@ -30,6 +30,8 @@ Use this section while developing the next release.
 
 - Existing folder- or Markdown-backed boards with one or more missing empty status stores are now detected and repaired instead of prompting for initialization.
 - Declining the no-board initialization prompt now opens the TUI in the agent projects pane without creating an active task board.
+- Agent services now resolve `codex` from `PATH` by default instead of pinning a version-manager-specific executable path, while preserving explicit `CLT_AGENT_CODEX_PATH` overrides.
+- `clt agent start` now restarts an existing Linux user service after rewriting its systemd unit so updated environment settings take effect.
 
 ## [0.1.10] - 2026-05-11
 

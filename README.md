@@ -144,8 +144,10 @@ Useful runtime tuning variables are:
 - `CLT_AGENT_LEASE_TIMEOUT_SECONDS`: active lease expiry, default `3600`.
 - `CLT_AGENT_FAILURE_BACKOFF_SECONDS`: delay after a failed project run, default `300`.
 - `CLT_AGENT_SUCCESS_COOLDOWN_SECONDS`: delay after a successful project run, default `5`.
-- `CLT_AGENT_CODEX_PATH`: Codex executable path. `clt agent start` resolves and stores this for the background service so launchd/systemd does not depend on an interactive shell `PATH`.
+- `CLT_AGENT_CODEX_PATH`: optional Codex executable override. By default, `clt agent start` verifies that `codex` works and the background service resolves `codex` from the stored `PATH` instead of pinning the executable's absolute location.
 - `CLT_AGENT_HEARTBEAT_TAIL`: print a short stderr tail on still-running heartbeats when set to `1`, `true`, `yes`, or `on`; default `false`.
+
+If Codex is installed through a version manager such as NVM, make sure the `PATH` used for `clt agent start` contains a stable bin directory. For example, NVM can maintain `~/.nvm/current`; putting `~/.nvm/current/bin` before version-specific directories lets the service continue finding `codex` after switching Node versions. Run `clt agent start` again after changing the service `PATH`; on Linux this reloads and restarts the existing user service.
 
 ### Adding Tasks
 Add a new task to the To Do list:

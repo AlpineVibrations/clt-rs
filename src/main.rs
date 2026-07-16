@@ -147,7 +147,7 @@ enum AgentServiceAction {
 
 #[derive(Clone, Debug)]
 struct AgentServiceEnvironment {
-    codex_path: PathBuf,
+    codex_path_override: Option<PathBuf>,
     path: OsString,
 }
 
@@ -963,11 +963,9 @@ fn manage_systemd_agent(
             )
             .with_context(|| format!("Failed to write systemd unit {:?}", unit_path))?;
 
-            run_service_command("systemctl", &["--user", "daemon-reload"])?;
-            run_service_command(
-                "systemctl",
-                &["--user", "enable", "--now", AGENT_SYSTEMD_UNIT],
-            )?;
+            for args in systemd_start_command_args() {
+                run_service_command("systemctl", args)?;
+            }
             println!(
                 "Started clt agent systemd user service {} ({})",
                 AGENT_SYSTEMD_UNIT,
@@ -1036,6 +1034,14 @@ fn systemd_service_status() -> Result<String> {
     }
 }
 
+fn systemd_start_command_args() -> [&'static [&'static str]; 3] {
+    [
+        &["--user", "daemon-reload"],
+        &["--user", "enable", AGENT_SYSTEMD_UNIT],
+        &["--user", "restart", AGENT_SYSTEMD_UNIT],
+    ]
+}
+
 fn launchd_plist_path(home: &Path) -> PathBuf {
     home.join("Library/LaunchAgents")
         .join(format!("{AGENT_LAUNCHD_LABEL}.plist"))
@@ -1050,7 +1056,17 @@ fn launchd_plist_content(
     let stdout_path = xml_escape(&state_dir_service_log_path(state_dir, "out"));
     let stderr_path = xml_escape(&state_dir_service_log_path(state_dir, "err"));
     let state_dir = xml_escape(&state_dir.display().to_string());
-    let codex_path = xml_escape(&service_env.codex_path.display().to_string());
+    let codex_path_environment = service_env
+        .codex_path_override
+        .as_ref()
+        .map(|codex_path| {
+            let codex_path = xml_escape(&codex_path.display().to_string());
+            format!(
+                "    <key>{AGENT_CODEX_PATH_ENV}</key>\n\
+    <string>{codex_path}</string>\n"
+            )
+        })
+        .unwrap_or_default();
     let path = service_env.path.to_string_lossy();
     let path = xml_escape(path.as_ref());
 
@@ -1073,8 +1089,7 @@ fn launchd_plist_content(
     <string>{state_dir}</string>
     <key>{AGENT_DAEMON_MODE_ENV}</key>
     <string>service</string>
-    <key>{AGENT_CODEX_PATH_ENV}</key>
-    <string>{codex_path}</string>
+{codex_path_environment}\
     <key>PATH</key>
     <string>{path}</string>
   </dict>
@@ -1108,6 +1123,17 @@ fn systemd_unit_content(
     state_dir: &Path,
     service_env: &AgentServiceEnvironment,
 ) -> String {
+    let codex_path_environment = service_env
+        .codex_path_override
+        .as_ref()
+        .map(|codex_path| {
+            format!(
+                "Environment={}\n",
+                systemd_env_assignment(AGENT_CODEX_PATH_ENV, &codex_path.display().to_string())
+            )
+        })
+        .unwrap_or_default();
+
     format!(
         "[Unit]\n\
 Description=CLT Codex agent\n\
@@ -1118,7 +1144,7 @@ Type=simple\n\
 ExecStart={} agent daemon\n\
 Environment={}\n\
 Environment={}\n\
-Environment={}\n\
+{codex_path_environment}\
 Environment={}\n\
 Restart=on-failure\n\
 RestartSec=10\n\
@@ -1128,20 +1154,23 @@ WantedBy=default.target\n",
         systemd_quote_arg(&executable.display().to_string()),
         systemd_env_assignment(AGENT_STATE_DIR_ENV, &state_dir.display().to_string()),
         systemd_env_assignment(AGENT_DAEMON_MODE_ENV, "service"),
-        systemd_env_assignment(
-            AGENT_CODEX_PATH_ENV,
-            &service_env.codex_path.display().to_string()
-        ),
         systemd_env_assignment("PATH", service_env.path.to_string_lossy().as_ref())
     )
 }
 
 fn resolve_agent_service_environment() -> Result<AgentServiceEnvironment> {
     let path = agent_service_path_env();
-    let codex_path = resolve_agent_codex_path_for_service(&path)?;
-    validate_agent_codex_path(&codex_path, &path)?;
+    let codex_path_override =
+        resolve_agent_codex_path_override_for_service(agent_codex_path_env().as_deref(), &path)?;
+    let codex_command = codex_path_override
+        .as_deref()
+        .unwrap_or_else(|| Path::new("codex"));
+    validate_agent_codex_path(codex_command, &path)?;
 
-    Ok(AgentServiceEnvironment { codex_path, path })
+    Ok(AgentServiceEnvironment {
+        codex_path_override,
+        path,
+    })
 }
 
 fn agent_service_path_env() -> OsString {
@@ -1152,25 +1181,28 @@ fn agent_service_path_env() -> OsString {
         })
 }
 
-fn resolve_agent_codex_path_for_service(path_env: &OsStr) -> Result<PathBuf> {
-    if let Some(configured) = agent_codex_path_env() {
+fn resolve_agent_codex_path_override_for_service(
+    configured: Option<&Path>,
+    path_env: &OsStr,
+) -> Result<Option<PathBuf>> {
+    if let Some(configured) = configured {
         let resolved =
-            resolve_agent_command_candidate(&configured, path_env).with_context(|| {
+            resolve_agent_command_candidate(configured, path_env).with_context(|| {
                 format!(
                     "Failed to resolve {}={}",
                     AGENT_CODEX_PATH_ENV,
                     configured.display()
                 )
             })?;
-        return Ok(prefer_packaged_native_codex_binary(&resolved));
+        return Ok(Some(prefer_packaged_native_codex_binary(&resolved)));
     }
 
-    let codex = find_executable_on_path("codex", path_env).ok_or_else(|| {
+    find_executable_on_path("codex", path_env).ok_or_else(|| {
         anyhow::anyhow!(
             "Failed to find `codex` in PATH while installing the agent service. Install the Codex CLI, start the service from a shell where `codex --version` works, or set {AGENT_CODEX_PATH_ENV} to the Codex executable path."
         )
     })?;
-    Ok(prefer_packaged_native_codex_binary(&codex))
+    Ok(None)
 }
 
 fn agent_codex_command() -> PathBuf {
@@ -8744,7 +8776,7 @@ mod tests {
     #[test]
     fn launchd_plist_runs_agent_daemon_with_state_dir() {
         let service_env = AgentServiceEnvironment {
-            codex_path: PathBuf::from("/Users/alex/bin/Codex & Tools/codex"),
+            codex_path_override: None,
             path: OsString::from("/Users/alex/bin:/usr/bin:/bin"),
         };
         let plist = launchd_plist_content(
@@ -8761,8 +8793,7 @@ mod tests {
         assert!(plist.contains("<string>/Users/alex/Library/Application Support/clt</string>"));
         assert!(plist.contains("<key>CLT_AGENT_DAEMON_MODE</key>"));
         assert!(plist.contains("<string>service</string>"));
-        assert!(plist.contains("<key>CLT_AGENT_CODEX_PATH</key>"));
-        assert!(plist.contains("<string>/Users/alex/bin/Codex &amp; Tools/codex</string>"));
+        assert!(!plist.contains("<key>CLT_AGENT_CODEX_PATH</key>"));
         assert!(plist.contains("<key>PATH</key>"));
         assert!(plist.contains("<string>/Users/alex/bin:/usr/bin:/bin</string>"));
         assert!(plist.contains(
@@ -8798,7 +8829,7 @@ mod tests {
     #[test]
     fn systemd_unit_runs_agent_daemon_with_state_dir() {
         let service_env = AgentServiceEnvironment {
-            codex_path: PathBuf::from("/home/alex/bin/codex with spaces"),
+            codex_path_override: None,
             path: OsString::from("/home/alex/bin:/usr/bin:/bin"),
         };
         let unit = systemd_unit_content(
@@ -8811,12 +8842,71 @@ mod tests {
         assert!(unit.contains("ExecStart=\"/home/alex/bin/clt with spaces\" agent daemon"));
         assert!(unit.contains("Environment=\"CLT_AGENT_STATE_DIR=/home/alex/.local/state/clt\""));
         assert!(unit.contains("Environment=\"CLT_AGENT_DAEMON_MODE=service\""));
-        assert!(
-            unit.contains("Environment=\"CLT_AGENT_CODEX_PATH=/home/alex/bin/codex with spaces\"")
-        );
+        assert!(!unit.contains("CLT_AGENT_CODEX_PATH"));
         assert!(unit.contains("Environment=\"PATH=/home/alex/bin:/usr/bin:/bin\""));
         assert!(unit.contains("Restart=on-failure"));
         assert!(unit.contains("WantedBy=default.target"));
+    }
+
+    #[test]
+    fn service_definitions_preserve_explicit_codex_path_overrides() {
+        let launchd_env = AgentServiceEnvironment {
+            codex_path_override: Some(PathBuf::from("/Users/alex/bin/Codex & Tools/codex")),
+            path: OsString::from("/Users/alex/bin:/usr/bin:/bin"),
+        };
+        let plist = launchd_plist_content(
+            Path::new("/Applications/CLT/clt"),
+            Path::new("/Users/alex/Library/Application Support/clt"),
+            &launchd_env,
+        );
+        assert!(plist.contains("<key>CLT_AGENT_CODEX_PATH</key>"));
+        assert!(plist.contains("<string>/Users/alex/bin/Codex &amp; Tools/codex</string>"));
+
+        let systemd_env = AgentServiceEnvironment {
+            codex_path_override: Some(PathBuf::from("/home/alex/bin/codex with spaces")),
+            path: OsString::from("/home/alex/bin:/usr/bin:/bin"),
+        };
+        let unit = systemd_unit_content(
+            Path::new("/home/alex/bin/clt"),
+            Path::new("/home/alex/.local/state/clt"),
+            &systemd_env,
+        );
+        assert!(
+            unit.contains("Environment=\"CLT_AGENT_CODEX_PATH=/home/alex/bin/codex with spaces\"")
+        );
+    }
+
+    #[test]
+    fn systemd_start_restarts_service_after_reloading_unit() {
+        assert_eq!(
+            systemd_start_command_args(),
+            [
+                &["--user", "daemon-reload"][..],
+                &["--user", "enable", "clt-agent.service"][..],
+                &["--user", "restart", "clt-agent.service"][..],
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_service_codex_command_is_left_for_path_lookup() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_root("agent-codex-path-lookup");
+        fs::create_dir_all(&root).unwrap();
+        let codex = root.join("codex");
+        fs::write(&codex, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = fs::metadata(&codex).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&codex, permissions).unwrap();
+
+        let resolved =
+            resolve_agent_codex_path_override_for_service(None, root.as_os_str()).unwrap();
+
+        assert_eq!(resolved, None);
+        validate_agent_codex_path(Path::new("codex"), root.as_os_str()).unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
