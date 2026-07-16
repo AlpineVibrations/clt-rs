@@ -1,0 +1,3 @@
+a 5 second turso timeout was just added check the lateset done task. this seams crazy is that a 5 secon pause? or this is jsut for testing?
+
+Completion note: COMPLETED 2026-07-16: Confirmed Turso's five-second busy timeout is not an unconditional pause or a test-only setting. Uncontended statements run immediately; only statements that encounter database contention sleep and retry, up to five accumulated seconds before returning busy. Added an explanatory source comment. Checks: `cargo fmt -- --check`; `cargo test agent_daemon_loop_repeats_passes_and_respects_success_cooldown -- --test-threads=1`; `cargo test -- --test-threads=1` (121 passed); `git diff --check`.

@@ -3030,6 +3030,8 @@ mod agent_store {
     use super::*;
     use turso::{Builder, Connection, Database, Value, params};
 
+    // This is a contention ceiling, not a delay for every query: Turso only
+    // sleeps and retries while a statement reports that the database is busy.
     const AGENT_DB_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
     struct AgentMigration {
