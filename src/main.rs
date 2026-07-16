@@ -1673,7 +1673,7 @@ async fn run_agent_daemon_loop_async(
             return Ok(());
         }
 
-        if !scheduling_stopped {
+        if !scheduling_stopped && active_passes.is_empty() {
             let task_state_dir = state_dir.clone();
             let active_project_ids = active_runs.iter().map(|run| run.project_id).collect();
             let task_daemon_checkin = daemon_checkin.clone();
@@ -3030,6 +3030,8 @@ mod agent_store {
     use super::*;
     use turso::{Builder, Connection, Database, Value, params};
 
+    const AGENT_DB_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
     struct AgentMigration {
         version: i64,
         statements: &'static [&'static str],
@@ -3180,10 +3182,20 @@ mod agent_store {
             let conn = db
                 .connect()
                 .with_context(|| format!("Failed to connect to agent database {:?}", db_path))?;
+            configure_agent_connection(&conn)?;
 
             apply_migrations(&conn).await?;
 
             Ok(Self { db_path, db })
+        }
+
+        fn connect(&self) -> Result<Connection> {
+            let conn = self
+                .db
+                .connect()
+                .context("Failed to connect to agent database")?;
+            configure_agent_connection(&conn)?;
+            Ok(conn)
         }
 
         pub(crate) fn register_project_blocking(
@@ -3197,10 +3209,7 @@ mod agent_store {
         }
 
         async fn register_project(&self, project_root: &Path, name: &str) -> Result<bool> {
-            let conn = self
-                .db
-                .connect()
-                .context("Failed to connect to agent database")?;
+            let conn = self.connect()?;
             let path = project_root.display().to_string();
             let exists = query_count(
                 &conn,
@@ -3239,10 +3248,7 @@ mod agent_store {
         }
 
         async fn unregister_project(&self, project_root: &Path) -> Result<bool> {
-            let conn = self
-                .db
-                .connect()
-                .context("Failed to connect to agent database")?;
+            let conn = self.connect()?;
             let path = project_root.display().to_string();
             let removed = conn
                 .execute("DELETE FROM projects WHERE path = ?1", [path.as_str()])
@@ -3259,10 +3265,7 @@ mod agent_store {
         }
 
         async fn list_projects(&self) -> Result<Vec<AgentProject>> {
-            let conn = self
-                .db
-                .connect()
-                .context("Failed to connect to agent database")?;
+            let conn = self.connect()?;
             let mut rows = conn
                 .query(
                     "SELECT id, path, name, enabled, git_commit_enabled, last_scan_at, last_run_at,
@@ -3315,10 +3318,7 @@ mod agent_store {
         }
 
         async fn record_project_scan(&self, project_id: i64) -> Result<String> {
-            let conn = self
-                .db
-                .connect()
-                .context("Failed to connect to agent database")?;
+            let conn = self.connect()?;
             let scanned_at = agent_timestamp();
 
             conn.execute(
@@ -3352,10 +3352,7 @@ mod agent_store {
             acquired_at: &str,
             expires_at: &str,
         ) -> Result<bool> {
-            let conn = self
-                .db
-                .connect()
-                .context("Failed to connect to agent database")?;
+            let conn = self.connect()?;
 
             conn.execute(
                 "DELETE FROM leases WHERE project_id = ?1 AND expires_at <= ?2",
@@ -3383,10 +3380,7 @@ mod agent_store {
         }
 
         async fn release_lease(&self, project_id: i64, holder: &str) -> Result<bool> {
-            let conn = self
-                .db
-                .connect()
-                .context("Failed to connect to agent database")?;
+            let conn = self.connect()?;
             let removed = conn
                 .execute(
                     "DELETE FROM leases WHERE project_id = ?1 AND holder = ?2",
@@ -3408,10 +3402,7 @@ mod agent_store {
         }
 
         async fn list_active_leases(&self, now: &str) -> Result<Vec<AgentLeaseRecord>> {
-            let conn = self
-                .db
-                .connect()
-                .context("Failed to connect to agent database")?;
+            let conn = self.connect()?;
             let mut rows = conn
                 .query(
                     "SELECT l.project_id, p.name, p.path, l.holder, l.acquired_at, l.expires_at
@@ -3449,10 +3440,7 @@ mod agent_store {
         }
 
         async fn record_run_outcome(&self, outcome: AgentRunOutcome<'_>) -> Result<i64> {
-            let conn = self
-                .db
-                .connect()
-                .context("Failed to connect to agent database")?;
+            let conn = self.connect()?;
 
             conn.execute(
                 "INSERT INTO runs (
@@ -3488,10 +3476,7 @@ mod agent_store {
         }
 
         async fn list_recent_runs(&self, limit: i64) -> Result<Vec<AgentRunRecord>> {
-            let conn = self
-                .db
-                .connect()
-                .context("Failed to connect to agent database")?;
+            let conn = self.connect()?;
             let mut rows = conn
                 .query(
                     "SELECT r.id, r.project_id, p.name, p.path, r.status, r.started_at,
@@ -3535,10 +3520,7 @@ mod agent_store {
         }
 
         async fn latest_run_for_project(&self, project_id: i64) -> Result<Option<AgentRunRecord>> {
-            let conn = self
-                .db
-                .connect()
-                .context("Failed to connect to agent database")?;
+            let conn = self.connect()?;
             let mut rows = conn
                 .query(
                     "SELECT r.id, r.project_id, p.name, p.path, r.status, r.started_at,
@@ -3603,10 +3585,7 @@ mod agent_store {
             checked_in_at: &str,
             expires_at: &str,
         ) -> Result<()> {
-            let conn = self
-                .db
-                .connect()
-                .context("Failed to connect to agent database")?;
+            let conn = self.connect()?;
 
             conn.execute(
                 "INSERT INTO daemon_checkins (holder, mode, started_at, checked_in_at, expires_at)
@@ -3631,10 +3610,7 @@ mod agent_store {
         }
 
         async fn clear_daemon_checkin(&self, holder: &str) -> Result<bool> {
-            let conn = self
-                .db
-                .connect()
-                .context("Failed to connect to agent database")?;
+            let conn = self.connect()?;
             let removed = conn
                 .execute("DELETE FROM daemon_checkins WHERE holder = ?1", [holder])
                 .await
@@ -3650,10 +3626,7 @@ mod agent_store {
         }
 
         async fn list_daemon_checkins(&self) -> Result<Vec<AgentDaemonCheckin>> {
-            let conn = self
-                .db
-                .connect()
-                .context("Failed to connect to agent database")?;
+            let conn = self.connect()?;
             let mut rows = conn
                 .query(
                     "SELECT holder, mode, started_at, checked_in_at, expires_at
@@ -3692,10 +3665,7 @@ mod agent_store {
         }
 
         async fn clean_agent_history(&self, cleaned_at: &str) -> Result<AgentCleanSummary> {
-            let conn = self
-                .db
-                .connect()
-                .context("Failed to connect to agent database")?;
+            let conn = self.connect()?;
 
             let projects_reset = conn
                 .execute(
@@ -3745,10 +3715,7 @@ mod agent_store {
 
         #[cfg(test)]
         async fn table_exists(&self, table_name: &str) -> Result<bool> {
-            let conn = self
-                .db
-                .connect()
-                .context("Failed to connect to agent database")?;
+            let conn = self.connect()?;
             let count = query_count(
                 &conn,
                 "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = ?1",
@@ -3764,10 +3731,7 @@ mod agent_store {
             tokio::runtime::Runtime::new()
                 .context("Failed to create async runtime for agent store")?
                 .block_on(async {
-                    let conn = self
-                        .db
-                        .connect()
-                        .context("Failed to connect to agent database")?;
+                    let conn = self.connect()?;
                     query_count(&conn, "SELECT COUNT(*) FROM runs", ()).await
                 })
         }
@@ -3777,10 +3741,7 @@ mod agent_store {
             tokio::runtime::Runtime::new()
                 .context("Failed to create async runtime for agent store")?
                 .block_on(async {
-                    let conn = self
-                        .db
-                        .connect()
-                        .context("Failed to connect to agent database")?;
+                    let conn = self.connect()?;
                     query_count(&conn, "SELECT COUNT(*) FROM leases", ()).await
                 })
         }
@@ -3796,10 +3757,7 @@ mod agent_store {
         }
 
         async fn set_project_enabled(&self, project_id: i64, enabled: bool) -> Result<bool> {
-            let conn = self
-                .db
-                .connect()
-                .context("Failed to connect to agent database")?;
+            let conn = self.connect()?;
             let changed = conn
                 .execute(
                     "UPDATE projects SET enabled = ?1, updated_at = ?2 WHERE id = ?3",
@@ -3830,10 +3788,7 @@ mod agent_store {
             project_root: &Path,
             enabled: bool,
         ) -> Result<bool> {
-            let conn = self
-                .db
-                .connect()
-                .context("Failed to connect to agent database")?;
+            let conn = self.connect()?;
             let path = project_root.display().to_string();
             let changed = conn
                 .execute(
@@ -3865,10 +3820,7 @@ mod agent_store {
             project_id: i64,
             enabled: bool,
         ) -> Result<bool> {
-            let conn = self
-                .db
-                .connect()
-                .context("Failed to connect to agent database")?;
+            let conn = self.connect()?;
             let changed = conn
                 .execute(
                     "UPDATE projects SET git_commit_enabled = ?1, updated_at = ?2 WHERE id = ?3",
@@ -3901,10 +3853,7 @@ mod agent_store {
             project_root: &Path,
             enabled: bool,
         ) -> Result<bool> {
-            let conn = self
-                .db
-                .connect()
-                .context("Failed to connect to agent database")?;
+            let conn = self.connect()?;
             let path = project_root.display().to_string();
             let changed = conn
                 .execute(
@@ -3920,6 +3869,11 @@ mod agent_store {
 
             Ok(changed > 0)
         }
+    }
+
+    fn configure_agent_connection(conn: &Connection) -> Result<()> {
+        conn.busy_timeout(AGENT_DB_BUSY_TIMEOUT)
+            .context("Failed to configure agent database busy timeout")
     }
 
     async fn update_project_after_run(
@@ -9826,13 +9780,7 @@ mod tests {
         drop(store);
 
         let daemon_runner: Arc<dyn AgentRunner> = runner.clone();
-        run_agent_daemon_loop(
-            &state_dir,
-            daemon_runner,
-            Duration::from_millis(25),
-            Some(2),
-        )
-        .unwrap();
+        run_agent_daemon_loop(&state_dir, daemon_runner, Duration::ZERO, Some(2)).unwrap();
         let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
 
         assert_eq!(store.run_count_blocking().unwrap(), 1);
