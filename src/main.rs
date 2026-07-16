@@ -5896,7 +5896,7 @@ fn tui_agent_log_title(log_view: &TuiAgentLogView) -> String {
     )
 }
 
-fn latest_agent_stdout_path(log_dir: &Path) -> Result<Option<PathBuf>> {
+fn latest_agent_log_path(log_dir: &Path, extension: &str) -> Result<Option<PathBuf>> {
     if !log_dir.exists() {
         return Ok(None);
     }
@@ -5907,12 +5907,26 @@ fn latest_agent_stdout_path(log_dir: &Path) -> Result<Option<PathBuf>> {
     {
         let entry = entry?;
         let path = entry.path();
-        if entry.file_type()?.is_file() && path.extension() == Some(OsStr::new("out")) {
+        if entry.file_type()?.is_file() && path.extension() == Some(OsStr::new(extension)) {
             paths.push(path);
         }
     }
     paths.sort();
     Ok(paths.pop())
+}
+
+fn preferred_recorded_agent_output_path(run: agent_store::AgentRunRecord) -> Option<PathBuf> {
+    let stdout_path = run.stdout_path.map(PathBuf::from);
+    let stdout_has_output = stdout_path
+        .as_ref()
+        .and_then(|path| fs::metadata(path).ok())
+        .is_some_and(|metadata| metadata.len() > 0);
+
+    if stdout_has_output {
+        stdout_path
+    } else {
+        run.stderr_path.map(PathBuf::from).or(stdout_path)
+    }
 }
 
 fn selected_tui_agent_log_view(panel: &TuiAgentPanel) -> Result<Option<TuiAgentLogView>> {
@@ -5929,7 +5943,10 @@ fn selected_tui_agent_log_view_at(
     };
 
     let live_path = if selected.runtime_state.is_running() {
-        latest_agent_stdout_path(&agent_project_run_log_dir(state_dir, &selected.project)?)?
+        latest_agent_log_path(
+            &agent_project_run_log_dir(state_dir, &selected.project)?,
+            "err",
+        )?
     } else {
         None
     };
@@ -5941,7 +5958,7 @@ fn selected_tui_agent_log_view_at(
             (
                 store
                     .latest_run_for_project_blocking(selected.project.id)?
-                    .and_then(|run| run.stdout_path.map(PathBuf::from)),
+                    .and_then(preferred_recorded_agent_output_path),
                 false,
             )
         }
@@ -8375,17 +8392,48 @@ mod tests {
     }
 
     #[test]
-    fn latest_agent_stdout_path_uses_newest_output_file() {
-        let root = temp_root("agent-latest-stdout");
+    fn latest_agent_log_path_uses_newest_file_with_requested_extension() {
+        let root = temp_root("agent-latest-log");
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("100-000-p1-1.out"), "older").unwrap();
         fs::write(root.join("200-000-p1-1.out"), "newer").unwrap();
-        fs::write(root.join("300-000-p1-1.err"), "ignore stderr").unwrap();
+        fs::write(root.join("300-000-p1-1.err"), "latest progress").unwrap();
 
         assert_eq!(
-            latest_agent_stdout_path(&root).unwrap(),
+            latest_agent_log_path(&root, "out").unwrap(),
             Some(root.join("200-000-p1-1.out"))
         );
+        assert_eq!(
+            latest_agent_log_path(&root, "err").unwrap(),
+            Some(root.join("300-000-p1-1.err"))
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recorded_agent_output_falls_back_to_stderr_when_stdout_is_empty() {
+        let root = temp_root("agent-recorded-output-fallback");
+        fs::create_dir_all(&root).unwrap();
+        let stdout_path = root.join("run.out");
+        let stderr_path = root.join("run.err");
+        fs::write(&stdout_path, "").unwrap();
+        fs::write(&stderr_path, "agent progress").unwrap();
+        let run = agent_store::AgentRunRecord {
+            id: 1,
+            project_id: 1,
+            project_name: "alpha".to_string(),
+            project_path: root.clone(),
+            status: "success".to_string(),
+            started_at: "100".to_string(),
+            finished_at: Some("101".to_string()),
+            exit_code: Some(0),
+            stdout_path: Some(stdout_path.display().to_string()),
+            stderr_path: Some(stderr_path.display().to_string()),
+            summary: Some("completed".to_string()),
+        };
+
+        assert_eq!(preferred_recorded_agent_output_path(run), Some(stderr_path));
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -8399,7 +8447,9 @@ mod tests {
         let log_dir = agent_project_run_log_dir(&state_dir, &project.project).unwrap();
         fs::create_dir_all(&log_dir).unwrap();
         let stdout_path = log_dir.join("200-000-p1-1.out");
-        fs::write(&stdout_path, "started\n").unwrap();
+        let stderr_path = log_dir.join("200-000-p1-1.err");
+        fs::write(&stdout_path, "").unwrap();
+        fs::write(&stderr_path, "started\n").unwrap();
 
         let mut panel = TuiAgentPanel {
             projects: vec![project],
@@ -8418,7 +8468,7 @@ mod tests {
         assert!(tui_agent_log_title(&log_view).contains("[LIVE]"));
         assert_eq!(log_view.content, "started\n");
 
-        append_agent_log_line(&stdout_path, "still working").unwrap();
+        append_agent_log_line(&stderr_path, "still working").unwrap();
         log_view.refresh().unwrap();
         assert!(log_view.content.contains("still working"));
 
