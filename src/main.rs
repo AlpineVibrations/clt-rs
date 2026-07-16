@@ -1090,8 +1090,7 @@ fn launchd_plist_content(
     <string>{state_dir}</string>
     <key>{AGENT_DAEMON_MODE_ENV}</key>
     <string>service</string>
-{codex_path_environment}\
-    <key>PATH</key>
+{codex_path_environment}    <key>PATH</key>
     <string>{path}</string>
   </dict>
   <key>RunAtLoad</key>
@@ -9219,6 +9218,7 @@ mod tests {
         assert!(plist.contains("<key>CLT_AGENT_DAEMON_MODE</key>"));
         assert!(plist.contains("<string>service</string>"));
         assert!(!plist.contains("<key>CLT_AGENT_CODEX_PATH</key>"));
+        assert!(!plist.lines().any(|line| line.trim() == "\\"));
         assert!(plist.contains("<key>PATH</key>"));
         assert!(plist.contains("<string>/Users/alex/bin:/usr/bin:/bin</string>"));
         assert!(plist.contains(
