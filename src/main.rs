@@ -5435,14 +5435,16 @@ struct TuiAgentLogView {
     project_name: String,
     path: Option<PathBuf>,
     content: String,
+    is_live: bool,
 }
 
 impl TuiAgentLogView {
-    fn new(project_name: String, path: PathBuf) -> Result<Self> {
+    fn new(project_name: String, path: PathBuf, is_live: bool) -> Result<Self> {
         let mut view = Self {
             project_name,
             path: Some(path),
             content: String::new(),
+            is_live,
         };
         view.refresh()?;
         Ok(view)
@@ -5453,6 +5455,7 @@ impl TuiAgentLogView {
             project_name,
             path: None,
             content,
+            is_live: false,
         }
     }
 
@@ -5883,7 +5886,15 @@ fn tui_agent_log_refresh_interval() -> Duration {
 }
 
 fn tui_agent_panel_instructions() -> &'static str {
-    "Up/Down selects, Enter opens board/adds current project, Space toggles ON/OFF or adds current project, g toggles git-commit, l shows output log."
+    "Up/Down selects, Enter opens board/adds current project, Space toggles ON/OFF or adds current project, g toggles git-commit, l shows live/current output log."
+}
+
+fn tui_agent_log_title(log_view: &TuiAgentLogView) -> String {
+    let status = if log_view.is_live { "LIVE" } else { "LATEST" };
+    format!(
+        "Agent Output [{status}]: {} (l/Esc closes)",
+        log_view.project_name
+    )
 }
 
 fn latest_agent_stdout_path(log_dir: &Path) -> Result<Option<PathBuf>> {
@@ -5924,17 +5935,20 @@ fn selected_tui_agent_log_view_at(
         None
     };
 
-    let path = match live_path {
-        Some(path) => Some(path),
+    let (path, is_live) = match live_path {
+        Some(path) => (Some(path), true),
         None => {
             let store = open_agent_store_at(state_dir)?;
-            store
-                .latest_run_for_project_blocking(selected.project.id)?
-                .and_then(|run| run.stdout_path.map(PathBuf::from))
+            (
+                store
+                    .latest_run_for_project_blocking(selected.project.id)?
+                    .and_then(|run| run.stdout_path.map(PathBuf::from)),
+                false,
+            )
         }
     };
 
-    path.map(|path| TuiAgentLogView::new(selected.project.name.clone(), path))
+    path.map(|path| TuiAgentLogView::new(selected.project.name.clone(), path, is_live))
         .transpose()
 }
 
@@ -6866,7 +6880,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
             let console_title = if let Some(log_view) = agent_log_view.as_ref()
                 && current_pane == TuiPane::AgentProjects
             {
-                format!("Agent Output: {} (l/Esc closes)", log_view.project_name)
+                tui_agent_log_title(log_view)
             } else if current_pane == TuiPane::AgentProjects {
                 "Agent Projects Console".to_string()
             } else if archive_view {
@@ -7241,7 +7255,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                  [Enter]        - Open subtasks, edit selected task, or open selected agent project\n\
                                  [e]            - Edit selected task\n\
                                  [g]            - Toggle git-commit for selected agent project\n\
-                                 [l]            - Toggle selected agent project's output log\n\
+                                 [l]            - Toggle selected agent project's live/current output log\n\
                                  [a]            - Toggle archive view\n\
                                  [Backspace]    - Return to parent board\n\
                                  [d/Del]        - Delete selected task\n\
@@ -7475,8 +7489,13 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
 
                                     match selected_tui_agent_log_view(&agent_panel) {
                                         Ok(Some(log_view)) => {
+                                            let output_kind = if log_view.is_live {
+                                                "live agent output"
+                                            } else {
+                                                "latest agent output"
+                                            };
                                             feedback_buffer = format!(
-                                                "Showing agent output for {}",
+                                                "Showing {output_kind} for {}",
                                                 log_view.project_name
                                             );
                                             agent_log_view = Some(log_view);
@@ -8346,7 +8365,7 @@ mod tests {
         );
         assert!(!tui_agent_panel_instructions().contains("Auto-refreshes"));
         assert!(!tui_agent_panel_instructions().contains("r refresh"));
-        assert!(tui_agent_panel_instructions().contains("l shows output log"));
+        assert!(tui_agent_panel_instructions().contains("l shows live/current output log"));
     }
 
     #[test]
@@ -8368,6 +8387,41 @@ mod tests {
             latest_agent_stdout_path(&root).unwrap(),
             Some(root.join("200-000-p1-1.out"))
         );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn running_agent_log_view_streams_the_current_output_file() {
+        let root = temp_root("agent-live-output");
+        let state_dir = root.join("state/clt");
+        let mut project = tui_agent_project_for_test(1, "alpha");
+        project.runtime_state = TuiAgentRuntimeState::Running;
+        let log_dir = agent_project_run_log_dir(&state_dir, &project.project).unwrap();
+        fs::create_dir_all(&log_dir).unwrap();
+        let stdout_path = log_dir.join("200-000-p1-1.out");
+        fs::write(&stdout_path, "started\n").unwrap();
+
+        let mut panel = TuiAgentPanel {
+            projects: vec![project],
+            current_project_registration: None,
+            daemon_status: "running".to_string(),
+            state: ListState::default(),
+            scroll_offset: 0,
+            last_error: None,
+        };
+        panel.state.select(Some(0));
+
+        let mut log_view = selected_tui_agent_log_view_at(&panel, &state_dir)
+            .unwrap()
+            .unwrap();
+        assert!(log_view.is_live);
+        assert!(tui_agent_log_title(&log_view).contains("[LIVE]"));
+        assert_eq!(log_view.content, "started\n");
+
+        append_agent_log_line(&stdout_path, "still working").unwrap();
+        log_view.refresh().unwrap();
+        assert!(log_view.content.contains("still working"));
 
         fs::remove_dir_all(root).unwrap();
     }
