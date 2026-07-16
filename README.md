@@ -70,6 +70,37 @@ clt init --folders
 clt agent register
 ```
 
+#### Linux Codex sandbox setup
+
+Codex uses Bubblewrap (`bwrap`) to sandbox commands on Linux. Install the distribution package before starting the agent:
+
+```bash
+# Ubuntu or Debian
+sudo apt install bubblewrap
+
+# Fedora
+sudo dnf install bubblewrap
+```
+
+Ubuntu 24.04 may also restrict the unprivileged user namespace that Bubblewrap needs. If Codex reports `bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted`, install and load the Bubblewrap-specific AppArmor profile:
+
+```bash
+sudo apt install apparmor-profiles apparmor-utils
+sudo install -m 0644 \
+  /usr/share/apparmor/extra-profiles/bwrap-userns-restrict \
+  /etc/apparmor.d/bwrap-userns-restrict
+sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
+```
+
+Verify the sandbox before starting the background agent:
+
+```bash
+codex sandbox -- /bin/true
+echo $?
+```
+
+The sandbox command should produce no output and exit with status `0`. Prefer the AppArmor profile over disabling `kernel.apparmor_restrict_unprivileged_userns` globally. See the [Codex sandbox documentation](https://learn.chatgpt.com/docs/sandboxing) for platform prerequisites and container-specific guidance.
+
 Register more projects by passing their paths:
 ```bash
 clt agent register ~/code/project-a
