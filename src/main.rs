@@ -59,6 +59,14 @@ const AGENT_DEFAULT_RUN_TIMEOUT_SECONDS: u64 = 45 * 60;
 const AGENT_DEFAULT_SUCCESS_COOLDOWN_SECONDS: u64 = 5;
 const AGENT_DAEMON_CHECKIN_STALE_SECONDS: u64 = 45;
 const AGENT_NO_TASKS_LEFT_MARKER: &str = "NO_TASKS_LEFT";
+const AGENT_CODEX_MODELS: [&str; 5] = [
+    "",
+    "gpt-5.6",
+    "gpt-5.6-terra",
+    "gpt-5.4",
+    "gpt-5.3-codex-spark",
+];
+const AGENT_CODEX_REASONING_EFFORTS: [&str; 5] = ["", "low", "medium", "high", "xhigh"];
 const TUI_AGENT_PANEL_REFRESH_SECONDS: u64 = 2;
 const TUI_AGENT_LOG_REFRESH_MILLIS: u64 = 500;
 const TUI_AGENT_TABLE_DOING_LAST_RUN_GAP: &str = "   ";
@@ -770,6 +778,19 @@ fn format_agent_project_summary(
             format_optional_agent_timestamp(project.last_failure_at.as_deref())
         ),
         format!("   settings  git commit: {}", git_commit),
+        format!(
+            "             model: {}  reasoning: {}  fast: {}",
+            project.codex_model.as_deref().unwrap_or("default"),
+            project
+                .codex_reasoning_effort
+                .as_deref()
+                .unwrap_or("default"),
+            if project.codex_fast_enabled {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        ),
         format!("   health    failures: {}", project.failure_count),
         format!("   path      {}", project.path.display()),
     ]);
@@ -2359,7 +2380,25 @@ impl AgentRunner for CodexAgentRunner {
             .arg("--sandbox")
             .arg("danger-full-access")
             .arg("--ask-for-approval")
-            .arg("never")
+            .arg("never");
+        if let Some(model) = project.codex_model.as_deref() {
+            command.arg("--model").arg(model);
+        }
+        if let Some(reasoning_effort) = project.codex_reasoning_effort.as_deref() {
+            command
+                .arg("--config")
+                .arg(format!("model_reasoning_effort=\"{reasoning_effort}\""));
+        }
+        if project.codex_fast_enabled {
+            command
+                .arg("--enable")
+                .arg("fast_mode")
+                .arg("--config")
+                .arg("service_tier=\"fast\"");
+        } else {
+            command.arg("--disable").arg("fast_mode");
+        }
+        command
             .arg("exec")
             .arg("-C")
             .arg(&project.path)
@@ -3096,6 +3135,14 @@ mod agent_store {
                 "ALTER TABLE projects ADD COLUMN git_commit_enabled INTEGER NOT NULL DEFAULT 0",
             ],
         },
+        AgentMigration {
+            version: 4,
+            statements: &[
+                "ALTER TABLE projects ADD COLUMN codex_model TEXT",
+                "ALTER TABLE projects ADD COLUMN codex_reasoning_effort TEXT",
+                "ALTER TABLE projects ADD COLUMN codex_fast_enabled INTEGER NOT NULL DEFAULT 0",
+            ],
+        },
     ];
 
     pub(crate) struct TursoAgentStore {
@@ -3111,6 +3158,9 @@ mod agent_store {
         pub(crate) name: String,
         pub(crate) enabled: bool,
         pub(crate) git_commit_enabled: bool,
+        pub(crate) codex_model: Option<String>,
+        pub(crate) codex_reasoning_effort: Option<String>,
+        pub(crate) codex_fast_enabled: bool,
         pub(crate) last_scan_at: Option<String>,
         pub(crate) last_run_at: Option<String>,
         pub(crate) last_success_at: Option<String>,
@@ -3270,7 +3320,8 @@ mod agent_store {
             let conn = self.connect()?;
             let mut rows = conn
                 .query(
-                    "SELECT id, path, name, enabled, git_commit_enabled, last_scan_at, last_run_at,
+                    "SELECT id, path, name, enabled, git_commit_enabled, codex_model,
+                            codex_reasoning_effort, codex_fast_enabled, last_scan_at, last_run_at,
                             last_success_at, last_failure_at, failure_count
                      FROM projects
                      ORDER BY name COLLATE NOCASE, path COLLATE NOCASE",
@@ -3290,11 +3341,14 @@ mod agent_store {
                 let name = row_text(&row, 2, "name")?;
                 let enabled = row_integer(&row, 3, "enabled")? != 0;
                 let git_commit_enabled = row_integer(&row, 4, "git_commit_enabled")? != 0;
-                let last_scan_at = row_optional_text(&row, 5, "last_scan_at")?;
-                let last_run_at = row_optional_text(&row, 6, "last_run_at")?;
-                let last_success_at = row_optional_text(&row, 7, "last_success_at")?;
-                let last_failure_at = row_optional_text(&row, 8, "last_failure_at")?;
-                let failure_count = row_integer(&row, 9, "failure_count")?;
+                let codex_model = row_optional_text(&row, 5, "codex_model")?;
+                let codex_reasoning_effort = row_optional_text(&row, 6, "codex_reasoning_effort")?;
+                let codex_fast_enabled = row_integer(&row, 7, "codex_fast_enabled")? != 0;
+                let last_scan_at = row_optional_text(&row, 8, "last_scan_at")?;
+                let last_run_at = row_optional_text(&row, 9, "last_run_at")?;
+                let last_success_at = row_optional_text(&row, 10, "last_success_at")?;
+                let last_failure_at = row_optional_text(&row, 11, "last_failure_at")?;
+                let failure_count = row_integer(&row, 12, "failure_count")?;
 
                 projects.push(AgentProject {
                     id,
@@ -3302,6 +3356,9 @@ mod agent_store {
                     name,
                     enabled,
                     git_commit_enabled,
+                    codex_model,
+                    codex_reasoning_effort,
+                    codex_fast_enabled,
                     last_scan_at,
                     last_run_at,
                     last_success_at,
@@ -3868,6 +3925,53 @@ mod agent_store {
                 )
                 .await
                 .with_context(|| format!("Failed to set project {} git-commit state", path))?;
+
+            Ok(changed > 0)
+        }
+
+        pub(crate) fn set_project_codex_settings_blocking(
+            &self,
+            project_id: i64,
+            model: Option<&str>,
+            reasoning_effort: Option<&str>,
+            fast_enabled: bool,
+        ) -> Result<bool> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(self.set_project_codex_settings(
+                    project_id,
+                    model,
+                    reasoning_effort,
+                    fast_enabled,
+                ))
+        }
+
+        async fn set_project_codex_settings(
+            &self,
+            project_id: i64,
+            model: Option<&str>,
+            reasoning_effort: Option<&str>,
+            fast_enabled: bool,
+        ) -> Result<bool> {
+            let conn = self.connect()?;
+            let changed = conn
+                .execute(
+                    "UPDATE projects
+                     SET codex_model = ?1,
+                         codex_reasoning_effort = ?2,
+                         codex_fast_enabled = ?3,
+                         updated_at = ?4
+                     WHERE id = ?5",
+                    params![
+                        model,
+                        reasoning_effort,
+                        if fast_enabled { 1_i64 } else { 0_i64 },
+                        agent_timestamp(),
+                        project_id
+                    ],
+                )
+                .await
+                .with_context(|| format!("Failed to set project {} Codex settings", project_id))?;
 
             Ok(changed > 0)
         }
@@ -5318,7 +5422,7 @@ fn tui_start_state(active_board: bool) -> TuiStartState {
             active_board,
             current_pane: TuiPane::Tasks,
             feedback_buffer: String::from(
-                "Kanban View! Tab switches to the agent projects pane, Enter opens a selected project there, Space toggles it ON/OFF, g toggles git-commit, Backspace returns to parent, Space creates a task on the board, 'a' opens archive view, Shift+Arrows or I/K reorder, Shift+Arrows or J/L move tasks, 'd' deletes, 'q' quits.",
+                "Kanban View! Tab switches to the agent projects pane, Enter opens a selected project there, Space toggles it ON/OFF, g toggles git-commit, m/f/t change its Codex model/fast/thinking settings, Backspace returns to parent, Space creates a task on the board, 'a' opens archive view, Shift+Arrows or I/K reorder, Shift+Arrows or J/L move tasks, 'd' deletes, 'q' quits.",
             ),
         }
     } else {
@@ -5855,6 +5959,124 @@ fn toggle_selected_tui_agent_project_git_commit(
     }
 }
 
+fn next_agent_codex_setting(current: Option<&str>, choices: &[&str]) -> Option<String> {
+    let current_idx = choices
+        .iter()
+        .position(|choice| Some(*choice) == current)
+        .unwrap_or(0);
+    let next = choices[(current_idx + 1) % choices.len()];
+    (!next.is_empty()).then(|| next.to_string())
+}
+
+fn update_selected_tui_agent_codex_settings(
+    panel: &mut TuiAgentPanel,
+    active_root: &Path,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+    fast_enabled: bool,
+) -> Result<bool> {
+    let Some(project_id) = panel.selected_project().map(|entry| entry.project.id) else {
+        return Ok(false);
+    };
+
+    let store = open_agent_store()?;
+    let changed = store.set_project_codex_settings_blocking(
+        project_id,
+        model.as_deref(),
+        reasoning_effort.as_deref(),
+        fast_enabled,
+    )?;
+    panel.refresh(active_root);
+    Ok(changed)
+}
+
+fn cycle_selected_tui_agent_codex_model(
+    panel: &mut TuiAgentPanel,
+    active_root: &Path,
+) -> Result<String> {
+    let Some(project) = panel.selected_project().map(|entry| entry.project.clone()) else {
+        return Ok("No registered project selected".to_string());
+    };
+    let model = next_agent_codex_setting(project.codex_model.as_deref(), &AGENT_CODEX_MODELS);
+    let label = model.as_deref().unwrap_or("default").to_string();
+    let changed = update_selected_tui_agent_codex_settings(
+        panel,
+        active_root,
+        model,
+        project.codex_reasoning_effort,
+        project.codex_fast_enabled,
+    )?;
+
+    if changed {
+        Ok(format!("Codex model for {}: {}", project.name, label))
+    } else {
+        Ok(format!(
+            "Project is no longer registered: {}",
+            project.path.display()
+        ))
+    }
+}
+
+fn cycle_selected_tui_agent_codex_reasoning(
+    panel: &mut TuiAgentPanel,
+    active_root: &Path,
+) -> Result<String> {
+    let Some(project) = panel.selected_project().map(|entry| entry.project.clone()) else {
+        return Ok("No registered project selected".to_string());
+    };
+    let reasoning = next_agent_codex_setting(
+        project.codex_reasoning_effort.as_deref(),
+        &AGENT_CODEX_REASONING_EFFORTS,
+    );
+    let label = reasoning.as_deref().unwrap_or("default").to_string();
+    let changed = update_selected_tui_agent_codex_settings(
+        panel,
+        active_root,
+        project.codex_model,
+        reasoning,
+        project.codex_fast_enabled,
+    )?;
+
+    if changed {
+        Ok(format!("Codex thinking for {}: {}", project.name, label))
+    } else {
+        Ok(format!(
+            "Project is no longer registered: {}",
+            project.path.display()
+        ))
+    }
+}
+
+fn toggle_selected_tui_agent_codex_fast(
+    panel: &mut TuiAgentPanel,
+    active_root: &Path,
+) -> Result<String> {
+    let Some(project) = panel.selected_project().map(|entry| entry.project.clone()) else {
+        return Ok("No registered project selected".to_string());
+    };
+    let fast_enabled = !project.codex_fast_enabled;
+    let changed = update_selected_tui_agent_codex_settings(
+        panel,
+        active_root,
+        project.codex_model,
+        project.codex_reasoning_effort,
+        fast_enabled,
+    )?;
+
+    if changed {
+        Ok(format!(
+            "Codex fast mode for {}: {}",
+            project.name,
+            if fast_enabled { "ON" } else { "OFF" }
+        ))
+    } else {
+        Ok(format!(
+            "Project is no longer registered: {}",
+            project.path.display()
+        ))
+    }
+}
+
 fn tui_agent_panel_refresh_interval() -> Duration {
     Duration::from_secs(TUI_AGENT_PANEL_REFRESH_SECONDS)
 }
@@ -5864,7 +6086,7 @@ fn tui_agent_log_refresh_interval() -> Duration {
 }
 
 fn tui_agent_panel_instructions() -> &'static str {
-    "Up/Down selects, Enter opens board/adds current project, Space toggles ON/OFF or adds current project, g toggles git-commit, l shows live/current output log."
+    "Up/Down selects, Enter opens/adds, Space toggles ON/OFF, g toggles git-commit, m cycles model, f toggles fast, t cycles thinking, l shows output."
 }
 
 fn tui_agent_log_title(log_view: &TuiAgentLogView) -> String {
@@ -6086,24 +6308,36 @@ fn format_agent_project_table_row(
     } else {
         "OFF"
     };
+    let fast = if item.project.codex_fast_enabled {
+        "ON"
+    } else {
+        "OFF"
+    };
+    let model = item.project.codex_model.as_deref().unwrap_or("default");
+    let thinking = item
+        .project
+        .codex_reasoning_effort
+        .as_deref()
+        .unwrap_or("default");
     let todo = item.scan.todo_count.to_string();
     let doing = item.scan.doing_count.to_string();
     let last_run = format_agent_table_last_run(&item.project);
 
-    if width < 80 {
+    if width < 120 {
         return truncate_to_width(
             &format!(
-                "{} {} {} {} {} {} {} {}{}{}",
+                "{} {} {} {} {} {} {} {} {} {} {}",
                 fit_cell(marker, 1),
                 fit_cell_right(&(idx + 1).to_string(), 3),
                 fit_cell(state, 6),
                 fit_cell(git, 4),
+                fit_cell(fast, 5),
+                fit_cell(model, 15),
+                fit_cell(thinking, 8),
                 fit_cell(runtime_state, 7),
-                fit_cell(&item.project.name, 22),
+                fit_cell(&item.project.name, 12),
                 fit_cell_right(&todo, 4),
-                fit_cell_right(&doing, 5),
-                TUI_AGENT_TABLE_DOING_LAST_RUN_GAP,
-                fit_cell(&last_run, 11)
+                fit_cell_right(&doing, 5)
             ),
             width,
         );
@@ -6114,15 +6348,21 @@ fn format_agent_project_table_row(
     let state_width = 6;
     let runtime_width = 7;
     let git_width = 4;
+    let fast_width = 5;
+    let model_width = 16;
+    let thinking_width = 8;
     let todo_width = 4;
     let doing_width = 5;
     let last_run_width = 11;
-    let gap_count = 8 + TUI_AGENT_TABLE_DOING_LAST_RUN_GAP.len();
+    let gap_count = 11 + TUI_AGENT_TABLE_DOING_LAST_RUN_GAP.len();
     let fixed_width = number_width
         + marker_width
         + state_width
         + runtime_width
         + git_width
+        + fast_width
+        + model_width
+        + thinking_width
         + todo_width
         + doing_width
         + last_run_width
@@ -6133,11 +6373,14 @@ fn format_agent_project_table_row(
 
     truncate_to_width(
         &format!(
-            "{} {} {} {} {} {} {} {}{}{} {}",
+            "{} {} {} {} {} {} {} {} {} {} {}{}{} {}",
             fit_cell(marker, marker_width),
             fit_cell_right(&(idx + 1).to_string(), number_width),
             fit_cell(state, state_width),
             fit_cell(git, git_width),
+            fit_cell(fast, fast_width),
+            fit_cell(model, model_width),
+            fit_cell(thinking, thinking_width),
             fit_cell(runtime_state, runtime_width),
             fit_cell(&item.project.name, project_width),
             fit_cell_right(&todo, todo_width),
@@ -6154,20 +6397,21 @@ fn format_current_project_registration_row(
     registration: &TuiCurrentProjectRegistration,
     width: usize,
 ) -> String {
-    if width < 80 {
+    if width < 120 {
         return truncate_to_width(
             &format!(
-                "{} {} {} {} {} {} {} {}{}{}",
+                "{} {} {} {} {} {} {} {} {} {} {}",
                 fit_cell("+", 1),
                 fit_cell_right("", 3),
                 fit_cell("ADD", 6),
                 fit_cell("-", 4),
+                fit_cell("-", 5),
+                fit_cell("Enter/Space", 15),
+                fit_cell("-", 8),
                 fit_cell("-", 7),
-                fit_cell(&registration.name, 22),
+                fit_cell(&registration.name, 12),
                 fit_cell_right("-", 4),
-                fit_cell_right("-", 5),
-                TUI_AGENT_TABLE_DOING_LAST_RUN_GAP,
-                fit_cell("Enter/Space", 11)
+                fit_cell_right("-", 5)
             ),
             width,
         );
@@ -6178,15 +6422,21 @@ fn format_current_project_registration_row(
     let state_width = 6;
     let runtime_width = 7;
     let git_width = 4;
+    let fast_width = 5;
+    let model_width = 16;
+    let thinking_width = 8;
     let todo_width = 4;
     let doing_width = 5;
     let last_run_width = 11;
-    let gap_count = 8 + TUI_AGENT_TABLE_DOING_LAST_RUN_GAP.len();
+    let gap_count = 11 + TUI_AGENT_TABLE_DOING_LAST_RUN_GAP.len();
     let fixed_width = number_width
         + marker_width
         + state_width
         + runtime_width
         + git_width
+        + fast_width
+        + model_width
+        + thinking_width
         + todo_width
         + doing_width
         + last_run_width
@@ -6197,11 +6447,14 @@ fn format_current_project_registration_row(
 
     truncate_to_width(
         &format!(
-            "{} {} {} {} {} {} {} {}{}{} {}",
+            "{} {} {} {} {} {} {} {} {} {} {}{}{} {}",
             fit_cell("+", marker_width),
             fit_cell_right("", number_width),
             fit_cell("ADD", state_width),
             fit_cell("-", git_width),
+            fit_cell("-", fast_width),
+            fit_cell("Enter/Space", model_width),
+            fit_cell("-", thinking_width),
             fit_cell("-", runtime_width),
             fit_cell(&registration.name, project_width),
             fit_cell_right("-", todo_width),
@@ -6215,20 +6468,21 @@ fn format_current_project_registration_row(
 }
 
 fn format_agent_project_table_header(width: usize) -> String {
-    if width < 80 {
+    if width < 120 {
         return truncate_to_width(
             &format!(
-                "{} {} {} {} {} {} {} {}{}{}",
+                "{} {} {} {} {} {} {} {} {} {} {}",
                 fit_cell("", 1),
                 fit_cell_right("#", 3),
                 fit_cell("STATUS", 6),
                 fit_cell("GIT", 4),
+                fit_cell("FAST", 5),
+                fit_cell("MODEL", 15),
+                fit_cell("THINK", 8),
                 fit_cell("AGENT", 7),
-                fit_cell("PROJECT", 22),
+                fit_cell("PROJECT", 12),
                 fit_cell_right("TODO", 4),
-                fit_cell_right("DOING", 5),
-                TUI_AGENT_TABLE_DOING_LAST_RUN_GAP,
-                fit_cell("LAST RUN", 11)
+                fit_cell_right("DOING", 5)
             ),
             width,
         );
@@ -6239,15 +6493,21 @@ fn format_agent_project_table_header(width: usize) -> String {
     let state_width = 6;
     let runtime_width = 7;
     let git_width = 4;
+    let fast_width = 5;
+    let model_width = 16;
+    let thinking_width = 8;
     let todo_width = 4;
     let doing_width = 5;
     let last_run_width = 11;
-    let gap_count = 8 + TUI_AGENT_TABLE_DOING_LAST_RUN_GAP.len();
+    let gap_count = 11 + TUI_AGENT_TABLE_DOING_LAST_RUN_GAP.len();
     let fixed_width = number_width
         + marker_width
         + state_width
         + runtime_width
         + git_width
+        + fast_width
+        + model_width
+        + thinking_width
         + todo_width
         + doing_width
         + last_run_width
@@ -6258,11 +6518,14 @@ fn format_agent_project_table_header(width: usize) -> String {
 
     truncate_to_width(
         &format!(
-            "{} {} {} {} {} {} {} {}{}{} {}",
+            "{} {} {} {} {} {} {} {} {} {} {}{}{} {}",
             fit_cell("", marker_width),
             fit_cell_right("#", number_width),
             fit_cell("STATUS", state_width),
             fit_cell("GIT", git_width),
+            fit_cell("FAST", fast_width),
+            fit_cell("MODEL", model_width),
+            fit_cell("THINK", thinking_width),
             fit_cell("AGENT", runtime_width),
             fit_cell("PROJECT", project_width),
             fit_cell_right("TODO", todo_width),
@@ -7485,6 +7748,72 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                         Err(e) => feedback_buffer = format!("Error: {}", e),
                                     }
                                 }
+                                KeyCode::Char('m') | KeyCode::Char('M') => {
+                                    if agent_panel
+                                        .selected_current_project_registration()
+                                        .is_some()
+                                    {
+                                        feedback_buffer =
+                                            "Register current project before changing its Codex model"
+                                                .to_string();
+                                        continue;
+                                    }
+
+                                    match cycle_selected_tui_agent_codex_model(
+                                        &mut agent_panel,
+                                        &active_root,
+                                    ) {
+                                        Ok(message) => {
+                                            last_agent_panel_refresh = Instant::now();
+                                            feedback_buffer = message;
+                                        }
+                                        Err(e) => feedback_buffer = format!("Error: {}", e),
+                                    }
+                                }
+                                KeyCode::Char('f') | KeyCode::Char('F') => {
+                                    if agent_panel
+                                        .selected_current_project_registration()
+                                        .is_some()
+                                    {
+                                        feedback_buffer =
+                                            "Register current project before changing Codex fast mode"
+                                                .to_string();
+                                        continue;
+                                    }
+
+                                    match toggle_selected_tui_agent_codex_fast(
+                                        &mut agent_panel,
+                                        &active_root,
+                                    ) {
+                                        Ok(message) => {
+                                            last_agent_panel_refresh = Instant::now();
+                                            feedback_buffer = message;
+                                        }
+                                        Err(e) => feedback_buffer = format!("Error: {}", e),
+                                    }
+                                }
+                                KeyCode::Char('t') | KeyCode::Char('T') => {
+                                    if agent_panel
+                                        .selected_current_project_registration()
+                                        .is_some()
+                                    {
+                                        feedback_buffer =
+                                            "Register current project before changing Codex thinking"
+                                                .to_string();
+                                        continue;
+                                    }
+
+                                    match cycle_selected_tui_agent_codex_reasoning(
+                                        &mut agent_panel,
+                                        &active_root,
+                                    ) {
+                                        Ok(message) => {
+                                            last_agent_panel_refresh = Instant::now();
+                                            feedback_buffer = message;
+                                        }
+                                        Err(e) => feedback_buffer = format!("Error: {}", e),
+                                    }
+                                }
                                 KeyCode::Char('l') | KeyCode::Char('L') => {
                                     if agent_log_view.take().is_some() {
                                         feedback_buffer = "Closed agent output log".to_string();
@@ -8327,6 +8656,9 @@ mod tests {
                 name: name.to_string(),
                 enabled: true,
                 git_commit_enabled: false,
+                codex_model: None,
+                codex_reasoning_effort: None,
+                codex_fast_enabled: false,
                 last_scan_at: None,
                 last_run_at: None,
                 last_success_at: None,
@@ -8462,7 +8794,10 @@ mod tests {
         );
         assert!(!tui_agent_panel_instructions().contains("Auto-refreshes"));
         assert!(!tui_agent_panel_instructions().contains("r refresh"));
-        assert!(tui_agent_panel_instructions().contains("l shows live/current output log"));
+        assert!(tui_agent_panel_instructions().contains("m cycles model"));
+        assert!(tui_agent_panel_instructions().contains("f toggles fast"));
+        assert!(tui_agent_panel_instructions().contains("t cycles thinking"));
+        assert!(tui_agent_panel_instructions().contains("l shows output"));
     }
 
     #[test]
@@ -8711,24 +9046,47 @@ mod tests {
     }
 
     #[test]
-    fn agent_project_table_pads_doing_before_last_run() {
+    fn agent_project_table_shows_codex_settings() {
         let mut project = tui_agent_project_for_test(1, "alpha");
         project.scan = AgentProjectScan::pending_with_doing(12, 3);
         project.runtime_state = TuiAgentRuntimeState::Running;
+        project.project.codex_model = Some("gpt-5.6-terra".to_string());
+        project.project.codex_reasoning_effort = Some("high".to_string());
+        project.project.codex_fast_enabled = true;
 
-        let compact_header = format_agent_project_table_header(79);
-        let compact_row = format_agent_project_table_row(0, &project, 79, false);
-        let wide_header = format_agent_project_table_header(100);
-        let wide_row = format_agent_project_table_row(0, &project, 100, false);
+        let compact_header = format_agent_project_table_header(100);
+        let compact_row = format_agent_project_table_row(0, &project, 100, false);
+        let wide_header = format_agent_project_table_header(160);
+        let wide_row = format_agent_project_table_row(0, &project, 160, false);
 
-        assert!(compact_header.find("GIT").unwrap() < compact_header.find("AGENT").unwrap());
-        assert!(compact_row.find("OFF").unwrap() < compact_row.find("RUNNING").unwrap());
-        assert!(wide_header.find("GIT").unwrap() < wide_header.find("AGENT").unwrap());
-        assert!(wide_row.find("OFF").unwrap() < wide_row.find("RUNNING").unwrap());
-        assert!(compact_header.contains("DOING   LAST RUN"));
+        for header in [&compact_header, &wide_header] {
+            assert!(header.find("GIT").unwrap() < header.find("FAST").unwrap());
+            assert!(header.find("FAST").unwrap() < header.find("MODEL").unwrap());
+            assert!(header.find("MODEL").unwrap() < header.find("THINK").unwrap());
+        }
+        for row in [&compact_row, &wide_row] {
+            assert!(row.contains("gpt-5.6-terra"));
+            assert!(row.contains("high"));
+            assert!(row.contains("RUNNING"));
+        }
         assert!(wide_header.contains("DOING   LAST RUN"));
-        assert!(compact_row.contains("    3   -"));
         assert!(wide_row.contains("    3   -"));
+    }
+
+    #[test]
+    fn codex_setting_cycles_return_to_project_defaults() {
+        let mut model = None;
+        for _ in 0..AGENT_CODEX_MODELS.len() {
+            model = next_agent_codex_setting(model.as_deref(), &AGENT_CODEX_MODELS);
+        }
+        assert_eq!(model, None);
+
+        let mut reasoning = None;
+        for _ in 0..AGENT_CODEX_REASONING_EFFORTS.len() {
+            reasoning =
+                next_agent_codex_setting(reasoning.as_deref(), &AGENT_CODEX_REASONING_EFFORTS);
+        }
+        assert_eq!(reasoning, None);
     }
 
     #[test]
@@ -9150,6 +9508,9 @@ mod tests {
             name: "demo-project".to_string(),
             enabled: true,
             git_commit_enabled: false,
+            codex_model: None,
+            codex_reasoning_effort: None,
+            codex_fast_enabled: false,
             last_scan_at: None,
             last_run_at: Some("last-run".to_string()),
             last_success_at: Some("last-success".to_string()),
@@ -9168,6 +9529,7 @@ mod tests {
             "             success:   last-success",
             "             failure:   -",
             "   settings  git commit: disabled",
+            "             model: default  reasoning: default  fast: disabled",
             "   health    failures: 3",
             "   path      /tmp/demo-project",
         ]
@@ -9285,6 +9647,9 @@ mod tests {
             name: "project".to_string(),
             enabled: true,
             git_commit_enabled: false,
+            codex_model: None,
+            codex_reasoning_effort: None,
+            codex_fast_enabled: false,
             last_scan_at: None,
             last_run_at: None,
             last_success_at: Some("100".to_string()),
@@ -9677,6 +10042,41 @@ mod tests {
         );
         let project = store.list_projects_blocking().unwrap().remove(0);
         assert!(!project.git_commit_enabled);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_store_persists_per_project_codex_settings() {
+        let root = temp_root("agent-codex-settings");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert_eq!(project.codex_model, None);
+        assert_eq!(project.codex_reasoning_effort, None);
+        assert!(!project.codex_fast_enabled);
+
+        assert!(
+            store
+                .set_project_codex_settings_blocking(
+                    project.id,
+                    Some("gpt-5.6-terra"),
+                    Some("high"),
+                    true,
+                )
+                .unwrap()
+        );
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert_eq!(project.codex_model.as_deref(), Some("gpt-5.6-terra"));
+        assert_eq!(project.codex_reasoning_effort.as_deref(), Some("high"));
+        assert!(project.codex_fast_enabled);
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -10554,6 +10954,9 @@ mod tests {
             name: "project".to_string(),
             enabled: true,
             git_commit_enabled: false,
+            codex_model: None,
+            codex_reasoning_effort: None,
+            codex_fast_enabled: false,
             last_scan_at: None,
             last_run_at: None,
             last_success_at: None,
@@ -10653,6 +11056,9 @@ mod tests {
             name: "Project With Spaces".to_string(),
             enabled: true,
             git_commit_enabled: false,
+            codex_model: Some("gpt-5.6-terra".to_string()),
+            codex_reasoning_effort: Some("high".to_string()),
+            codex_fast_enabled: true,
             last_scan_at: None,
             last_run_at: None,
             last_success_at: None,
@@ -10675,7 +11081,7 @@ mod tests {
         );
         let stderr = fs::read_to_string(&result.stderr_path).unwrap();
         assert!(stderr.contains(
-            "arg=--sandbox\narg=danger-full-access\narg=--ask-for-approval\narg=never\narg=exec\narg=-C\n"
+            "arg=--sandbox\narg=danger-full-access\narg=--ask-for-approval\narg=never\narg=--model\narg=gpt-5.6-terra\narg=--config\narg=model_reasoning_effort=\"high\"\narg=--enable\narg=fast_mode\narg=--config\narg=service_tier=\"fast\"\narg=exec\narg=-C\n"
         ));
         assert!(stderr.contains(&format!("arg={}\n", project_root.display())));
 
@@ -10693,7 +11099,11 @@ mod tests {
         fs::create_dir_all(&project_root).unwrap();
 
         let fake_codex = root.join("fake-codex");
-        fs::write(&fake_codex, "#!/bin/sh\nprintf 'started\\n'\nsleep 10\n").unwrap();
+        fs::write(
+            &fake_codex,
+            "#!/bin/sh\nprintf 'arg=%s\\n' \"$@\" >&2\nprintf 'started\\n'\nsleep 10\n",
+        )
+        .unwrap();
         let mut permissions = fs::metadata(&fake_codex).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&fake_codex, permissions).unwrap();
@@ -10704,6 +11114,9 @@ mod tests {
             name: "Shutdown Project".to_string(),
             enabled: true,
             git_commit_enabled: false,
+            codex_model: None,
+            codex_reasoning_effort: None,
+            codex_fast_enabled: false,
             last_scan_at: None,
             last_run_at: None,
             last_success_at: None,
@@ -10722,11 +11135,9 @@ mod tests {
         let result = runner.run_project(&project, &shutdown).unwrap();
 
         assert_eq!(result.status, "interrupted");
-        assert!(
-            fs::read_to_string(&result.stderr_path)
-                .unwrap()
-                .contains("agent is shutting down")
-        );
+        let stderr = fs::read_to_string(&result.stderr_path).unwrap();
+        assert!(stderr.contains("arg=--disable\narg=fast_mode\narg=exec\n"));
+        assert!(stderr.contains("agent is shutting down"));
 
         fs::remove_dir_all(root).unwrap();
     }

@@ -70,6 +70,8 @@ Press `Enter` to open a folder task with subtasks, `e` to edit the selected task
 
 Press `Tab` to switch to the full-screen agent projects pane. There, Up/Down selects a registered project, `Enter` opens that project's task board, `Space` toggles the project `ON` or `OFF`, and `g` toggles the `GIT` column, which controls whether that project's agent prompt asks Codex to use the `git-commit` skill after a completed task. The currently open project is marked with `*`, and the terminal title updates to the active project.
 
+Each registered project also has persisted Codex launch settings in the `FAST`, `MODEL`, and `THINK` columns. Press `f` to toggle Fast mode, `m` to cycle through the default and supported model choices, and `t` to cycle through the default, low, medium, high, and extra-high reasoning levels. A `default` model or thinking value inherits the user's Codex configuration. These settings are applied to future automated runs; they do not change an agent process that is already running.
+
 ### Codex Agent
 `clt agent` can run Codex against enabled registered projects that have pending `todo` tasks. Each project keeps its own repo-local `tasks/` board, while the agent stores cross-project runtime state in one central state directory.
 
