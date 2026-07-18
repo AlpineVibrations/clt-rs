@@ -70,6 +70,9 @@ const AGENT_CODEX_REASONING_EFFORTS: [&str; 5] = ["", "low", "medium", "high", "
 const TUI_AGENT_PANEL_REFRESH_SECONDS: u64 = 2;
 const TUI_AGENT_LOG_REFRESH_MILLIS: u64 = 500;
 const TUI_AGENT_TABLE_DOING_LAST_RUN_GAP: &str = "   ";
+const TUI_AGENT_TABLE_FAST_WIDTH: usize = 4;
+const TUI_AGENT_TABLE_MODEL_WIDTH: usize = 11;
+const TUI_AGENT_TABLE_THINKING_WIDTH: usize = 5;
 const TUI_NO_ACTIVE_BOARD_MESSAGE: &str =
     "No active board. Open an initialized registered project from the agent projects pane.";
 const AGENT_LAUNCHD_LABEL: &str = "com.alpinevibrations.clt.agent";
@@ -6226,12 +6229,28 @@ fn replace_open_tui_agent_log_view(
     });
 }
 
-fn tui_feedback_console_height(total_height: u16, agent_log_open: bool) -> u16 {
+fn tui_feedback_console_height(
+    total_height: u16,
+    total_width: u16,
+    content: &str,
+    agent_log_open: bool,
+) -> u16 {
+    let minimum_height = 3.min(total_height);
+    let maximum_height = (total_height / 2).max(minimum_height).min(total_height);
     if agent_log_open {
-        (total_height / 2).max(3).min(total_height)
-    } else {
-        3.min(total_height)
+        return maximum_height;
     }
+
+    let content_width = total_width.saturating_sub(2) as usize;
+    let content_height = wrap_input_text(content, content_width)
+        .lines()
+        .count()
+        .max(1)
+        .min(u16::MAX as usize) as u16;
+    content_height
+        .saturating_add(2)
+        .max(minimum_height)
+        .min(maximum_height)
 }
 
 fn tui_log_scroll_offset(content: &str, viewport_height: u16) -> u16 {
@@ -6294,6 +6313,22 @@ fn active_board_marker(is_current_board: bool) -> &'static str {
     if is_current_board { "*" } else { "" }
 }
 
+fn compact_agent_model_setting(model: Option<&str>) -> String {
+    let model = model.unwrap_or("default");
+    model
+        .strip_prefix("gpt-")
+        .unwrap_or(model)
+        .replace("-codex", "")
+}
+
+fn compact_agent_thinking_setting(thinking: Option<&str>) -> &str {
+    match thinking {
+        None => "def",
+        Some("medium") => "med",
+        Some(value) => value,
+    }
+}
+
 fn format_agent_project_table_row(
     idx: usize,
     item: &TuiAgentProject,
@@ -6313,12 +6348,8 @@ fn format_agent_project_table_row(
     } else {
         "OFF"
     };
-    let model = item.project.codex_model.as_deref().unwrap_or("default");
-    let thinking = item
-        .project
-        .codex_reasoning_effort
-        .as_deref()
-        .unwrap_or("default");
+    let model = compact_agent_model_setting(item.project.codex_model.as_deref());
+    let thinking = compact_agent_thinking_setting(item.project.codex_reasoning_effort.as_deref());
     let todo = item.scan.todo_count.to_string();
     let doing = item.scan.doing_count.to_string();
     let last_run = format_agent_table_last_run(&item.project);
@@ -6331,11 +6362,11 @@ fn format_agent_project_table_row(
                 fit_cell_right(&(idx + 1).to_string(), 3),
                 fit_cell(state, 6),
                 fit_cell(git, 4),
-                fit_cell(fast, 5),
-                fit_cell(model, 15),
-                fit_cell(thinking, 8),
                 fit_cell(runtime_state, 7),
                 fit_cell(&item.project.name, 12),
+                fit_cell(fast, TUI_AGENT_TABLE_FAST_WIDTH),
+                fit_cell(&model, TUI_AGENT_TABLE_MODEL_WIDTH),
+                fit_cell(thinking, TUI_AGENT_TABLE_THINKING_WIDTH),
                 fit_cell_right(&todo, 4),
                 fit_cell_right(&doing, 5)
             ),
@@ -6348,9 +6379,9 @@ fn format_agent_project_table_row(
     let state_width = 6;
     let runtime_width = 7;
     let git_width = 4;
-    let fast_width = 5;
-    let model_width = 16;
-    let thinking_width = 8;
+    let fast_width = TUI_AGENT_TABLE_FAST_WIDTH;
+    let model_width = TUI_AGENT_TABLE_MODEL_WIDTH;
+    let thinking_width = TUI_AGENT_TABLE_THINKING_WIDTH;
     let todo_width = 4;
     let doing_width = 5;
     let last_run_width = 11;
@@ -6378,11 +6409,11 @@ fn format_agent_project_table_row(
             fit_cell_right(&(idx + 1).to_string(), number_width),
             fit_cell(state, state_width),
             fit_cell(git, git_width),
-            fit_cell(fast, fast_width),
-            fit_cell(model, model_width),
-            fit_cell(thinking, thinking_width),
             fit_cell(runtime_state, runtime_width),
             fit_cell(&item.project.name, project_width),
+            fit_cell(fast, fast_width),
+            fit_cell(&model, model_width),
+            fit_cell(thinking, thinking_width),
             fit_cell_right(&todo, todo_width),
             fit_cell_right(&doing, doing_width),
             TUI_AGENT_TABLE_DOING_LAST_RUN_GAP,
@@ -6405,11 +6436,11 @@ fn format_current_project_registration_row(
                 fit_cell_right("", 3),
                 fit_cell("ADD", 6),
                 fit_cell("-", 4),
-                fit_cell("-", 5),
-                fit_cell("Enter/Space", 15),
-                fit_cell("-", 8),
                 fit_cell("-", 7),
                 fit_cell(&registration.name, 12),
+                fit_cell("-", TUI_AGENT_TABLE_FAST_WIDTH),
+                fit_cell("Enter/Space", TUI_AGENT_TABLE_MODEL_WIDTH),
+                fit_cell("-", TUI_AGENT_TABLE_THINKING_WIDTH),
                 fit_cell_right("-", 4),
                 fit_cell_right("-", 5)
             ),
@@ -6422,9 +6453,9 @@ fn format_current_project_registration_row(
     let state_width = 6;
     let runtime_width = 7;
     let git_width = 4;
-    let fast_width = 5;
-    let model_width = 16;
-    let thinking_width = 8;
+    let fast_width = TUI_AGENT_TABLE_FAST_WIDTH;
+    let model_width = TUI_AGENT_TABLE_MODEL_WIDTH;
+    let thinking_width = TUI_AGENT_TABLE_THINKING_WIDTH;
     let todo_width = 4;
     let doing_width = 5;
     let last_run_width = 11;
@@ -6452,11 +6483,11 @@ fn format_current_project_registration_row(
             fit_cell_right("", number_width),
             fit_cell("ADD", state_width),
             fit_cell("-", git_width),
-            fit_cell("-", fast_width),
-            fit_cell("Enter/Space", model_width),
-            fit_cell("-", thinking_width),
             fit_cell("-", runtime_width),
             fit_cell(&registration.name, project_width),
+            fit_cell("-", fast_width),
+            fit_cell("-", model_width),
+            fit_cell("-", thinking_width),
             fit_cell_right("-", todo_width),
             fit_cell_right("-", doing_width),
             TUI_AGENT_TABLE_DOING_LAST_RUN_GAP,
@@ -6476,11 +6507,11 @@ fn format_agent_project_table_header(width: usize) -> String {
                 fit_cell_right("#", 3),
                 fit_cell("STATUS", 6),
                 fit_cell("GIT", 4),
-                fit_cell("FAST", 5),
-                fit_cell("MODEL", 15),
-                fit_cell("THINK", 8),
                 fit_cell("AGENT", 7),
                 fit_cell("PROJECT", 12),
+                fit_cell("FAST", TUI_AGENT_TABLE_FAST_WIDTH),
+                fit_cell("MODEL", TUI_AGENT_TABLE_MODEL_WIDTH),
+                fit_cell("THINK", TUI_AGENT_TABLE_THINKING_WIDTH),
                 fit_cell_right("TODO", 4),
                 fit_cell_right("DOING", 5)
             ),
@@ -6493,9 +6524,9 @@ fn format_agent_project_table_header(width: usize) -> String {
     let state_width = 6;
     let runtime_width = 7;
     let git_width = 4;
-    let fast_width = 5;
-    let model_width = 16;
-    let thinking_width = 8;
+    let fast_width = TUI_AGENT_TABLE_FAST_WIDTH;
+    let model_width = TUI_AGENT_TABLE_MODEL_WIDTH;
+    let thinking_width = TUI_AGENT_TABLE_THINKING_WIDTH;
     let todo_width = 4;
     let doing_width = 5;
     let last_run_width = 11;
@@ -6523,11 +6554,11 @@ fn format_agent_project_table_header(width: usize) -> String {
             fit_cell_right("#", number_width),
             fit_cell("STATUS", state_width),
             fit_cell("GIT", git_width),
+            fit_cell("AGENT", runtime_width),
+            fit_cell("PROJECT", project_width),
             fit_cell("FAST", fast_width),
             fit_cell("MODEL", model_width),
             fit_cell("THINK", thinking_width),
-            fit_cell("AGENT", runtime_width),
-            fit_cell("PROJECT", project_width),
             fit_cell_right("TODO", todo_width),
             fit_cell_right("DOING", doing_width),
             TUI_AGENT_TABLE_DOING_LAST_RUN_GAP,
@@ -7176,16 +7207,28 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                     0
                 };
 
+            let console_height = {
+                let (console_content, _) = tui_console_content(
+                    current_pane == TuiPane::AgentProjects,
+                    &agent_panel,
+                    agent_log_view.as_ref(),
+                    feedback_buffer.as_str(),
+                );
+                tui_feedback_console_height(
+                    size.height,
+                    size.width,
+                    console_content,
+                    agent_log_view.is_some() && current_pane == TuiPane::AgentProjects,
+                )
+            };
+
             // Main layout: active pane, input area (if active), and feedback console
             let main_layout = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Min(0),
                     Constraint::Length(input_height),
-                    Constraint::Length(tui_feedback_console_height(
-                        size.height,
-                        agent_log_view.is_some() && current_pane == TuiPane::AgentProjects,
-                    )),
+                    Constraint::Length(console_height),
                 ])
                 .split(size);
 
@@ -7499,7 +7542,11 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                 feedback_buffer.as_str(),
             );
             let feedback_area = *main_layout.last().unwrap();
-            let feedback_paragraph = Paragraph::new(console_content)
+            let wrapped_console_content = wrap_input_text(
+                console_content,
+                feedback_area.width.saturating_sub(2) as usize,
+            );
+            let feedback_paragraph = Paragraph::new(wrapped_console_content.as_str())
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
@@ -7507,7 +7554,10 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                 )
                 .style(Style::default().fg(console_color))
                 .scroll((
-                    tui_log_scroll_offset(console_content, feedback_area.height.saturating_sub(2)),
+                    tui_log_scroll_offset(
+                        &wrapped_console_content,
+                        feedback_area.height.saturating_sub(2),
+                    ),
                     0,
                 ));
 
@@ -8802,8 +8852,20 @@ mod tests {
 
     #[test]
     fn agent_log_console_expands_and_scrolls_to_latest_output() {
-        assert_eq!(tui_feedback_console_height(40, false), 3);
-        assert_eq!(tui_feedback_console_height(40, true), 20);
+        assert_eq!(tui_feedback_console_height(40, 80, "short", false), 3);
+        assert_eq!(
+            tui_feedback_console_height(40, 12, "a message that wraps", false),
+            4
+        );
+        assert_eq!(
+            tui_feedback_console_height(40, 80, "one\ntwo\nthree", false),
+            5
+        );
+        assert_eq!(
+            tui_feedback_console_height(40, 12, &"x".repeat(1_000), false),
+            20
+        );
+        assert_eq!(tui_feedback_console_height(40, 80, "short", true), 20);
         assert_eq!(tui_log_scroll_offset("one\ntwo\nthree\nfour", 2), 2);
     }
 
@@ -9060,12 +9122,15 @@ mod tests {
         let wide_row = format_agent_project_table_row(0, &project, 160, false);
 
         for header in [&compact_header, &wide_header] {
-            assert!(header.find("GIT").unwrap() < header.find("FAST").unwrap());
+            assert!(header.find("PROJECT").unwrap() < header.find("FAST").unwrap());
             assert!(header.find("FAST").unwrap() < header.find("MODEL").unwrap());
             assert!(header.find("MODEL").unwrap() < header.find("THINK").unwrap());
+            assert!(header.find("THINK").unwrap() < header.find("TODO").unwrap());
+            assert!(header.find("THINK").unwrap() - header.find("FAST").unwrap() <= 17);
         }
         for row in [&compact_row, &wide_row] {
-            assert!(row.contains("gpt-5.6-terra"));
+            assert!(row.contains("5.6-terra"));
+            assert!(!row.contains("gpt-"));
             assert!(row.contains("high"));
             assert!(row.contains("RUNNING"));
         }

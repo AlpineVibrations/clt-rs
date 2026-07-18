@@ -1,0 +1,3 @@
+the new featuref for the agent tui needs its clumns reorganized . they should be to the right of the project name. and they should be way more compact. also the console view at the bottom of the tui needs to expand with larger messages.
+
+Completion note: COMPLETED 2026-07-18: Moved the compact FAST, MODEL, and THINK settings directly after PROJECT, shortened model/thinking labels, and made the bottom console grow with wrapped messages up to half the terminal. Checks: `cargo fmt -- --check`; focused agent table and console tests; `cargo test -- --test-threads=1` (123 passed); `cargo clippy --all-targets -- -D warnings`; `git diff --check`.
