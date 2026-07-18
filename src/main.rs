@@ -69,10 +69,8 @@ const AGENT_CODEX_MODELS: [&str; 5] = [
 const AGENT_CODEX_REASONING_EFFORTS: [&str; 5] = ["", "low", "medium", "high", "xhigh"];
 const TUI_AGENT_PANEL_REFRESH_SECONDS: u64 = 2;
 const TUI_AGENT_LOG_REFRESH_MILLIS: u64 = 500;
-const TUI_AGENT_TABLE_DOING_LAST_RUN_GAP: &str = "   ";
-const TUI_AGENT_TABLE_FAST_WIDTH: usize = 4;
-const TUI_AGENT_TABLE_MODEL_WIDTH: usize = 11;
-const TUI_AGENT_TABLE_THINKING_WIDTH: usize = 5;
+const TUI_AGENT_TABLE_CODEX_LAST_RUN_GAP: &str = "   ";
+const TUI_AGENT_TABLE_CODEX_MAX_WIDTH: usize = 20;
 const TUI_NO_ACTIVE_BOARD_MESSAGE: &str =
     "No active board. Open an initialized registered project from the agent projects pane.";
 const AGENT_LAUNCHD_LABEL: &str = "com.alpinevibrations.clt.agent";
@@ -6329,10 +6327,87 @@ fn compact_agent_thinking_setting(thinking: Option<&str>) -> &str {
     }
 }
 
+fn compact_agent_codex_settings(
+    model: Option<&str>,
+    thinking: Option<&str>,
+    fast_enabled: bool,
+) -> String {
+    let mut settings = Vec::new();
+
+    if model.is_some() {
+        settings.push(compact_agent_model_setting(model));
+    }
+    if thinking.is_some() {
+        settings.push(compact_agent_thinking_setting(thinking).to_string());
+    }
+    if fast_enabled {
+        settings.push("fast".to_string());
+    }
+
+    if settings.is_empty() {
+        "default".to_string()
+    } else {
+        settings.join("/")
+    }
+}
+
+fn agent_codex_column_width(projects: &[TuiAgentProject], include_registration: bool) -> usize {
+    let settings_width = projects
+        .iter()
+        .map(|item| {
+            compact_agent_codex_settings(
+                item.project.codex_model.as_deref(),
+                item.project.codex_reasoning_effort.as_deref(),
+                item.project.codex_fast_enabled,
+            )
+            .chars()
+            .count()
+        })
+        .max()
+        .unwrap_or(0);
+    let registration_width = if include_registration {
+        "Enter/Space".len()
+    } else {
+        0
+    };
+
+    "CODEX"
+        .len()
+        .max(settings_width)
+        .max(registration_width)
+        .min(TUI_AGENT_TABLE_CODEX_MAX_WIDTH)
+}
+
+fn agent_project_column_width(
+    projects: &[TuiAgentProject],
+    registration: Option<&TuiCurrentProjectRegistration>,
+    table_width: usize,
+    codex_width: usize,
+) -> usize {
+    let desired_width = projects
+        .iter()
+        .map(|item| item.project.name.chars().count())
+        .chain(registration.map(|item| item.name.chars().count()))
+        .max()
+        .unwrap_or(0)
+        .max("PROJECT".len());
+    let fixed_width = if table_width < 120 { 52 } else { 53 } + codex_width;
+    let available_width = table_width.saturating_sub(fixed_width);
+    let max_project_width = if available_width > "PATH".len() {
+        available_width - "PATH".len()
+    } else {
+        available_width
+    };
+
+    desired_width.min(max_project_width)
+}
+
 fn format_agent_project_table_row(
     idx: usize,
     item: &TuiAgentProject,
     width: usize,
+    project_width: usize,
+    codex_width: usize,
     is_current_board: bool,
 ) -> String {
     let marker = active_board_marker(is_current_board);
@@ -6343,32 +6418,32 @@ fn format_agent_project_table_row(
     } else {
         "OFF"
     };
-    let fast = if item.project.codex_fast_enabled {
-        "ON"
-    } else {
-        "OFF"
-    };
-    let model = compact_agent_model_setting(item.project.codex_model.as_deref());
-    let thinking = compact_agent_thinking_setting(item.project.codex_reasoning_effort.as_deref());
+    let codex = compact_agent_codex_settings(
+        item.project.codex_model.as_deref(),
+        item.project.codex_reasoning_effort.as_deref(),
+        item.project.codex_fast_enabled,
+    );
     let todo = item.scan.todo_count.to_string();
     let doing = item.scan.doing_count.to_string();
     let last_run = format_agent_table_last_run(&item.project);
 
     if width < 120 {
+        let path_width = width.saturating_sub(52 + project_width + codex_width);
         return truncate_to_width(
             &format!(
-                "{} {} {} {} {} {} {} {} {} {} {}",
+                "{}{} {} {} {} {} {} {} {}{}{} {}",
                 fit_cell(marker, 1),
                 fit_cell_right(&(idx + 1).to_string(), 3),
                 fit_cell(state, 6),
                 fit_cell(git, 4),
                 fit_cell(runtime_state, 7),
-                fit_cell(&item.project.name, 12),
-                fit_cell(fast, TUI_AGENT_TABLE_FAST_WIDTH),
-                fit_cell(&model, TUI_AGENT_TABLE_MODEL_WIDTH),
-                fit_cell(thinking, TUI_AGENT_TABLE_THINKING_WIDTH),
+                fit_cell(&item.project.name, project_width),
                 fit_cell_right(&todo, 4),
-                fit_cell_right(&doing, 5)
+                fit_cell_right(&doing, 5),
+                fit_cell(&codex, codex_width),
+                TUI_AGENT_TABLE_CODEX_LAST_RUN_GAP,
+                fit_cell(&last_run, 11),
+                fit_cell(&item.project.path.display().to_string(), path_width)
             ),
             width,
         );
@@ -6379,44 +6454,35 @@ fn format_agent_project_table_row(
     let state_width = 6;
     let runtime_width = 7;
     let git_width = 4;
-    let fast_width = TUI_AGENT_TABLE_FAST_WIDTH;
-    let model_width = TUI_AGENT_TABLE_MODEL_WIDTH;
-    let thinking_width = TUI_AGENT_TABLE_THINKING_WIDTH;
     let todo_width = 4;
     let doing_width = 5;
     let last_run_width = 11;
-    let gap_count = 11 + TUI_AGENT_TABLE_DOING_LAST_RUN_GAP.len();
+    let gap_count = 8 + TUI_AGENT_TABLE_CODEX_LAST_RUN_GAP.len();
     let fixed_width = number_width
         + marker_width
         + state_width
         + runtime_width
         + git_width
-        + fast_width
-        + model_width
-        + thinking_width
+        + codex_width
         + todo_width
         + doing_width
         + last_run_width
         + gap_count;
-    let variable_width = width.saturating_sub(fixed_width);
-    let project_width = ((variable_width * 2) / 5).clamp(18, 32);
-    let path_width = variable_width.saturating_sub(project_width);
+    let path_width = width.saturating_sub(fixed_width + project_width);
 
     truncate_to_width(
         &format!(
-            "{} {} {} {} {} {} {} {} {} {} {}{}{} {}",
+            "{}{} {} {} {} {} {} {} {}{}{} {}",
             fit_cell(marker, marker_width),
             fit_cell_right(&(idx + 1).to_string(), number_width),
             fit_cell(state, state_width),
             fit_cell(git, git_width),
             fit_cell(runtime_state, runtime_width),
             fit_cell(&item.project.name, project_width),
-            fit_cell(fast, fast_width),
-            fit_cell(&model, model_width),
-            fit_cell(thinking, thinking_width),
             fit_cell_right(&todo, todo_width),
             fit_cell_right(&doing, doing_width),
-            TUI_AGENT_TABLE_DOING_LAST_RUN_GAP,
+            fit_cell(&codex, codex_width),
+            TUI_AGENT_TABLE_CODEX_LAST_RUN_GAP,
             fit_cell(&last_run, last_run_width),
             fit_cell(&item.project.path.display().to_string(), path_width)
         ),
@@ -6427,22 +6493,26 @@ fn format_agent_project_table_row(
 fn format_current_project_registration_row(
     registration: &TuiCurrentProjectRegistration,
     width: usize,
+    project_width: usize,
+    codex_width: usize,
 ) -> String {
     if width < 120 {
+        let path_width = width.saturating_sub(52 + project_width + codex_width);
         return truncate_to_width(
             &format!(
-                "{} {} {} {} {} {} {} {} {} {} {}",
+                "{}{} {} {} {} {} {} {} {}{}{} {}",
                 fit_cell("+", 1),
                 fit_cell_right("", 3),
                 fit_cell("ADD", 6),
                 fit_cell("-", 4),
                 fit_cell("-", 7),
-                fit_cell(&registration.name, 12),
-                fit_cell("-", TUI_AGENT_TABLE_FAST_WIDTH),
-                fit_cell("Enter/Space", TUI_AGENT_TABLE_MODEL_WIDTH),
-                fit_cell("-", TUI_AGENT_TABLE_THINKING_WIDTH),
+                fit_cell(&registration.name, project_width),
                 fit_cell_right("-", 4),
-                fit_cell_right("-", 5)
+                fit_cell_right("-", 5),
+                fit_cell("Enter/Space", codex_width),
+                TUI_AGENT_TABLE_CODEX_LAST_RUN_GAP,
+                fit_cell("Enter/Space", 11),
+                fit_cell(&registration.path.display().to_string(), path_width)
             ),
             width,
         );
@@ -6453,44 +6523,35 @@ fn format_current_project_registration_row(
     let state_width = 6;
     let runtime_width = 7;
     let git_width = 4;
-    let fast_width = TUI_AGENT_TABLE_FAST_WIDTH;
-    let model_width = TUI_AGENT_TABLE_MODEL_WIDTH;
-    let thinking_width = TUI_AGENT_TABLE_THINKING_WIDTH;
     let todo_width = 4;
     let doing_width = 5;
     let last_run_width = 11;
-    let gap_count = 11 + TUI_AGENT_TABLE_DOING_LAST_RUN_GAP.len();
+    let gap_count = 8 + TUI_AGENT_TABLE_CODEX_LAST_RUN_GAP.len();
     let fixed_width = number_width
         + marker_width
         + state_width
         + runtime_width
         + git_width
-        + fast_width
-        + model_width
-        + thinking_width
+        + codex_width
         + todo_width
         + doing_width
         + last_run_width
         + gap_count;
-    let variable_width = width.saturating_sub(fixed_width);
-    let project_width = ((variable_width * 2) / 5).clamp(18, 32);
-    let path_width = variable_width.saturating_sub(project_width);
+    let path_width = width.saturating_sub(fixed_width + project_width);
 
     truncate_to_width(
         &format!(
-            "{} {} {} {} {} {} {} {} {} {} {}{}{} {}",
+            "{}{} {} {} {} {} {} {} {}{}{} {}",
             fit_cell("+", marker_width),
             fit_cell_right("", number_width),
             fit_cell("ADD", state_width),
             fit_cell("-", git_width),
             fit_cell("-", runtime_width),
             fit_cell(&registration.name, project_width),
-            fit_cell("-", fast_width),
-            fit_cell("-", model_width),
-            fit_cell("-", thinking_width),
             fit_cell_right("-", todo_width),
             fit_cell_right("-", doing_width),
-            TUI_AGENT_TABLE_DOING_LAST_RUN_GAP,
+            fit_cell("-", codex_width),
+            TUI_AGENT_TABLE_CODEX_LAST_RUN_GAP,
             fit_cell("Enter/Space", last_run_width),
             fit_cell(&registration.path.display().to_string(), path_width)
         ),
@@ -6498,22 +6559,28 @@ fn format_current_project_registration_row(
     )
 }
 
-fn format_agent_project_table_header(width: usize) -> String {
+fn format_agent_project_table_header(
+    width: usize,
+    project_width: usize,
+    codex_width: usize,
+) -> String {
     if width < 120 {
+        let path_width = width.saturating_sub(52 + project_width + codex_width);
         return truncate_to_width(
             &format!(
-                "{} {} {} {} {} {} {} {} {} {} {}",
+                "{}{} {} {} {} {} {} {} {}{}{} {}",
                 fit_cell("", 1),
                 fit_cell_right("#", 3),
                 fit_cell("STATUS", 6),
                 fit_cell("GIT", 4),
                 fit_cell("AGENT", 7),
-                fit_cell("PROJECT", 12),
-                fit_cell("FAST", TUI_AGENT_TABLE_FAST_WIDTH),
-                fit_cell("MODEL", TUI_AGENT_TABLE_MODEL_WIDTH),
-                fit_cell("THINK", TUI_AGENT_TABLE_THINKING_WIDTH),
+                fit_cell("PROJECT", project_width),
                 fit_cell_right("TODO", 4),
-                fit_cell_right("DOING", 5)
+                fit_cell_right("DOING", 5),
+                fit_cell("CODEX", codex_width),
+                TUI_AGENT_TABLE_CODEX_LAST_RUN_GAP,
+                fit_cell("LAST RUN", 11),
+                fit_cell("PATH", path_width)
             ),
             width,
         );
@@ -6524,44 +6591,35 @@ fn format_agent_project_table_header(width: usize) -> String {
     let state_width = 6;
     let runtime_width = 7;
     let git_width = 4;
-    let fast_width = TUI_AGENT_TABLE_FAST_WIDTH;
-    let model_width = TUI_AGENT_TABLE_MODEL_WIDTH;
-    let thinking_width = TUI_AGENT_TABLE_THINKING_WIDTH;
     let todo_width = 4;
     let doing_width = 5;
     let last_run_width = 11;
-    let gap_count = 11 + TUI_AGENT_TABLE_DOING_LAST_RUN_GAP.len();
+    let gap_count = 8 + TUI_AGENT_TABLE_CODEX_LAST_RUN_GAP.len();
     let fixed_width = number_width
         + marker_width
         + state_width
         + runtime_width
         + git_width
-        + fast_width
-        + model_width
-        + thinking_width
+        + codex_width
         + todo_width
         + doing_width
         + last_run_width
         + gap_count;
-    let variable_width = width.saturating_sub(fixed_width);
-    let project_width = ((variable_width * 2) / 5).clamp(18, 32);
-    let path_width = variable_width.saturating_sub(project_width);
+    let path_width = width.saturating_sub(fixed_width + project_width);
 
     truncate_to_width(
         &format!(
-            "{} {} {} {} {} {} {} {} {} {} {}{}{} {}",
+            "{}{} {} {} {} {} {} {} {}{}{} {}",
             fit_cell("", marker_width),
             fit_cell_right("#", number_width),
             fit_cell("STATUS", state_width),
             fit_cell("GIT", git_width),
             fit_cell("AGENT", runtime_width),
             fit_cell("PROJECT", project_width),
-            fit_cell("FAST", fast_width),
-            fit_cell("MODEL", model_width),
-            fit_cell("THINK", thinking_width),
             fit_cell_right("TODO", todo_width),
             fit_cell_right("DOING", doing_width),
-            TUI_AGENT_TABLE_DOING_LAST_RUN_GAP,
+            fit_cell("CODEX", codex_width),
+            TUI_AGENT_TABLE_CODEX_LAST_RUN_GAP,
             fit_cell("LAST RUN", last_run_width),
             fit_cell("PATH", path_width)
         ),
@@ -6630,6 +6688,16 @@ fn render_tui_agent_panel(
     let table_width = inner_area.width as usize;
     let row_viewport_height = inner_area.height.saturating_sub(2) as usize;
     panel.keep_selection_visible(row_viewport_height);
+    let codex_width = agent_codex_column_width(
+        &panel.projects,
+        panel.current_project_registration.is_some(),
+    );
+    let project_width = agent_project_column_width(
+        &panel.projects,
+        panel.current_project_registration.as_ref(),
+        table_width,
+        codex_width,
+    );
 
     let header_area = Rect {
         x: inner_area.x,
@@ -6638,8 +6706,12 @@ fn render_tui_agent_panel(
         height: 1,
     };
     f.render_widget(
-        Paragraph::new(format_agent_project_table_header(table_width))
-            .style(Style::default().fg(Color::Indexed(244))),
+        Paragraph::new(format_agent_project_table_header(
+            table_width,
+            project_width,
+            codex_width,
+        ))
+        .style(Style::default().fg(Color::Indexed(244))),
         header_area,
     );
 
@@ -6675,7 +6747,12 @@ fn render_tui_agent_panel(
         let (text, row_style) = if idx == 0 {
             if let Some(registration) = panel.current_project_registration.as_ref() {
                 (
-                    format_current_project_registration_row(registration, table_width),
+                    format_current_project_registration_row(
+                        registration,
+                        table_width,
+                        project_width,
+                        codex_width,
+                    ),
                     Style::default().fg(Color::LightGreen),
                 )
             } else {
@@ -6685,6 +6762,8 @@ fn render_tui_agent_panel(
                         idx,
                         item,
                         table_width,
+                        project_width,
+                        codex_width,
                         item.project.path == active_root,
                     ),
                     if item.project.enabled {
@@ -6702,6 +6781,8 @@ fn render_tui_agent_panel(
                     project_idx,
                     item,
                     table_width,
+                    project_width,
+                    codex_width,
                     item.project.path == active_root,
                 ),
                 if item.project.enabled {
@@ -9100,7 +9181,14 @@ mod tests {
             name: "current".to_string(),
         };
 
-        let row = format_current_project_registration_row(&registration, 100);
+        let project_width =
+            agent_project_column_width(&[], Some(&registration), 100, "Enter/Space".len());
+        let row = format_current_project_registration_row(
+            &registration,
+            100,
+            project_width,
+            "Enter/Space".len(),
+        );
 
         assert!(row.contains("ADD"));
         assert!(row.contains("current"));
@@ -9116,26 +9204,98 @@ mod tests {
         project.project.codex_reasoning_effort = Some("high".to_string());
         project.project.codex_fast_enabled = true;
 
-        let compact_header = format_agent_project_table_header(100);
-        let compact_row = format_agent_project_table_row(0, &project, 100, false);
-        let wide_header = format_agent_project_table_header(160);
-        let wide_row = format_agent_project_table_row(0, &project, 160, false);
+        let codex_width = agent_codex_column_width(std::slice::from_ref(&project), false);
+        let compact_project_width =
+            agent_project_column_width(std::slice::from_ref(&project), None, 100, codex_width);
+        let wide_project_width =
+            agent_project_column_width(std::slice::from_ref(&project), None, 160, codex_width);
+        let compact_header =
+            format_agent_project_table_header(100, compact_project_width, codex_width);
+        let compact_row = format_agent_project_table_row(
+            0,
+            &project,
+            100,
+            compact_project_width,
+            codex_width,
+            false,
+        );
+        let active_compact_row = format_agent_project_table_row(
+            0,
+            &project,
+            100,
+            compact_project_width,
+            codex_width,
+            true,
+        );
+        let wide_header = format_agent_project_table_header(160, wide_project_width, codex_width);
+        let wide_row = format_agent_project_table_row(
+            0,
+            &project,
+            160,
+            wide_project_width,
+            codex_width,
+            false,
+        );
 
         for header in [&compact_header, &wide_header] {
-            assert!(header.find("PROJECT").unwrap() < header.find("FAST").unwrap());
-            assert!(header.find("FAST").unwrap() < header.find("MODEL").unwrap());
-            assert!(header.find("MODEL").unwrap() < header.find("THINK").unwrap());
-            assert!(header.find("THINK").unwrap() < header.find("TODO").unwrap());
-            assert!(header.find("THINK").unwrap() - header.find("FAST").unwrap() <= 17);
+            assert!(header.find("PROJECT").unwrap() < header.find("TODO").unwrap());
+            assert!(header.find("TODO").unwrap() < header.find("DOING").unwrap());
+            assert!(header.find("DOING").unwrap() < header.find("CODEX").unwrap());
+            assert!(header.find("CODEX").unwrap() < header.find("LAST RUN").unwrap());
+            assert!(header.find("LAST RUN").unwrap() < header.find("PATH").unwrap());
+            assert!(!header.contains("FAST"));
+            assert!(!header.contains("MODEL"));
+            assert!(!header.contains("THINK"));
         }
         for row in [&compact_row, &wide_row] {
-            assert!(row.contains("5.6-terra"));
+            assert!(row.contains("5.6-terra/high/fast"));
             assert!(!row.contains("gpt-"));
-            assert!(row.contains("high"));
             assert!(row.contains("RUNNING"));
+            assert!(row.contains("/tmp/alpha"));
         }
-        assert!(wide_header.contains("DOING   LAST RUN"));
-        assert!(wide_row.contains("    3   -"));
+        assert!(active_compact_row.starts_with("*  1 "));
+    }
+
+    #[test]
+    fn compact_codex_settings_omit_disabled_overrides() {
+        assert_eq!(compact_agent_codex_settings(None, None, false), "default");
+        assert_eq!(
+            compact_agent_codex_settings(Some("gpt-5.6"), Some("high"), false),
+            "5.6/high"
+        );
+        assert_eq!(
+            compact_agent_codex_settings(None, Some("high"), false),
+            "high"
+        );
+        assert_eq!(compact_agent_codex_settings(None, None, true), "fast");
+    }
+
+    #[test]
+    fn codex_column_width_tracks_its_longest_value() {
+        let default_project = tui_agent_project_for_test(1, "default");
+        assert_eq!(agent_codex_column_width(&[default_project], false), 7);
+
+        let mut configured_project = tui_agent_project_for_test(2, "configured");
+        configured_project.project.codex_model = Some("gpt-5.6".to_string());
+        configured_project.project.codex_reasoning_effort = Some("high".to_string());
+        assert_eq!(agent_codex_column_width(&[configured_project], false), 8);
+    }
+
+    #[test]
+    fn project_column_prioritizes_the_full_name_over_the_path() {
+        let project_name = "customer-facing-analytics-dashboard";
+        let project = tui_agent_project_for_test(1, project_name);
+        let full_path = project.project.path.display().to_string();
+        let codex_width = agent_codex_column_width(std::slice::from_ref(&project), false);
+        let project_width =
+            agent_project_column_width(std::slice::from_ref(&project), None, 100, codex_width);
+
+        let row =
+            format_agent_project_table_row(0, &project, 100, project_width, codex_width, false);
+
+        assert_eq!(project_width, project_name.chars().count());
+        assert!(row.contains(project_name));
+        assert!(!row.contains(&full_path));
     }
 
     #[test]
