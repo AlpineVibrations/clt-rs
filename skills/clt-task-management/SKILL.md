@@ -1,3 +1,8 @@
+---
+name: clt-task-management
+description: Manage project tasks with the clt file-system-backed Kanban CLI, including initialization, task creation and listing, status transitions, outcome notes, deletion, folder-backed tasks, and nested boards. Use when Codex needs to inspect, create, track, update, complete, or organize tasks in a project that uses clt or tasks/todo.md, tasks/doing.md, and tasks/done.md.
+---
+
 # Skills: Project Task Management with `clt`
 
 This document defines the skills and operational procedures for an agent to manage project tasks using the `clt` (lls-cli-task) tool.
