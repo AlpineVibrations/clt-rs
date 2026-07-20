@@ -66,7 +66,8 @@ const AGENT_CODEX_MODELS: [&str; 5] = [
     "gpt-5.4",
     "gpt-5.3-codex-spark",
 ];
-const AGENT_CODEX_REASONING_EFFORTS: [&str; 5] = ["", "low", "medium", "high", "xhigh"];
+const AGENT_CODEX_REASONING_EFFORTS: [&str; 7] =
+    ["", "low", "medium", "high", "xhigh", "max", "ultra"];
 const TUI_AGENT_PANEL_REFRESH_SECONDS: u64 = 2;
 const TUI_AGENT_LOG_REFRESH_MILLIS: u64 = 500;
 const TUI_AGENT_TABLE_CODEX_LAST_RUN_GAP: &str = "   ";
@@ -9300,6 +9301,11 @@ mod tests {
 
     #[test]
     fn codex_setting_cycles_return_to_project_defaults() {
+        assert_eq!(
+            AGENT_CODEX_REASONING_EFFORTS,
+            ["", "low", "medium", "high", "xhigh", "max", "ultra"]
+        );
+
         let mut model = None;
         for _ in 0..AGENT_CODEX_MODELS.len() {
             model = next_agent_codex_setting(model.as_deref(), &AGENT_CODEX_MODELS);
