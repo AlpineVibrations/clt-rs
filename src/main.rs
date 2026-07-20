@@ -5550,7 +5550,7 @@ fn tui_start_state(active_board: bool) -> TuiStartState {
             active_board,
             current_pane: TuiPane::Tasks,
             feedback_buffer: String::from(
-                "Kanban View! Tab switches to the agent projects pane, Enter opens a selected project there, Space toggles it ON/OFF, g toggles git-commit, m/f/t change its Codex model/fast/thinking settings, Backspace returns to parent, Space creates a task on the board, b moves a task to backlog, B toggles the backlog column, 'a' opens archive view, Shift+Arrows or I/K reorder, Shift+Arrows or J/L move tasks, 'd' deletes, 'q' quits.",
+                "Kanban View! Tab switches to the agent projects pane, Enter opens a selected project there, Space toggles it ON/OFF, g toggles git-commit, m/f/t change its Codex model/fast/thinking settings, Backspace returns to parent, Space creates a task on the board, b moves a task to backlog, B toggles the backlog column, 'a' opens archive view, Shift+Arrows reorder or move tasks, 'd' deletes, 'q' quits.",
             ),
         }
     } else {
@@ -7823,8 +7823,6 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                  [Tab]          - Switch between task board and agent projects panes\n\
                                  [Arrows]       - Navigate boards and tasks\n\
                                  [Shift+Arrows] - Reorder/Move tasks\n\
-                                 [I, K]         - Move task Up/Down\n\
-                                 [J, L]         - Move task Left/Right\n\
                                  [0, 1, 2, 3]   - Focus Backlog/To Do/Doing/Done\n\
                                  [Input Arrows]         - Move cursor in wrapped input\n\
                                  [Ctrl/Alt+Left/Right]  - Jump input cursor by word\n\
@@ -8542,158 +8540,6 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                         statuses[selected_board],
                                         &mut board_states[selected_board],
                                     );
-                                }
-                                KeyCode::Char('i') | KeyCode::Char('I') => {
-                                    if let Some(idx) = selected_task_index_in_board(
-                                        &board_dir,
-                                        statuses[selected_board],
-                                        &board_states[selected_board],
-                                    ) {
-                                        if idx > 0 {
-                                            match reorder_task_in_board(
-                                                &board_dir,
-                                                statuses[selected_board],
-                                                idx,
-                                                idx - 1,
-                                            ) {
-                                                Ok(_) => {
-                                                    feedback_buffer =
-                                                        format!("Moved task up to position {}", idx)
-                                                }
-                                                Err(e) => feedback_buffer = format!("Error: {}", e),
-                                            }
-                                            board_states[selected_board].select(Some(idx - 1));
-                                        } else {
-                                            feedback_buffer = "Already at the top".to_string();
-                                        }
-                                    } else {
-                                        board_states[selected_board].select(None);
-                                        feedback_buffer = "No task selected".to_string();
-                                    }
-                                }
-                                KeyCode::Char('k') | KeyCode::Char('K') => {
-                                    if let Some(idx) = selected_task_index_in_board(
-                                        &board_dir,
-                                        statuses[selected_board],
-                                        &board_states[selected_board],
-                                    ) {
-                                        let tasks = read_tasks_in_board(
-                                            &board_dir,
-                                            statuses[selected_board],
-                                        )
-                                        .unwrap_or_default();
-                                        if tasks.is_empty() {
-                                            board_states[selected_board].select(None);
-                                            feedback_buffer = "No task selected".to_string();
-                                        } else if idx < tasks.len() - 1 {
-                                            match reorder_task_in_board(
-                                                &board_dir,
-                                                statuses[selected_board],
-                                                idx,
-                                                idx + 1,
-                                            ) {
-                                                Ok(_) => {
-                                                    feedback_buffer = format!(
-                                                        "Moved task down to position {}",
-                                                        idx + 2
-                                                    )
-                                                }
-                                                Err(e) => feedback_buffer = format!("Error: {}", e),
-                                            }
-                                            board_states[selected_board].select(Some(idx + 1));
-                                        } else {
-                                            feedback_buffer = "Already at the bottom".to_string();
-                                        }
-                                    } else {
-                                        board_states[selected_board].select(None);
-                                        feedback_buffer = "No task selected".to_string();
-                                    }
-                                }
-                                KeyCode::Char('j') | KeyCode::Char('J') => {
-                                    if let Some(idx) = selected_task_index_in_board(
-                                        &board_dir,
-                                        statuses[selected_board],
-                                        &board_states[selected_board],
-                                    ) {
-                                        if let Some(to_board) = adjacent_visible_tui_board(
-                                            selected_board,
-                                            backlog_visible,
-                                            -1,
-                                        ) {
-                                            let from = statuses[selected_board];
-                                            let to = statuses[to_board];
-                                            match move_task_in_board(
-                                                &board_dir,
-                                                from,
-                                                to,
-                                                &(idx + 1).to_string(),
-                                            ) {
-                                                Ok(_) => {
-                                                    selected_board = to_board;
-                                                    for state in board_states.iter_mut() {
-                                                        state.select(None);
-                                                    }
-                                                    select_last_task_if_present_in_board(
-                                                        &board_dir,
-                                                        to,
-                                                        &mut board_states[selected_board],
-                                                    );
-                                                    feedback_buffer =
-                                                        format!("Moved task to {}", to)
-                                                }
-                                                Err(e) => feedback_buffer = format!("Error: {}", e),
-                                            }
-                                        } else {
-                                            feedback_buffer =
-                                                "Already at the first board".to_string();
-                                        }
-                                    } else {
-                                        board_states[selected_board].select(None);
-                                        feedback_buffer = "No task selected".to_string();
-                                    }
-                                }
-                                KeyCode::Char('l') | KeyCode::Char('L') => {
-                                    if let Some(idx) = selected_task_index_in_board(
-                                        &board_dir,
-                                        statuses[selected_board],
-                                        &board_states[selected_board],
-                                    ) {
-                                        if let Some(to_board) = adjacent_visible_tui_board(
-                                            selected_board,
-                                            backlog_visible,
-                                            1,
-                                        ) {
-                                            let from = statuses[selected_board];
-                                            let to = statuses[to_board];
-                                            match move_task_in_board(
-                                                &board_dir,
-                                                from,
-                                                to,
-                                                &(idx + 1).to_string(),
-                                            ) {
-                                                Ok(_) => {
-                                                    selected_board = to_board;
-                                                    for state in board_states.iter_mut() {
-                                                        state.select(None);
-                                                    }
-                                                    select_last_task_if_present_in_board(
-                                                        &board_dir,
-                                                        to,
-                                                        &mut board_states[selected_board],
-                                                    );
-                                                    feedback_buffer =
-                                                        format!("Moved task to {}", to)
-                                                }
-                                                Err(e) => feedback_buffer = format!("Error: {}", e),
-                                            }
-                                        } else {
-                                            feedback_buffer =
-                                                "Already at the last board".to_string();
-                                        }
-                                    } else {
-                                        board_states[selected_board].select(None);
-                                        feedback_buffer = "No task selected".to_string();
-                                    }
                                 }
                                 KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Delete => {
                                     if let Some(idx) = selected_task_index_in_board(
