@@ -16,7 +16,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::{
     ExecutableCommand,
-    event::{self, Event, KeyCode, KeyModifiers},
+    event::{
+        self, Event, KeyCode, KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
+    },
     terminal::{
         EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode,
     },
@@ -6826,7 +6829,14 @@ fn tui_console_content<'a>(
     (feedback, Color::Gray)
 }
 
-struct TerminalSession;
+fn tui_keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
+    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+}
+
+struct TerminalSession {
+    keyboard_enhancement_enabled: bool,
+}
 
 impl TerminalSession {
     fn enter(title: &str) -> Result<Self> {
@@ -6836,18 +6846,40 @@ impl TerminalSession {
             let _ = disable_raw_mode();
             return Err(err.into());
         }
+
+        // Request mode 2 modified-key reporting. In particular, tmux only forwards its
+        // unambiguous extended key sequences when the application inside the pane asks for
+        // them, which keeps Shift+Up/Down distinct from plain task navigation.
+        #[cfg(not(windows))]
+        if let Err(err) = stdout.execute(PushKeyboardEnhancementFlags(
+            tui_keyboard_enhancement_flags(),
+        )) {
+            let _ = stdout.execute(LeaveAlternateScreen);
+            let _ = disable_raw_mode();
+            return Err(err.into());
+        }
+        let keyboard_enhancement_enabled = cfg!(not(windows));
+
         if let Err(err) = set_terminal_title(title) {
+            if keyboard_enhancement_enabled {
+                let _ = stdout.execute(PopKeyboardEnhancementFlags);
+            }
             let _ = stdout.execute(LeaveAlternateScreen);
             let _ = disable_raw_mode();
             return Err(err);
         }
 
-        Ok(Self)
+        Ok(Self {
+            keyboard_enhancement_enabled,
+        })
     }
 }
 
 impl Drop for TerminalSession {
     fn drop(&mut self) {
+        if self.keyboard_enhancement_enabled {
+            let _ = stdout().execute(PopKeyboardEnhancementFlags);
+        }
         let _ = disable_raw_mode();
         let _ = stdout().execute(LeaveAlternateScreen);
     }
@@ -8778,6 +8810,15 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("clt-{}-{}", name, nonce))
+    }
+
+    #[test]
+    fn tui_requests_unambiguous_reporting_for_every_key() {
+        let flags = tui_keyboard_enhancement_flags();
+
+        assert!(flags.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
+        assert!(flags.contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES));
+        assert!(!flags.contains(KeyboardEnhancementFlags::REPORT_EVENT_TYPES));
     }
 
     fn tui_agent_project_for_test(id: i64, name: &str) -> TuiAgentProject {

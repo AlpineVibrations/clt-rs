@@ -1,0 +1,3 @@
+still on mac terminal and in tmux from a mac i cannot use Shift arrow up or down keys to move a task up and down in the order. but i can use shift left and right to move it between boards/. lets fix this
+
+Completion note: COMPLETED 2026-07-20: The TUI terminal session now requests unambiguous mode-2 key reporting so tmux preserves Shift+Up/Down separately from plain navigation, and restores the prior keyboard mode on exit and setup errors. Verified with `cargo fmt -- --check`, `cargo test tui_requests_unambiguous_reporting_for_every_key -- --test-threads=1`, `cargo clippy --all-targets -- -D warnings`, and `cargo test -- --test-threads=1` (127 passed).
