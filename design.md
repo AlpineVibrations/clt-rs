@@ -11,7 +11,8 @@ The CLI resolves the task root directory as follows:
 
 Once the root directory (`<root>`) is determined, the CLI must:
 1. Create a subdirectory named `tasks/` inside `<root>`.
-2. Create and initialize three Markdown files inside `tasks/`:
+2. Create and initialize four Markdown files inside `tasks/`:
+    * `backlog.md`: For captured tasks that are not ready to start.
     * `todo.md`: For tasks not yet started.
     * `doing.md`: For tasks currently in progress.
     * `done.md`: For completed tasks.
@@ -22,24 +23,27 @@ Each markdown file should start with appropriate headers (e.g., `# To Do Tasks`,
 ### 3. Core Functionality (CLI Commands)
 The CLI needs commands to interact with tasks. All commands support the optional `--local` flag to override git root detection.
 
-*   `lls-cli-task init`: Initializes the `tasks/` directory and the three markdown files if they don't exist.
+*   `lls-cli-task init`: Initializes the `tasks/` directory and the four markdown files if they don't exist.
 *   `lls-cli-task add <task_description> [optional_metadata]`: Creates a new task and adds it to `todo.md`.
 *   `lls-cli-task status <transition> <task_index>`: Allows moving a task from one list to another (e.g., `status todo->doing 1`).
-*   `lls-cli-task list`: Displays an overview of all tasks across the three files, numbered by their current index.
+*   `lls-cli-task list`: Displays an overview of all tasks across the four files, numbered by their current index.
 
 ### 4. View Layer (TUI/Kanban View)
 The primary interaction view, accessible via a dedicated command (e.g., `lls-cli-task view`), must use `ratatui` to render a Kanban board representation of the tasks.
 
 **Kanban Layout:**
-The screen will be divided into three visible columns corresponding to the state:
-1.  **To Do:** Tasks read from `tasks/todo.md`.
-2.  **In Progress:** Tasks read from `tasks/doing.md`.
-3.  **Done:** Tasks read from `tasks/done.md`.
+The screen defaults to three visible columns, with a fourth Backlog column available on demand:
+1.  **Backlog:** Tasks read from `tasks/backlog.md`; hidden by default and toggled with `B`.
+2.  **To Do:** Tasks read from `tasks/todo.md`.
+3.  **In Progress:** Tasks read from `tasks/doing.md`.
+4.  **Done:** Tasks read from `tasks/done.md`.
+
+Pressing `b` moves the selected task into Backlog. Pressing `0` reveals and focuses Backlog; `1`, `2`, and `3` retain their existing To Do, Doing, and Done mappings.
 
 Tasks within each column must display their description.
 
 ### 5. Implementation Notes
-*   **State Persistence**: All task data must be persisted in the respective Markdown files (`todo.md`, `doing.md`, `done.md`).
+*   **State Persistence**: All task data must be persisted in the respective Markdown files (`backlog.md`, `todo.md`, `doing.md`, `done.md`).
 *   **Task Identification**: Tasks are identified by their 1-based index within their current list. This allows for a clean markdown format without stored IDs.
 *   **Markdown Parsing**: The CLI must reliably parse tasks from Markdown content (lines starting with `- `).
 
@@ -54,6 +58,7 @@ Registered projects must store:
 Agent scheduling must:
 *   Run at most one Codex task per project at a time.
 *   Skip paused projects, projects without pending `todo` work, and projects with active leases.
+*   Ignore `backlog` tasks until a user promotes them to `todo`.
 *   Prompt Codex to inspect the task board, move one task to `doing`, complete it, run relevant checks, update the task, mark it done when completed, and stop after one task.
 *   Append the `$git-commit` skill instruction only when `git_commit_enabled` is true for that project.
 

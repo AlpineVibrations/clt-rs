@@ -37,7 +37,12 @@ use tui_input::{Input, InputRequest};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
-const TASK_STATUSES: [&str; 3] = ["todo", "doing", "done"];
+const TASK_STATUSES: [&str; 4] = ["todo", "doing", "done", "backlog"];
+const TODO_BOARD_INDEX: usize = 0;
+const DONE_BOARD_INDEX: usize = 2;
+const BACKLOG_BOARD_INDEX: usize = 3;
+const DEFAULT_TUI_BOARD_INDICES: [usize; 3] = [0, 1, 2];
+const TUI_BOARD_INDICES_WITH_BACKLOG: [usize; 4] = [3, 0, 1, 2];
 const TASK_DETAIL_FILES: [&str; 3] = ["task.md", "README.md", "index.md"];
 const ARCHIVE_STATUS_CANDIDATES: [&str; 2] = ["archived", "archive"];
 const AGENT_STATE_DIR_ENV: &str = "CLT_AGENT_STATE_DIR";
@@ -292,13 +297,13 @@ struct Cli {
 enum Commands {
     /// Initializes the tasks directory and status stores
     Init {
-        /// Create todo/doing/done folders instead of markdown files
+        /// Create backlog/todo/doing/done folders instead of markdown files
         #[arg(long, default_value_t = false)]
         folders: bool,
     },
     /// Expands markdown status files into folder-backed task files
     Expand {
-        /// Optional status to expand (todo, doing, done). Expands all statuses if omitted.
+        /// Optional status to expand (backlog, todo, doing, done). Expands all if omitted.
         status: Option<String>,
     },
     /// Adds a new task to the todo list
@@ -318,19 +323,19 @@ enum Commands {
     },
     /// Marks a task as done
     Done {
-        /// The status the task is currently in (todo, doing)
+        /// The status the task is currently in (backlog, todo, doing)
         status: String,
         /// The index of the task to mark as done
         task_index: String,
     },
     /// Deletes a task
     Delete {
-        /// The status the task is currently in (todo, doing, done)
+        /// The status the task is currently in (backlog, todo, doing, done)
         status: String,
         /// The index of the task to delete
         task_index: String,
     },
-    /// Lists tasks. Optional status to filter by (todo, doing, done)
+    /// Lists tasks. Optional status to filter by (backlog, todo, doing, done)
     List { status: Option<String> },
     /// Manages Codex automation across registered projects
     Agent {
@@ -4226,28 +4231,31 @@ fn ensure_task_store(root: &Path) -> Result<()> {
 
 fn status_filename(status: &str) -> Result<&'static str> {
     match status {
+        "backlog" => Ok("backlog.md"),
         "todo" => Ok("todo.md"),
         "doing" => Ok("doing.md"),
         "done" => Ok("done.md"),
-        _ => anyhow::bail!("Invalid status. Use 'todo', 'doing', or 'done'."),
+        _ => anyhow::bail!("Invalid status. Use 'backlog', 'todo', 'doing', or 'done'."),
     }
 }
 
 fn normalize_status_arg(status: &str) -> Result<&'static str> {
     match status {
+        "0" | "backlog" => Ok("backlog"),
         "1" | "todo" => Ok("todo"),
         "2" | "doing" => Ok("doing"),
         "3" | "done" => Ok("done"),
-        _ => anyhow::bail!("Invalid status. Use 'todo', 'doing', or 'done'."),
+        _ => anyhow::bail!("Invalid status. Use 'backlog', 'todo', 'doing', or 'done'."),
     }
 }
 
 fn status_header(status: &str) -> Result<&'static str> {
     match status {
+        "backlog" => Ok("# Backlog Tasks\n"),
         "todo" => Ok("# To Do Tasks\n"),
         "doing" => Ok("# Doing Tasks\n"),
         "done" => Ok("# Done Tasks\n"),
-        _ => anyhow::bail!("Invalid status. Use 'todo', 'doing', or 'done'."),
+        _ => anyhow::bail!("Invalid status. Use 'backlog', 'todo', 'doing', or 'done'."),
     }
 }
 
@@ -5113,6 +5121,7 @@ fn list_tasks(root: &Path, filter_status: Option<String>) -> Result<()> {
 
     if let Some(ref s) = filter_status {
         let status = match s.as_str() {
+            "0" => "backlog",
             "1" => "todo",
             "2" => "doing",
             "3" => "done",
@@ -5336,6 +5345,120 @@ fn normalize_board_selections_in_board(
     }
 }
 
+fn visible_tui_board_indices(backlog_visible: bool) -> &'static [usize] {
+    if backlog_visible {
+        &TUI_BOARD_INDICES_WITH_BACKLOG
+    } else {
+        &DEFAULT_TUI_BOARD_INDICES
+    }
+}
+
+fn adjacent_visible_tui_board(
+    selected_board: usize,
+    backlog_visible: bool,
+    direction: isize,
+) -> Option<usize> {
+    let visible = visible_tui_board_indices(backlog_visible);
+    let position = visible.iter().position(|board| *board == selected_board)?;
+    let next = position as isize + direction;
+    if next < 0 || next >= visible.len() as isize {
+        None
+    } else {
+        Some(visible[next as usize])
+    }
+}
+
+fn wrapped_visible_tui_board(
+    selected_board: usize,
+    backlog_visible: bool,
+    direction: isize,
+) -> usize {
+    let visible = visible_tui_board_indices(backlog_visible);
+    let position = visible
+        .iter()
+        .position(|board| *board == selected_board)
+        .unwrap_or(0);
+    let next = (position as isize + direction).rem_euclid(visible.len() as isize) as usize;
+    visible[next]
+}
+
+fn toggle_tui_backlog_column(
+    board_dir: &Path,
+    board_states: &mut [ListState],
+    selected_board: &mut usize,
+    backlog_visible: &mut bool,
+) -> String {
+    *backlog_visible = !*backlog_visible;
+    if *backlog_visible {
+        let backlog_count = read_task_entries(board_dir, "backlog")
+            .map(|entries| entries.len())
+            .unwrap_or(0);
+        format!("Backlog column shown ({backlog_count} tasks). Press B again to hide it.")
+    } else {
+        if *selected_board == BACKLOG_BOARD_INDEX {
+            *selected_board = TODO_BOARD_INDEX;
+            for state in board_states.iter_mut() {
+                state.select(None);
+            }
+            select_first_task_if_present_in_board(
+                board_dir,
+                "todo",
+                &mut board_states[TODO_BOARD_INDEX],
+            );
+        }
+        "Backlog column hidden. Press B to show it.".to_string()
+    }
+}
+
+fn move_selected_tui_task_to_backlog(
+    board_dir: &Path,
+    statuses: &[&str],
+    board_states: &mut [ListState],
+    selected_board: &mut usize,
+    backlog_visible: bool,
+) -> Result<String> {
+    if *selected_board == BACKLOG_BOARD_INDEX {
+        return Ok("Task is already in backlog.".to_string());
+    }
+
+    let Some(idx) = selected_task_index_in_board(
+        board_dir,
+        statuses[*selected_board],
+        &board_states[*selected_board],
+    ) else {
+        return Ok("No task selected".to_string());
+    };
+
+    let from_board = *selected_board;
+    move_task_in_board(
+        board_dir,
+        statuses[from_board],
+        "backlog",
+        &(idx + 1).to_string(),
+    )?;
+
+    if backlog_visible {
+        *selected_board = BACKLOG_BOARD_INDEX;
+        for state in board_states.iter_mut() {
+            state.select(None);
+        }
+        select_last_task_if_present_in_board(
+            board_dir,
+            "backlog",
+            &mut board_states[BACKLOG_BOARD_INDEX],
+        );
+    } else {
+        normalize_board_selection_in_board(
+            board_dir,
+            statuses[from_board],
+            &mut board_states[from_board],
+        );
+        board_states[BACKLOG_BOARD_INDEX].select(None);
+    }
+
+    Ok("Moved task to backlog".to_string())
+}
+
 fn task_display_height(
     task: &str,
     idx: usize,
@@ -5427,7 +5550,7 @@ fn tui_start_state(active_board: bool) -> TuiStartState {
             active_board,
             current_pane: TuiPane::Tasks,
             feedback_buffer: String::from(
-                "Kanban View! Tab switches to the agent projects pane, Enter opens a selected project there, Space toggles it ON/OFF, g toggles git-commit, m/f/t change its Codex model/fast/thinking settings, Backspace returns to parent, Space creates a task on the board, 'a' opens archive view, Shift+Arrows or I/K reorder, Shift+Arrows or J/L move tasks, 'd' deletes, 'q' quits.",
+                "Kanban View! Tab switches to the agent projects pane, Enter opens a selected project there, Space toggles it ON/OFF, g toggles git-commit, m/f/t change its Codex model/fast/thinking settings, Backspace returns to parent, Space creates a task on the board, b moves a task to backlog, B toggles the backlog column, 'a' opens archive view, Shift+Arrows or I/K reorder, Shift+Arrows or J/L move tasks, 'd' deletes, 'q' quits.",
             ),
         }
     } else {
@@ -7218,34 +7341,37 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
     let mut task_input = Input::default();
     let mut feedback_buffer = start_state.feedback_buffer;
     let mut archive_view = false;
+    let mut backlog_visible = false;
     let mut current_pane = start_state.current_pane;
     let mut agent_panel = TuiAgentPanel::new(&active_root);
     let mut last_agent_panel_refresh = Instant::now();
     let mut agent_log_view: Option<TuiAgentLogView> = None;
     let mut last_agent_log_refresh = Instant::now();
 
-    let mut selected_board = 0; // 0: todo, 1: doing, 2: done
+    let mut selected_board = TODO_BOARD_INDEX;
     let mut editing_task_idx: Option<usize> = None;
     let mut board_states = [
         ListState::default(),
         ListState::default(),
         ListState::default(),
+        ListState::default(),
     ];
-    let mut board_scroll_offsets = [0usize; 3];
+    let mut board_scroll_offsets = [0usize; 4];
     let mut archive_state = ListState::default();
     let mut archive_scroll_offset = 0usize;
 
     let statuses = TASK_STATUSES;
-    let titles = ["To Do", "Doing", "Done"];
+    let titles = ["To Do", "Doing", "Done", "Backlog"];
     // let c_1 = Color::LightCyan;
     // let c_2 = Color::LightGreen;
     // let c_3 = Color::LightMagenta;
     let c_1 = Color::Indexed(110);
     let c_2 = Color::Indexed(108);
     let c_3 = Color::Indexed(139);
+    let c_backlog = Color::Indexed(244);
     let text_color = Color::Indexed(248); //Color::DarkGray;
     let c_highlight = Color::Indexed(221);
-    let colors = [c_1, c_2, c_3];
+    let colors = [c_1, c_2, c_3, c_backlog];
 
     loop {
         if last_agent_panel_refresh.elapsed() >= tui_agent_panel_refresh_interval() {
@@ -7294,6 +7420,11 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                 "Agent Projects Console".to_string()
             } else if archive_view {
                 format!("{board_title} Archive Console")
+            } else if !backlog_visible {
+                let backlog_count = read_task_entries(&board_dir, "backlog")
+                    .map(|entries| entries.len())
+                    .unwrap_or(0);
+                format!("{board_title} Console | Backlog: {backlog_count} [B]")
             } else {
                 format!("{board_title} Console")
             };
@@ -7441,18 +7572,17 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
 
                 f.render_widget(block, content_area);
             } else {
+                let visible_boards = visible_tui_board_indices(backlog_visible);
+                let column_count = visible_boards.len();
                 let chunks = Layout::default()
                     .direction(Direction::Horizontal)
-                    .constraints([
-                        Constraint::Percentage(33),
-                        Constraint::Percentage(33),
-                        Constraint::Percentage(33),
-                    ])
+                    .constraints(vec![Constraint::Ratio(1, column_count as u32); column_count])
                     .split(content_area);
 
-                for (i, status) in statuses.iter().enumerate() {
-                    let selected_idx = board_states[i].selected();
-                    let col_width = (size.width / 3) as usize;
+                for (column_index, board_index) in visible_boards.iter().copied().enumerate() {
+                    let status = statuses[board_index];
+                    let selected_idx = board_states[board_index].selected();
+                    let col_width = (size.width / column_count as u16) as usize;
                     let entries = read_task_entries(&board_dir, status).unwrap_or_default();
                     let tasks: Vec<String> = entries
                         .iter()
@@ -7521,8 +7651,8 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                     let block = Block::default()
                         .title(format!(
                             "{} {}",
-                            titles[i],
-                            if selected_board == i {
+                            titles[board_index],
+                            if selected_board == board_index {
                                 "  <<<<<< * >>>>>>     "
                             } else {
                                 ""
@@ -7533,13 +7663,13 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                 .alignment(Alignment::Right),
                         )
                         .borders(Borders::ALL)
-                        .border_style(Style::default().fg(colors[i]));
+                        .border_style(Style::default().fg(colors[board_index]));
 
-                    let inner_area = block.inner(chunks[i]);
+                    let inner_area = block.inner(chunks[column_index]);
                     keep_selected_task_visible(
                         &display_tasks,
                         selected_idx,
-                        &mut board_scroll_offsets[i],
+                        &mut board_scroll_offsets[board_index],
                         inner_area.height as usize,
                         col_width,
                     );
@@ -7549,7 +7679,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                         .iter()
                         .zip(entries.iter())
                         .enumerate()
-                        .skip(board_scroll_offsets[i])
+                        .skip(board_scroll_offsets[board_index])
                     {
                         let cleaned = t.strip_prefix("- ").unwrap_or(t);
                         let is_selected = Some(idx) == selected_idx;
@@ -7607,11 +7737,11 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                         f.render_widget(Paragraph::new(item_text).style(style), item_area);
 
                         current_y += line_count;
-                        if inner_area.y + current_y as u16 >= chunks[i].height {
+                        if inner_area.y + current_y as u16 >= chunks[column_index].height {
                             break;
                         }
                     }
-                    f.render_widget(block, chunks[i]);
+                    f.render_widget(block, chunks[column_index]);
                 }
             }
 
@@ -7686,6 +7816,8 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                  [g]            - Toggle git-commit for selected agent project\n\
                                  [l]            - Toggle selected agent project's live/current output log\n\
                                  [a]            - Toggle archive view\n\
+                                 [b]            - Move selected task to backlog\n\
+                                 [B]            - Show/hide backlog column\n\
                                  [Backspace]    - Return to parent board\n\
                                  [d/Del]        - Delete selected task\n\
                                  [Tab]          - Switch between task board and agent projects panes\n\
@@ -7693,7 +7825,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                  [Shift+Arrows] - Reorder/Move tasks\n\
                                  [I, K]         - Move task Up/Down\n\
                                  [J, L]         - Move task Left/Right\n\
-                                 [1, 2, 3]      - Switch board focus\n\
+                                 [0, 1, 2, 3]   - Focus Backlog/To Do/Doing/Done\n\
                                  [Input Arrows]         - Move cursor in wrapped input\n\
                                  [Ctrl/Alt+Left/Right]  - Jump input cursor by word\n\
                                  [Ctrl+A/E/W/U/K]       - Edit input line\n\
@@ -7702,7 +7834,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
 
                 let area = f.area();
                 let popover_width = area.width.min(70);
-                let popover_height = area.height.min(22);
+                let popover_height = area.height.min(26);
                 let x = area.width.saturating_sub(popover_width) / 2;
                 let y = area.height.saturating_sub(popover_height) / 2;
 
@@ -7820,11 +7952,11 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                             active_board = true;
                                             board_stack.clear();
                                             board_stack.push(get_tasks_dir(&active_root));
-                                            selected_board = 0;
+                                            selected_board = TODO_BOARD_INDEX;
                                             for state in board_states.iter_mut() {
                                                 state.select(None);
                                             }
-                                            board_scroll_offsets = [0usize; 3];
+                                            board_scroll_offsets = [0usize; 4];
                                             archive_state.select(None);
                                             archive_scroll_offset = 0;
                                             archive_view = false;
@@ -8071,6 +8203,14 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                             }
                         } else if key.modifiers.contains(KeyModifiers::SHIFT) {
                             match key.code {
+                                KeyCode::Char('B') | KeyCode::Char('b') => {
+                                    feedback_buffer = toggle_tui_backlog_column(
+                                        &board_dir,
+                                        &mut board_states,
+                                        &mut selected_board,
+                                        &mut backlog_visible,
+                                    );
+                                }
                                 KeyCode::Up => {
                                     if let Some(idx) = selected_task_index_in_board(
                                         &board_dir,
@@ -8143,8 +8283,11 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                         statuses[selected_board],
                                         &board_states[selected_board],
                                     ) {
-                                        if selected_board > 0 {
-                                            let to_board = selected_board - 1;
+                                        if let Some(to_board) = adjacent_visible_tui_board(
+                                            selected_board,
+                                            backlog_visible,
+                                            -1,
+                                        ) {
                                             let from = statuses[selected_board];
                                             let to = statuses[to_board];
                                             match move_task_in_board(
@@ -8183,8 +8326,11 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                         statuses[selected_board],
                                         &board_states[selected_board],
                                     ) {
-                                        if selected_board < 2 {
-                                            let to_board = selected_board + 1;
+                                        if let Some(to_board) = adjacent_visible_tui_board(
+                                            selected_board,
+                                            backlog_visible,
+                                            1,
+                                        ) {
                                             let from = statuses[selected_board];
                                             let to = statuses[to_board];
                                             match move_task_in_board(
@@ -8231,6 +8377,26 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                     state.select(None);
                                     feedback_buffer = "Task unselected".to_string();
                                 }
+                                KeyCode::Char('B') => {
+                                    feedback_buffer = toggle_tui_backlog_column(
+                                        &board_dir,
+                                        &mut board_states,
+                                        &mut selected_board,
+                                        &mut backlog_visible,
+                                    );
+                                }
+                                KeyCode::Char('b') => {
+                                    feedback_buffer = match move_selected_tui_task_to_backlog(
+                                        &board_dir,
+                                        &statuses,
+                                        &mut board_states,
+                                        &mut selected_board,
+                                        backlog_visible,
+                                    ) {
+                                        Ok(message) => message,
+                                        Err(error) => format!("Error: {error}"),
+                                    };
+                                }
                                 KeyCode::Char('a') | KeyCode::Char('A') => {
                                     archive_view = true;
                                     current_mode = Mode::View;
@@ -8247,7 +8413,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                 KeyCode::Backspace => {
                                     if board_stack.len() > 1 {
                                         board_stack.pop();
-                                        selected_board = 0;
+                                        selected_board = TODO_BOARD_INDEX;
                                         for state in board_states.iter_mut() {
                                             state.select(None);
                                         }
@@ -8277,7 +8443,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                             {
                                                 ensure_board_store(path)?;
                                                 board_stack.push(path.clone());
-                                                selected_board = 0;
+                                                selected_board = TODO_BOARD_INDEX;
                                                 for state in board_states.iter_mut() {
                                                     state.select(None);
                                                 }
@@ -8330,8 +8496,22 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                     current_mode = Mode::Input;
                                     task_input.reset();
                                 }
+                                KeyCode::Char('0') => {
+                                    backlog_visible = true;
+                                    selected_board = BACKLOG_BOARD_INDEX;
+                                    for state in board_states.iter_mut() {
+                                        state.select(None);
+                                    }
+                                    select_first_task_if_present_in_board(
+                                        &board_dir,
+                                        statuses[selected_board],
+                                        &mut board_states[selected_board],
+                                    );
+                                    feedback_buffer =
+                                        "Backlog column shown and focused.".to_string();
+                                }
                                 KeyCode::Char('1') => {
-                                    selected_board = 0;
+                                    selected_board = TODO_BOARD_INDEX;
                                     for state in board_states.iter_mut() {
                                         state.select(None);
                                     }
@@ -8353,7 +8533,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                     );
                                 }
                                 KeyCode::Char('3') => {
-                                    selected_board = 2;
+                                    selected_board = DONE_BOARD_INDEX;
                                     for state in board_states.iter_mut() {
                                         state.select(None);
                                     }
@@ -8435,8 +8615,11 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                         statuses[selected_board],
                                         &board_states[selected_board],
                                     ) {
-                                        if selected_board > 0 {
-                                            let to_board = selected_board - 1;
+                                        if let Some(to_board) = adjacent_visible_tui_board(
+                                            selected_board,
+                                            backlog_visible,
+                                            -1,
+                                        ) {
                                             let from = statuses[selected_board];
                                             let to = statuses[to_board];
                                             match move_task_in_board(
@@ -8475,8 +8658,11 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                         statuses[selected_board],
                                         &board_states[selected_board],
                                     ) {
-                                        if selected_board < 2 {
-                                            let to_board = selected_board + 1;
+                                        if let Some(to_board) = adjacent_visible_tui_board(
+                                            selected_board,
+                                            backlog_visible,
+                                            1,
+                                        ) {
                                             let from = statuses[selected_board];
                                             let to = statuses[to_board];
                                             match move_task_in_board(
@@ -8572,11 +8758,11 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                     }
                                 }
                                 KeyCode::Left => {
-                                    if selected_board > 0 {
-                                        selected_board -= 1;
-                                    } else {
-                                        selected_board = 2;
-                                    }
+                                    selected_board = wrapped_visible_tui_board(
+                                        selected_board,
+                                        backlog_visible,
+                                        -1,
+                                    );
                                     for state in board_states.iter_mut() {
                                         state.select(None);
                                     }
@@ -8587,11 +8773,11 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                     );
                                 }
                                 KeyCode::Right => {
-                                    if selected_board < 2 {
-                                        selected_board += 1;
-                                    } else {
-                                        selected_board = 0;
-                                    }
+                                    selected_board = wrapped_visible_tui_board(
+                                        selected_board,
+                                        backlog_visible,
+                                        1,
+                                    );
                                     for state in board_states.iter_mut() {
                                         state.select(None);
                                     }
@@ -9371,11 +9557,13 @@ mod tests {
         let todo = fs::read_to_string(root.join("tasks/todo.md")).unwrap();
         let doing = fs::read_to_string(root.join("tasks/doing.md")).unwrap();
         let done = fs::read_to_string(root.join("tasks/done.md")).unwrap();
+        let backlog = fs::read_to_string(root.join("tasks/backlog.md")).unwrap();
 
         assert!(todo.contains("# To Do Tasks"));
         assert!(todo.contains("- write from a fresh directory"));
         assert_eq!(doing, "# Doing Tasks\n");
         assert_eq!(done, "# Done Tasks\n");
+        assert_eq!(backlog, "# Backlog Tasks\n");
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -9389,6 +9577,7 @@ mod tests {
         assert!(root.join("tasks/todo").is_dir());
         assert!(root.join("tasks/doing").is_dir());
         assert!(root.join("tasks/done").is_dir());
+        assert!(root.join("tasks/backlog").is_dir());
         assert!(!root.join("tasks/todo.md").exists());
 
         fs::remove_dir_all(root).unwrap();
@@ -9405,6 +9594,7 @@ mod tests {
         assert!(root.join("tasks/todo").is_dir());
         assert!(root.join("tasks/doing").is_dir());
         assert!(root.join("tasks/done").is_dir());
+        assert!(root.join("tasks/backlog").is_dir());
         assert!(done_dir.join("0001-shipped.md").is_file());
         assert!(!root.join("tasks/todo.md").exists());
 
@@ -9434,6 +9624,10 @@ mod tests {
         assert_eq!(
             fs::read_to_string(tasks_dir.join("done.md")).unwrap(),
             "# Done Tasks\n- shipped already\n"
+        );
+        assert_eq!(
+            fs::read_to_string(tasks_dir.join("backlog.md")).unwrap(),
+            "# Backlog Tasks\n"
         );
 
         fs::remove_dir_all(root).unwrap();
@@ -9465,10 +9659,12 @@ mod tests {
         let todo = fs::read_to_string(tasks_dir.join("todo.md")).unwrap();
         let doing = fs::read_to_string(tasks_dir.join("doing.md")).unwrap();
         let done = fs::read_to_string(tasks_dir.join("done.md")).unwrap();
+        let backlog = fs::read_to_string(tasks_dir.join("backlog.md")).unwrap();
 
         assert_eq!(todo, "# Custom Todo\n- keep me\n");
         assert_eq!(doing, "# Doing Tasks\n");
         assert_eq!(done, "# Done Tasks\n");
+        assert_eq!(backlog, "# Backlog Tasks\n");
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -9510,9 +9706,11 @@ mod tests {
         assert!(root.join("tasks/todo").is_dir());
         assert!(root.join("tasks/doing").is_dir());
         assert!(root.join("tasks/done").is_dir());
+        assert!(root.join("tasks/backlog").is_dir());
         assert!(root.join("tasks/todo.md.bak").exists());
         assert!(root.join("tasks/doing.md.bak").exists());
         assert!(root.join("tasks/done.md.bak").exists());
+        assert!(root.join("tasks/backlog.md.bak").exists());
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -10386,6 +10584,22 @@ mod tests {
         assert_eq!(scan.todo_count, 1);
         assert_eq!(scan.doing_count, 0);
         assert!(has_pending_agent_task(&root));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_scan_does_not_treat_backlog_as_actionable_work() {
+        let root = temp_root("agent-scan-backlog");
+        add_task(&root, "not ready for an agent", None).unwrap();
+        move_task(&root, "todo", "backlog", "1").unwrap();
+
+        let scan = scan_agent_project(&root);
+
+        assert_eq!(scan.status, AgentProjectScanStatus::Empty);
+        assert_eq!(scan.todo_count, 0);
+        assert_eq!(scan.doing_count, 0);
+        assert!(!has_pending_agent_task(&root));
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -11443,6 +11657,87 @@ mod tests {
 
         assert_eq!(todo, "# To Do Tasks\n");
         assert_eq!(doing, "# Doing Tasks\n- ship the fix\n");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn move_task_supports_backlog_as_a_status() {
+        let root = temp_root("move-backlog");
+
+        add_task(&root, "consider this later", None).unwrap();
+        move_task(&root, "todo", "backlog", "1").unwrap();
+
+        assert!(read_tasks(&root, "todo").unwrap().is_empty());
+        assert_eq!(
+            read_tasks(&root, "backlog").unwrap(),
+            vec!["- consider this later"]
+        );
+        assert_eq!(normalize_status_arg("0").unwrap(), "backlog");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tui_backlog_visibility_preserves_existing_board_order() {
+        assert_eq!(visible_tui_board_indices(false), &[0, 1, 2]);
+        assert_eq!(visible_tui_board_indices(true), &[3, 0, 1, 2]);
+        assert_eq!(adjacent_visible_tui_board(0, false, -1), None);
+        assert_eq!(adjacent_visible_tui_board(0, true, -1), Some(3));
+        assert_eq!(adjacent_visible_tui_board(3, true, 1), Some(0));
+        assert_eq!(wrapped_visible_tui_board(0, false, -1), 2);
+        assert_eq!(wrapped_visible_tui_board(0, true, -1), 3);
+    }
+
+    #[test]
+    fn tui_backlog_action_moves_the_selected_task_while_column_is_hidden() {
+        let root = temp_root("tui-move-backlog-hidden");
+        add_task(&root, "first", None).unwrap();
+        add_task(&root, "move me", None).unwrap();
+        let board_dir = root.join("tasks");
+        let mut states: [ListState; 4] = std::array::from_fn(|_| ListState::default());
+        states[TODO_BOARD_INDEX].select(Some(1));
+        let mut selected_board = TODO_BOARD_INDEX;
+
+        let message = move_selected_tui_task_to_backlog(
+            &board_dir,
+            &TASK_STATUSES,
+            &mut states,
+            &mut selected_board,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(message, "Moved task to backlog");
+        assert_eq!(selected_board, TODO_BOARD_INDEX);
+        assert_eq!(states[TODO_BOARD_INDEX].selected(), Some(0));
+        assert_eq!(read_tasks(&root, "todo").unwrap(), vec!["- first"]);
+        assert_eq!(read_tasks(&root, "backlog").unwrap(), vec!["- move me"]);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn hiding_focused_backlog_returns_focus_to_todo() {
+        let root = temp_root("tui-hide-backlog");
+        add_task(&root, "todo task", None).unwrap();
+        let board_dir = root.join("tasks");
+        let mut states: [ListState; 4] = std::array::from_fn(|_| ListState::default());
+        states[BACKLOG_BOARD_INDEX].select(Some(0));
+        let mut selected_board = BACKLOG_BOARD_INDEX;
+        let mut backlog_visible = true;
+
+        let message = toggle_tui_backlog_column(
+            &board_dir,
+            &mut states,
+            &mut selected_board,
+            &mut backlog_visible,
+        );
+
+        assert_eq!(message, "Backlog column hidden. Press B to show it.");
+        assert!(!backlog_visible);
+        assert_eq!(selected_board, TODO_BOARD_INDEX);
+        assert_eq!(states[TODO_BOARD_INDEX].selected(), Some(0));
 
         fs::remove_dir_all(root).unwrap();
     }

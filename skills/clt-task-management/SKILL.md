@@ -1,6 +1,6 @@
 ---
 name: clt-task-management
-description: Manage project tasks with the clt file-system-backed Kanban CLI, including initialization, task creation and listing, status transitions, outcome notes, deletion, folder-backed tasks, and nested boards. Use when Codex needs to inspect, create, track, update, complete, or organize tasks in a project that uses clt or tasks/todo.md, tasks/doing.md, and tasks/done.md.
+description: Manage project tasks with the clt file-system-backed Kanban CLI, including backlog triage, initialization, task creation and listing, status transitions, outcome notes, deletion, folder-backed tasks, and nested boards. Use when Codex needs to inspect, create, track, update, complete, or organize tasks in a project that uses clt or tasks/backlog.md, tasks/todo.md, tasks/doing.md, and tasks/done.md.
 ---
 
 # Skills: Project Task Management with `clt`
@@ -9,24 +9,27 @@ This document defines the skills and operational procedures for an agent to mana
 
 ## Overview
 The project uses a file-system-backed Kanban system. By default, the tool automatically detects the git repository root and locates the `tasks/` directory there to keep task management centralized across the project. Tasks are stored in Markdown status files by default:
+- `tasks/backlog.md`: Captured tasks that are not ready to start.
 - `tasks/todo.md`: Tasks to be started.
 - `tasks/doing.md`: Tasks currently in progress.
 - `tasks/done.md`: Completed tasks.
 
 Statuses can also be folders instead of Markdown files:
+- `tasks/backlog/`: Each direct file or subfolder is one backlogged task.
 - `tasks/todo/`: Each direct file or subfolder is one todo task.
 - `tasks/doing/`: Each direct file or subfolder is one active task.
 - `tasks/done/`: Each direct file or subfolder is one completed task.
 
-For folder-backed statuses, `clt` displays the first sentence of each task file while preserving the full file content for longer notes. A task subfolder with its own `todo`, `doing`, and `done` stores is a nested subtask board in the TUI.
+For folder-backed statuses, `clt` displays the first sentence of each task file while preserving the full file content for longer notes. A task subfolder with its own `backlog`, `todo`, `doing`, and `done` stores is a nested subtask board in the TUI.
 
 ## Core Workflow
 The agent must adhere to the following state transition pipeline:
-`Todo` → `Doing` → `Done`
+`Backlog` → `Todo` → `Doing` → `Done`
 
-1. **Identify/Create**: Add new requirements or bugs to the `todo` list.
-2. **Activate**: When starting work on a task, move it from `todo` to `doing`.
-3. **Complete**: Once the task is verified and finished, move it from `doing` to `done`.
+1. **Capture/Triage**: Put work that is not ready in `backlog`. Backlog tasks are not eligible for automated agent runs.
+2. **Identify/Create**: Add actionable requirements or bugs to `todo`, or promote a ready backlog task to `todo`.
+3. **Activate**: When starting work on a task, move it from `todo` to `doing`.
+4. **Complete**: Once the task is verified and finished, move it from `doing` to `done`.
 
 ## Command Reference
 
@@ -46,7 +49,8 @@ clt --local init
 
 To expand existing Markdown status files into folder-backed task files:
 ```bash
-clt expand        # Expand todo.md, doing.md, and done.md
+clt expand        # Expand backlog.md, todo.md, doing.md, and done.md
+clt expand backlog
 clt expand todo   # Expand one status
 ```
 Expansion preserves the original Markdown file as `status.md.bak`.
@@ -61,6 +65,7 @@ clt add "Task description" ["Optional metadata"]
 Always list tasks before performing index-based operations to ensure the correct `task_index` is used.
 ```bash
 clt list          # List all tasks across all statuses
+clt list backlog  # List captured work that is not ready
 clt list todo     # List only todo tasks
 clt list doing    # List only doing tasks
 clt list done     # List only done tasks
@@ -68,6 +73,9 @@ clt list done     # List only done tasks
 
 **Sample output:**
 ```
+--- BACKLOG ---
+1. Investigate a future migration
+
 --- TODO ---
 1. Fix login bug
 2. Add dark mode
@@ -79,7 +87,7 @@ clt list done     # List only done tasks
 1. Set up CI pipeline
 ```
 
-Each section lists tasks with a 1-based index scoped to that status. An empty section displays the header with no items beneath it. Always use the index relative to its section — index `1` in `TODO` and index `1` in `DOING` refer to different tasks.
+Each section lists tasks with a 1-based index scoped to that status. An empty section displays the header with no items beneath it. Always use the index relative to its section — index `1` in `BACKLOG`, index `1` in `TODO`, and index `1` in `DOING` refer to different tasks.
 
 Folder-backed tasks still use the same status-scoped indexes. `clt list` marks folder tasks that contain nested boards with `[subtasks]`.
 
@@ -89,6 +97,12 @@ Move tasks between lists using their 1-based index.
 **Move to In Progress:**
 ```bash
 clt status todo <index> doing
+```
+
+**Backlog or promote a task:**
+```bash
+clt status todo <index> backlog
+clt status backlog <index> todo
 ```
 
 **Mark as Done:**
@@ -108,6 +122,7 @@ clt delete <status> <index>
 - **Root Awareness**: Be aware that `clt` operates relative to the git root by default. If you need to manage tasks in a specific subdirectory that is not the git root, use the `--local` flag.
 - **Verify Indices**: Task indices are dynamic. Always run `clt list <status>` immediately before a `status`, `done`, or `delete` command to avoid modifying the wrong task.
 - **Preserve Existing Tasks**: Never delete, reorder, or rewrite `clt` tasks unless explicitly asked. Other people may add todos while you are working, and those are real tasks, not noise.
+- **Backlog Is Not Actionable**: Do not start or automatically select backlog tasks. Work on one only after the user or project workflow promotes it to `todo`.
 - **Default Storage Mode**: Use regular Markdown-file mode for agent-created task lists unless the user explicitly asks for expanded folder-backed tasks. Do not run `clt init --folders` or `clt expand` just because a task has some detail.
 - **Folder-Backed Tasks**: When a status is already a folder, edit the task file for detailed notes. Keep the first sentence suitable for list and TUI display.
 - **Outcome Notes**: Before changing a task's status after a work attempt, record the outcome in the task. For a Markdown-backed status, append the note to the task's existing line. For a folder-backed status, preserve the first sentence and add a `Completion note:` or `Blocked note:` section to the task file.
@@ -132,6 +147,8 @@ clt add "Fix memory leak in parser" "BUG, HIGH"
 clt list todo
 ```
 ```
+--- BACKLOG ---
+
 --- TODO ---
 1. Fix memory leak in parser
 ```
@@ -180,6 +197,8 @@ clt done doing 1
 clt list
 ```
 ```
+--- BACKLOG ---
+
 --- TODO ---
 
 --- DOING ---
@@ -192,3 +211,6 @@ clt list
 For a visual representation of the board, the tool provides a TUI (Terminal User Interface). While agents primarily use the CLI, the TUI is the primary interface for human collaborators.
 ```bash
 clt
+```
+
+The Backlog column is hidden by default. Press `b` to move the selected task to Backlog, `B` to show or hide the column, or `0` to show and focus it. Keys `1`, `2`, and `3` focus Todo, Doing, and Done.

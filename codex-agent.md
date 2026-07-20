@@ -36,6 +36,7 @@ Task data remains in each project:
 ```text
 <project>/
   tasks/
+    backlog/
     todo/
     doing/
     done/
@@ -244,6 +245,7 @@ The scheduler should:
 - Skip projects with an active non-expired lease.
 - Skip projects in failure backoff.
 - Prefer projects with pending `todo` tasks.
+- Ignore backlog-only projects until a task is promoted to `todo`.
 - Treat `NO_TASKS_LEFT` as a clean idle result.
 - Stop or mark failure on timeout.
 

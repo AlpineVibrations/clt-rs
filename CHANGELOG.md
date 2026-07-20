@@ -10,10 +10,12 @@ Use this section while developing the next release.
 
 ### Added
 
-- Added folder-backed status support: `tasks/todo/`, `tasks/doing/`, and `tasks/done/` can now contain one task per file or subfolder.
+- Added a first-class Backlog status for Markdown- and folder-backed boards, including CLI listing and status transitions.
+- Added a hidden-by-default Backlog TUI column: `b` sends the selected task to Backlog, `B` toggles the column, and `0` reveals and focuses it.
+- Added folder-backed status support: `tasks/backlog/`, `tasks/todo/`, `tasks/doing/`, and `tasks/done/` can now contain one task per file or subfolder.
 - Added `clt init --folders` for fresh folder-backed task stores.
 - Added `clt expand [status]` to migrate Markdown status files into folder-backed task files.
-- Added nested subtask board navigation in the TUI for folder tasks that contain their own `todo`, `doing`, and `done` stores.
+- Added nested subtask board navigation in the TUI for folder tasks that contain their own `backlog`, `todo`, `doing`, and `done` stores.
 - Added first-sentence summaries for long task files while preserving full task content on moves.
 - Added a multi-project Codex agent registry with `register`, `unregister`, `pause`, `resume`, scheduler, daemon, service, status, and log commands.
 - Added a full-screen TUI agent projects pane for switching between registered project boards, toggling projects `ON` or `OFF`, and seeing `todo`/`doing` counts.

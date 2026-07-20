@@ -16,9 +16,9 @@ A file-system-backed task manager written in Rust. `clt` stores work in Markdown
 
 ## Features
 
-- **File-based Persistence**: Tasks are stored in `tasks/todo.md`, `tasks/doing.md`, and `tasks/done.md`, or in status folders such as `tasks/todo/`.
+- **File-based Persistence**: Tasks are stored in `tasks/backlog.md`, `tasks/todo.md`, `tasks/doing.md`, and `tasks/done.md`, or in status folders such as `tasks/todo/`.
 - **Long Task Files**: In a status folder, each direct file is a task. `clt` displays the first sentence and preserves the full file content.
-- **Nested Boards**: A task subfolder can contain its own `todo`, `doing`, and `done` files or folders. The TUI can open those as subtask boards.
+- **Nested Boards**: A task subfolder can contain its own `backlog`, `todo`, `doing`, and `done` files or folders. The TUI can open those as subtask boards.
 - **Kanban TUI**: A visual board view powered by `ratatui`, with nested board navigation and a full-screen registered-projects pane.
 - **Simple CLI**: Easy commands to add, move, and list tasks.
 - **Smart Root Detection**: Automatically finds the git repository root to keep tasks centralized, or uses the current directory.
@@ -68,12 +68,14 @@ clt
 ```
 Press `Enter` to open a folder task with subtasks, `e` to edit the selected task, `Space` to create a task, `Backspace` to return to the parent board, and `q` to quit.
 
+Backlog is a fourth column for captured work that is not ready to be acted on. It is hidden by default; the task-board console title shows its current task count. Press `b` to move the selected task to Backlog, `B` to show or hide the Backlog column, or `0` to show and focus it. When visible, Backlog appears to the left of To Do and works with the normal Left/Right focus and task-movement controls. Keys `1`, `2`, and `3` continue to focus To Do, Doing, and Done.
+
 Press `Tab` to switch to the full-screen agent projects pane. There, Up/Down selects a registered project, `Enter` opens that project's task board, `Space` toggles the project `ON` or `OFF`, and `g` toggles the `GIT` column, which controls whether that project's agent prompt asks Codex to use the `git-commit` skill after a completed task. The currently open project is marked with `*`, and the terminal title updates to the active project.
 
 Each registered project also has persisted Codex launch settings in the `CODEX` column. Enabled overrides are shown compactly as `model/thinking/fast`; settings that inherit the user's configuration are omitted, and `default` is shown when every setting is inherited. Press `f` to toggle Fast mode, `m` to cycle through the default and supported model choices, and `t` to cycle through the default, low, medium, high, extra-high, max, and ultra reasoning levels. These settings are applied to future automated runs; they do not change an agent process that is already running.
 
 ### Codex Agent
-`clt agent` can run Codex against enabled registered projects that have pending `todo` tasks. Each project keeps its own repo-local `tasks/` board, while the agent stores cross-project runtime state in one central state directory.
+`clt agent` can run Codex against enabled registered projects that have pending `todo` tasks. Backlog tasks are deliberately ignored until they are promoted to Todo. Each project keeps its own repo-local `tasks/` board, while the agent stores cross-project runtime state in one central state directory.
 
 Before registering a project, initialize its task board and make sure the `codex` CLI is installed and authenticated. With no path, `register` uses the same project root that normal `clt` commands use:
 ```bash
@@ -210,6 +212,8 @@ clt add "Fix login bug" "BUG, HIGH"
 ### Moving Tasks
 Change the status of a task:
 ```bash
+clt status todo 1 backlog
+clt status backlog 1 todo
 clt status todo 1 doing
 clt status doing 1 done
 ```
@@ -229,8 +233,11 @@ clt delete todo 1
 Get an overview of all tasks, or filter by status:
 ```bash
 clt list
+clt list backlog
 clt list todo
 ```
+
+Status number `0` is an alias for `backlog`; the existing `1`, `2`, and `3` aliases remain Todo, Doing, and Done.
 
 ### Folder-Backed Tasks
 You can create folder-backed statuses during init or expand an existing markdown list:
@@ -240,11 +247,12 @@ clt expand todo
 clt expand
 ```
 
-`clt expand todo` migrates only `todo.md`. `clt expand` migrates `todo.md`, `doing.md`, and `done.md`. The original Markdown files are preserved as `.bak` files.
+`clt expand todo` migrates only `todo.md`. `clt expand` migrates `backlog.md`, `todo.md`, `doing.md`, and `done.md`. The original Markdown files are preserved as `.bak` files.
 
 A folder-backed status looks like this:
 ```text
 tasks/
+  backlog.md
   todo/
     0001-write-release-plan.md
   doing.md
@@ -259,6 +267,7 @@ tasks/
   doing/
     0001-ship-dashboard/
       task.md
+      backlog.md
       todo.md
       doing.md
       done.md
