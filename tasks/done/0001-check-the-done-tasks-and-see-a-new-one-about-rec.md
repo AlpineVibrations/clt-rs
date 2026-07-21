@@ -1,0 +1,3 @@
+check the done tasks and see a new one about recovering stale session. sholdnt this be part of the automatic agent handling. becuase this happens sometimes
+
+Completion note: COMPLETED 2026-07-21: Confirmed automatic stale-session recovery was implemented by the preceding completed task in commit `df68438`: dead or expired leases resume the existing Doing task before any new Todo work. Re-verified with `cargo test agent_scheduler_resumes_doing_task -- --nocapture` (2 passed), `cargo test agent_codex_prompt -- --nocapture` (1 passed), `cargo test agent_run_once_reclaims_dead_local_process_lease -- --nocapture` (1 passed), `cargo fmt -- --check`, and `git diff --check`.
