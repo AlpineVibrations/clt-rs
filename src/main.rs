@@ -116,6 +116,14 @@ Git commit:
 - Include the code changes and related task-board updates in the commit when they are part of the same logical change.
 - Do not commit when there are no tasks left, the task is blocked, checks fail, or the work cannot be completed safely.
 "#;
+const AGENT_RESUME_DOING_PROMPT_APPENDIX: &str = r#"
+
+Interrupted task recovery:
+- A previous agent run was interrupted after moving a task to doing.
+- Resume and finish exactly one existing doing task.
+- Do not pick or move a TODO task; this recovery instruction replaces steps 2-4 above.
+- If there is no doing task to resume, say exactly: NO_TASKS_LEFT
+"#;
 
 #[derive(Clone, Debug)]
 struct TaskEntry {
@@ -212,6 +220,7 @@ struct AgentRunJob {
     state_dir: PathBuf,
     project: agent_store::AgentProject,
     holder: String,
+    task_selection: AgentTaskSelection,
 }
 
 struct AgentRunCompletion {
@@ -245,10 +254,26 @@ struct AgentDaemonCheckinSource {
 
 type AgentShutdownSignal = Arc<AtomicBool>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AgentTaskSelection {
+    NextTodo,
+    ResumeDoing,
+}
+
+impl AgentTaskSelection {
+    fn label(self) -> &'static str {
+        match self {
+            Self::NextTodo => "next_todo",
+            Self::ResumeDoing => "resume_doing",
+        }
+    }
+}
+
 trait AgentRunner: Send + Sync {
     fn run_project(
         &self,
         project: &agent_store::AgentProject,
+        task_selection: AgentTaskSelection,
         shutdown: &AgentShutdownSignal,
     ) -> Result<AgentRunResult>;
 }
@@ -1920,19 +1945,32 @@ fn run_agent_scheduler_pass_with_max_global_jobs(
             store.record_project_scan_blocking(project.id)
         })?;
 
-        if !scan.has_pending_task() {
+        let existing_lease = agent_lease_for_project(state_dir, project.id)?;
+        let resume_interrupted_task = scan.doing_count > 0
+            && existing_lease.as_ref().is_some_and(|lease| {
+                agent_lease_is_reclaimable(lease, reclaim_current_process_leases, now)
+            });
+        let task_selection = if resume_interrupted_task {
+            AgentTaskSelection::ResumeDoing
+        } else {
+            AgentTaskSelection::NextTodo
+        };
+
+        if !scan.has_pending_task() && !resume_interrupted_task {
             println!(
-                "Project {}: action=idle reason=no_pending_tasks todo={} scan_status={} path={}",
+                "Project {}: action=idle reason=no_pending_tasks todo={} doing={} scan_status={} path={}",
                 project.name,
                 scan.todo_count,
+                scan.doing_count,
                 scan.status_label(),
                 project.path.display()
             );
             continue;
         }
 
-        if let Some(reason) =
-            agent_project_cooldown_reason(&project, now, success_cooldown, failure_backoff)
+        if !resume_interrupted_task
+            && let Some(reason) =
+                agent_project_cooldown_reason(&project, now, success_cooldown, failure_backoff)
         {
             println!(
                 "Project {}: action=skip reason=\"{}\" todo={} scan_status={} path={}",
@@ -1949,11 +1987,12 @@ fn run_agent_scheduler_pass_with_max_global_jobs(
         if pass.active_agent_jobs + jobs.len() >= max_global_jobs {
             pass.deferred_projects += 1;
             println!(
-                "Project {}: action=defer reason=max_global_jobs_reached max_global_jobs={} active_agent_jobs={} todo={} scan_status={} path={}",
+                "Project {}: action=defer reason=max_global_jobs_reached max_global_jobs={} active_agent_jobs={} todo={} doing={} scan_status={} path={}",
                 project.name,
                 max_global_jobs,
                 pass.active_agent_jobs,
                 scan.todo_count,
+                scan.doing_count,
                 scan.status_label(),
                 project.path.display()
             );
@@ -1966,7 +2005,7 @@ fn run_agent_scheduler_pass_with_max_global_jobs(
             store.try_acquire_lease_blocking(project.id, &holder, &acquired_at, &expires_at)
         })?;
         if !acquired {
-            let lease = active_agent_lease_for_project(state_dir, project.id)?;
+            let lease = agent_lease_for_project(state_dir, project.id)?;
             if let Some(lease) = lease.as_ref()
                 && try_reclaim_inactive_agent_lease(
                     state_dir,
@@ -1987,16 +2026,18 @@ fn run_agent_scheduler_pass_with_max_global_jobs(
 
             if !acquired {
                 pass.skipped_active_lease += 1;
-                let lease = active_agent_lease_for_project(state_dir, project.id)?;
+                let lease = agent_lease_for_project(state_dir, project.id)?;
                 print_active_lease_skip(&project, &scan, lease.as_ref());
                 continue;
             }
         }
 
         println!(
-            "Project {}: action=running todo={} scan_status={} lease_holder={} lease_acquired_at={} lease_expires_at={} path={}",
+            "Project {}: action=running work={} todo={} doing={} scan_status={} lease_holder={} lease_acquired_at={} lease_expires_at={} path={}",
             project.name,
+            task_selection.label(),
             scan.todo_count,
+            scan.doing_count,
             scan.status_label(),
             holder,
             format_agent_timestamp(&acquired_at),
@@ -2009,6 +2050,7 @@ fn run_agent_scheduler_pass_with_max_global_jobs(
             state_dir: state_dir.to_path_buf(),
             project,
             holder: holder.clone(),
+            task_selection,
         });
     }
 
@@ -2040,7 +2082,7 @@ fn run_agent_job(
     shutdown: &AgentShutdownSignal,
 ) -> Result<AgentRunCompletion> {
     let started_at = agent_timestamp();
-    let run_result = runner.run_project(&job.project, shutdown);
+    let run_result = runner.run_project(&job.project, job.task_selection, shutdown);
     let finished_at = agent_timestamp();
 
     let (status, exit_code, log_dir, stdout_path, stderr_path, summary) = match run_result {
@@ -2206,17 +2248,33 @@ fn format_optional_u64(value: Option<u64>) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
-fn active_agent_lease_for_project(
+fn agent_lease_for_project(
     state_dir: &Path,
     project_id: i64,
 ) -> Result<Option<agent_store::AgentLeaseRecord>> {
-    let now = agent_timestamp();
     with_agent_store_at(state_dir, |store| {
-        let leases = store.list_active_leases_blocking(&now)?;
-        Ok(leases
-            .into_iter()
-            .find(|lease| lease.project_id == project_id))
+        store.lease_for_project_blocking(project_id)
     })
+}
+
+fn agent_lease_is_reclaimable(
+    lease: &agent_store::AgentLeaseRecord,
+    reclaim_current_process_leases: bool,
+    now: u64,
+) -> bool {
+    if lease
+        .expires_at
+        .parse::<u64>()
+        .is_ok_and(|expires_at| expires_at <= now)
+    {
+        return true;
+    }
+
+    match agent_lease_holder_liveness(&lease.holder) {
+        AgentLeaseHolderLiveness::Dead => true,
+        AgentLeaseHolderLiveness::CurrentProcess => reclaim_current_process_leases,
+        AgentLeaseHolderLiveness::Alive | AgentLeaseHolderLiveness::Unknown => false,
+    }
 }
 
 fn try_reclaim_inactive_agent_lease(
@@ -2227,12 +2285,11 @@ fn try_reclaim_inactive_agent_lease(
     reclaim_current_process_leases: bool,
 ) -> Result<bool> {
     let liveness = agent_lease_holder_liveness(&lease.holder);
-    let reclaimable = match liveness {
-        AgentLeaseHolderLiveness::Dead => true,
-        AgentLeaseHolderLiveness::CurrentProcess => reclaim_current_process_leases,
-        AgentLeaseHolderLiveness::Alive | AgentLeaseHolderLiveness::Unknown => false,
-    };
-    if !reclaimable {
+    if !agent_lease_is_reclaimable(
+        lease,
+        reclaim_current_process_leases,
+        agent_timestamp_seconds(),
+    ) {
         return Ok(false);
     }
 
@@ -2359,8 +2416,14 @@ impl CodexAgentRunner {
     }
 }
 
-fn agent_codex_prompt(project: &agent_store::AgentProject) -> String {
+fn agent_codex_prompt(
+    project: &agent_store::AgentProject,
+    task_selection: AgentTaskSelection,
+) -> String {
     let mut prompt = AGENT_CODEX_PROMPT_BASE.to_string();
+    if task_selection == AgentTaskSelection::ResumeDoing {
+        prompt.push_str(AGENT_RESUME_DOING_PROMPT_APPENDIX);
+    }
     if project.git_commit_enabled {
         prompt.push_str(AGENT_GIT_COMMIT_PROMPT_APPENDIX);
     }
@@ -2371,6 +2434,7 @@ impl AgentRunner for CodexAgentRunner {
     fn run_project(
         &self,
         project: &agent_store::AgentProject,
+        task_selection: AgentTaskSelection,
         shutdown: &AgentShutdownSignal,
     ) -> Result<AgentRunResult> {
         let log_dir = agent_project_run_log_dir(&self.state_dir, project)?;
@@ -2412,7 +2476,7 @@ impl AgentRunner for CodexAgentRunner {
             .arg("exec")
             .arg("-C")
             .arg(&project.path)
-            .arg(agent_codex_prompt(project))
+            .arg(agent_codex_prompt(project, task_selection))
             .current_dir(&project.path)
             .stdout(Stdio::from(stdout_file))
             .stderr(Stdio::from(stderr_file));
@@ -3459,6 +3523,46 @@ mod agent_store {
                 .with_context(|| format!("Failed to release lease for project {}", project_id))?;
 
             Ok(removed > 0)
+        }
+
+        pub(crate) fn lease_for_project_blocking(
+            &self,
+            project_id: i64,
+        ) -> Result<Option<AgentLeaseRecord>> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(self.lease_for_project(project_id))
+        }
+
+        async fn lease_for_project(&self, project_id: i64) -> Result<Option<AgentLeaseRecord>> {
+            let conn = self.connect()?;
+            let mut rows = conn
+                .query(
+                    "SELECT l.project_id, p.name, p.path, l.holder, l.acquired_at, l.expires_at
+                     FROM leases l
+                     JOIN projects p ON p.id = l.project_id
+                     WHERE l.project_id = ?1",
+                    [project_id],
+                )
+                .await
+                .with_context(|| format!("Failed to read lease for project {project_id}"))?;
+
+            let Some(row) = rows
+                .next()
+                .await
+                .context("Failed to read agent lease row")?
+            else {
+                return Ok(None);
+            };
+
+            Ok(Some(AgentLeaseRecord {
+                project_id: row_integer(&row, 0, "project_id")?,
+                project_name: row_text(&row, 1, "name")?,
+                project_path: PathBuf::from(row_text(&row, 2, "path")?),
+                holder: row_text(&row, 3, "holder")?,
+                acquired_at: row_text(&row, 4, "acquired_at")?,
+                expires_at: row_text(&row, 5, "expires_at")?,
+            }))
         }
 
         pub(crate) fn list_active_leases_blocking(
@@ -8828,6 +8932,7 @@ mod tests {
         fn run_project(
             &self,
             project: &agent_store::AgentProject,
+            _task_selection: AgentTaskSelection,
             _shutdown: &AgentShutdownSignal,
         ) -> Result<AgentRunResult> {
             self.ran_projects.lock().unwrap().push(project.path.clone());
@@ -11004,6 +11109,84 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn agent_scheduler_resumes_doing_task_after_crashed_process() {
+        let root = temp_root("agent-resume-doing-dead-lease");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        add_task(&project_root, "interrupted task", None).unwrap();
+        move_task(&project_root, "todo", "doing", "1").unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert!(
+            store
+                .try_acquire_lease_blocking(project.id, "clt-agent-4294967295", "100", "9999999999")
+                .unwrap()
+        );
+        drop(store);
+
+        let mut start = run_agent_scheduler_pass(&state_dir, false, &[]).unwrap();
+
+        assert_eq!(start.pass.pending_projects, 1);
+        assert_eq!(start.pass.runs_started, 1);
+        assert_eq!(start.jobs.len(), 1);
+        assert_eq!(
+            start.jobs[0].task_selection,
+            AgentTaskSelection::ResumeDoing
+        );
+
+        let runner = FakeAgentRunner::new(&state_dir, "success");
+        let shutdown = new_agent_shutdown_signal();
+        run_agent_job(start.jobs.pop().unwrap(), &runner, &shutdown).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+
+        assert_eq!(runner.ran_project_count(), 1);
+        assert_eq!(store.run_count_blocking().unwrap(), 1);
+        assert_eq!(store.lease_count_blocking().unwrap(), 0);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_scheduler_resumes_doing_task_after_lease_expiry() {
+        let root = temp_root("agent-resume-doing-expired-lease");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        add_task(&project_root, "expired interrupted task", None).unwrap();
+        move_task(&project_root, "todo", "doing", "1").unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert!(
+            store
+                .try_acquire_lease_blocking(project.id, "old-holder", "100", "101")
+                .unwrap()
+        );
+        drop(store);
+
+        let start = run_agent_scheduler_pass(&state_dir, false, &[]).unwrap();
+
+        assert_eq!(start.pass.pending_projects, 1);
+        assert_eq!(start.pass.runs_started, 1);
+        assert_eq!(start.jobs.len(), 1);
+        assert_eq!(
+            start.jobs[0].task_selection,
+            AgentTaskSelection::ResumeDoing
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn agent_store_recovers_stale_leases() {
         let root = temp_root("agent-run-stale-lease");
@@ -11296,14 +11479,20 @@ mod tests {
             failure_count: 0,
         };
 
-        let base_prompt = agent_codex_prompt(&project);
+        let base_prompt = agent_codex_prompt(&project, AgentTaskSelection::NextTodo);
         assert!(base_prompt.contains("Use the existing task-management CLI tooling: clt."));
+        assert!(!base_prompt.contains("Interrupted task recovery:"));
         assert!(!base_prompt.contains("$git-commit"));
 
         project.git_commit_enabled = true;
-        let commit_prompt = agent_codex_prompt(&project);
+        let commit_prompt = agent_codex_prompt(&project, AgentTaskSelection::NextTodo);
         assert!(commit_prompt.contains("$git-commit"));
         assert!(commit_prompt.contains("Do not commit when there are no tasks left"));
+
+        let recovery_prompt = agent_codex_prompt(&project, AgentTaskSelection::ResumeDoing);
+        assert!(recovery_prompt.contains("Interrupted task recovery:"));
+        assert!(recovery_prompt.contains("Resume and finish exactly one existing doing task."));
+        assert!(recovery_prompt.contains("Do not pick or move a TODO task"));
     }
 
     #[cfg(unix)]
@@ -11401,7 +11590,9 @@ mod tests {
             CodexAgentRunner::with_command(state_dir.clone(), Duration::from_secs(5), fake_codex);
         let shutdown = new_agent_shutdown_signal();
 
-        let result = runner.run_project(&project, &shutdown).unwrap();
+        let result = runner
+            .run_project(&project, AgentTaskSelection::NextTodo, &shutdown)
+            .unwrap();
 
         assert_eq!(result.status, "idle");
         assert_eq!(result.exit_code, Some(0));
@@ -11464,7 +11655,9 @@ mod tests {
             shutdown_thread_signal.store(true, Ordering::SeqCst);
         });
 
-        let result = runner.run_project(&project, &shutdown).unwrap();
+        let result = runner
+            .run_project(&project, AgentTaskSelection::NextTodo, &shutdown)
+            .unwrap();
 
         assert_eq!(result.status, "interrupted");
         let stderr = fs::read_to_string(&result.stderr_path).unwrap();

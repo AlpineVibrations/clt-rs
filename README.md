@@ -75,7 +75,7 @@ Press `Tab` to switch to the full-screen agent projects pane. There, Up/Down sel
 Each registered project also has persisted Codex launch settings in the `CODEX` column. Enabled overrides are shown compactly as `model/thinking/fast`; settings that inherit the user's configuration are omitted, and `default` is shown when every setting is inherited. Press `f` to toggle Fast mode, `m` to cycle through the default and supported model choices, and `t` to cycle through the default, low, medium, high, extra-high, max, and ultra reasoning levels. These settings are applied to future automated runs; they do not change an agent process that is already running.
 
 ### Codex Agent
-`clt agent` can run Codex against enabled registered projects that have pending `todo` tasks. Backlog tasks are deliberately ignored until they are promoted to Todo. Each project keeps its own repo-local `tasks/` board, while the agent stores cross-project runtime state in one central state directory.
+`clt agent` can run Codex against enabled registered projects that have pending `todo` tasks. It can also recover a task left in `doing` when a previous agent lease belongs to a crashed process or has expired. Backlog tasks are deliberately ignored until they are promoted to Todo. Each project keeps its own repo-local `tasks/` board, while the agent stores cross-project runtime state in one central state directory.
 
 Before registering a project, initialize its task board and make sure the `codex` CLI is installed and authenticated. With no path, `register` uses the same project root that normal `clt` commands use:
 ```bash
@@ -149,7 +149,7 @@ Run one foreground scheduler pass:
 clt agent run --once
 ```
 
-The scheduler scans enabled projects, picks projects with pending `todo` tasks, takes an agent lease, and starts one Codex run at a time. Each Codex run is prompted to inspect the board, move one available task to `doing`, complete it, run relevant checks, update the task through `clt`, and stop after that single task.
+The scheduler scans enabled projects, picks projects with pending `todo` tasks, takes an agent lease, and starts one Codex run at a time. Each Codex run is prompted to inspect the board, move one available task to `doing`, complete it, run relevant checks, update the task through `clt`, and stop after that single task. If a crashed run left a stale lease and a task in `doing`, the scheduler reclaims the lease and prompts the replacement run to resume that task before starting new work.
 
 Automated runs start Codex with `--sandbox danger-full-access --ask-for-approval never` so tasks can update Git metadata without pausing for interactive approval. This removes the Codex command sandbox for the entire run. Register only trusted repositories, or run the agent inside an externally isolated container or VM.
 
