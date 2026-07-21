@@ -4425,6 +4425,17 @@ fn get_archive_status_store(board_dir: &Path) -> Option<StatusStore> {
     })
 }
 
+fn get_or_create_archive_status_store(board_dir: &Path) -> Result<StatusStore> {
+    if let Some(store) = get_archive_status_store(board_dir) {
+        return Ok(store);
+    }
+
+    let archive_dir = board_dir.join(ARCHIVE_STATUS_CANDIDATES[0]);
+    fs::create_dir_all(&archive_dir)
+        .with_context(|| format!("Failed to create archive directory {:?}", archive_dir))?;
+    Ok(StatusStore::Directory(archive_dir))
+}
+
 // find_task_status is no longer needed for index-based referencing
 // as the user must specify the source list.
 
@@ -5012,6 +5023,36 @@ fn convert_status_to_directory(board_dir: &Path, status: &str) -> Result<PathBuf
     Ok(dir_path)
 }
 
+fn convert_archive_to_directory(archive_file: &Path) -> Result<PathBuf> {
+    let board_dir = archive_file
+        .parent()
+        .context("Archive file has no parent directory")?;
+    let archive_name = archive_file
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .context("Archive file has an invalid name")?;
+    let archive_dir = board_dir.join(archive_name);
+    fs::create_dir_all(&archive_dir)
+        .with_context(|| format!("Failed to create archive directory {:?}", archive_dir))?;
+
+    for entry in read_markdown_entries(archive_file)? {
+        insert_content_into_directory(&archive_dir, None, &entry.content)?;
+    }
+
+    let backup_name = format!(
+        "{}.bak",
+        archive_file
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("Archive file has an invalid name")?
+    );
+    let backup_path = unique_child_path(board_dir, &backup_name);
+    fs::rename(archive_file, &backup_path)
+        .with_context(|| format!("Failed to preserve archive file as {:?}", backup_path))?;
+
+    Ok(archive_dir)
+}
+
 fn expand_status_for_command(board_dir: &Path, status: &'static str) -> Result<ExpansionSummary> {
     ensure_board_store(board_dir)?;
 
@@ -5108,6 +5149,34 @@ fn move_task_in_board(board_dir: &Path, from: &str, to: &str, task_index_str: &s
         }
         (TaskSource::MarkdownLine { .. }, _) => {
             insert_task_content(board_dir, to, dest_index, &entry.content)?;
+            remove_task_entry(board_dir, from, &entry)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn move_task_to_archive_in_board(board_dir: &Path, from: &str, task_index_str: &str) -> Result<()> {
+    let task_index = parse_one_based_task_index(task_index_str)?;
+    let entry = task_entry_at(board_dir, from, task_index)?;
+
+    match (
+        &entry.source,
+        get_or_create_archive_status_store(board_dir)?,
+    ) {
+        (TaskSource::Path { path, .. }, StatusStore::Directory(archive_dir)) => {
+            move_path_into_directory(path, &archive_dir, None)?;
+        }
+        (TaskSource::Path { path, .. }, StatusStore::MarkdownFile(archive_file)) => {
+            let archive_dir = convert_archive_to_directory(&archive_file)?;
+            move_path_into_directory(path, &archive_dir, None)?;
+        }
+        (TaskSource::MarkdownLine { .. }, StatusStore::Directory(archive_dir)) => {
+            insert_content_into_directory(&archive_dir, None, &entry.content)?;
+            remove_task_entry(board_dir, from, &entry)?;
+        }
+        (TaskSource::MarkdownLine { .. }, StatusStore::MarkdownFile(archive_file)) => {
+            insert_content_into_markdown(&archive_file, None, &entry.content)?;
             remove_task_entry(board_dir, from, &entry)?;
         }
     }
@@ -5563,6 +5632,30 @@ fn move_selected_tui_task_to_backlog(
     Ok("Moved task to backlog".to_string())
 }
 
+fn move_selected_tui_task_to_archive(
+    board_dir: &Path,
+    statuses: &[&str],
+    board_states: &mut [ListState],
+    selected_board: usize,
+) -> Result<String> {
+    let Some(idx) = selected_task_index_in_board(
+        board_dir,
+        statuses[selected_board],
+        &board_states[selected_board],
+    ) else {
+        return Ok("No task selected".to_string());
+    };
+
+    move_task_to_archive_in_board(board_dir, statuses[selected_board], &(idx + 1).to_string())?;
+    normalize_board_selection_in_board(
+        board_dir,
+        statuses[selected_board],
+        &mut board_states[selected_board],
+    );
+
+    Ok("Moved task to archive".to_string())
+}
+
 fn task_display_height(
     task: &str,
     idx: usize,
@@ -5654,7 +5747,7 @@ fn tui_start_state(active_board: bool) -> TuiStartState {
             active_board,
             current_pane: TuiPane::Tasks,
             feedback_buffer: String::from(
-                "Kanban View! Tab switches to the agent projects pane, Enter opens a selected project there, Space toggles it ON/OFF, g toggles git-commit, m/f/t change its Codex model/fast/thinking settings, Backspace returns to parent, Space creates a task on the board, b moves a task to backlog, B toggles the backlog column, 'a' opens archive view, Shift+Arrows reorder or move tasks, 'd' deletes, 'q' quits.",
+                "Kanban View! Tab switches to the agent projects pane, Enter opens a selected project there, Space toggles it ON/OFF, g toggles git-commit, m/f/t change its Codex model/fast/thinking settings, Backspace returns to parent, Space creates a task on the board, a archives a task, A opens archive view, b moves a task to backlog, B toggles the backlog column, Shift+Arrows reorder or move tasks, 'd' deletes, 'q' quits.",
             ),
         }
     } else {
@@ -7612,7 +7705,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                     .collect();
                 let highlight_style = Style::default().fg(Color::Black).bg(c_highlight);
                 let block = Block::default()
-                    .title(" Archived - press a again to leave ")
+                    .title(" Archived - press A again to leave ")
                     .title(
                         Line::from(vec![Span::raw(format!(" {} ", tasks.len()))])
                             .alignment(Alignment::Right),
@@ -7919,7 +8012,8 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                  [e]            - Edit selected task\n\
                                  [g]            - Toggle git-commit for selected agent project\n\
                                  [l]            - Toggle selected agent project's live/current output log\n\
-                                 [a]            - Toggle archive view\n\
+                                 [a]            - Move selected task to archive\n\
+                                 [A]            - Toggle archive view\n\
                                  [b]            - Move selected task to backlog\n\
                                  [B]            - Show/hide backlog column\n\
                                  [Backspace]    - Return to parent board\n\
@@ -8263,7 +8357,9 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                             }
                         } else if archive_view {
                             match key.code {
-                                KeyCode::Char('a') | KeyCode::Char('A') => {
+                                KeyCode::Char('A') | KeyCode::Char('a')
+                                    if key.modifiers.contains(KeyModifiers::SHIFT) =>
+                                {
                                     archive_view = false;
                                     archive_state.select(None);
                                     archive_scroll_offset = 0;
@@ -8299,12 +8395,24 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                 }
                                 _ => {
                                     feedback_buffer =
-                                        "Archive view is read-only. Press a again to leave."
+                                        "Archive view is read-only. Press A again to leave."
                                             .to_string();
                                 }
                             }
                         } else if key.modifiers.contains(KeyModifiers::SHIFT) {
                             match key.code {
+                                KeyCode::Char('A') | KeyCode::Char('a') => {
+                                    archive_view = true;
+                                    current_mode = Mode::View;
+                                    archive_scroll_offset = 0;
+                                    select_first_archive_task_if_present_in_board(
+                                        &board_dir,
+                                        &mut archive_state,
+                                    );
+                                    feedback_buffer =
+                                        "Archive view. Press A again to leave archive view."
+                                            .to_string();
+                                }
                                 KeyCode::Char('B') | KeyCode::Char('b') => {
                                     feedback_buffer = toggle_tui_backlog_column(
                                         &board_dir,
@@ -8499,7 +8607,18 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                         Err(error) => format!("Error: {error}"),
                                     };
                                 }
-                                KeyCode::Char('a') | KeyCode::Char('A') => {
+                                KeyCode::Char('a') => {
+                                    feedback_buffer = match move_selected_tui_task_to_archive(
+                                        &board_dir,
+                                        &statuses,
+                                        &mut board_states,
+                                        selected_board,
+                                    ) {
+                                        Ok(message) => message,
+                                        Err(error) => format!("Error: {error}"),
+                                    };
+                                }
+                                KeyCode::Char('A') => {
                                     archive_view = true;
                                     current_mode = Mode::View;
                                     archive_scroll_offset = 0;
@@ -8508,7 +8627,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                         &mut archive_state,
                                     );
                                     feedback_buffer =
-                                        "Archive view. Press a again to leave archive view."
+                                        "Archive view. Press A again to leave archive view."
                                             .to_string();
                                 }
                                 KeyCode::Char('q') => break,
@@ -11757,6 +11876,36 @@ mod tests {
     }
 
     #[test]
+    fn tui_archive_action_moves_the_selected_task() {
+        let root = temp_root("tui-move-archive");
+        add_task(&root, "keep this active", None).unwrap();
+        add_task(&root, "archive me", None).unwrap();
+        let board_dir = root.join("tasks");
+        let mut states: [ListState; 4] = std::array::from_fn(|_| ListState::default());
+        states[TODO_BOARD_INDEX].select(Some(1));
+
+        let message = move_selected_tui_task_to_archive(
+            &board_dir,
+            &TASK_STATUSES,
+            &mut states,
+            TODO_BOARD_INDEX,
+        )
+        .unwrap();
+
+        assert_eq!(message, "Moved task to archive");
+        assert_eq!(states[TODO_BOARD_INDEX].selected(), Some(0));
+        assert_eq!(
+            read_tasks(&root, "todo").unwrap(),
+            vec!["- keep this active"]
+        );
+        let archived = read_archived_task_entries(&board_dir).unwrap();
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].summary, "archive me");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn hiding_focused_backlog_returns_focus_to_todo() {
         let root = temp_root("tui-hide-backlog");
         add_task(&root, "todo task", None).unwrap();
@@ -11845,6 +11994,39 @@ mod tests {
         assert!(entries.is_empty());
         assert!(!root.join("tasks/archived").exists());
         assert!(!root.join("tasks/archived.md").exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn archiving_folder_task_preserves_content_and_legacy_archive() {
+        let root = temp_root("archive-folder-task");
+        let tasks_dir = root.join("tasks");
+        fs::create_dir_all(tasks_dir.join("todo")).unwrap();
+        fs::write(
+            tasks_dir.join("todo/long-task.md"),
+            "Archive this task. Preserve the full details.\n\n- First detail\n- Second detail\n",
+        )
+        .unwrap();
+        fs::write(
+            tasks_dir.join("archived.md"),
+            "# Archived Tasks\n- older archived task\n",
+        )
+        .unwrap();
+
+        move_task_to_archive_in_board(&tasks_dir, "todo", "1").unwrap();
+
+        assert!(
+            directory_task_paths(&tasks_dir.join("todo"))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(tasks_dir.join("archived.md.bak").exists());
+        let archived = read_archived_task_entries(&tasks_dir).unwrap();
+        assert_eq!(archived.len(), 2);
+        assert_eq!(archived[0].summary, "older archived task");
+        assert_eq!(archived[1].summary, "Archive this task.");
+        assert!(archived[1].content.contains("Second detail"));
 
         fs::remove_dir_all(root).unwrap();
     }
