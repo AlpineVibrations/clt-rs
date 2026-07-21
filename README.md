@@ -209,11 +209,19 @@ clt add My first task
 clt add "Fix login bug" "BUG, HIGH"
 ```
 
+### Managing the Backlog
+Backlog is for captured work that is not ready to enter the To Do queue. `clt add` creates To Do tasks; move a task to Backlog when it needs to be deferred, list the Backlog for review, and promote it to To Do when it is ready:
+```bash
+clt status todo 1 backlog
+clt list backlog
+clt status backlog 1 todo
+```
+
+Automated agent runs ignore Backlog tasks until they are promoted to To Do.
+
 ### Moving Tasks
 Change the status of a task:
 ```bash
-clt status todo 1 backlog
-clt status backlog 1 todo
 clt status todo 1 doing
 clt status doing 1 done
 ```
