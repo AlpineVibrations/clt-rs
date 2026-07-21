@@ -7512,6 +7512,16 @@ fn board_display_name(root: &Path, board_dir: &Path) -> String {
     }
 }
 
+fn tui_console_block<'a>(title: &'a str, right_title: Option<&'a str>) -> Block<'a> {
+    let block = Block::default().borders(Borders::ALL).title(title);
+
+    if let Some(right_title) = right_title {
+        block.title(Line::from(right_title).alignment(Alignment::Right))
+    } else {
+        block
+    }
+}
+
 fn tui_view(root: &Path) -> Result<()> {
     tui_view_with_active_board(root, true)
 }
@@ -7609,21 +7619,24 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
             } else {
                 "No Active Board".to_string()
             };
-            let console_title = if let Some(log_view) = agent_log_view.as_ref()
+            let (console_title, console_right_title) = if let Some(log_view) = agent_log_view.as_ref()
                 && current_pane == TuiPane::AgentProjects
             {
-                tui_agent_log_title(log_view)
+                (tui_agent_log_title(log_view), None)
             } else if current_pane == TuiPane::AgentProjects {
-                "Agent Projects Console".to_string()
+                ("Agent Projects Console".to_string(), None)
             } else if archive_view {
-                format!("{board_title} Archive Console")
+                (format!("{board_title} Archive Console"), None)
             } else if !backlog_visible {
                 let backlog_count = read_task_entries(&board_dir, "backlog")
                     .map(|entries| entries.len())
                     .unwrap_or(0);
-                format!("{board_title} Console | Backlog: {backlog_count} [B]")
+                (
+                    format!("{board_title} Console"),
+                    Some(format!(" Backlog: {backlog_count} [B] ")),
+                )
             } else {
-                format!("{board_title} Console")
+                (format!("{board_title} Console"), None)
             };
 
             // Calculate input height if in Input or Edit mode
@@ -7988,11 +8001,10 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                 feedback_area.width.saturating_sub(2) as usize,
             );
             let feedback_paragraph = Paragraph::new(wrapped_console_content.as_str())
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(console_title.as_str()),
-                )
+                .block(tui_console_block(
+                    console_title.as_str(),
+                    console_right_title.as_deref(),
+                ))
                 .style(Style::default().fg(console_color))
                 .scroll((
                     tui_log_scroll_offset(
@@ -11801,6 +11813,23 @@ mod tests {
             app_title(Path::new("/Users/pro/code/lls/example")),
             "clt | example"
         );
+    }
+
+    #[test]
+    fn tui_console_block_right_aligns_the_backlog_status() {
+        use ratatui::{buffer::Buffer, widgets::Widget};
+
+        let area = Rect::new(0, 0, 48, 3);
+        let mut buffer = Buffer::empty(area);
+
+        tui_console_block("clt Console", Some(" Backlog: 2 [B] ")).render(area, &mut buffer);
+
+        let top_border = (0..area.width)
+            .map(|x| buffer[(x, 0)].symbol())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(top_border.starts_with("┌clt Console"));
+        assert!(top_border.ends_with(" Backlog: 2 [B] ┐"));
     }
 
     #[test]
