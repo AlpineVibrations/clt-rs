@@ -116,6 +116,13 @@ Git commit:
 - Include the code changes and related task-board updates in the commit when they are part of the same logical change.
 - Do not commit when there are no tasks left, the task is blocked, checks fail, or the work cannot be completed safely.
 "#;
+const AGENT_GIT_PUSH_PROMPT_APPENDIX: &str = r#"
+
+Git push:
+- This project is configured for commit and push. After creating the verified commit, use the $git-commit skill's pull-with-rebase and push workflow for the current branch.
+- Do not push when no commit was created or when synchronization, hooks, checks, or the commit fail.
+- Never force-push.
+"#;
 const AGENT_RESUME_DOING_PROMPT_APPENDIX: &str = r#"
 
 Interrupted task recovery:
@@ -124,6 +131,56 @@ Interrupted task recovery:
 - Do not pick or move a TODO task; this recovery instruction replaces steps 2-4 above.
 - If there is no doing task to resume, say exactly: NO_TASKS_LEFT
 "#;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AgentGitMode {
+    Off,
+    Commit,
+    CommitAndPush,
+}
+
+impl AgentGitMode {
+    fn next(self) -> Self {
+        match self {
+            Self::Off => Self::Commit,
+            Self::Commit => Self::CommitAndPush,
+            Self::CommitAndPush => Self::Off,
+        }
+    }
+
+    fn database_value(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Commit => "commit",
+            Self::CommitAndPush => "commit-and-push",
+        }
+    }
+
+    fn from_database(value: &str) -> Result<Self> {
+        match value {
+            "off" => Ok(Self::Off),
+            "commit" => Ok(Self::Commit),
+            "commit-and-push" => Ok(Self::CommitAndPush),
+            _ => anyhow::bail!("Unknown agent Git mode: {value}"),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Commit => "commit",
+            Self::CommitAndPush => "commit & push",
+        }
+    }
+
+    fn tui_label(self) -> &'static str {
+        match self {
+            Self::Off => "OFF",
+            Self::Commit => "COM",
+            Self::CommitAndPush => "PUSH",
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 struct TaskEntry {
@@ -430,6 +487,11 @@ enum AgentGitCommitCommands {
         /// Project path to update. Defaults to the current directory.
         path: Option<PathBuf>,
     },
+    /// Adds git commit and push instructions to this project's agent prompt
+    Push {
+        /// Project path to update. Defaults to the current directory.
+        path: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -528,21 +590,30 @@ fn handle_agent_command(command: AgentCommands, local: bool, default_root: &Path
             let store = open_agent_store()?;
             match command {
                 AgentGitCommitCommands::Enable { path } => {
-                    set_agent_project_git_commit_enabled(
+                    set_agent_project_git_mode(
                         &store,
                         path.as_deref(),
                         local,
                         default_root,
-                        true,
+                        AgentGitMode::Commit,
                     )?;
                 }
                 AgentGitCommitCommands::Disable { path } => {
-                    set_agent_project_git_commit_enabled(
+                    set_agent_project_git_mode(
                         &store,
                         path.as_deref(),
                         local,
                         default_root,
-                        false,
+                        AgentGitMode::Off,
+                    )?;
+                }
+                AgentGitCommitCommands::Push { path } => {
+                    set_agent_project_git_mode(
+                        &store,
+                        path.as_deref(),
+                        local,
+                        default_root,
+                        AgentGitMode::CommitAndPush,
                     )?;
                 }
             }
@@ -644,19 +715,18 @@ fn set_agent_project_enabled(
     Ok(())
 }
 
-fn set_agent_project_git_commit_enabled(
+fn set_agent_project_git_mode(
     store: &agent_store::TursoAgentStore,
     path: Option<&Path>,
     local: bool,
     default_root: &Path,
-    enabled: bool,
+    mode: AgentGitMode,
 ) -> Result<()> {
     let project_root = resolve_agent_project_root(path, local, default_root)?;
-    if store.set_project_git_commit_enabled_for_path_blocking(&project_root, enabled)? {
-        let action = if enabled { "Enabled" } else { "Disabled" };
+    if store.set_project_git_mode_for_path_blocking(&project_root, mode)? {
         println!(
-            "{} git-commit skill for project: {}",
-            action,
+            "Set Git mode to {} for project: {}",
+            mode.label(),
             project_root.display()
         );
     } else {
@@ -775,11 +845,6 @@ fn format_agent_project_summary(
     last_scan_at: Option<&str>,
 ) -> String {
     let state = if project.enabled { "enabled" } else { "paused" };
-    let git_commit = if project.git_commit_enabled {
-        "enabled"
-    } else {
-        "disabled"
-    };
     let mut lines = vec![
         format!("{}. {} [{}]", project.id, project.name, state),
         format!(
@@ -812,7 +877,7 @@ fn format_agent_project_summary(
             "             failure:   {}",
             format_optional_agent_timestamp(project.last_failure_at.as_deref())
         ),
-        format!("   settings  git commit: {}", git_commit),
+        format!("   settings  git: {}", project.git_mode.label()),
         format!(
             "             model: {}  reasoning: {}  fast: {}",
             project.codex_model.as_deref().unwrap_or("default"),
@@ -2424,8 +2489,13 @@ fn agent_codex_prompt(
     if task_selection == AgentTaskSelection::ResumeDoing {
         prompt.push_str(AGENT_RESUME_DOING_PROMPT_APPENDIX);
     }
-    if project.git_commit_enabled {
-        prompt.push_str(AGENT_GIT_COMMIT_PROMPT_APPENDIX);
+    match project.git_mode {
+        AgentGitMode::Off => {}
+        AgentGitMode::Commit => prompt.push_str(AGENT_GIT_COMMIT_PROMPT_APPENDIX),
+        AgentGitMode::CommitAndPush => {
+            prompt.push_str(AGENT_GIT_COMMIT_PROMPT_APPENDIX);
+            prompt.push_str(AGENT_GIT_PUSH_PROMPT_APPENDIX);
+        }
     }
     prompt
 }
@@ -3217,6 +3287,13 @@ mod agent_store {
                 "ALTER TABLE projects ADD COLUMN codex_fast_enabled INTEGER NOT NULL DEFAULT 0",
             ],
         },
+        AgentMigration {
+            version: 5,
+            statements: &[
+                "ALTER TABLE projects ADD COLUMN git_mode TEXT NOT NULL DEFAULT 'off'",
+                "UPDATE projects SET git_mode = 'commit' WHERE git_commit_enabled != 0",
+            ],
+        },
     ];
 
     pub(crate) struct TursoAgentStore {
@@ -3231,7 +3308,7 @@ mod agent_store {
         pub(crate) path: PathBuf,
         pub(crate) name: String,
         pub(crate) enabled: bool,
-        pub(crate) git_commit_enabled: bool,
+        pub(crate) git_mode: AgentGitMode,
         pub(crate) codex_model: Option<String>,
         pub(crate) codex_reasoning_effort: Option<String>,
         pub(crate) codex_fast_enabled: bool,
@@ -3394,7 +3471,7 @@ mod agent_store {
             let conn = self.connect()?;
             let mut rows = conn
                 .query(
-                    "SELECT id, path, name, enabled, git_commit_enabled, codex_model,
+                    "SELECT id, path, name, enabled, git_mode, codex_model,
                             codex_reasoning_effort, codex_fast_enabled, last_scan_at, last_run_at,
                             last_success_at, last_failure_at, failure_count
                      FROM projects
@@ -3414,7 +3491,7 @@ mod agent_store {
                 let path = PathBuf::from(row_text(&row, 1, "path")?);
                 let name = row_text(&row, 2, "name")?;
                 let enabled = row_integer(&row, 3, "enabled")? != 0;
-                let git_commit_enabled = row_integer(&row, 4, "git_commit_enabled")? != 0;
+                let git_mode = AgentGitMode::from_database(&row_text(&row, 4, "git_mode")?)?;
                 let codex_model = row_optional_text(&row, 5, "codex_model")?;
                 let codex_reasoning_effort = row_optional_text(&row, 6, "codex_reasoning_effort")?;
                 let codex_fast_enabled = row_integer(&row, 7, "codex_fast_enabled")? != 0;
@@ -3429,7 +3506,7 @@ mod agent_store {
                     path,
                     name,
                     enabled,
-                    git_commit_enabled,
+                    git_mode,
                     codex_model,
                     codex_reasoning_effort,
                     codex_fast_enabled,
@@ -3978,67 +4055,53 @@ mod agent_store {
             Ok(changed > 0)
         }
 
-        pub(crate) fn set_project_git_commit_enabled_blocking(
+        pub(crate) fn set_project_git_mode_blocking(
             &self,
             project_id: i64,
-            enabled: bool,
+            mode: AgentGitMode,
         ) -> Result<bool> {
             tokio::runtime::Runtime::new()
                 .context("Failed to create async runtime for agent store")?
-                .block_on(self.set_project_git_commit_enabled(project_id, enabled))
+                .block_on(self.set_project_git_mode(project_id, mode))
         }
 
-        async fn set_project_git_commit_enabled(
-            &self,
-            project_id: i64,
-            enabled: bool,
-        ) -> Result<bool> {
+        async fn set_project_git_mode(&self, project_id: i64, mode: AgentGitMode) -> Result<bool> {
             let conn = self.connect()?;
             let changed = conn
                 .execute(
-                    "UPDATE projects SET git_commit_enabled = ?1, updated_at = ?2 WHERE id = ?3",
-                    params![
-                        if enabled { 1_i64 } else { 0_i64 },
-                        agent_timestamp(),
-                        project_id
-                    ],
+                    "UPDATE projects SET git_mode = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![mode.database_value(), agent_timestamp(), project_id],
                 )
                 .await
-                .with_context(|| {
-                    format!("Failed to set project {} git-commit state", project_id)
-                })?;
+                .with_context(|| format!("Failed to set project {} Git mode", project_id))?;
 
             Ok(changed > 0)
         }
 
-        pub(crate) fn set_project_git_commit_enabled_for_path_blocking(
+        pub(crate) fn set_project_git_mode_for_path_blocking(
             &self,
             project_root: &Path,
-            enabled: bool,
+            mode: AgentGitMode,
         ) -> Result<bool> {
             tokio::runtime::Runtime::new()
                 .context("Failed to create async runtime for agent store")?
-                .block_on(self.set_project_git_commit_enabled_for_path(project_root, enabled))
+                .block_on(self.set_project_git_mode_for_path(project_root, mode))
         }
 
-        async fn set_project_git_commit_enabled_for_path(
+        async fn set_project_git_mode_for_path(
             &self,
             project_root: &Path,
-            enabled: bool,
+            mode: AgentGitMode,
         ) -> Result<bool> {
             let conn = self.connect()?;
             let path = project_root.display().to_string();
             let changed = conn
                 .execute(
-                    "UPDATE projects SET git_commit_enabled = ?1, updated_at = ?2 WHERE path = ?3",
-                    params![
-                        if enabled { 1_i64 } else { 0_i64 },
-                        agent_timestamp(),
-                        path.as_str()
-                    ],
+                    "UPDATE projects SET git_mode = ?1, updated_at = ?2 WHERE path = ?3",
+                    params![mode.database_value(), agent_timestamp(), path.as_str()],
                 )
                 .await
-                .with_context(|| format!("Failed to set project {} git-commit state", path))?;
+                .with_context(|| format!("Failed to set project {} Git mode", path))?;
 
             Ok(changed > 0)
         }
@@ -5747,7 +5810,7 @@ fn tui_start_state(active_board: bool) -> TuiStartState {
             active_board,
             current_pane: TuiPane::Tasks,
             feedback_buffer: String::from(
-                "Kanban View! Tab switches to the agent projects pane, Enter opens a selected project there, Space toggles it ON/OFF, g toggles git-commit, m/f/t change its Codex model/fast/thinking settings, Backspace returns to parent, Space creates a task on the board, a archives a task, A opens archive view, b moves a task to backlog, B toggles the backlog column, Shift+Arrows reorder or move tasks, 'd' deletes, 'q' quits.",
+                "Kanban View! Tab switches to the agent projects pane, Enter opens a selected project there, Space toggles it ON/OFF, g cycles Git off/commit/push, m/f/t change its Codex model/fast/thinking settings, Backspace returns to parent, Space creates a task on the board, a archives a task, A opens archive view, b moves a task to backlog, B toggles the backlog column, Shift+Arrows reorder or move tasks, 'd' deletes, 'q' quits.",
             ),
         }
     } else {
@@ -6260,7 +6323,7 @@ fn toggle_selected_tui_agent_project(
     }
 }
 
-fn toggle_selected_tui_agent_project_git_commit(
+fn cycle_selected_tui_agent_project_git_mode(
     panel: &mut TuiAgentPanel,
     active_root: &Path,
 ) -> Result<String> {
@@ -6268,14 +6331,13 @@ fn toggle_selected_tui_agent_project_git_commit(
         return Ok("No registered project selected".to_string());
     };
 
-    let enabled = !project.git_commit_enabled;
+    let mode = project.git_mode.next();
     let store = open_agent_store()?;
-    let changed = store.set_project_git_commit_enabled_blocking(project.id, enabled)?;
+    let changed = store.set_project_git_mode_blocking(project.id, mode)?;
     panel.refresh(active_root);
 
     if changed {
-        let action = if enabled { "Enabled" } else { "Disabled" };
-        Ok(format!("{} git-commit skill: {}", action, project.name))
+        Ok(format!("Git mode for {}: {}", project.name, mode.label()))
     } else {
         Ok(format!(
             "Project is no longer registered: {}",
@@ -6411,7 +6473,7 @@ fn tui_agent_log_refresh_interval() -> Duration {
 }
 
 fn tui_agent_panel_instructions() -> &'static str {
-    "Up/Down selects, Enter opens/adds, Space toggles ON/OFF, g toggles git-commit, m cycles model, f toggles fast, t cycles thinking, l shows output."
+    "Up/Down selects, Enter opens/adds, Space toggles ON/OFF, g cycles Git off/commit/push, m cycles model, f toggles fast, t cycles thinking, l shows output."
 }
 
 fn tui_agent_log_title(log_view: &TuiAgentLogView) -> String {
@@ -6737,11 +6799,7 @@ fn format_agent_project_table_row(
     let marker = active_board_marker(is_current_board);
     let state = if item.project.enabled { "ON" } else { "OFF" };
     let runtime_state = item.runtime_state.label();
-    let git = if item.project.git_commit_enabled {
-        "ON"
-    } else {
-        "OFF"
-    };
+    let git = item.project.git_mode.tui_label();
     let codex = compact_agent_codex_settings(
         item.project.codex_model.as_deref(),
         item.project.codex_reasoning_effort.as_deref(),
@@ -8022,7 +8080,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                  [Space]        - Create new task / toggle selected agent project\n\
                                  [Enter]        - Open subtasks, edit selected task, or open selected agent project\n\
                                  [e]            - Edit selected task\n\
-                                 [g]            - Toggle git-commit for selected agent project\n\
+                                 [g]            - Cycle selected project's Git mode: off/commit/push\n\
                                  [l]            - Toggle selected agent project's live/current output log\n\
                                  [a]            - Move selected task to archive\n\
                                  [A]            - Toggle archive view\n\
@@ -8236,12 +8294,12 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                         .is_some()
                                     {
                                         feedback_buffer =
-                                            "Register current project before toggling git-commit"
+                                            "Register current project before changing its Git mode"
                                                 .to_string();
                                         continue;
                                     }
 
-                                    match toggle_selected_tui_agent_project_git_commit(
+                                    match cycle_selected_tui_agent_project_git_mode(
                                         &mut agent_panel,
                                         &active_root,
                                     ) {
@@ -9096,7 +9154,7 @@ mod tests {
                 path: PathBuf::from(format!("/tmp/{name}")),
                 name: name.to_string(),
                 enabled: true,
-                git_commit_enabled: false,
+                git_mode: AgentGitMode::Off,
                 codex_model: None,
                 codex_reasoning_effort: None,
                 codex_fast_enabled: false,
@@ -9239,6 +9297,7 @@ mod tests {
         assert!(tui_agent_panel_instructions().contains("f toggles fast"));
         assert!(tui_agent_panel_instructions().contains("t cycles thinking"));
         assert!(tui_agent_panel_instructions().contains("l shows output"));
+        assert!(tui_agent_panel_instructions().contains("g cycles Git off/commit/push"));
     }
 
     #[test]
@@ -9564,6 +9623,35 @@ mod tests {
             assert!(row.contains("/tmp/alpha"));
         }
         assert!(active_compact_row.starts_with("*  1 "));
+    }
+
+    #[test]
+    fn agent_project_table_abbreviates_all_git_modes() {
+        let mut project = tui_agent_project_for_test(1, "alpha");
+
+        for (mode, expected) in [
+            (AgentGitMode::Off, "OFF"),
+            (AgentGitMode::Commit, "COM"),
+            (AgentGitMode::CommitAndPush, "PUSH"),
+        ] {
+            project.project.git_mode = mode;
+            let codex_width = agent_codex_column_width(std::slice::from_ref(&project), false);
+            let project_width =
+                agent_project_column_width(std::slice::from_ref(&project), None, 100, codex_width);
+            let header = format_agent_project_table_header(100, project_width, codex_width);
+            let row =
+                format_agent_project_table_row(0, &project, 100, project_width, codex_width, false);
+            let git_column = header.find("GIT").unwrap();
+
+            assert_eq!(row[git_column..git_column + 4].trim(), expected);
+        }
+    }
+
+    #[test]
+    fn agent_git_mode_cycles_off_commit_push() {
+        assert_eq!(AgentGitMode::Off.next(), AgentGitMode::Commit);
+        assert_eq!(AgentGitMode::Commit.next(), AgentGitMode::CommitAndPush);
+        assert_eq!(AgentGitMode::CommitAndPush.next(), AgentGitMode::Off);
     }
 
     #[test]
@@ -9947,6 +10035,20 @@ mod tests {
             }
             _ => panic!("expected agent git-commit disable command"),
         }
+
+        let push_cli =
+            Cli::try_parse_from(["clt", "agent", "git-commit", "push", "/tmp/project"]).unwrap();
+        match push_cli.command {
+            Some(Commands::Agent {
+                command:
+                    AgentCommands::GitCommit {
+                        command: AgentGitCommitCommands::Push { path },
+                    },
+            }) => {
+                assert_eq!(path, Some(PathBuf::from("/tmp/project")));
+            }
+            _ => panic!("expected agent git-commit push command"),
+        }
     }
 
     #[test]
@@ -10059,7 +10161,7 @@ mod tests {
             path: PathBuf::from("/tmp/demo-project"),
             name: "demo-project".to_string(),
             enabled: true,
-            git_commit_enabled: false,
+            git_mode: AgentGitMode::Off,
             codex_model: None,
             codex_reasoning_effort: None,
             codex_fast_enabled: false,
@@ -10080,7 +10182,7 @@ mod tests {
             "             last run:  last-run",
             "             success:   last-success",
             "             failure:   -",
-            "   settings  git commit: disabled",
+            "   settings  git: off",
             "             model: default  reasoning: default  fast: disabled",
             "   health    failures: 3",
             "   path      /tmp/demo-project",
@@ -10198,7 +10300,7 @@ mod tests {
             path: PathBuf::from("/tmp/project"),
             name: "project".to_string(),
             enabled: true,
-            git_commit_enabled: false,
+            git_mode: AgentGitMode::Off,
             codex_model: None,
             codex_reasoning_effort: None,
             codex_fast_enabled: false,
@@ -10466,6 +10568,77 @@ mod tests {
     }
 
     #[test]
+    fn agent_store_migrates_enabled_git_commits_to_commit_mode() {
+        let root = temp_root("agent-store-git-mode-migration");
+        let state_dir = root.join("state/clt");
+        let db_path = state_dir.join(AGENT_DB_FILE);
+        fs::create_dir_all(&state_dir).unwrap();
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let db = turso::Builder::new_local(db_path.to_string_lossy().as_ref())
+                .build()
+                .await
+                .unwrap();
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "CREATE TABLE schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                )",
+                (),
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "CREATE TABLE projects (
+                    id INTEGER PRIMARY KEY,
+                    path TEXT NOT NULL UNIQUE,
+                    name TEXT NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    registered_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_scan_at TEXT,
+                    last_run_at TEXT,
+                    last_success_at TEXT,
+                    last_failure_at TEXT,
+                    failure_count INTEGER NOT NULL DEFAULT 0,
+                    git_commit_enabled INTEGER NOT NULL DEFAULT 0,
+                    codex_model TEXT,
+                    codex_reasoning_effort TEXT,
+                    codex_fast_enabled INTEGER NOT NULL DEFAULT 0
+                )",
+                (),
+            )
+            .await
+            .unwrap();
+            for version in 1..=4 {
+                conn.execute(
+                    "INSERT INTO schema_migrations (version, applied_at)
+                     VALUES (?1, datetime('now'))",
+                    [version],
+                )
+                .await
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO projects (
+                    path, name, registered_at, updated_at, git_commit_enabled
+                 ) VALUES ('/tmp/legacy-project', 'legacy-project', datetime('now'), datetime('now'), 1)",
+                (),
+            )
+            .await
+            .unwrap();
+        });
+
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+
+        assert_eq!(project.git_mode, AgentGitMode::Commit);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn agent_store_register_is_idempotent_and_lists_projects() {
         let root = temp_root("agent-register");
         let state_dir = root.join("state/clt");
@@ -10565,7 +10738,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_store_can_enable_and_disable_git_commit_for_registered_project() {
+    fn agent_store_persists_all_git_modes_for_registered_project() {
         let root = temp_root("agent-git-commit");
         let state_dir = root.join("state/clt");
         let project_root = root.join("project");
@@ -10577,23 +10750,31 @@ mod tests {
             .register_project_blocking(&project_root, "project")
             .unwrap();
         let project = store.list_projects_blocking().unwrap().remove(0);
-        assert!(!project.git_commit_enabled);
+        assert_eq!(project.git_mode, AgentGitMode::Off);
 
         assert!(
             store
-                .set_project_git_commit_enabled_for_path_blocking(&project_root, true)
+                .set_project_git_mode_for_path_blocking(&project_root, AgentGitMode::Commit)
                 .unwrap()
         );
         let project = store.list_projects_blocking().unwrap().remove(0);
-        assert!(project.git_commit_enabled);
+        assert_eq!(project.git_mode, AgentGitMode::Commit);
 
         assert!(
             store
-                .set_project_git_commit_enabled_blocking(project.id, false)
+                .set_project_git_mode_blocking(project.id, AgentGitMode::CommitAndPush)
                 .unwrap()
         );
         let project = store.list_projects_blocking().unwrap().remove(0);
-        assert!(!project.git_commit_enabled);
+        assert_eq!(project.git_mode, AgentGitMode::CommitAndPush);
+
+        assert!(
+            store
+                .set_project_git_mode_blocking(project.id, AgentGitMode::Off)
+                .unwrap()
+        );
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert_eq!(project.git_mode, AgentGitMode::Off);
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -11593,13 +11774,13 @@ mod tests {
     }
 
     #[test]
-    fn agent_codex_prompt_includes_git_commit_only_when_enabled() {
+    fn agent_codex_prompt_follows_git_mode() {
         let mut project = agent_store::AgentProject {
             id: 1,
             path: PathBuf::from("/tmp/project"),
             name: "project".to_string(),
             enabled: true,
-            git_commit_enabled: false,
+            git_mode: AgentGitMode::Off,
             codex_model: None,
             codex_reasoning_effort: None,
             codex_fast_enabled: false,
@@ -11614,11 +11795,20 @@ mod tests {
         assert!(base_prompt.contains("Use the existing task-management CLI tooling: clt."));
         assert!(!base_prompt.contains("Interrupted task recovery:"));
         assert!(!base_prompt.contains("$git-commit"));
+        assert!(!base_prompt.contains("Git push:"));
 
-        project.git_commit_enabled = true;
+        project.git_mode = AgentGitMode::Commit;
         let commit_prompt = agent_codex_prompt(&project, AgentTaskSelection::NextTodo);
         assert!(commit_prompt.contains("$git-commit"));
         assert!(commit_prompt.contains("Do not commit when there are no tasks left"));
+        assert!(!commit_prompt.contains("Git push:"));
+
+        project.git_mode = AgentGitMode::CommitAndPush;
+        let push_prompt = agent_codex_prompt(&project, AgentTaskSelection::NextTodo);
+        assert!(push_prompt.contains("Git commit:"));
+        assert!(push_prompt.contains("Git push:"));
+        assert!(push_prompt.contains("pull-with-rebase and push workflow"));
+        assert!(push_prompt.contains("Never force-push"));
 
         let recovery_prompt = agent_codex_prompt(&project, AgentTaskSelection::ResumeDoing);
         assert!(recovery_prompt.contains("Interrupted task recovery:"));
@@ -11707,7 +11897,7 @@ mod tests {
             path: project_root.clone(),
             name: "Project With Spaces".to_string(),
             enabled: true,
-            git_commit_enabled: false,
+            git_mode: AgentGitMode::Off,
             codex_model: Some("gpt-5.6-terra".to_string()),
             codex_reasoning_effort: Some("high".to_string()),
             codex_fast_enabled: true,
@@ -11767,7 +11957,7 @@ mod tests {
             path: project_root,
             name: "Shutdown Project".to_string(),
             enabled: true,
-            git_commit_enabled: false,
+            git_mode: AgentGitMode::Off,
             codex_model: None,
             codex_reasoning_effort: None,
             codex_fast_enabled: false,

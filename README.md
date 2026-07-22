@@ -22,7 +22,7 @@ A file-system-backed task manager written in Rust. `clt` stores work in Markdown
 - **Kanban TUI**: A visual board view powered by `ratatui`, with nested board navigation and a full-screen registered-projects pane.
 - **Simple CLI**: Easy commands to add, move, and list tasks.
 - **Smart Root Detection**: Automatically finds the git repository root to keep tasks centralized, or uses the current directory.
-- **Agent Registry**: Register many projects, toggle them on or off, inspect `todo`/`doing` counts, toggle per-project git commits, and open any registered task board from the TUI.
+- **Agent Registry**: Register many projects, toggle them on or off, inspect `todo`/`doing` counts, choose per-project Git automation, and open any registered task board from the TUI.
 - **Codex Automation**: Run one Codex task at a time per enabled project, either in the foreground or through a background service.
 - **Agent Skills**: Includes installable `clt-task-management` and `git-commit` skill folders for task-board and safe commit workflows.
 
@@ -72,7 +72,7 @@ Press `a` to move the selected task into the archive. Press `A` to open the arch
 
 Backlog is a fourth column for captured work that is not ready to be acted on. It is hidden by default; the task-board console title shows its current task count. Press `b` to move the selected task to Backlog, `B` to show or hide the Backlog column, or `0` to show and focus it. When visible, Backlog appears to the left of To Do and works with the normal Left/Right focus and task-movement controls. Keys `1`, `2`, and `3` continue to focus To Do, Doing, and Done.
 
-Press `Tab` to switch to the full-screen agent projects pane. There, Up/Down selects a registered project, `Enter` opens that project's task board, `Space` toggles the project `ON` or `OFF`, and `g` toggles the `GIT` column, which controls whether that project's agent prompt asks Codex to use the `git-commit` skill after a completed task. The currently open project is marked with `*`, and the terminal title updates to the active project.
+Press `Tab` to switch to the full-screen agent projects pane. There, Up/Down selects a registered project, `Enter` opens that project's task board, `Space` toggles the project `ON` or `OFF`, and `g` cycles the `GIT` column through `OFF`, `COM`, and `PUSH`. These modes disable Git automation, ask Codex to commit after a completed task, or ask Codex to commit and push. The currently open project is marked with `*`, and the terminal title updates to the active project.
 
 Each registered project also has persisted Codex launch settings in the `CODEX` column. Enabled overrides are shown compactly as `model/thinking/fast`; settings that inherit the user's configuration are omitted, and `default` is shown when every setting is inherited. Press `f` to toggle Fast mode, `m` to cycle through the default and supported model choices, and `t` to cycle through the default, low, medium, high, extra-high, max, and ultra reasoning levels. These settings are applied to future automated runs; they do not change an agent process that is already running.
 
@@ -131,13 +131,14 @@ clt agent resume ~/code/project-a
 
 In the TUI agent pane, the same state appears as `OFF` or `ON`.
 
-Enable or disable the optional `git-commit` skill instruction per project:
+Configure the optional `git-commit` skill instruction per project:
 ```bash
 clt agent git-commit enable ~/code/project-a
+clt agent git-commit push ~/code/project-a
 clt agent git-commit disable ~/code/project-a
 ```
 
-When enabled, the scheduler appends a prompt section that tells Codex to use the `$git-commit` skill after completing and verifying a task. The instruction is skipped for projects where the setting is disabled. In the TUI, this setting appears in the `GIT` column.
+`enable` selects commit-only mode, `push` selects commit-and-push mode, and `disable` turns Git automation off. The scheduler adds matching instructions to the Codex prompt after task completion and verification. Existing enabled registrations migrate to commit-only mode. In the TUI, the modes appear as `COM`, `PUSH`, and `OFF` in the `GIT` column.
 
 Agent-facing workflow skills are included in the repository's `skills/` directory:
 

@@ -7,6 +7,8 @@ description: Commit and optionally push Git changes with a safe, direct workflow
 
 Use shell/Bash Git commands for inspection, staging, committing, rebasing, and pushing. Prefer non-interactive commands. Do not change Git config.
 
+The caller may request either a commit-only or commit-and-push workflow. An automated agent prompt that explicitly selects commit and push authorizes pushing the completed task for that run.
+
 ## Default Flow
 
 ```bash
@@ -24,14 +26,14 @@ Then:
 2. Stage the intended files.
 3. Verify the staged diff.
 4. Commit with a message based on the staged diff.
-5. Push only if requested, after `git pull --rebase --autostash`.
+5. Push only if requested by the user or explicitly selected by the automated agent prompt, after `git pull --rebase --autostash`.
 
 ## Safety Rules
 
 - Follow repo instructions in `AGENTS.md`, `README`, `CONTRIBUTING`, or project docs when present.
 - Do not create or switch branches unless the user asks or the repo explicitly requires it.
 - If the repo has no branch rule, committing on the current branch is acceptable, including `main` or `master`.
-- Do not push unless the user asks to push.
+- Do not push unless the user asks to push or the automated agent prompt explicitly selects commit and push.
 - Do not force-push unless the user explicitly asks; use `--force-with-lease`, never plain `--force`.
 - Do not amend commits unless the user asks.
 - Do not skip hooks with `--no-verify` unless the user explicitly asks.
@@ -171,7 +173,7 @@ If the fix is unclear, report the failure and ask before continuing. Do not bypa
 
 ## Pull And Push
 
-When the user asks to push, sync first:
+When the user asks to push or the automated agent prompt explicitly selects commit and push, sync first:
 
 ```bash
 git pull --rebase --autostash
