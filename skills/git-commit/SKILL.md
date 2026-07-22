@@ -1,6 +1,6 @@
 ---
 name: git-commit
-description: Commit and optionally push Git changes with a safe, direct workflow. Use when the user asks to commit, save changes, create a git commit, push changes, finish Git work, or mentions /commit. Inspect the diff, respect existing staged changes, stage only the intended logical change, generate a clear commit message from the staged diff, and pull with rebase before pushing when push is requested.
+description: Commit and optionally push Git changes with a safe, direct workflow. Use when the user asks to commit, save changes, create a git commit, push changes, finish Git work, or mentions /commit. Inspect the diff, respect existing staged changes, stage only the intended logical change, generate a clear commit message from the staged diff, and pull with the user's configured integration strategy before pushing when push is requested.
 ---
 
 # Git Commit Workflow
@@ -26,7 +26,7 @@ Then:
 2. Stage the intended files.
 3. Verify the staged diff.
 4. Commit with a message based on the staged diff.
-5. Push only if requested by the user or explicitly selected by the automated agent prompt, after `git pull --rebase --autostash`.
+5. Push only if requested by the user or explicitly selected by the automated agent prompt, after `git pull --autostash`.
 
 ## Safety Rules
 
@@ -173,17 +173,19 @@ If the fix is unclear, report the failure and ask before continuing. Do not bypa
 
 ## Pull And Push
 
-When the user asks to push or the automated agent prompt explicitly selects commit and push, sync first:
+When the user asks to push or the automated agent prompt explicitly selects commit and push, sync first. Use a normal pull so Git honors the user's existing `pull.rebase` or branch configuration instead of forcing a different integration strategy:
 
 ```bash
-git pull --rebase --autostash
+git pull --autostash
 ```
 
-If rebase conflicts occur:
+The pull may merge or rebase according to that configuration. Do not pass `--rebase` or `--no-rebase`, and do not change Git configuration, unless the user explicitly asks for a specific strategy.
+
+If conflicts occur:
 
 1. Inspect the conflict.
 2. Resolve only when the correct resolution is clear.
-3. Continue with `git rebase --continue`.
+3. Continue with `git rebase --continue` for a rebase or `git merge --continue` for a merge.
 4. Ask the user when the correct resolution is ambiguous.
 
 Then push:

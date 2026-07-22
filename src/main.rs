@@ -119,7 +119,7 @@ Git commit:
 const AGENT_GIT_PUSH_PROMPT_APPENDIX: &str = r#"
 
 Git push:
-- This project is configured for commit and push. After creating the verified commit, use the $git-commit skill's pull-with-rebase and push workflow for the current branch.
+- This project is configured for commit and push. After creating the verified commit, use the $git-commit skill to pull first with the locally configured merge/rebase strategy, then push the current branch.
 - Do not push when no commit was created or when synchronization, hooks, checks, or the commit fail.
 - Never force-push.
 "#;
@@ -11928,7 +11928,10 @@ mod tests {
         let push_prompt = agent_codex_prompt(&project, AgentTaskSelection::NextTodo);
         assert!(push_prompt.contains("Git commit:"));
         assert!(push_prompt.contains("Git push:"));
-        assert!(push_prompt.contains("pull-with-rebase and push workflow"));
+        assert!(
+            push_prompt.contains("pull first with the locally configured merge/rebase strategy")
+        );
+        assert!(!push_prompt.contains("pull-with-rebase"));
         assert!(push_prompt.contains("Never force-push"));
 
         let recovery_prompt = agent_codex_prompt(&project, AgentTaskSelection::ResumeDoing);
