@@ -21,6 +21,7 @@ Use this section while developing the next release.
 - Added a full-screen TUI agent projects pane for switching between registered project boards, toggling projects `ON` or `OFF`, and seeing `todo`/`doing` counts.
 - Added per-project `git-commit` skill toggles for Codex agent runs through `clt agent git-commit enable|disable` and the TUI agent projects pane.
 - Added per-project commit-and-push automation through `clt agent git-commit push`; the TUI now cycles Git automation through `OFF`, `COM`, and `PUSH` modes.
+- Added live/latest agent output viewing directly from the active Kanban board with `l`.
 - Added `skill-git-commit.md` guidance for safe agent-driven Git commits.
 
 ### Changed

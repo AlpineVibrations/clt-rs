@@ -5810,7 +5810,7 @@ fn tui_start_state(active_board: bool) -> TuiStartState {
             active_board,
             current_pane: TuiPane::Tasks,
             feedback_buffer: String::from(
-                "Kanban View! Tab switches to the agent projects pane, Enter opens a selected project there, Space toggles it ON/OFF, g cycles Git off/commit/push, m/f/t change its Codex model/fast/thinking settings, Backspace returns to parent, Space creates a task on the board, a archives a task, A opens archive view, b moves a task to backlog, B toggles the backlog column, Shift+Arrows reorder or move tasks, 'd' deletes, 'q' quits.",
+                "Kanban View! Tab switches to the agent projects pane, Enter opens a selected project there, Space toggles it ON/OFF, g cycles Git off/commit/push, m/f/t change its Codex model/fast/thinking settings, l shows the active project's agent output, Backspace returns to parent, Space creates a task on the board, a archives a task, A opens archive view, b moves a task to backlog, B toggles the backlog column, Shift+Arrows reorder or move tasks, 'd' deletes, 'q' quits.",
             ),
         }
     } else {
@@ -6048,14 +6048,14 @@ impl TuiAgentPanel {
         self.state.select(Some(idx));
     }
 
-    fn select_project_for_path(&mut self, path: &Path) {
+    fn select_project_for_path(&mut self, path: &Path) -> bool {
         if self
             .current_project_registration
             .as_ref()
             .is_some_and(|registration| registration.path == path)
         {
             self.state.select(Some(0));
-            return;
+            return true;
         }
 
         if let Some(project_idx) = self
@@ -6065,6 +6065,9 @@ impl TuiAgentPanel {
         {
             self.state
                 .select(Some(self.project_start_index() + project_idx));
+            true
+        } else {
+            false
         }
     }
 
@@ -6520,6 +6523,26 @@ fn preferred_recorded_agent_output_path(run: agent_store::AgentRunRecord) -> Opt
 fn selected_tui_agent_log_view(panel: &TuiAgentPanel) -> Result<Option<TuiAgentLogView>> {
     let state_dir = agent_state_dir()?;
     selected_tui_agent_log_view_at(panel, &state_dir)
+}
+
+fn selected_tui_agent_log_view_for_path(
+    panel: &mut TuiAgentPanel,
+    project_path: &Path,
+) -> Result<Option<TuiAgentLogView>> {
+    let state_dir = agent_state_dir()?;
+    selected_tui_agent_log_view_for_path_at(panel, project_path, &state_dir)
+}
+
+fn selected_tui_agent_log_view_for_path_at(
+    panel: &mut TuiAgentPanel,
+    project_path: &Path,
+    state_dir: &Path,
+) -> Result<Option<TuiAgentLogView>> {
+    if !panel.select_project_for_path(project_path) {
+        return Ok(None);
+    }
+
+    selected_tui_agent_log_view_at(panel, state_dir)
 }
 
 fn selected_tui_agent_log_view_at(
@@ -7195,13 +7218,11 @@ fn tui_console_content<'a>(
     log_view: Option<&'a TuiAgentLogView>,
     feedback: &'a str,
 ) -> (&'a str, Color) {
-    if agent_pane {
-        if let Some(error) = panel.last_error.as_deref() {
-            return (error, Color::Red);
-        }
-        if let Some(log_view) = log_view {
-            return (&log_view.content, Color::Gray);
-        }
+    if agent_pane && let Some(error) = panel.last_error.as_deref() {
+        return (error, Color::Red);
+    }
+    if let Some(log_view) = log_view {
+        return (&log_view.content, Color::Gray);
     }
 
     (feedback, Color::Gray)
@@ -7677,9 +7698,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
             } else {
                 "No Active Board".to_string()
             };
-            let (console_title, console_right_title) = if let Some(log_view) = agent_log_view.as_ref()
-                && current_pane == TuiPane::AgentProjects
-            {
+            let (console_title, console_right_title) = if let Some(log_view) = agent_log_view.as_ref() {
                 (tui_agent_log_title(log_view), None)
             } else if current_pane == TuiPane::AgentProjects {
                 ("Agent Projects Console".to_string(), None)
@@ -7731,7 +7750,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                     size.height,
                     size.width,
                     console_content,
-                    agent_log_view.is_some() && current_pane == TuiPane::AgentProjects,
+                    agent_log_view.is_some(),
                 )
             };
 
@@ -8081,7 +8100,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                  [Enter]        - Open subtasks, edit selected task, or open selected agent project\n\
                                  [e]            - Edit selected task\n\
                                  [g]            - Cycle selected project's Git mode: off/commit/push\n\
-                                 [l]            - Toggle selected agent project's live/current output log\n\
+                                 [l]            - Toggle active/selected project's live/current agent output\n\
                                  [a]            - Move selected task to archive\n\
                                  [A]            - Toggle archive view\n\
                                  [b]            - Move selected task to backlog\n\
@@ -8139,6 +8158,11 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                 last_agent_panel_refresh = Instant::now();
                                 TuiPane::AgentProjects
                             } else if active_board {
+                                if agent_log_view.is_some() {
+                                    agent_panel.select_project_for_path(&active_root);
+                                    sync_open_tui_agent_log_view(&agent_panel, &mut agent_log_view);
+                                    last_agent_log_refresh = Instant::now();
+                                }
                                 TuiPane::Tasks
                             } else {
                                 TuiPane::AgentProjects
@@ -8150,12 +8174,14 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                             } else {
                                 "Task board pane.".to_string()
                             };
+                        } else if matches!(key.code, KeyCode::Esc)
+                            && agent_log_view.take().is_some()
+                        {
+                            feedback_buffer = "Closed agent output log".to_string();
                         } else if current_pane == TuiPane::AgentProjects {
                             match key.code {
                                 KeyCode::Esc => {
-                                    if agent_log_view.take().is_some() {
-                                        feedback_buffer = "Closed agent output log".to_string();
-                                    } else if active_board {
+                                    if active_board {
                                         current_pane = TuiPane::Tasks;
                                         feedback_buffer = "Task board pane.".to_string();
                                     } else {
@@ -8700,6 +8726,48 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                         "Archive view. Press A again to leave archive view."
                                             .to_string();
                                 }
+                                KeyCode::Char('l') | KeyCode::Char('L') => {
+                                    if agent_log_view.take().is_some() {
+                                        feedback_buffer = "Closed agent output log".to_string();
+                                        continue;
+                                    }
+
+                                    agent_panel.refresh(&active_root);
+                                    last_agent_panel_refresh = Instant::now();
+                                    match selected_tui_agent_log_view_for_path(
+                                        &mut agent_panel,
+                                        &active_root,
+                                    ) {
+                                        Ok(Some(log_view)) => {
+                                            let output_kind = if log_view.is_live {
+                                                "live agent output"
+                                            } else {
+                                                "latest agent output"
+                                            };
+                                            feedback_buffer = format!(
+                                                "Showing {output_kind} for {}",
+                                                log_view.project_name
+                                            );
+                                            agent_log_view = Some(log_view);
+                                            last_agent_log_refresh = Instant::now();
+                                        }
+                                        Ok(None) => {
+                                            feedback_buffer = if agent_panel.last_error.is_some() {
+                                                agent_panel.last_error.clone().unwrap_or_default()
+                                            } else if agent_panel
+                                                .selected_current_project_registration()
+                                                .is_some()
+                                            {
+                                                "Register current project before viewing agent output"
+                                                    .to_string()
+                                            } else {
+                                                "No agent output recorded for current project"
+                                                    .to_string()
+                                            };
+                                        }
+                                        Err(e) => feedback_buffer = format!("Error: {}", e),
+                                    }
+                                }
                                 KeyCode::Char('q') => break,
                                 KeyCode::Backspace => {
                                     if board_stack.len() > 1 {
@@ -9241,6 +9309,25 @@ mod tests {
     }
 
     #[test]
+    fn tui_kanban_console_displays_an_open_agent_log() {
+        let panel = TuiAgentPanel {
+            projects: Vec::new(),
+            current_project_registration: None,
+            daemon_status: "running".to_string(),
+            state: ListState::default(),
+            scroll_offset: 0,
+            last_error: None,
+        };
+        let log_view = TuiAgentLogView::message("alpha".to_string(), "live output".to_string());
+
+        let (content, color) =
+            tui_console_content(false, &panel, Some(&log_view), "Kanban instructions");
+
+        assert_eq!(content, "live output");
+        assert_eq!(color, Color::Gray);
+    }
+
+    #[test]
     fn tui_agent_panel_selects_the_active_project_by_path() {
         let mut panel = TuiAgentPanel {
             projects: vec![
@@ -9399,6 +9486,40 @@ mod tests {
         append_agent_log_line(&stderr_path, "still working").unwrap();
         log_view.refresh().unwrap();
         assert!(log_view.content.contains("still working"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn kanban_agent_log_view_uses_the_active_project() {
+        let root = temp_root("kanban-agent-log");
+        let state_dir = root.join("state/clt");
+        let mut alpha = tui_agent_project_for_test(1, "alpha");
+        alpha.runtime_state = TuiAgentRuntimeState::Running;
+        let active_path = alpha.project.path.clone();
+        let log_dir = agent_project_run_log_dir(&state_dir, &alpha.project).unwrap();
+        fs::create_dir_all(&log_dir).unwrap();
+        fs::write(log_dir.join("200-000-p1-1.err"), "alpha is working\n").unwrap();
+
+        let mut panel = TuiAgentPanel {
+            projects: vec![alpha, tui_agent_project_for_test(2, "beta")],
+            current_project_registration: None,
+            daemon_status: "running".to_string(),
+            state: ListState::default(),
+            scroll_offset: 0,
+            last_error: None,
+        };
+        panel.state.select(Some(1));
+
+        let log_view =
+            selected_tui_agent_log_view_for_path_at(&mut panel, &active_path, &state_dir)
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(panel.selected_project().unwrap().project.name, "alpha");
+        assert_eq!(log_view.project_name, "alpha");
+        assert_eq!(log_view.content, "alpha is working\n");
+        assert!(log_view.is_live);
 
         fs::remove_dir_all(root).unwrap();
     }
