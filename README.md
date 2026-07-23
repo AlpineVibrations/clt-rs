@@ -70,6 +70,11 @@ clt
 ```
 Press `Enter` to open a folder task with subtasks, `e` to edit the selected task, `Space` to create a task, `Backspace` to return to the parent board, and `q` to quit.
 
+Use `Shift+Up` and `Shift+Down` to reorder the selected task, and `Shift+Left` and `Shift+Right` to move it between columns. Stock macOS Terminal does not encode Shift in its default Up/Down sequences. When `clt` runs locally on macOS, it recovers the live Shift state automatically. When Terminal connects to a remote host, add these two mappings under Terminal > Settings > Profiles > Keyboard so the modifier survives SSH and tmux:
+
+- Shift+Up: send `\033[1;2A`
+- Shift+Down: send `\033[1;2B`
+
 Press `a` to move the selected task into the archive. Press `A` to open the archive's single-panel scrolling view, and press `A` again to return to the Kanban board.
 
 Backlog is a fourth column for captured work that is not ready to be acted on. It is hidden by default; the task-board console title shows its current task count. Press `b` to move the selected task to Backlog, `B` to show or hide the Backlog column, or `0` to show and focus it. When visible, Backlog appears to the left of To Do and works with the normal Left/Right focus and task-movement controls. Keys `1`, `2`, and `3` continue to focus To Do, Doing, and Done.

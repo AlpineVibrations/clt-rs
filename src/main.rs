@@ -17,8 +17,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crossterm::{
     ExecutableCommand,
     event::{
-        self, Event, KeyCode, KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-        PushKeyboardEnhancementFlags,
+        self, Event, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     terminal::{
         EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode,
@@ -7416,6 +7416,40 @@ fn tui_keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
         | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
 }
 
+#[cfg(target_os = "macos")]
+fn macos_shift_key_pressed() -> bool {
+    const COMBINED_SESSION_STATE: i32 = 0;
+    const SHIFT_FLAG: u64 = 1 << 17;
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGEventSourceFlagsState(state_id: i32) -> u64;
+    }
+
+    // SAFETY: CGEventSourceFlagsState is a read-only CoreGraphics query with no
+    // pointer arguments. COMBINED_SESSION_STATE is a documented source-state ID.
+    unsafe { CGEventSourceFlagsState(COMBINED_SESSION_STATE) & SHIFT_FLAG != 0 }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_shift_key_pressed() -> bool {
+    false
+}
+
+fn restore_macos_shift_for_vertical_arrow_with_state(
+    mut key: KeyEvent,
+    shift_key_pressed: bool,
+) -> KeyEvent {
+    if shift_key_pressed && matches!(key.code, KeyCode::Up | KeyCode::Down) {
+        key.modifiers.insert(KeyModifiers::SHIFT);
+    }
+    key
+}
+
+fn restore_macos_shift_for_vertical_arrow(key: KeyEvent) -> KeyEvent {
+    restore_macos_shift_for_vertical_arrow_with_state(key, macos_shift_key_pressed())
+}
+
 struct TerminalSession {
     keyboard_enhancement_enabled: bool,
 }
@@ -8329,6 +8363,10 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
         #[allow(clippy::collapsible_if)]
         if event::poll(std::time::Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
+                // Terminal.app omits Shift from Up/Down escape sequences. When clt is
+                // running locally on macOS, recover it from the session's live modifier
+                // state before dispatching the key. Other platforms remain unchanged.
+                let key = restore_macos_shift_for_vertical_arrow(key);
                 let input_available_width = terminal.size()?.width.saturating_sub(2) as usize;
                 match current_mode {
                     Mode::View => {
@@ -9396,6 +9434,32 @@ mod tests {
         assert!(flags.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
         assert!(flags.contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES));
         assert!(!flags.contains(KeyboardEnhancementFlags::REPORT_EVENT_TYPES));
+    }
+
+    #[test]
+    fn tui_restores_shift_for_vertical_arrows_when_terminal_omits_it() {
+        for code in [KeyCode::Up, KeyCode::Down] {
+            let key = KeyEvent::new(code, KeyModifiers::NONE);
+
+            let restored = restore_macos_shift_for_vertical_arrow_with_state(key, true);
+
+            assert!(restored.modifiers.contains(KeyModifiers::SHIFT));
+        }
+    }
+
+    #[test]
+    fn tui_does_not_add_shift_to_other_keys_or_without_live_shift() {
+        let left = KeyEvent::new(KeyCode::Left, KeyModifiers::NONE);
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL);
+
+        assert_eq!(
+            restore_macos_shift_for_vertical_arrow_with_state(left, true),
+            left
+        );
+        assert_eq!(
+            restore_macos_shift_for_vertical_arrow_with_state(up, false),
+            up
+        );
     }
 
     fn tui_agent_project_for_test(id: i64, name: &str) -> TuiAgentProject {
