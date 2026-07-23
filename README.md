@@ -74,6 +74,8 @@ Backlog is a fourth column for captured work that is not ready to be acted on. I
 
 Press `Tab` to switch to the full-screen agent projects pane. There, Up/Down selects a registered project, `Enter` opens that project's task board, `Space` toggles the project `ON` or `OFF`, and `g` cycles the `GIT` column through `OFF`, `COM`, and `PUSH`. These modes disable Git automation, ask Codex to commit after a completed task, or ask Codex to commit and push. The currently open project is marked with `*`, and the terminal title updates to the active project.
 
+The agent projects pane also monitors the installed background service. If the operating system still reports the service as running but its daemon check-in becomes stale, the pane restarts the service automatically and shows `service restarting` while it recovers. A service explicitly stopped with `clt agent stop` remains stopped.
+
 Press `l` from the Kanban board to open the active project's live agent output, or its latest recorded output when no run is active. The same key opens the selected project's output from the agent projects pane. The console expands and follows new output until `l` or `Esc` closes the log.
 
 Each registered project also has persisted Codex launch settings in the `CODEX` column. Enabled overrides are shown compactly as `model/thinking/fast`; settings that inherit the user's configuration are omitted, and `default` is shown when every setting is inherited. Press `f` to toggle Fast mode, `m` to cycle through the default and supported model choices, and `t` to cycle through the default, low, medium, high, extra-high, max, and ultra reasoning levels. These settings are applied to future automated runs; they do not change an agent process that is already running.

@@ -1156,6 +1156,21 @@ fn systemd_service_status() -> Result<String> {
     }
 }
 
+fn restart_running_agent_service() -> Result<()> {
+    match current_agent_platform() {
+        AgentPlatform::Macos => {
+            let target = format!("{}/{}", launchd_user_domain()?, AGENT_LAUNCHD_LABEL);
+            run_service_command_quiet("launchctl", &["kickstart", "-k", &target])
+        }
+        AgentPlatform::Linux => {
+            run_service_command_quiet("systemctl", &["--user", "restart", AGENT_SYSTEMD_UNIT])
+        }
+        AgentPlatform::Other => anyhow::bail!(
+            "Automatic agent service recovery is only supported on macOS launchd and Linux user systemd."
+        ),
+    }
+}
+
 fn systemd_start_command_args() -> [&'static [&'static str]; 3] {
     [
         &["--user", "daemon-reload"],
@@ -1267,7 +1282,7 @@ Environment={}\n\
 Environment={}\n\
 {codex_path_environment}\
 Environment={}\n\
-Restart=on-failure\n\
+Restart=always\n\
 RestartSec=10\n\
 \n\
 [Install]\n\
@@ -1577,6 +1592,24 @@ fn run_service_command_optional(program: &str, args: &[&str]) -> Result<bool> {
         .with_context(|| format!("Failed to run {}", service_command_display(program, args)))?;
 
     Ok(status.success())
+}
+
+fn run_service_command_quiet(program: &str, args: &[&str]) -> Result<()> {
+    let status = Command::new(program)
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .with_context(|| format!("Failed to run {}", service_command_display(program, args)))?;
+    if !status.success() {
+        anyhow::bail!(
+            "{} failed with status {}",
+            service_command_display(program, args),
+            status
+        );
+    }
+
+    Ok(())
 }
 
 fn service_command_display(program: &str, args: &[&str]) -> String {
@@ -6138,9 +6171,25 @@ fn load_tui_agent_panel_snapshot(_active_root: &Path) -> Result<TuiAgentPanelSna
     let state_dir = agent_state_dir()?;
     let service_status = agent_service_status(&state_dir);
     let store = open_agent_store_at(&state_dir)?;
-    let checkins = store.list_daemon_checkins_blocking()?;
-    let daemon_status =
-        format_agent_daemon_runtime_status(&service_status, &checkins, agent_timestamp_seconds());
+    let mut checkins = store.list_daemon_checkins_blocking()?;
+    let now = agent_timestamp_seconds();
+    let service_restarted = agent_service_needs_restart(&service_status, &checkins, now);
+    if service_restarted {
+        restart_running_agent_service().context("Failed to restart stale agent service")?;
+        for checkin in checkins
+            .iter()
+            .filter(|checkin| checkin.mode == "service" && !daemon_checkin_is_fresh(checkin, now))
+        {
+            store.clear_daemon_checkin_blocking(&checkin.holder)?;
+        }
+        checkins
+            .retain(|checkin| checkin.mode != "service" || daemon_checkin_is_fresh(checkin, now));
+    }
+    let daemon_status = if service_restarted {
+        "service restarting".to_string()
+    } else {
+        format_agent_daemon_runtime_status(&service_status, &checkins, now)
+    };
     let projects = store.list_projects_blocking()?;
     let active_leases = store.list_active_leases_blocking(&agent_timestamp())?;
 
@@ -6161,6 +6210,22 @@ fn load_tui_agent_panel_snapshot(_active_root: &Path) -> Result<TuiAgentPanelSna
         projects,
         daemon_status,
     })
+}
+
+fn agent_service_needs_restart(
+    service_status: &str,
+    checkins: &[agent_store::AgentDaemonCheckin],
+    now: u64,
+) -> bool {
+    service_status == "running"
+        && checkins
+            .iter()
+            .filter(|checkin| checkin.mode == "service")
+            .any(|checkin| !daemon_checkin_is_fresh(checkin, now))
+        && !checkins
+            .iter()
+            .filter(|checkin| checkin.mode == "service")
+            .any(|checkin| daemon_checkin_is_fresh(checkin, now))
 }
 
 fn tui_agent_runtime_state(
@@ -10540,7 +10605,7 @@ mod tests {
         assert!(unit.contains("Environment=\"CLT_AGENT_DAEMON_MODE=service\""));
         assert!(!unit.contains("CLT_AGENT_CODEX_PATH"));
         assert!(unit.contains("Environment=\"PATH=/home/alex/bin:/usr/bin:/bin\""));
-        assert!(unit.contains("Restart=on-failure"));
+        assert!(unit.contains("Restart=always"));
         assert!(unit.contains("WantedBy=default.target"));
     }
 
@@ -11119,6 +11184,48 @@ mod tests {
             format_agent_daemon_runtime_status("not-installed", &[], 160),
             "disabled"
         );
+    }
+
+    #[test]
+    fn agent_service_restart_requires_running_service_with_only_stale_service_checkins() {
+        let stale_service = agent_store::AgentDaemonCheckin {
+            holder: "clt-agent-1".to_string(),
+            mode: "service".to_string(),
+            started_at: "100".to_string(),
+            checked_in_at: "120".to_string(),
+            expires_at: "150".to_string(),
+        };
+        let fresh_service = agent_store::AgentDaemonCheckin {
+            holder: "clt-agent-2".to_string(),
+            expires_at: "200".to_string(),
+            ..stale_service.clone()
+        };
+        let stale_cli = agent_store::AgentDaemonCheckin {
+            mode: "cli".to_string(),
+            ..stale_service.clone()
+        };
+
+        assert!(agent_service_needs_restart(
+            "running",
+            std::slice::from_ref(&stale_service),
+            160
+        ));
+        assert!(agent_service_needs_restart(
+            "running",
+            &[stale_service.clone(), stale_cli.clone()],
+            160
+        ));
+        assert!(!agent_service_needs_restart(
+            "installed",
+            std::slice::from_ref(&stale_service),
+            160
+        ));
+        assert!(!agent_service_needs_restart(
+            "running",
+            &[stale_service, fresh_service],
+            160
+        ));
+        assert!(!agent_service_needs_restart("running", &[stale_cli], 160));
     }
 
     #[test]

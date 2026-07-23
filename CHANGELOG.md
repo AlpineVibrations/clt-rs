@@ -35,6 +35,7 @@ Use this section while developing the next release.
 
 ### Fixed
 
+- The agent projects pane now detects and restarts a stale background service while leaving explicitly stopped services alone; Linux services also restart after unexpected clean exits.
 - Agent scheduling now reclaims crashed or expired leases and resumes the interrupted `doing` task instead of leaving it stranded.
 - Existing folder- or Markdown-backed boards with one or more missing empty status stores are now detected and repaired instead of prompting for initialization.
 - Declining the no-board initialization prompt now opens the TUI in the agent projects pane without creating an active task board.
