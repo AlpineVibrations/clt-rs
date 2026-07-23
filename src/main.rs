@@ -67,6 +67,11 @@ const AGENT_DEFAULT_RUN_TIMEOUT_SECONDS: u64 = 45 * 60;
 const AGENT_DEFAULT_SUCCESS_COOLDOWN_SECONDS: u64 = 5;
 const AGENT_DAEMON_CHECKIN_STALE_SECONDS: u64 = 45;
 const AGENT_NO_TASKS_LEFT_MARKER: &str = "NO_TASKS_LEFT";
+const CLT_TASK_MANAGEMENT_SKILL_NAME: &str = "clt-task-management";
+const GIT_COMMIT_SKILL_NAME: &str = "git-commit";
+const EMBEDDED_CLT_TASK_MANAGEMENT_SKILL: &str =
+    include_str!("../skills/clt-task-management/SKILL.md");
+const EMBEDDED_GIT_COMMIT_SKILL: &str = include_str!("../skills/git-commit/SKILL.md");
 const AGENT_CODEX_MODELS: [&str; 5] = [
     "",
     "gpt-5.6",
@@ -2518,7 +2523,30 @@ fn agent_codex_prompt(
     project: &agent_store::AgentProject,
     task_selection: AgentTaskSelection,
 ) -> String {
+    let clt_skill_available =
+        agent_skill_is_available(&project.path, CLT_TASK_MANAGEMENT_SKILL_NAME);
+    let git_skill_available = project.git_mode == AgentGitMode::Off
+        || agent_skill_is_available(&project.path, GIT_COMMIT_SKILL_NAME);
+    build_agent_codex_prompt(
+        project,
+        task_selection,
+        clt_skill_available,
+        git_skill_available,
+    )
+}
+
+fn build_agent_codex_prompt(
+    project: &agent_store::AgentProject,
+    task_selection: AgentTaskSelection,
+    clt_skill_available: bool,
+    git_skill_available: bool,
+) -> String {
     let mut prompt = AGENT_CODEX_PROMPT_BASE.to_string();
+    if clt_skill_available {
+        prompt.push_str(
+            "\nTask workflow:\n- Use the $clt-task-management skill for the task-board workflow.\n",
+        );
+    }
     if task_selection == AgentTaskSelection::ResumeDoing {
         prompt.push_str(AGENT_RESUME_DOING_PROMPT_APPENDIX);
     }
@@ -2530,7 +2558,97 @@ fn agent_codex_prompt(
             prompt.push_str(AGENT_GIT_PUSH_PROMPT_APPENDIX);
         }
     }
+    if !clt_skill_available {
+        append_embedded_agent_skill(
+            &mut prompt,
+            CLT_TASK_MANAGEMENT_SKILL_NAME,
+            EMBEDDED_CLT_TASK_MANAGEMENT_SKILL,
+        );
+    }
+    if project.git_mode != AgentGitMode::Off && !git_skill_available {
+        append_embedded_agent_skill(
+            &mut prompt,
+            GIT_COMMIT_SKILL_NAME,
+            EMBEDDED_GIT_COMMIT_SKILL,
+        );
+    }
     prompt
+}
+
+fn append_embedded_agent_skill(prompt: &mut String, name: &str, contents: &str) {
+    prompt.push_str("\n\nEmbedded skill fallback:\n");
+    prompt.push_str("- The $");
+    prompt.push_str(name);
+    prompt.push_str(
+        " skill was not found in a standard Codex skill directory. Follow this bundled version for this run.\n\n<skill>\n<name>",
+    );
+    prompt.push_str(name);
+    prompt.push_str("</name>\n<source>embedded in clt</source>\n");
+    prompt.push_str(contents);
+    if !contents.ends_with('\n') {
+        prompt.push('\n');
+    }
+    prompt.push_str("</skill>");
+}
+
+fn agent_skill_is_available(project_root: &Path, skill_name: &str) -> bool {
+    agent_skill_search_roots(project_root)
+        .iter()
+        .any(|root| agent_skill_root_contains_name(root, skill_name))
+}
+
+fn agent_skill_search_roots(project_root: &Path) -> Vec<PathBuf> {
+    let repository_root =
+        get_task_root_at(project_root, false).unwrap_or_else(|_| project_root.to_path_buf());
+    let mut roots = Vec::new();
+    let mut directory = project_root.to_path_buf();
+
+    loop {
+        roots.push(directory.join(".agents/skills"));
+        if directory == repository_root
+            || !directory.pop()
+            || !directory.starts_with(&repository_root)
+        {
+            break;
+        }
+    }
+
+    if let Some(home) = std::env::var_os("HOME") {
+        roots.push(PathBuf::from(home).join(".agents/skills"));
+    }
+    roots.push(PathBuf::from("/etc/codex/skills"));
+    roots
+}
+
+fn agent_skill_root_contains_name(root: &Path, skill_name: &str) -> bool {
+    let Ok(entries) = fs::read_dir(root) else {
+        return false;
+    };
+
+    entries.filter_map(Result::ok).any(|entry| {
+        fs::read_to_string(entry.path().join("SKILL.md"))
+            .ok()
+            .and_then(|contents| skill_frontmatter_name(&contents).map(str::to_string))
+            .is_some_and(|name| name == skill_name)
+    })
+}
+
+fn skill_frontmatter_name(contents: &str) -> Option<&str> {
+    let mut lines = contents.lines();
+    if lines.next()?.trim() != "---" {
+        return None;
+    }
+
+    for line in lines {
+        let line = line.trim();
+        if line == "---" {
+            break;
+        }
+        if let Some(name) = line.strip_prefix("name:") {
+            return Some(name.trim().trim_matches(['\"', '\'']));
+        }
+    }
+    None
 }
 
 impl AgentRunner for CodexAgentRunner {
@@ -12019,20 +12137,25 @@ mod tests {
             failure_count: 0,
         };
 
-        let base_prompt = agent_codex_prompt(&project, AgentTaskSelection::NextTodo);
+        let base_prompt =
+            build_agent_codex_prompt(&project, AgentTaskSelection::NextTodo, true, true);
         assert!(base_prompt.contains("Use the existing task-management CLI tooling: clt."));
+        assert!(base_prompt.contains("Use the $clt-task-management skill"));
+        assert!(!base_prompt.contains("Embedded skill fallback:"));
         assert!(!base_prompt.contains("Interrupted task recovery:"));
         assert!(!base_prompt.contains("$git-commit"));
         assert!(!base_prompt.contains("Git push:"));
 
         project.git_mode = AgentGitMode::Commit;
-        let commit_prompt = agent_codex_prompt(&project, AgentTaskSelection::NextTodo);
+        let commit_prompt =
+            build_agent_codex_prompt(&project, AgentTaskSelection::NextTodo, true, true);
         assert!(commit_prompt.contains("$git-commit"));
         assert!(commit_prompt.contains("Do not commit when there are no tasks left"));
         assert!(!commit_prompt.contains("Git push:"));
 
         project.git_mode = AgentGitMode::CommitAndPush;
-        let push_prompt = agent_codex_prompt(&project, AgentTaskSelection::NextTodo);
+        let push_prompt =
+            build_agent_codex_prompt(&project, AgentTaskSelection::NextTodo, true, true);
         assert!(push_prompt.contains("Git commit:"));
         assert!(push_prompt.contains("Git push:"));
         assert!(
@@ -12041,10 +12164,64 @@ mod tests {
         assert!(!push_prompt.contains("pull-with-rebase"));
         assert!(push_prompt.contains("Never force-push"));
 
-        let recovery_prompt = agent_codex_prompt(&project, AgentTaskSelection::ResumeDoing);
+        let recovery_prompt =
+            build_agent_codex_prompt(&project, AgentTaskSelection::ResumeDoing, true, true);
         assert!(recovery_prompt.contains("Interrupted task recovery:"));
         assert!(recovery_prompt.contains("Resume and finish exactly one existing doing task."));
         assert!(recovery_prompt.contains("Do not pick or move a TODO task"));
+    }
+
+    #[test]
+    fn agent_codex_prompt_embeds_only_missing_required_skills() {
+        let mut project = agent_store::AgentProject {
+            id: 1,
+            path: PathBuf::from("/tmp/project"),
+            name: "project".to_string(),
+            enabled: true,
+            git_mode: AgentGitMode::Off,
+            codex_model: None,
+            codex_reasoning_effort: None,
+            codex_fast_enabled: false,
+            last_scan_at: None,
+            last_run_at: None,
+            last_success_at: None,
+            last_failure_at: None,
+            failure_count: 0,
+        };
+
+        let base_prompt =
+            build_agent_codex_prompt(&project, AgentTaskSelection::NextTodo, false, false);
+        assert!(base_prompt.contains("<name>clt-task-management</name>"));
+        assert!(base_prompt.contains("# Skills: Project Task Management with `clt`"));
+        assert!(!base_prompt.contains("<name>git-commit</name>"));
+
+        project.git_mode = AgentGitMode::Commit;
+        let commit_prompt =
+            build_agent_codex_prompt(&project, AgentTaskSelection::NextTodo, true, false);
+        assert!(!commit_prompt.contains("<name>clt-task-management</name>"));
+        assert!(commit_prompt.contains("<name>git-commit</name>"));
+        assert!(commit_prompt.contains("# Git Commit Workflow"));
+    }
+
+    #[test]
+    fn agent_skill_lookup_uses_frontmatter_name() {
+        let root = temp_root("agent-skill-lookup");
+        let skills_root = root.join("skills");
+        let skill_dir = skills_root.join("custom-folder-name");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: \"git-commit\"\ndescription: Test skill.\n---\n",
+        )
+        .unwrap();
+
+        assert!(agent_skill_root_contains_name(&skills_root, "git-commit"));
+        assert!(!agent_skill_root_contains_name(
+            &skills_root,
+            "clt-task-management"
+        ));
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]

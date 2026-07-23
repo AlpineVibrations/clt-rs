@@ -34,7 +34,9 @@ Ensure you have Rust and Cargo installed.
 cargo install clt-rs
 ```
 
-To install the bundled agent skills, clone this repository and copy the skill folders into the `skills` directory inside your home `.agents` directory. From the repository root, run:
+The installed `clt` binary embeds both agent skills. Before an automated Codex run, `clt` looks for each required skill by its frontmatter name in the standard repository, user, and admin skill directories. If a skill is unavailable, `clt` adds its bundled instructions to that run's prompt automatically, so `cargo install clt-rs` is sufficient for agent automation.
+
+To make the skills discoverable to Codex outside `clt` agent runs, clone this repository and copy the skill folders into the `skills` directory inside your home `.agents` directory. From the repository root, run:
 
 ```bash
 mkdir -p ~/.agents/skills
@@ -149,7 +151,7 @@ Agent-facing workflow skills are included in the repository's `skills/` director
 - `skills/clt-task-management/`: task-board workflow guidance for using `clt`.
 - `skills/git-commit/`: git commit and optional push workflow guidance.
 
-Copy these folders into `~/.agents/skills/` using the commands in [Installation](#installation) before asking Codex to use them.
+Automated `clt` agent runs use embedded copies when these skills are not installed. Copy the folders into `~/.agents/skills/` using the commands in [Installation](#installation) only when you also want to invoke them directly in other Codex sessions.
 
 Run one foreground scheduler pass:
 ```bash
