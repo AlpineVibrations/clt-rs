@@ -5876,6 +5876,20 @@ enum TuiTaskReorderDirection {
     Down,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TuiTaskReorganizeDirection {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TuiTaskBoardMoveDirection {
+    Left,
+    Right,
+}
+
 fn tui_task_reorder_direction(key: &crossterm::event::KeyEvent) -> Option<TuiTaskReorderDirection> {
     match key.code {
         KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
@@ -5892,6 +5906,23 @@ fn tui_task_reorder_direction(key: &crossterm::event::KeyEvent) -> Option<TuiTas
         }
         _ => None,
     }
+}
+
+fn tui_task_reorganize_direction(
+    key: &crossterm::event::KeyEvent,
+) -> Option<TuiTaskReorganizeDirection> {
+    match key.code {
+        KeyCode::Up => Some(TuiTaskReorganizeDirection::Up),
+        KeyCode::Down => Some(TuiTaskReorganizeDirection::Down),
+        KeyCode::Left => Some(TuiTaskReorganizeDirection::Left),
+        KeyCode::Right => Some(TuiTaskReorganizeDirection::Right),
+        _ => None,
+    }
+}
+
+fn tui_starts_reorganize_mode(key: &crossterm::event::KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('r' | 'R'))
+        && key.modifiers.difference(KeyModifiers::SHIFT).is_empty()
 }
 
 fn reorder_selected_tui_task(
@@ -5933,6 +5964,87 @@ fn reorder_selected_tui_task(
             format!("Moved task {direction} to position {}", target_idx + 1)
         }
         Err(error) => format!("Error: {error}"),
+    }
+}
+
+fn move_selected_tui_task_between_boards(
+    board_dir: &Path,
+    statuses: &[&str],
+    board_states: &mut [ListState],
+    selected_board: &mut usize,
+    backlog_visible: bool,
+    direction: TuiTaskBoardMoveDirection,
+) -> String {
+    let Some(idx) = selected_task_index_in_board(
+        board_dir,
+        statuses[*selected_board],
+        &board_states[*selected_board],
+    ) else {
+        board_states[*selected_board].select(None);
+        return "No task selected".to_string();
+    };
+
+    let (offset, boundary_message) = match direction {
+        TuiTaskBoardMoveDirection::Left => (-1, "Already at the first board"),
+        TuiTaskBoardMoveDirection::Right => (1, "Already at the last board"),
+    };
+    let Some(to_board) = adjacent_visible_tui_board(*selected_board, backlog_visible, offset)
+    else {
+        return boundary_message.to_string();
+    };
+    let from = statuses[*selected_board];
+    let to = statuses[to_board];
+
+    match move_task_in_board(board_dir, from, to, &(idx + 1).to_string()) {
+        Ok(_) => {
+            *selected_board = to_board;
+            for state in board_states.iter_mut() {
+                state.select(None);
+            }
+            select_last_task_if_present_in_board(board_dir, to, &mut board_states[*selected_board]);
+            format!("Moved task to {to}")
+        }
+        Err(error) => format!("Error: {error}"),
+    }
+}
+
+fn reorganize_selected_tui_task(
+    board_dir: &Path,
+    statuses: &[&str],
+    board_states: &mut [ListState],
+    selected_board: &mut usize,
+    backlog_visible: bool,
+    direction: TuiTaskReorganizeDirection,
+) -> String {
+    match direction {
+        TuiTaskReorganizeDirection::Up => reorder_selected_tui_task(
+            board_dir,
+            statuses[*selected_board],
+            &mut board_states[*selected_board],
+            TuiTaskReorderDirection::Up,
+        ),
+        TuiTaskReorganizeDirection::Down => reorder_selected_tui_task(
+            board_dir,
+            statuses[*selected_board],
+            &mut board_states[*selected_board],
+            TuiTaskReorderDirection::Down,
+        ),
+        TuiTaskReorganizeDirection::Left => move_selected_tui_task_between_boards(
+            board_dir,
+            statuses,
+            board_states,
+            selected_board,
+            backlog_visible,
+            TuiTaskBoardMoveDirection::Left,
+        ),
+        TuiTaskReorganizeDirection::Right => move_selected_tui_task_between_boards(
+            board_dir,
+            statuses,
+            board_states,
+            selected_board,
+            backlog_visible,
+            TuiTaskBoardMoveDirection::Right,
+        ),
     }
 }
 
@@ -6004,6 +6116,7 @@ fn keep_selected_task_visible(
 
 enum Mode {
     View,
+    Reorganize,
     Input,
     Edit,
     Help,
@@ -6027,7 +6140,7 @@ fn tui_start_state(active_board: bool) -> TuiStartState {
             active_board,
             current_pane: TuiPane::Tasks,
             feedback_buffer: String::from(
-                "Kanban View! Tab switches to the agent projects pane, Enter opens a selected project there, Space toggles it ON/OFF, g cycles Git off/commit/push, m/f/t change its Codex model/fast/thinking settings, l shows the active project's agent output, Backspace returns to parent, Space creates a task on the board, a archives a task, A opens archive view, b moves a task to backlog, B toggles the backlog column, Shift+Arrows reorder or move tasks, Ctrl-P/N reorder up/down, 'd' deletes, 'q' quits.",
+                "Kanban View! Tab switches to the agent projects pane, Enter opens a selected project there, Space toggles it ON/OFF, g cycles Git off/commit/push, m/f/t change its Codex model/fast/thinking settings, l shows the active project's agent output, Backspace returns to parent, Space creates a task on the board, a archives a task, A opens archive view, b moves a task to backlog, B toggles the backlog column, tap r then an Arrow to reorganize once, Shift+Arrows reorder or move tasks, Ctrl-P/N reorder up/down, 'd' deletes, 'q' quits.",
             ),
         }
     } else {
@@ -8176,7 +8289,8 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                         .collect();
 
                     let task_focus_active =
-                        matches!(current_mode, Mode::View) && current_pane == TuiPane::Tasks;
+                        matches!(current_mode, Mode::View | Mode::Reorganize)
+                            && current_pane == TuiPane::Tasks;
                     let highlight_style = if task_focus_active {
                         Style::default().fg(Color::Black).bg(c_highlight)
                     } else {
@@ -8358,6 +8472,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                  [d/Del]        - Delete selected task\n\
                                  [Tab]          - Switch between task board and agent projects panes\n\
                                  [Arrows]       - Navigate boards and tasks\n\
+                                 [r, then Arrow] - Reorganize task once (Esc cancels)\n\
                                  [Shift+Arrows] - Reorder/Move tasks\n\
                                  [Ctrl-P/N]     - Reorder task Up/Down\n\
                                  [0, 1, 2, 3]   - Focus Backlog/To Do/Doing/Done\n\
@@ -8369,7 +8484,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
 
                 let area = f.area();
                 let popover_width = area.width.min(70);
-                let popover_height = area.height.min(26);
+                let popover_height = area.height.min(27);
                 let x = area.width.saturating_sub(popover_width) / 2;
                 let y = area.height.saturating_sub(popover_height) / 2;
 
@@ -8752,6 +8867,11 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                 &mut board_states[selected_board],
                                 direction,
                             );
+                        } else if tui_starts_reorganize_mode(&key) {
+                            current_mode = Mode::Reorganize;
+                            feedback_buffer =
+                                "Reorganize: press an Arrow to move the selected task (Esc cancels)."
+                                    .to_string();
                         } else if key.modifiers.contains(KeyModifiers::SHIFT) {
                             match key.code {
                                 KeyCode::Char('A') | KeyCode::Char('a') => {
@@ -8775,90 +8895,24 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                     );
                                 }
                                 KeyCode::Left => {
-                                    if let Some(idx) = selected_task_index_in_board(
+                                    feedback_buffer = move_selected_tui_task_between_boards(
                                         &board_dir,
-                                        statuses[selected_board],
-                                        &board_states[selected_board],
-                                    ) {
-                                        if let Some(to_board) = adjacent_visible_tui_board(
-                                            selected_board,
-                                            backlog_visible,
-                                            -1,
-                                        ) {
-                                            let from = statuses[selected_board];
-                                            let to = statuses[to_board];
-                                            match move_task_in_board(
-                                                &board_dir,
-                                                from,
-                                                to,
-                                                &(idx + 1).to_string(),
-                                            ) {
-                                                Ok(_) => {
-                                                    selected_board = to_board;
-                                                    for state in board_states.iter_mut() {
-                                                        state.select(None);
-                                                    }
-                                                    select_last_task_if_present_in_board(
-                                                        &board_dir,
-                                                        to,
-                                                        &mut board_states[selected_board],
-                                                    );
-                                                    feedback_buffer =
-                                                        format!("Moved task to {}", to)
-                                                }
-                                                Err(e) => feedback_buffer = format!("Error: {}", e),
-                                            }
-                                        } else {
-                                            feedback_buffer =
-                                                "Already at the first board".to_string();
-                                        }
-                                    } else {
-                                        board_states[selected_board].select(None);
-                                        feedback_buffer = "No task selected".to_string();
-                                    }
+                                        &statuses,
+                                        &mut board_states,
+                                        &mut selected_board,
+                                        backlog_visible,
+                                        TuiTaskBoardMoveDirection::Left,
+                                    );
                                 }
                                 KeyCode::Right => {
-                                    if let Some(idx) = selected_task_index_in_board(
+                                    feedback_buffer = move_selected_tui_task_between_boards(
                                         &board_dir,
-                                        statuses[selected_board],
-                                        &board_states[selected_board],
-                                    ) {
-                                        if let Some(to_board) = adjacent_visible_tui_board(
-                                            selected_board,
-                                            backlog_visible,
-                                            1,
-                                        ) {
-                                            let from = statuses[selected_board];
-                                            let to = statuses[to_board];
-                                            match move_task_in_board(
-                                                &board_dir,
-                                                from,
-                                                to,
-                                                &(idx + 1).to_string(),
-                                            ) {
-                                                Ok(_) => {
-                                                    selected_board = to_board;
-                                                    for state in board_states.iter_mut() {
-                                                        state.select(None);
-                                                    }
-                                                    select_last_task_if_present_in_board(
-                                                        &board_dir,
-                                                        to,
-                                                        &mut board_states[selected_board],
-                                                    );
-                                                    feedback_buffer =
-                                                        format!("Moved task to {}", to)
-                                                }
-                                                Err(e) => feedback_buffer = format!("Error: {}", e),
-                                            }
-                                        } else {
-                                            feedback_buffer =
-                                                "Already at the last board".to_string();
-                                        }
-                                    } else {
-                                        board_states[selected_board].select(None);
-                                        feedback_buffer = "No task selected".to_string();
-                                    }
+                                        &statuses,
+                                        &mut board_states,
+                                        &mut selected_board,
+                                        backlog_visible,
+                                        TuiTaskBoardMoveDirection::Right,
+                                    );
                                 }
                                 _ => {}
                             }
@@ -9217,6 +9271,23 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                             }
                         }
                     }
+                    Mode::Reorganize => {
+                        current_mode = Mode::View;
+                        feedback_buffer = if matches!(key.code, KeyCode::Esc) {
+                            "Reorganize cancelled.".to_string()
+                        } else if let Some(direction) = tui_task_reorganize_direction(&key) {
+                            reorganize_selected_tui_task(
+                                &board_dir,
+                                &statuses,
+                                &mut board_states,
+                                &mut selected_board,
+                                backlog_visible,
+                                direction,
+                            )
+                        } else {
+                            "Reorganize cancelled: expected an Arrow.".to_string()
+                        };
+                    }
                     Mode::Help => match key.code {
                         KeyCode::Enter
                         | KeyCode::Esc
@@ -9437,6 +9508,44 @@ mod tests {
     }
 
     #[test]
+    fn tui_reorganize_prefix_and_arrows_are_unambiguous() {
+        let key = |code, modifiers| crossterm::event::KeyEvent::new(code, modifiers);
+
+        assert!(tui_starts_reorganize_mode(&key(
+            KeyCode::Char('r'),
+            KeyModifiers::NONE
+        )));
+        assert!(tui_starts_reorganize_mode(&key(
+            KeyCode::Char('R'),
+            KeyModifiers::SHIFT
+        )));
+        assert!(!tui_starts_reorganize_mode(&key(
+            KeyCode::Char('r'),
+            KeyModifiers::CONTROL
+        )));
+
+        for (code, direction) in [
+            (KeyCode::Up, TuiTaskReorganizeDirection::Up),
+            (KeyCode::Down, TuiTaskReorganizeDirection::Down),
+            (KeyCode::Left, TuiTaskReorganizeDirection::Left),
+            (KeyCode::Right, TuiTaskReorganizeDirection::Right),
+        ] {
+            assert_eq!(
+                tui_task_reorganize_direction(&key(code, KeyModifiers::NONE)),
+                Some(direction)
+            );
+        }
+        assert_eq!(
+            tui_task_reorganize_direction(&key(KeyCode::Esc, KeyModifiers::NONE)),
+            None
+        );
+        assert_eq!(
+            tui_task_reorganize_direction(&key(KeyCode::Char('x'), KeyModifiers::NONE)),
+            None
+        );
+    }
+
+    #[test]
     fn tui_reorder_action_moves_the_selected_task_and_selection() {
         let root = temp_root("tui-reorder-action");
         add_task(&root, "alpha", None).unwrap();
@@ -9468,6 +9577,53 @@ mod tests {
             read_tasks(&root, "todo").unwrap(),
             vec!["- alpha", "- beta"]
         );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tui_reorganize_action_moves_the_selected_task_between_boards() {
+        let root = temp_root("tui-reorganize-horizontal-action");
+        add_task(&root, "alpha", None).unwrap();
+        let board_dir = root.join("tasks");
+        let mut board_states = [
+            ListState::default(),
+            ListState::default(),
+            ListState::default(),
+            ListState::default(),
+        ];
+        let mut selected_board = TODO_BOARD_INDEX;
+        board_states[selected_board].select(Some(0));
+
+        let message = reorganize_selected_tui_task(
+            &board_dir,
+            &TASK_STATUSES,
+            &mut board_states,
+            &mut selected_board,
+            false,
+            TuiTaskReorganizeDirection::Right,
+        );
+
+        assert_eq!(message, "Moved task to doing");
+        assert_eq!(selected_board, 1);
+        assert_eq!(board_states[selected_board].selected(), Some(0));
+        assert!(read_tasks(&root, "todo").unwrap().is_empty());
+        assert_eq!(read_tasks(&root, "doing").unwrap(), vec!["- alpha"]);
+
+        let message = reorganize_selected_tui_task(
+            &board_dir,
+            &TASK_STATUSES,
+            &mut board_states,
+            &mut selected_board,
+            false,
+            TuiTaskReorganizeDirection::Left,
+        );
+
+        assert_eq!(message, "Moved task to todo");
+        assert_eq!(selected_board, TODO_BOARD_INDEX);
+        assert_eq!(board_states[selected_board].selected(), Some(0));
+        assert_eq!(read_tasks(&root, "todo").unwrap(), vec!["- alpha"]);
+        assert!(read_tasks(&root, "doing").unwrap().is_empty());
 
         fs::remove_dir_all(root).unwrap();
     }
