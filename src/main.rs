@@ -17,8 +17,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crossterm::{
     ExecutableCommand,
     event::{
-        self, Event, KeyCode, KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-        PushKeyboardEnhancementFlags,
+        self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     terminal::{
         EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode,
@@ -142,6 +142,70 @@ enum AgentGitMode {
     Off,
     Commit,
     CommitAndPush,
+}
+
+struct InitializationPromptRawMode;
+
+impl InitializationPromptRawMode {
+    fn enter() -> Result<Self> {
+        enable_raw_mode()?;
+        Ok(Self)
+    }
+}
+
+impl Drop for InitializationPromptRawMode {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+    }
+}
+
+fn initialization_prompt_choice(key: &KeyEvent) -> Option<bool> {
+    if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+        || key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return None;
+    }
+
+    match key.code {
+        KeyCode::Char('y' | 'Y') => Some(true),
+        KeyCode::Char('n' | 'N') => Some(false),
+        _ => None,
+    }
+}
+
+fn prompt_to_initialize_tasks() -> Result<bool> {
+    print!("Tasks not initialized. Would you like to initialize now? (y/n): ");
+    io::stdout().flush()?;
+
+    let choice = {
+        let _raw_mode = InitializationPromptRawMode::enter()?;
+        loop {
+            if let Event::Key(key) = event::read()? {
+                if key.code == KeyCode::Char('c')
+                    && key.modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                {
+                    break None;
+                }
+                if let Some(choice) = initialization_prompt_choice(&key) {
+                    break Some(choice);
+                }
+            }
+        }
+    };
+
+    match choice {
+        Some(choice) => {
+            println!("{}", if choice { 'y' } else { 'n' });
+            Ok(choice)
+        }
+        None => {
+            println!();
+            anyhow::bail!("Initialization cancelled")
+        }
+    }
 }
 
 impl AgentGitMode {
@@ -547,13 +611,7 @@ fn main() -> Result<()> {
         }
         None => {
             if !ensure_existing_board(&root)? {
-                print!("Tasks not initialized. Would you like to initialize now? (y/n): ");
-                io::stdout().flush()?;
-
-                let mut response = String::new();
-                io::stdin().read_line(&mut response)?;
-
-                if response.trim().to_lowercase() == "y" {
+                if prompt_to_initialize_tasks()? {
                     init_tasks(&root, false)?;
                 } else {
                     tui_view_without_active_board(&root)?;
@@ -9475,6 +9533,36 @@ mod tests {
         assert!(flags.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
         assert!(flags.contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES));
         assert!(!flags.contains(KeyboardEnhancementFlags::REPORT_EVENT_TYPES));
+    }
+
+    #[test]
+    fn initialization_prompt_accepts_y_or_n_without_enter() {
+        let key = |code, modifiers| crossterm::event::KeyEvent::new(code, modifiers);
+
+        assert_eq!(
+            initialization_prompt_choice(&key(KeyCode::Char('y'), KeyModifiers::NONE)),
+            Some(true)
+        );
+        assert_eq!(
+            initialization_prompt_choice(&key(KeyCode::Char('Y'), KeyModifiers::SHIFT)),
+            Some(true)
+        );
+        assert_eq!(
+            initialization_prompt_choice(&key(KeyCode::Char('n'), KeyModifiers::NONE)),
+            Some(false)
+        );
+        assert_eq!(
+            initialization_prompt_choice(&key(KeyCode::Char('N'), KeyModifiers::SHIFT)),
+            Some(false)
+        );
+        assert_eq!(
+            initialization_prompt_choice(&key(KeyCode::Enter, KeyModifiers::NONE)),
+            None
+        );
+        assert_eq!(
+            initialization_prompt_choice(&key(KeyCode::Char('y'), KeyModifiers::CONTROL)),
+            None
+        );
     }
 
     #[test]
