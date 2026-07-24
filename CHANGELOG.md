@@ -35,7 +35,7 @@ Use this section while developing the next release.
 
 ### Fixed
 
-- Shift+Up and Shift+Down task reordering now recovers Terminal.app's omitted Shift modifier when `clt` runs locally on macOS; documented the equivalent Terminal profile mappings for remote sessions.
+- Documented the Terminal.app profile mappings required to preserve Shift+Up and Shift+Down task reordering through SSH and tmux.
 - The agent projects pane now detects and restarts a stale background service while leaving explicitly stopped services alone; Linux services also restart after unexpected clean exits.
 - Agent scheduling now reclaims crashed or expired leases and resumes the interrupted `doing` task instead of leaving it stranded.
 - Existing folder- or Markdown-backed boards with one or more missing empty status stores are now detected and repaired instead of prompting for initialization.
