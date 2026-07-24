@@ -70,7 +70,9 @@ clt
 ```
 Press `Enter` to open a folder task with subtasks, `e` to edit the selected task, `Space` to create a task, `Backspace` to return to the parent board, and `q` to quit.
 
-Use `Shift+Up` and `Shift+Down` to reorder the selected task, and `Shift+Left` and `Shift+Right` to move it between columns. Stock macOS Terminal does not encode Shift in its default Up/Down sequences, so the modifier is lost before an SSH or tmux session reaches `clt` on a remote machine. Add these two mappings on the Mac under Terminal > Settings > Profiles > Keyboard:
+Use `Shift+Up` and `Shift+Down` to reorder the selected task, and `Shift+Left` and `Shift+Right` to move it between columns. `Ctrl-P` also reorders the selected task up and `Ctrl-N` reorders it down; these portable alternatives work in stock macOS Terminal and through SSH or tmux.
+
+Stock macOS Terminal does not encode Shift in its default Up/Down sequences, so the modifier is lost before `clt` receives it. To keep using Shift+Up/Down there, add these two mappings on the Mac under Terminal > Settings > Profiles > Keyboard:
 
 - Shift+Up: send `\033[1;2A`
 - Shift+Down: send `\033[1;2B`

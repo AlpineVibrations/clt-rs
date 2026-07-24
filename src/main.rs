@@ -5870,6 +5870,72 @@ fn move_selected_tui_task_to_archive(
     Ok("Moved task to archive".to_string())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TuiTaskReorderDirection {
+    Up,
+    Down,
+}
+
+fn tui_task_reorder_direction(key: &crossterm::event::KeyEvent) -> Option<TuiTaskReorderDirection> {
+    match key.code {
+        KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            Some(TuiTaskReorderDirection::Up)
+        }
+        KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            Some(TuiTaskReorderDirection::Down)
+        }
+        KeyCode::Char('p' | 'P') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(TuiTaskReorderDirection::Up)
+        }
+        KeyCode::Char('n' | 'N') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(TuiTaskReorderDirection::Down)
+        }
+        _ => None,
+    }
+}
+
+fn reorder_selected_tui_task(
+    board_dir: &Path,
+    status: &str,
+    state: &mut ListState,
+    direction: TuiTaskReorderDirection,
+) -> String {
+    let Some(idx) = selected_task_index_in_board(board_dir, status, state) else {
+        state.select(None);
+        return "No task selected".to_string();
+    };
+
+    let target_idx = match direction {
+        TuiTaskReorderDirection::Up if idx == 0 => return "Already at the top".to_string(),
+        TuiTaskReorderDirection::Up => idx - 1,
+        TuiTaskReorderDirection::Down => {
+            let tasks = read_tasks_in_board(board_dir, status).unwrap_or_default();
+            if tasks.is_empty() {
+                state.select(None);
+                return "No task selected".to_string();
+            }
+            if idx >= tasks.len() - 1 {
+                return "Already at the bottom".to_string();
+            }
+            idx + 1
+        }
+    };
+
+    let result = reorder_task_in_board(board_dir, status, idx, target_idx);
+    state.select(Some(target_idx));
+
+    match result {
+        Ok(_) => {
+            let direction = match direction {
+                TuiTaskReorderDirection::Up => "up",
+                TuiTaskReorderDirection::Down => "down",
+            };
+            format!("Moved task {direction} to position {}", target_idx + 1)
+        }
+        Err(error) => format!("Error: {error}"),
+    }
+}
+
 fn task_display_height(
     task: &str,
     idx: usize,
@@ -5961,7 +6027,7 @@ fn tui_start_state(active_board: bool) -> TuiStartState {
             active_board,
             current_pane: TuiPane::Tasks,
             feedback_buffer: String::from(
-                "Kanban View! Tab switches to the agent projects pane, Enter opens a selected project there, Space toggles it ON/OFF, g cycles Git off/commit/push, m/f/t change its Codex model/fast/thinking settings, l shows the active project's agent output, Backspace returns to parent, Space creates a task on the board, a archives a task, A opens archive view, b moves a task to backlog, B toggles the backlog column, Shift+Arrows reorder or move tasks, 'd' deletes, 'q' quits.",
+                "Kanban View! Tab switches to the agent projects pane, Enter opens a selected project there, Space toggles it ON/OFF, g cycles Git off/commit/push, m/f/t change its Codex model/fast/thinking settings, l shows the active project's agent output, Backspace returns to parent, Space creates a task on the board, a archives a task, A opens archive view, b moves a task to backlog, B toggles the backlog column, Shift+Arrows reorder or move tasks, Ctrl-P/N reorder up/down, 'd' deletes, 'q' quits.",
             ),
         }
     } else {
@@ -8293,6 +8359,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                  [Tab]          - Switch between task board and agent projects panes\n\
                                  [Arrows]       - Navigate boards and tasks\n\
                                  [Shift+Arrows] - Reorder/Move tasks\n\
+                                 [Ctrl-P/N]     - Reorder task Up/Down\n\
                                  [0, 1, 2, 3]   - Focus Backlog/To Do/Doing/Done\n\
                                  [Input Arrows]         - Move cursor in wrapped input\n\
                                  [Ctrl/Alt+Left/Right]  - Jump input cursor by word\n\
@@ -8678,6 +8745,13 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                             .to_string();
                                 }
                             }
+                        } else if let Some(direction) = tui_task_reorder_direction(&key) {
+                            feedback_buffer = reorder_selected_tui_task(
+                                &board_dir,
+                                statuses[selected_board],
+                                &mut board_states[selected_board],
+                                direction,
+                            );
                         } else if key.modifiers.contains(KeyModifiers::SHIFT) {
                             match key.code {
                                 KeyCode::Char('A') | KeyCode::Char('a') => {
@@ -8699,72 +8773,6 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                         &mut selected_board,
                                         &mut backlog_visible,
                                     );
-                                }
-                                KeyCode::Up => {
-                                    if let Some(idx) = selected_task_index_in_board(
-                                        &board_dir,
-                                        statuses[selected_board],
-                                        &board_states[selected_board],
-                                    ) {
-                                        if idx > 0 {
-                                            match reorder_task_in_board(
-                                                &board_dir,
-                                                statuses[selected_board],
-                                                idx,
-                                                idx - 1,
-                                            ) {
-                                                Ok(_) => {
-                                                    feedback_buffer =
-                                                        format!("Moved task up to position {}", idx)
-                                                }
-                                                Err(e) => feedback_buffer = format!("Error: {}", e),
-                                            }
-                                            board_states[selected_board].select(Some(idx - 1));
-                                        } else {
-                                            feedback_buffer = "Already at the top".to_string();
-                                        }
-                                    } else {
-                                        board_states[selected_board].select(None);
-                                        feedback_buffer = "No task selected".to_string();
-                                    }
-                                }
-                                KeyCode::Down => {
-                                    if let Some(idx) = selected_task_index_in_board(
-                                        &board_dir,
-                                        statuses[selected_board],
-                                        &board_states[selected_board],
-                                    ) {
-                                        let tasks = read_tasks_in_board(
-                                            &board_dir,
-                                            statuses[selected_board],
-                                        )
-                                        .unwrap_or_default();
-                                        if tasks.is_empty() {
-                                            board_states[selected_board].select(None);
-                                            feedback_buffer = "No task selected".to_string();
-                                        } else if idx < tasks.len() - 1 {
-                                            match reorder_task_in_board(
-                                                &board_dir,
-                                                statuses[selected_board],
-                                                idx,
-                                                idx + 1,
-                                            ) {
-                                                Ok(_) => {
-                                                    feedback_buffer = format!(
-                                                        "Moved task down to position {}",
-                                                        idx + 2
-                                                    )
-                                                }
-                                                Err(e) => feedback_buffer = format!("Error: {}", e),
-                                            }
-                                            board_states[selected_board].select(Some(idx + 1));
-                                        } else {
-                                            feedback_buffer = "Already at the bottom".to_string();
-                                        }
-                                    } else {
-                                        board_states[selected_board].select(None);
-                                        feedback_buffer = "No task selected".to_string();
-                                    }
                                 }
                                 KeyCode::Left => {
                                     if let Some(idx) = selected_task_index_in_board(
@@ -8857,7 +8865,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                         } else if key.modifiers.contains(KeyModifiers::CONTROL)
                             || key.modifiers.contains(KeyModifiers::ALT)
                         {
-                            // Alt/Ctrl modifiers no longer used for moving tasks
+                            // Other Alt/Ctrl modifiers are not used for moving tasks.
                             _ = ();
                         } else {
                             match key.code {
@@ -9396,6 +9404,72 @@ mod tests {
         assert!(flags.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
         assert!(flags.contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES));
         assert!(!flags.contains(KeyboardEnhancementFlags::REPORT_EVENT_TYPES));
+    }
+
+    #[test]
+    fn tui_reorder_shortcuts_support_shift_arrows_and_control_previous_next() {
+        let key = |code, modifiers| crossterm::event::KeyEvent::new(code, modifiers);
+
+        assert_eq!(
+            tui_task_reorder_direction(&key(KeyCode::Up, KeyModifiers::SHIFT)),
+            Some(TuiTaskReorderDirection::Up)
+        );
+        assert_eq!(
+            tui_task_reorder_direction(&key(KeyCode::Down, KeyModifiers::SHIFT)),
+            Some(TuiTaskReorderDirection::Down)
+        );
+        assert_eq!(
+            tui_task_reorder_direction(&key(KeyCode::Char('p'), KeyModifiers::CONTROL)),
+            Some(TuiTaskReorderDirection::Up)
+        );
+        assert_eq!(
+            tui_task_reorder_direction(&key(KeyCode::Char('n'), KeyModifiers::CONTROL)),
+            Some(TuiTaskReorderDirection::Down)
+        );
+        assert_eq!(
+            tui_task_reorder_direction(&key(KeyCode::Up, KeyModifiers::NONE)),
+            None
+        );
+        assert_eq!(
+            tui_task_reorder_direction(&key(KeyCode::Char('p'), KeyModifiers::NONE)),
+            None
+        );
+    }
+
+    #[test]
+    fn tui_reorder_action_moves_the_selected_task_and_selection() {
+        let root = temp_root("tui-reorder-action");
+        add_task(&root, "alpha", None).unwrap();
+        add_task(&root, "beta", None).unwrap();
+        let board_dir = root.join("tasks");
+        let mut state = ListState::default();
+        state.select(Some(0));
+
+        let message = reorder_selected_tui_task(
+            &board_dir,
+            "todo",
+            &mut state,
+            TuiTaskReorderDirection::Down,
+        );
+
+        assert_eq!(message, "Moved task down to position 2");
+        assert_eq!(state.selected(), Some(1));
+        assert_eq!(
+            read_tasks(&root, "todo").unwrap(),
+            vec!["- beta", "- alpha"]
+        );
+
+        let message =
+            reorder_selected_tui_task(&board_dir, "todo", &mut state, TuiTaskReorderDirection::Up);
+
+        assert_eq!(message, "Moved task up to position 1");
+        assert_eq!(state.selected(), Some(0));
+        assert_eq!(
+            read_tasks(&root, "todo").unwrap(),
+            vec!["- alpha", "- beta"]
+        );
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn tui_agent_project_for_test(id: i64, name: &str) -> TuiAgentProject {

@@ -35,6 +35,7 @@ Use this section while developing the next release.
 
 ### Fixed
 
+- Added `Ctrl-P` and `Ctrl-N` task-reordering alternatives for terminals that do not distinguish Shift+Up/Down.
 - Documented the Terminal.app profile mappings required to preserve Shift+Up and Shift+Down task reordering through SSH and tmux.
 - The agent projects pane now detects and restarts a stale background service while leaving explicitly stopped services alone; Linux services also restart after unexpected clean exits.
 - Agent scheduling now reclaims crashed or expired leases and resumes the interrupted `doing` task instead of leaving it stranded.
