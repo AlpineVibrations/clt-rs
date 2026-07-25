@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local, Utc};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use ratatui::layout::{Alignment, Position, Rect};
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -142,6 +142,12 @@ enum AgentGitMode {
     Off,
     Commit,
     CommitAndPush,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum ShellKind {
+    Bash,
+    Zsh,
 }
 
 struct InitializationPromptRawMode;
@@ -440,6 +446,10 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     local: bool,
 
+    /// Write the TUI's final project directory for a shell wrapper
+    #[arg(long, global = true, hide = true)]
+    cwd_file: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -488,6 +498,12 @@ enum Commands {
     },
     /// Lists tasks. Optional status to filter by (backlog, todo, doing, done)
     List { status: Option<String> },
+    /// Prints shell integration that changes directory after leaving the TUI
+    ShellInit {
+        /// Shell to generate integration for
+        #[arg(value_enum)]
+        shell: ShellKind,
+    },
     /// Manages Codex automation across registered projects
     Agent {
         #[command(subcommand)]
@@ -565,6 +581,11 @@ enum AgentGitCommitCommands {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let Some(Commands::ShellInit { shell }) = cli.command.as_ref() {
+        print!("{}", shell_init_script(*shell));
+        return Ok(());
+    }
+
     let root = get_task_root(cli.local)?;
     let cwd = std::env::current_dir()?;
 
@@ -606,6 +627,7 @@ fn main() -> Result<()> {
         Some(Commands::List { status }) => {
             list_tasks(&root, status)?;
         }
+        Some(Commands::ShellInit { .. }) => unreachable!("shell init handled before root lookup"),
         Some(Commands::Agent { command }) => {
             handle_agent_command(command, cli.local, &root)?;
         }
@@ -614,15 +636,48 @@ fn main() -> Result<()> {
                 if prompt_to_initialize_tasks()? {
                     init_tasks(&root, false)?;
                 } else {
-                    tui_view_without_active_board(&root)?;
+                    let final_root = tui_view_without_active_board(&root)?;
+                    write_tui_cwd_file(cli.cwd_file.as_deref(), &final_root)?;
                     return Ok(());
                 }
             }
-            tui_view(&root)?;
+            let final_root = tui_view(&root)?;
+            write_tui_cwd_file(cli.cwd_file.as_deref(), &final_root)?;
         }
     }
 
     Ok(())
+}
+
+fn shell_init_script(shell: ShellKind) -> &'static str {
+    match shell {
+        ShellKind::Bash | ShellKind::Zsh => {
+            r#"clt() {
+    local cwd_file cwd exit_status
+    cwd_file="$(mktemp "${TMPDIR:-/tmp}/clt-cwd.XXXXXX")" || return
+    command clt --cwd-file "$cwd_file" "$@"
+    exit_status=$?
+    if [ -s "$cwd_file" ]; then
+        IFS= read -r cwd < "$cwd_file"
+        if [ -n "$cwd" ] && [ "$cwd" != "$PWD" ]; then
+            builtin cd -- "$cwd" || exit_status=$?
+        fi
+    fi
+    command rm -f -- "$cwd_file"
+    return "$exit_status"
+}
+"#
+        }
+    }
+}
+
+fn write_tui_cwd_file(cwd_file: Option<&Path>, active_root: &Path) -> Result<()> {
+    let Some(cwd_file) = cwd_file else {
+        return Ok(());
+    };
+
+    fs::write(cwd_file, active_root.as_os_str().as_encoded_bytes())
+        .with_context(|| format!("Failed to write TUI exit directory to {cwd_file:?}"))
 }
 
 fn handle_agent_command(command: AgentCommands, local: bool, default_root: &Path) -> Result<()> {
@@ -8021,15 +8076,15 @@ fn tui_console_block<'a>(title: &'a str, right_title: Option<&'a str>) -> Block<
     }
 }
 
-fn tui_view(root: &Path) -> Result<()> {
+fn tui_view(root: &Path) -> Result<PathBuf> {
     tui_view_with_active_board(root, true)
 }
 
-fn tui_view_without_active_board(root: &Path) -> Result<()> {
+fn tui_view_without_active_board(root: &Path) -> Result<PathBuf> {
     tui_view_with_active_board(root, false)
 }
 
-fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Result<()> {
+fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Result<PathBuf> {
     // Setup terminal
     let title = app_title(root);
     let _terminal_session = TerminalSession::enter(&title)?;
@@ -9429,7 +9484,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
         }
     }
 
-    Ok(())
+    Ok(active_root)
 }
 
 fn init_tasks(root: &Path, folders: bool) -> Result<()> {
@@ -10547,6 +10602,45 @@ mod tests {
         let cli = Cli::try_parse_from(["clt"]).unwrap();
 
         assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn shell_init_command_and_cwd_handoff_flag_parse() {
+        let cli = Cli::try_parse_from(["clt", "--cwd-file", "/tmp/clt-cwd", "shell-init", "zsh"])
+            .unwrap();
+
+        assert_eq!(cli.cwd_file, Some(PathBuf::from("/tmp/clt-cwd")));
+        assert!(matches!(
+            cli.command,
+            Some(Commands::ShellInit {
+                shell: ShellKind::Zsh
+            })
+        ));
+    }
+
+    #[test]
+    fn shell_init_wraps_clt_and_changes_to_the_returned_directory() {
+        for shell in [ShellKind::Bash, ShellKind::Zsh] {
+            let script = shell_init_script(shell);
+
+            assert!(script.contains("command clt --cwd-file"));
+            assert!(script.contains("builtin cd --"));
+            assert!(script.contains("command rm -f --"));
+        }
+    }
+
+    #[test]
+    fn tui_cwd_handoff_writes_the_active_project_path() {
+        let cwd_file = temp_root("tui-cwd-file");
+        let active_root = temp_root("tui-active-project");
+
+        write_tui_cwd_file(Some(&cwd_file), &active_root).unwrap();
+
+        assert_eq!(
+            fs::read(&cwd_file).unwrap(),
+            active_root.as_os_str().as_encoded_bytes()
+        );
+        fs::remove_file(cwd_file).unwrap();
     }
 
     #[test]

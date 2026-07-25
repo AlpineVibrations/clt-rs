@@ -34,6 +34,20 @@ Ensure you have Rust and Cargo installed.
 cargo install clt-rs
 ```
 
+### Shell integration
+
+A command cannot directly change the directory of the shell that launched it, so `clt` provides a small shell wrapper for project switching. Add the appropriate line to your shell configuration:
+
+```bash
+# ~/.zshrc
+eval "$(command clt shell-init zsh)"
+
+# ~/.bashrc
+eval "$(command clt shell-init bash)"
+```
+
+Restart the shell or reload its configuration. After opening another registered project from the agent projects pane, pressing `q` now exits `clt` and leaves the shell in that project's directory. Other `clt` commands continue to work through the wrapper.
+
 The installed `clt` binary embeds both agent skills. Before an automated Codex run, `clt` looks for each required skill by its frontmatter name in the standard repository, user, and admin skill directories. If a skill is unavailable, `clt` adds its bundled instructions to that run's prompt automatically, so `cargo install clt-rs` is sufficient for agent automation.
 
 To make the skills discoverable to Codex outside `clt` agent runs, clone this repository and copy the skill folders into the `skills` directory inside your home `.agents` directory. From the repository root, run:
