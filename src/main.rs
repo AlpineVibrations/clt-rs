@@ -17,8 +17,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crossterm::{
     ExecutableCommand,
     event::{
-        self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
-        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
     terminal::{
         EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode,
@@ -6235,6 +6236,165 @@ enum Mode {
     Help,
 }
 
+const PASTED_CONTENT_MARKER_START: u32 = 0xe000;
+const PASTED_CONTENT_MARKER_END: u32 = 0xf8ff;
+
+struct PastedContent {
+    marker: char,
+    content: String,
+    line_count: usize,
+}
+
+impl PastedContent {
+    fn label(&self) -> String {
+        let noun = if self.line_count == 1 {
+            "line"
+        } else {
+            "lines"
+        };
+        format!("[Pasted Content {} {}]", self.line_count, noun)
+    }
+}
+
+#[derive(Default)]
+struct TaskInput {
+    input: Input,
+    pasted_content: Vec<PastedContent>,
+}
+
+impl TaskInput {
+    fn new(value: String) -> Self {
+        Self {
+            input: Input::new(value),
+            pasted_content: Vec::new(),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.input.reset();
+        self.pasted_content.clear();
+    }
+
+    fn insert_paste(&mut self, content: String) {
+        if content.is_empty() {
+            return;
+        }
+
+        let content = content.replace("\r\n", "\n").replace('\r', "\n");
+        if !content.contains('\n') {
+            for ch in content.chars() {
+                self.input.handle(InputRequest::InsertChar(ch));
+            }
+            return;
+        }
+
+        let marker_value = PASTED_CONTENT_MARKER_START + self.pasted_content.len() as u32;
+        let Some(marker) = (marker_value <= PASTED_CONTENT_MARKER_END)
+            .then(|| char::from_u32(marker_value))
+            .flatten()
+        else {
+            for ch in content.chars() {
+                self.input.handle(InputRequest::InsertChar(ch));
+            }
+            return;
+        };
+
+        let line_count = content.lines().count().max(1);
+        self.input.handle(InputRequest::InsertChar(marker));
+        self.pasted_content.push(PastedContent {
+            marker,
+            content,
+            line_count,
+        });
+    }
+
+    fn pasted_for_marker(&self, marker: char) -> Option<&PastedContent> {
+        self.pasted_content
+            .iter()
+            .find(|pasted| pasted.marker == marker)
+    }
+
+    fn display_value(&self) -> String {
+        let mut value = String::new();
+        for ch in self.input.value().chars() {
+            if let Some(pasted) = self.pasted_for_marker(ch) {
+                value.push_str(&pasted.label());
+            } else {
+                value.push(ch);
+            }
+        }
+        value
+    }
+
+    fn display_cursor(&self) -> usize {
+        self.input
+            .value()
+            .chars()
+            .take(self.input.cursor())
+            .map(|ch| {
+                self.pasted_for_marker(ch)
+                    .map(|pasted| pasted.label().chars().count())
+                    .unwrap_or(1)
+            })
+            .sum()
+    }
+
+    fn submitted_value(&self) -> String {
+        let mut value = String::new();
+        for ch in self.input.value().chars() {
+            if let Some(pasted) = self.pasted_for_marker(ch) {
+                value.push_str(&pasted.content);
+            } else {
+                value.push(ch);
+            }
+        }
+        value
+    }
+}
+
+fn append_styled_wrapped_text(
+    lines: &mut Vec<Vec<Span<'static>>>,
+    col: &mut usize,
+    text: &str,
+    width: usize,
+    style: Style,
+) {
+    for ch in text.chars() {
+        if ch == '\n' {
+            lines.push(Vec::new());
+            *col = 0;
+            continue;
+        }
+        if width > 0 && *col >= width {
+            lines.push(Vec::new());
+            *col = 0;
+        }
+        lines
+            .last_mut()
+            .expect("input display always has a line")
+            .push(Span::styled(ch.to_string(), style));
+        *col += 1;
+    }
+}
+
+fn styled_task_input_lines(label: &str, input: &TaskInput, width: usize) -> Vec<Line<'static>> {
+    let normal_style = Style::default().fg(Color::White);
+    let pasted_style = Style::default().fg(Color::Blue);
+    let mut lines = vec![Vec::new()];
+    let mut col = 0;
+
+    append_styled_wrapped_text(&mut lines, &mut col, label, width, normal_style);
+    for ch in input.input.value().chars() {
+        if let Some(pasted) = input.pasted_for_marker(ch) {
+            append_styled_wrapped_text(&mut lines, &mut col, &pasted.label(), width, pasted_style);
+        } else {
+            append_styled_wrapped_text(&mut lines, &mut col, &ch.to_string(), width, normal_style);
+        }
+    }
+
+    lines.into_iter().map(Line::from).collect()
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TuiPane {
     Tasks,
@@ -7720,6 +7880,11 @@ impl TerminalSession {
             let _ = disable_raw_mode();
             return Err(err.into());
         }
+        if let Err(err) = stdout.execute(EnableBracketedPaste) {
+            let _ = stdout.execute(LeaveAlternateScreen);
+            let _ = disable_raw_mode();
+            return Err(err.into());
+        }
 
         // Request mode 2 modified-key reporting. In particular, tmux only forwards its
         // unambiguous extended key sequences when the application inside the pane asks for
@@ -7728,6 +7893,7 @@ impl TerminalSession {
         if let Err(err) = stdout.execute(PushKeyboardEnhancementFlags(
             tui_keyboard_enhancement_flags(),
         )) {
+            let _ = stdout.execute(DisableBracketedPaste);
             let _ = stdout.execute(LeaveAlternateScreen);
             let _ = disable_raw_mode();
             return Err(err.into());
@@ -7738,6 +7904,7 @@ impl TerminalSession {
             if keyboard_enhancement_enabled {
                 let _ = stdout.execute(PopKeyboardEnhancementFlags);
             }
+            let _ = stdout.execute(DisableBracketedPaste);
             let _ = stdout.execute(LeaveAlternateScreen);
             let _ = disable_raw_mode();
             return Err(err);
@@ -7754,6 +7921,7 @@ impl Drop for TerminalSession {
         if self.keyboard_enhancement_enabled {
             let _ = stdout().execute(PopKeyboardEnhancementFlags);
         }
+        let _ = stdout().execute(DisableBracketedPaste);
         let _ = disable_raw_mode();
         let _ = stdout().execute(LeaveAlternateScreen);
     }
@@ -8099,7 +8267,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
     let start_state = tui_start_state(start_with_active_board);
     let mut active_board = start_state.active_board;
     let mut current_mode = Mode::View;
-    let mut task_input = Input::default();
+    let mut task_input = TaskInput::default();
     let mut feedback_buffer = start_state.feedback_buffer;
     let mut archive_view = false;
     let mut backlog_visible = false;
@@ -8199,13 +8367,14 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                     } else {
                         " Edit Task: "
                     };
-                    let full_text = format!("{}{}", label, task_input.value());
+                    let display_value = task_input.display_value();
+                    let full_text = format!("{}{}", label, display_value);
                     // Subtract 2 for the borders of the block
                     let available_width = size.width.saturating_sub(2) as usize;
                     let wrapped = wrap_input_text(&full_text, available_width);
                     let lines = wrapped.lines().count();
                     let cursor_idx =
-                        label.len() + byte_index_at_char(task_input.value(), task_input.cursor());
+                        label.len() + byte_index_at_char(&display_value, task_input.display_cursor());
                     let cursor_row =
                         input_cursor_offset_at(&full_text, available_width, cursor_idx).1 as usize;
                     // Height = content rows + 2 (for top and bottom borders)
@@ -8514,11 +8683,12 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                 } else {
                     " Edit Task: "
                 };
-                let input_text = format!("{}{}", label, task_input.value());
+                let display_value = task_input.display_value();
+                let input_text = format!("{}{}", label, display_value);
                 // Subtract 2 for the borders of the block
                 let available_width = size.width.saturating_sub(2) as usize;
-                let wrapped_input = wrap_input_text(&input_text, available_width);
-                let input_paragraph = Paragraph::new(wrapped_input.as_str())
+                let input_lines = styled_task_input_lines(label, &task_input, available_width);
+                let input_paragraph = Paragraph::new(input_lines)
                     .block(
                         Block::default()
                             .borders(Borders::ALL)
@@ -8530,7 +8700,8 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                 let (cursor_x, cursor_y) = input_cursor_offset_at(
                     &input_text,
                     available_width,
-                    label.len() + byte_index_at_char(task_input.value(), task_input.cursor()),
+                    label.len()
+                        + byte_index_at_char(&display_value, task_input.display_cursor()),
                 );
                 let input_inner = main_layout[1].inner(ratatui::layout::Margin {
                     horizontal: 1,
@@ -8623,863 +8794,904 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
 
         #[allow(clippy::collapsible_if)]
         if event::poll(std::time::Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                let input_available_width = terminal.size()?.width.saturating_sub(2) as usize;
-                match current_mode {
-                    Mode::View => {
-                        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
-                            let no_active_board =
-                                current_pane == TuiPane::AgentProjects && !active_board;
-                            current_pane = if current_pane == TuiPane::Tasks {
-                                agent_panel.refresh(&active_root);
-                                agent_panel.select_project_for_path(&active_root);
-                                last_agent_panel_refresh = Instant::now();
-                                TuiPane::AgentProjects
-                            } else if active_board {
-                                if agent_log_view.is_some() {
-                                    agent_panel.select_project_for_path(&active_root);
-                                    sync_open_tui_agent_log_view(&agent_panel, &mut agent_log_view);
-                                    last_agent_log_refresh = Instant::now();
-                                }
-                                TuiPane::Tasks
-                            } else {
-                                TuiPane::AgentProjects
-                            };
-                            feedback_buffer = if no_active_board {
-                                TUI_NO_ACTIVE_BOARD_MESSAGE.to_string()
-                            } else if current_pane == TuiPane::AgentProjects {
-                                tui_agent_panel_instructions().to_string()
-                            } else {
-                                "Task board pane.".to_string()
-                            };
-                        } else if matches!(key.code, KeyCode::Esc)
-                            && agent_log_view.take().is_some()
-                        {
-                            feedback_buffer = "Closed agent output log".to_string();
-                        } else if current_pane == TuiPane::AgentProjects {
-                            match key.code {
-                                KeyCode::Esc => {
-                                    if active_board {
-                                        current_pane = TuiPane::Tasks;
-                                        feedback_buffer = "Task board pane.".to_string();
-                                    } else {
-                                        feedback_buffer = TUI_NO_ACTIVE_BOARD_MESSAGE.to_string();
-                                    }
-                                }
-                                KeyCode::Char('q') => break,
-                                KeyCode::Char('h') | KeyCode::Char('H') | KeyCode::Char('?') => {
-                                    current_mode = Mode::Help;
-                                }
-                                KeyCode::Enter => {
-                                    if agent_panel
-                                        .selected_current_project_registration()
-                                        .is_some()
-                                    {
-                                        match register_selected_current_project(
-                                            &mut agent_panel,
-                                            &active_root,
-                                        ) {
-                                            Ok(message) => {
-                                                last_agent_panel_refresh = Instant::now();
-                                                feedback_buffer = message;
-                                            }
-                                            Err(e) => feedback_buffer = format!("Error: {}", e),
-                                        }
-                                        continue;
-                                    }
-
-                                    let Some(project) = agent_panel
-                                        .selected_project()
-                                        .map(|entry| entry.project.clone())
-                                    else {
-                                        feedback_buffer =
-                                            "No registered project selected".to_string();
-                                        continue;
-                                    };
-
-                                    match ensure_existing_board(&project.path) {
-                                        Ok(true) => {}
-                                        Ok(false) => {
-                                            feedback_buffer = format!(
-                                                "Project is not initialized: {}",
-                                                project.path.display()
-                                            );
-                                            continue;
-                                        }
-                                        Err(error) => {
-                                            feedback_buffer = format!(
-                                                "Failed to repair project board {}: {}",
-                                                project.path.display(),
-                                                error
-                                            );
-                                            continue;
-                                        }
-                                    }
-
-                                    match std::env::set_current_dir(&project.path) {
-                                        Ok(_) => {
-                                            active_root = project.path.clone();
-                                            active_board = true;
-                                            board_stack.clear();
-                                            board_stack.push(get_tasks_dir(&active_root));
-                                            selected_board = TODO_BOARD_INDEX;
-                                            for state in board_states.iter_mut() {
-                                                state.select(None);
-                                            }
-                                            board_scroll_offsets = [0usize; 4];
-                                            archive_state.select(None);
-                                            archive_scroll_offset = 0;
-                                            archive_view = false;
-                                            current_pane = TuiPane::Tasks;
-                                            let board_dir = get_tasks_dir(&active_root);
-                                            select_first_task_if_present_in_board(
-                                                &board_dir,
-                                                statuses[selected_board],
-                                                &mut board_states[selected_board],
-                                            );
-                                            feedback_buffer = match set_terminal_title(&app_title(
-                                                &active_root,
-                                            )) {
-                                                Ok(_) => {
-                                                    format!(
-                                                        "Opened project board: {}",
-                                                        project.name
-                                                    )
-                                                }
-                                                Err(err) => {
-                                                    format!(
-                                                        "Opened project board: {}; failed to update title: {}",
-                                                        project.name, err
-                                                    )
-                                                }
-                                            };
-                                        }
-                                        Err(err) => {
-                                            feedback_buffer = format!(
-                                                "Failed to switch to {}: {}",
-                                                project.path.display(),
-                                                err
-                                            );
-                                        }
-                                    }
-                                }
-                                KeyCode::Char(' ') => {
-                                    if agent_panel
-                                        .selected_current_project_registration()
-                                        .is_some()
-                                    {
-                                        match register_selected_current_project(
-                                            &mut agent_panel,
-                                            &active_root,
-                                        ) {
-                                            Ok(message) => {
-                                                last_agent_panel_refresh = Instant::now();
-                                                feedback_buffer = message;
-                                            }
-                                            Err(e) => feedback_buffer = format!("Error: {}", e),
-                                        }
-                                        continue;
-                                    }
-
-                                    match toggle_selected_tui_agent_project(
-                                        &mut agent_panel,
-                                        &active_root,
-                                    ) {
-                                        Ok(message) => {
-                                            last_agent_panel_refresh = Instant::now();
-                                            feedback_buffer = message;
-                                        }
-                                        Err(e) => feedback_buffer = format!("Error: {}", e),
-                                    }
-                                }
-                                KeyCode::Char('g') | KeyCode::Char('G') => {
-                                    if agent_panel
-                                        .selected_current_project_registration()
-                                        .is_some()
-                                    {
-                                        feedback_buffer =
-                                            "Register current project before changing its Git mode"
-                                                .to_string();
-                                        continue;
-                                    }
-
-                                    match cycle_selected_tui_agent_project_git_mode(
-                                        &mut agent_panel,
-                                        &active_root,
-                                    ) {
-                                        Ok(message) => {
-                                            last_agent_panel_refresh = Instant::now();
-                                            feedback_buffer = message;
-                                        }
-                                        Err(e) => feedback_buffer = format!("Error: {}", e),
-                                    }
-                                }
-                                KeyCode::Char('m') | KeyCode::Char('M') => {
-                                    if agent_panel
-                                        .selected_current_project_registration()
-                                        .is_some()
-                                    {
-                                        feedback_buffer =
-                                            "Register current project before changing its Codex model"
-                                                .to_string();
-                                        continue;
-                                    }
-
-                                    match cycle_selected_tui_agent_codex_model(
-                                        &mut agent_panel,
-                                        &active_root,
-                                    ) {
-                                        Ok(message) => {
-                                            last_agent_panel_refresh = Instant::now();
-                                            feedback_buffer = message;
-                                        }
-                                        Err(e) => feedback_buffer = format!("Error: {}", e),
-                                    }
-                                }
-                                KeyCode::Char('f') | KeyCode::Char('F') => {
-                                    if agent_panel
-                                        .selected_current_project_registration()
-                                        .is_some()
-                                    {
-                                        feedback_buffer =
-                                            "Register current project before changing Codex fast mode"
-                                                .to_string();
-                                        continue;
-                                    }
-
-                                    match toggle_selected_tui_agent_codex_fast(
-                                        &mut agent_panel,
-                                        &active_root,
-                                    ) {
-                                        Ok(message) => {
-                                            last_agent_panel_refresh = Instant::now();
-                                            feedback_buffer = message;
-                                        }
-                                        Err(e) => feedback_buffer = format!("Error: {}", e),
-                                    }
-                                }
-                                KeyCode::Char('t') | KeyCode::Char('T') => {
-                                    if agent_panel
-                                        .selected_current_project_registration()
-                                        .is_some()
-                                    {
-                                        feedback_buffer =
-                                            "Register current project before changing Codex thinking"
-                                                .to_string();
-                                        continue;
-                                    }
-
-                                    match cycle_selected_tui_agent_codex_reasoning(
-                                        &mut agent_panel,
-                                        &active_root,
-                                    ) {
-                                        Ok(message) => {
-                                            last_agent_panel_refresh = Instant::now();
-                                            feedback_buffer = message;
-                                        }
-                                        Err(e) => feedback_buffer = format!("Error: {}", e),
-                                    }
-                                }
-                                KeyCode::Char('l') | KeyCode::Char('L') => {
-                                    if agent_log_view.take().is_some() {
-                                        feedback_buffer = "Closed agent output log".to_string();
-                                        continue;
-                                    }
-
-                                    match selected_tui_agent_log_view(&agent_panel) {
-                                        Ok(Some(log_view)) => {
-                                            let output_kind = if log_view.is_live {
-                                                "live agent output"
-                                            } else {
-                                                "latest agent output"
-                                            };
-                                            feedback_buffer = format!(
-                                                "Showing {output_kind} for {}",
-                                                log_view.project_name
-                                            );
-                                            agent_log_view = Some(log_view);
-                                            last_agent_log_refresh = Instant::now();
-                                        }
-                                        Ok(None) => {
-                                            feedback_buffer = if agent_panel
-                                                .selected_current_project_registration()
-                                                .is_some()
-                                            {
-                                                "Register current project before viewing agent output"
-                                                .to_string()
-                                            } else {
-                                                "No agent output recorded for selected project"
-                                                    .to_string()
-                                            };
-                                        }
-                                        Err(e) => feedback_buffer = format!("Error: {}", e),
-                                    }
-                                }
-                                KeyCode::Up => {
-                                    agent_panel.select_previous();
-                                    sync_open_tui_agent_log_view(&agent_panel, &mut agent_log_view);
-                                    last_agent_log_refresh = Instant::now();
-                                }
-                                KeyCode::Down => {
-                                    agent_panel.select_next();
-                                    sync_open_tui_agent_log_view(&agent_panel, &mut agent_log_view);
-                                    last_agent_log_refresh = Instant::now();
-                                }
-                                _ => {
-                                    feedback_buffer = tui_agent_panel_instructions().to_string();
-                                }
-                            }
-                        } else if archive_view {
-                            match key.code {
-                                KeyCode::Char('A') | KeyCode::Char('a')
-                                    if key.modifiers.contains(KeyModifiers::SHIFT) =>
-                                {
-                                    archive_view = false;
-                                    archive_state.select(None);
-                                    archive_scroll_offset = 0;
-                                    feedback_buffer = "Returned to Kanban view".to_string();
-                                }
-                                KeyCode::Char('q') => break,
-                                KeyCode::Char('h') | KeyCode::Char('H') | KeyCode::Char('?') => {
-                                    current_mode = Mode::Help;
-                                }
-                                KeyCode::Up => {
-                                    let tasks =
-                                        read_archived_task_entries(&board_dir).unwrap_or_default();
-                                    if !tasks.is_empty() {
-                                        let i = archive_state.selected().unwrap_or(0);
-                                        if i > 0 {
-                                            archive_state.select(Some(i - 1));
-                                        } else {
-                                            archive_state.select(Some(tasks.len() - 1));
-                                        }
-                                    }
-                                }
-                                KeyCode::Down => {
-                                    let tasks =
-                                        read_archived_task_entries(&board_dir).unwrap_or_default();
-                                    if !tasks.is_empty() {
-                                        let i = archive_state.selected().unwrap_or(0);
-                                        if i < tasks.len() - 1 {
-                                            archive_state.select(Some(i + 1));
-                                        } else {
-                                            archive_state.select(Some(0));
-                                        }
-                                    }
-                                }
-                                _ => {
-                                    feedback_buffer =
-                                        "Archive view is read-only. Press A again to leave."
-                                            .to_string();
-                                }
-                            }
-                        } else if let Some(direction) = tui_task_reorder_direction(&key) {
-                            feedback_buffer = reorder_selected_tui_task(
-                                &board_dir,
-                                statuses[selected_board],
-                                &mut board_states[selected_board],
-                                direction,
-                            );
-                        } else if tui_starts_reorganize_mode(&key) {
-                            current_mode = Mode::Reorganize;
-                            feedback_buffer =
-                                "Reorganize: press an Arrow to move the selected task (Esc cancels)."
-                                    .to_string();
-                        } else if key.modifiers.contains(KeyModifiers::SHIFT) {
-                            match key.code {
-                                KeyCode::Char('A') | KeyCode::Char('a') => {
-                                    archive_view = true;
-                                    current_mode = Mode::View;
-                                    archive_scroll_offset = 0;
-                                    select_first_archive_task_if_present_in_board(
-                                        &board_dir,
-                                        &mut archive_state,
-                                    );
-                                    feedback_buffer =
-                                        "Archive view. Press A again to leave archive view."
-                                            .to_string();
-                                }
-                                KeyCode::Char('B') | KeyCode::Char('b') => {
-                                    feedback_buffer = toggle_tui_backlog_column(
-                                        &board_dir,
-                                        &mut board_states,
-                                        &mut selected_board,
-                                        &mut backlog_visible,
-                                    );
-                                }
-                                KeyCode::Left => {
-                                    feedback_buffer = move_selected_tui_task_between_boards(
-                                        &board_dir,
-                                        &statuses,
-                                        &mut board_states,
-                                        &mut selected_board,
-                                        backlog_visible,
-                                        TuiTaskBoardMoveDirection::Left,
-                                    );
-                                }
-                                KeyCode::Right => {
-                                    feedback_buffer = move_selected_tui_task_between_boards(
-                                        &board_dir,
-                                        &statuses,
-                                        &mut board_states,
-                                        &mut selected_board,
-                                        backlog_visible,
-                                        TuiTaskBoardMoveDirection::Right,
-                                    );
-                                }
-                                _ => {}
-                            }
-                        } else if key.modifiers.contains(KeyModifiers::CONTROL)
-                            || key.modifiers.contains(KeyModifiers::ALT)
-                        {
-                            // Other Alt/Ctrl modifiers are not used for moving tasks.
-                            _ = ();
-                        } else {
-                            match key.code {
-                                KeyCode::Esc => {
-                                    let state = &mut board_states[selected_board];
-                                    state.select(None);
-                                    feedback_buffer = "Task unselected".to_string();
-                                }
-                                KeyCode::Char('B') => {
-                                    feedback_buffer = toggle_tui_backlog_column(
-                                        &board_dir,
-                                        &mut board_states,
-                                        &mut selected_board,
-                                        &mut backlog_visible,
-                                    );
-                                }
-                                KeyCode::Char('b') => {
-                                    feedback_buffer = match move_selected_tui_task_to_backlog(
-                                        &board_dir,
-                                        &statuses,
-                                        &mut board_states,
-                                        &mut selected_board,
-                                        backlog_visible,
-                                    ) {
-                                        Ok(message) => message,
-                                        Err(error) => format!("Error: {error}"),
-                                    };
-                                }
-                                KeyCode::Char('a') => {
-                                    feedback_buffer = match move_selected_tui_task_to_archive(
-                                        &board_dir,
-                                        &statuses,
-                                        &mut board_states,
-                                        selected_board,
-                                    ) {
-                                        Ok(message) => message,
-                                        Err(error) => format!("Error: {error}"),
-                                    };
-                                }
-                                KeyCode::Char('A') => {
-                                    archive_view = true;
-                                    current_mode = Mode::View;
-                                    archive_scroll_offset = 0;
-                                    select_first_archive_task_if_present_in_board(
-                                        &board_dir,
-                                        &mut archive_state,
-                                    );
-                                    feedback_buffer =
-                                        "Archive view. Press A again to leave archive view."
-                                            .to_string();
-                                }
-                                KeyCode::Char('l') | KeyCode::Char('L') => {
-                                    if agent_log_view.take().is_some() {
-                                        feedback_buffer = "Closed agent output log".to_string();
-                                        continue;
-                                    }
-
+            match event::read()? {
+                Event::Paste(content) if matches!(current_mode, Mode::Input | Mode::Edit) => {
+                    task_input.insert_paste(content);
+                }
+                Event::Key(key) => {
+                    let input_available_width = terminal.size()?.width.saturating_sub(2) as usize;
+                    match current_mode {
+                        Mode::View => {
+                            if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+                                let no_active_board =
+                                    current_pane == TuiPane::AgentProjects && !active_board;
+                                current_pane = if current_pane == TuiPane::Tasks {
                                     agent_panel.refresh(&active_root);
+                                    agent_panel.select_project_for_path(&active_root);
                                     last_agent_panel_refresh = Instant::now();
-                                    match selected_tui_agent_log_view_for_path(
-                                        &mut agent_panel,
-                                        &active_root,
-                                    ) {
-                                        Ok(Some(log_view)) => {
-                                            let output_kind = if log_view.is_live {
-                                                "live agent output"
-                                            } else {
-                                                "latest agent output"
-                                            };
-                                            feedback_buffer = format!(
-                                                "Showing {output_kind} for {}",
-                                                log_view.project_name
-                                            );
-                                            agent_log_view = Some(log_view);
-                                            last_agent_log_refresh = Instant::now();
-                                        }
-                                        Ok(None) => {
-                                            feedback_buffer = if agent_panel.last_error.is_some() {
-                                                agent_panel.last_error.clone().unwrap_or_default()
-                                            } else if agent_panel
-                                                .selected_current_project_registration()
-                                                .is_some()
-                                            {
-                                                "Register current project before viewing agent output"
-                                                    .to_string()
-                                            } else {
-                                                "No agent output recorded for current project"
-                                                    .to_string()
-                                            };
-                                        }
-                                        Err(e) => feedback_buffer = format!("Error: {}", e),
-                                    }
-                                }
-                                KeyCode::Char('q') => break,
-                                KeyCode::Backspace => {
-                                    if board_stack.len() > 1 {
-                                        board_stack.pop();
-                                        selected_board = TODO_BOARD_INDEX;
-                                        for state in board_states.iter_mut() {
-                                            state.select(None);
-                                        }
-                                        let parent_board = board_stack
-                                            .last()
-                                            .cloned()
-                                            .unwrap_or_else(|| get_tasks_dir(&active_root));
-                                        select_first_task_if_present_in_board(
-                                            &parent_board,
-                                            statuses[selected_board],
-                                            &mut board_states[selected_board],
+                                    TuiPane::AgentProjects
+                                } else if active_board {
+                                    if agent_log_view.is_some() {
+                                        agent_panel.select_project_for_path(&active_root);
+                                        sync_open_tui_agent_log_view(
+                                            &agent_panel,
+                                            &mut agent_log_view,
                                         );
-                                        feedback_buffer = "Returned to parent board".to_string();
-                                    } else {
-                                        feedback_buffer = "Already at the top board".to_string();
+                                        last_agent_log_refresh = Instant::now();
                                     }
-                                }
-                                KeyCode::Enter => {
-                                    if let Some((idx, entry)) = selected_task_entry_in_board(
-                                        &board_dir,
-                                        statuses[selected_board],
-                                        &board_states[selected_board],
-                                    ) {
-                                        match &entry.source {
-                                            TaskSource::Path { path, is_dir: true }
-                                                if entry.has_subtasks =>
-                                            {
-                                                ensure_board_store(path)?;
-                                                board_stack.push(path.clone());
+                                    TuiPane::Tasks
+                                } else {
+                                    TuiPane::AgentProjects
+                                };
+                                feedback_buffer = if no_active_board {
+                                    TUI_NO_ACTIVE_BOARD_MESSAGE.to_string()
+                                } else if current_pane == TuiPane::AgentProjects {
+                                    tui_agent_panel_instructions().to_string()
+                                } else {
+                                    "Task board pane.".to_string()
+                                };
+                            } else if matches!(key.code, KeyCode::Esc)
+                                && agent_log_view.take().is_some()
+                            {
+                                feedback_buffer = "Closed agent output log".to_string();
+                            } else if current_pane == TuiPane::AgentProjects {
+                                match key.code {
+                                    KeyCode::Esc => {
+                                        if active_board {
+                                            current_pane = TuiPane::Tasks;
+                                            feedback_buffer = "Task board pane.".to_string();
+                                        } else {
+                                            feedback_buffer =
+                                                TUI_NO_ACTIVE_BOARD_MESSAGE.to_string();
+                                        }
+                                    }
+                                    KeyCode::Char('q') => break,
+                                    KeyCode::Char('h')
+                                    | KeyCode::Char('H')
+                                    | KeyCode::Char('?') => {
+                                        current_mode = Mode::Help;
+                                    }
+                                    KeyCode::Enter => {
+                                        if agent_panel
+                                            .selected_current_project_registration()
+                                            .is_some()
+                                        {
+                                            match register_selected_current_project(
+                                                &mut agent_panel,
+                                                &active_root,
+                                            ) {
+                                                Ok(message) => {
+                                                    last_agent_panel_refresh = Instant::now();
+                                                    feedback_buffer = message;
+                                                }
+                                                Err(e) => feedback_buffer = format!("Error: {}", e),
+                                            }
+                                            continue;
+                                        }
+
+                                        let Some(project) = agent_panel
+                                            .selected_project()
+                                            .map(|entry| entry.project.clone())
+                                        else {
+                                            feedback_buffer =
+                                                "No registered project selected".to_string();
+                                            continue;
+                                        };
+
+                                        match ensure_existing_board(&project.path) {
+                                            Ok(true) => {}
+                                            Ok(false) => {
+                                                feedback_buffer = format!(
+                                                    "Project is not initialized: {}",
+                                                    project.path.display()
+                                                );
+                                                continue;
+                                            }
+                                            Err(error) => {
+                                                feedback_buffer = format!(
+                                                    "Failed to repair project board {}: {}",
+                                                    project.path.display(),
+                                                    error
+                                                );
+                                                continue;
+                                            }
+                                        }
+
+                                        match std::env::set_current_dir(&project.path) {
+                                            Ok(_) => {
+                                                active_root = project.path.clone();
+                                                active_board = true;
+                                                board_stack.clear();
+                                                board_stack.push(get_tasks_dir(&active_root));
                                                 selected_board = TODO_BOARD_INDEX;
                                                 for state in board_states.iter_mut() {
                                                     state.select(None);
                                                 }
+                                                board_scroll_offsets = [0usize; 4];
+                                                archive_state.select(None);
+                                                archive_scroll_offset = 0;
+                                                archive_view = false;
+                                                current_pane = TuiPane::Tasks;
+                                                let board_dir = get_tasks_dir(&active_root);
                                                 select_first_task_if_present_in_board(
-                                                    path,
+                                                    &board_dir,
                                                     statuses[selected_board],
                                                     &mut board_states[selected_board],
                                                 );
-                                                feedback_buffer =
-                                                    "Opened subtask board".to_string();
+                                                feedback_buffer = match set_terminal_title(
+                                                    &app_title(&active_root),
+                                                ) {
+                                                    Ok(_) => {
+                                                        format!(
+                                                            "Opened project board: {}",
+                                                            project.name
+                                                        )
+                                                    }
+                                                    Err(err) => {
+                                                        format!(
+                                                            "Opened project board: {}; failed to update title: {}",
+                                                            project.name, err
+                                                        )
+                                                    }
+                                                };
                                             }
-                                            _ => {
-                                                current_mode = Mode::Edit;
-                                                editing_task_idx = Some(idx + 1);
-                                                task_input = Input::new(
-                                                    entry.content.trim_end().to_string(),
-                                                );
-                                            }
-                                        }
-                                    } else {
-                                        board_states[selected_board].select(None);
-                                        current_mode = Mode::Input;
-                                        task_input.reset();
-                                    }
-                                }
-                                KeyCode::Char('e') | KeyCode::Char('E') => {
-                                    if let Some((idx, entry)) = selected_task_entry_in_board(
-                                        &board_dir,
-                                        statuses[selected_board],
-                                        &board_states[selected_board],
-                                    ) {
-                                        current_mode = Mode::Edit;
-                                        editing_task_idx = Some(idx + 1);
-                                        task_input =
-                                            Input::new(entry.content.trim_end().to_string());
-                                    } else {
-                                        feedback_buffer = "No task selected".to_string();
-                                    }
-                                }
-                                KeyCode::Char(' ') => {
-                                    if selected_task_index_in_board(
-                                        &board_dir,
-                                        statuses[selected_board],
-                                        &board_states[selected_board],
-                                    )
-                                    .is_none()
-                                    {
-                                        board_states[selected_board].select(None);
-                                    }
-                                    current_mode = Mode::Input;
-                                    task_input.reset();
-                                }
-                                KeyCode::Char('0') => {
-                                    backlog_visible = true;
-                                    selected_board = BACKLOG_BOARD_INDEX;
-                                    for state in board_states.iter_mut() {
-                                        state.select(None);
-                                    }
-                                    select_first_task_if_present_in_board(
-                                        &board_dir,
-                                        statuses[selected_board],
-                                        &mut board_states[selected_board],
-                                    );
-                                    feedback_buffer =
-                                        "Backlog column shown and focused.".to_string();
-                                }
-                                KeyCode::Char('1') => {
-                                    selected_board = TODO_BOARD_INDEX;
-                                    for state in board_states.iter_mut() {
-                                        state.select(None);
-                                    }
-                                    select_first_task_if_present_in_board(
-                                        &board_dir,
-                                        statuses[selected_board],
-                                        &mut board_states[selected_board],
-                                    );
-                                }
-                                KeyCode::Char('2') => {
-                                    selected_board = 1;
-                                    for state in board_states.iter_mut() {
-                                        state.select(None);
-                                    }
-                                    select_first_task_if_present_in_board(
-                                        &board_dir,
-                                        statuses[selected_board],
-                                        &mut board_states[selected_board],
-                                    );
-                                }
-                                KeyCode::Char('3') => {
-                                    selected_board = DONE_BOARD_INDEX;
-                                    for state in board_states.iter_mut() {
-                                        state.select(None);
-                                    }
-                                    select_first_task_if_present_in_board(
-                                        &board_dir,
-                                        statuses[selected_board],
-                                        &mut board_states[selected_board],
-                                    );
-                                }
-                                KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Delete => {
-                                    if let Some(idx) = selected_task_index_in_board(
-                                        &board_dir,
-                                        statuses[selected_board],
-                                        &board_states[selected_board],
-                                    ) {
-                                        let status = statuses[selected_board];
-                                        match delete_task_in_board(
-                                            &board_dir,
-                                            status,
-                                            &(idx + 1).to_string(),
-                                        ) {
-                                            Ok(_) => {
+                                            Err(err) => {
                                                 feedback_buffer = format!(
-                                                    "Deleted task {} from {}",
-                                                    idx + 1,
-                                                    status
+                                                    "Failed to switch to {}: {}",
+                                                    project.path.display(),
+                                                    err
                                                 );
-                                                board_states[selected_board].select(if idx > 0 {
-                                                    Some(idx - 1)
-                                                } else {
-                                                    None
-                                                });
                                             }
-                                            Err(e) => feedback_buffer = format!("Error: {}", e),
-                                        }
-                                    } else {
-                                        board_states[selected_board].select(None);
-                                        feedback_buffer = "No task selected to delete".to_string();
-                                    }
-                                }
-                                KeyCode::Char('h') | KeyCode::Char('H') | KeyCode::Char('?') => {
-                                    current_mode = Mode::Help;
-                                }
-                                KeyCode::Up => {
-                                    let state = &mut board_states[selected_board];
-                                    let tasks =
-                                        read_tasks_in_board(&board_dir, statuses[selected_board])
-                                            .unwrap_or_default();
-                                    if !tasks.is_empty() {
-                                        let i = state.selected().unwrap_or(0);
-                                        if i > 0 {
-                                            state.select(Some(i - 1));
-                                        } else {
-                                            state.select(Some(tasks.len() - 1));
                                         }
                                     }
-                                }
-                                KeyCode::Down => {
-                                    let state = &mut board_states[selected_board];
-                                    let tasks =
-                                        read_tasks_in_board(&board_dir, statuses[selected_board])
-                                            .unwrap_or_default();
-                                    if !tasks.is_empty() {
-                                        let i = state.selected().unwrap_or(0);
-                                        if i < tasks.len() - 1 {
-                                            state.select(Some(i + 1));
-                                        } else {
-                                            state.select(Some(0));
-                                        }
-                                    }
-                                }
-                                KeyCode::Left => {
-                                    selected_board = wrapped_visible_tui_board(
-                                        selected_board,
-                                        backlog_visible,
-                                        -1,
-                                    );
-                                    for state in board_states.iter_mut() {
-                                        state.select(None);
-                                    }
-                                    select_first_task_if_present_in_board(
-                                        &board_dir,
-                                        statuses[selected_board],
-                                        &mut board_states[selected_board],
-                                    );
-                                }
-                                KeyCode::Right => {
-                                    selected_board = wrapped_visible_tui_board(
-                                        selected_board,
-                                        backlog_visible,
-                                        1,
-                                    );
-                                    for state in board_states.iter_mut() {
-                                        state.select(None);
-                                    }
-                                    select_first_task_if_present_in_board(
-                                        &board_dir,
-                                        statuses[selected_board],
-                                        &mut board_states[selected_board],
-                                    );
-                                }
-                                KeyCode::Char(c) if c.is_ascii_digit() => {
-                                    let new_pos = (c as u8 - b'0') as usize;
-                                    if let Some(idx) = selected_task_index_in_board(
-                                        &board_dir,
-                                        statuses[selected_board],
-                                        &board_states[selected_board],
-                                    ) {
-                                        if new_pos > 0 {
-                                            match reorder_task_in_board(
-                                                &board_dir,
-                                                statuses[selected_board],
-                                                idx,
-                                                new_pos - 1,
+                                    KeyCode::Char(' ') => {
+                                        if agent_panel
+                                            .selected_current_project_registration()
+                                            .is_some()
+                                        {
+                                            match register_selected_current_project(
+                                                &mut agent_panel,
+                                                &active_root,
                                             ) {
-                                                Ok(_) => {
-                                                    feedback_buffer = format!(
-                                                        "Reordered task to position {}",
-                                                        new_pos
-                                                    )
+                                                Ok(message) => {
+                                                    last_agent_panel_refresh = Instant::now();
+                                                    feedback_buffer = message;
                                                 }
                                                 Err(e) => feedback_buffer = format!("Error: {}", e),
                                             }
+                                            continue;
                                         }
-                                    } else {
-                                        board_states[selected_board].select(None);
-                                        feedback_buffer = "No task selected".to_string();
+
+                                        match toggle_selected_tui_agent_project(
+                                            &mut agent_panel,
+                                            &active_root,
+                                        ) {
+                                            Ok(message) => {
+                                                last_agent_panel_refresh = Instant::now();
+                                                feedback_buffer = message;
+                                            }
+                                            Err(e) => feedback_buffer = format!("Error: {}", e),
+                                        }
+                                    }
+                                    KeyCode::Char('g') | KeyCode::Char('G') => {
+                                        if agent_panel
+                                            .selected_current_project_registration()
+                                            .is_some()
+                                        {
+                                            feedback_buffer =
+                                            "Register current project before changing its Git mode"
+                                                .to_string();
+                                            continue;
+                                        }
+
+                                        match cycle_selected_tui_agent_project_git_mode(
+                                            &mut agent_panel,
+                                            &active_root,
+                                        ) {
+                                            Ok(message) => {
+                                                last_agent_panel_refresh = Instant::now();
+                                                feedback_buffer = message;
+                                            }
+                                            Err(e) => feedback_buffer = format!("Error: {}", e),
+                                        }
+                                    }
+                                    KeyCode::Char('m') | KeyCode::Char('M') => {
+                                        if agent_panel
+                                            .selected_current_project_registration()
+                                            .is_some()
+                                        {
+                                            feedback_buffer =
+                                            "Register current project before changing its Codex model"
+                                                .to_string();
+                                            continue;
+                                        }
+
+                                        match cycle_selected_tui_agent_codex_model(
+                                            &mut agent_panel,
+                                            &active_root,
+                                        ) {
+                                            Ok(message) => {
+                                                last_agent_panel_refresh = Instant::now();
+                                                feedback_buffer = message;
+                                            }
+                                            Err(e) => feedback_buffer = format!("Error: {}", e),
+                                        }
+                                    }
+                                    KeyCode::Char('f') | KeyCode::Char('F') => {
+                                        if agent_panel
+                                            .selected_current_project_registration()
+                                            .is_some()
+                                        {
+                                            feedback_buffer =
+                                            "Register current project before changing Codex fast mode"
+                                                .to_string();
+                                            continue;
+                                        }
+
+                                        match toggle_selected_tui_agent_codex_fast(
+                                            &mut agent_panel,
+                                            &active_root,
+                                        ) {
+                                            Ok(message) => {
+                                                last_agent_panel_refresh = Instant::now();
+                                                feedback_buffer = message;
+                                            }
+                                            Err(e) => feedback_buffer = format!("Error: {}", e),
+                                        }
+                                    }
+                                    KeyCode::Char('t') | KeyCode::Char('T') => {
+                                        if agent_panel
+                                            .selected_current_project_registration()
+                                            .is_some()
+                                        {
+                                            feedback_buffer =
+                                            "Register current project before changing Codex thinking"
+                                                .to_string();
+                                            continue;
+                                        }
+
+                                        match cycle_selected_tui_agent_codex_reasoning(
+                                            &mut agent_panel,
+                                            &active_root,
+                                        ) {
+                                            Ok(message) => {
+                                                last_agent_panel_refresh = Instant::now();
+                                                feedback_buffer = message;
+                                            }
+                                            Err(e) => feedback_buffer = format!("Error: {}", e),
+                                        }
+                                    }
+                                    KeyCode::Char('l') | KeyCode::Char('L') => {
+                                        if agent_log_view.take().is_some() {
+                                            feedback_buffer = "Closed agent output log".to_string();
+                                            continue;
+                                        }
+
+                                        match selected_tui_agent_log_view(&agent_panel) {
+                                            Ok(Some(log_view)) => {
+                                                let output_kind = if log_view.is_live {
+                                                    "live agent output"
+                                                } else {
+                                                    "latest agent output"
+                                                };
+                                                feedback_buffer = format!(
+                                                    "Showing {output_kind} for {}",
+                                                    log_view.project_name
+                                                );
+                                                agent_log_view = Some(log_view);
+                                                last_agent_log_refresh = Instant::now();
+                                            }
+                                            Ok(None) => {
+                                                feedback_buffer = if agent_panel
+                                                    .selected_current_project_registration()
+                                                    .is_some()
+                                                {
+                                                    "Register current project before viewing agent output"
+                                                .to_string()
+                                                } else {
+                                                    "No agent output recorded for selected project"
+                                                        .to_string()
+                                                };
+                                            }
+                                            Err(e) => feedback_buffer = format!("Error: {}", e),
+                                        }
+                                    }
+                                    KeyCode::Up => {
+                                        agent_panel.select_previous();
+                                        sync_open_tui_agent_log_view(
+                                            &agent_panel,
+                                            &mut agent_log_view,
+                                        );
+                                        last_agent_log_refresh = Instant::now();
+                                    }
+                                    KeyCode::Down => {
+                                        agent_panel.select_next();
+                                        sync_open_tui_agent_log_view(
+                                            &agent_panel,
+                                            &mut agent_log_view,
+                                        );
+                                        last_agent_log_refresh = Instant::now();
+                                    }
+                                    _ => {
+                                        feedback_buffer =
+                                            tui_agent_panel_instructions().to_string();
                                     }
                                 }
-                                _ => {}
-                            }
-                        }
-                    }
-                    Mode::Reorganize => {
-                        current_mode = Mode::View;
-                        feedback_buffer = if matches!(key.code, KeyCode::Esc) {
-                            "Reorganize cancelled.".to_string()
-                        } else if let Some(direction) = tui_task_reorganize_direction(&key) {
-                            reorganize_selected_tui_task(
-                                &board_dir,
-                                &statuses,
-                                &mut board_states,
-                                &mut selected_board,
-                                backlog_visible,
-                                direction,
-                            )
-                        } else {
-                            "Reorganize cancelled: expected an Arrow.".to_string()
-                        };
-                    }
-                    Mode::Help => match key.code {
-                        KeyCode::Enter
-                        | KeyCode::Esc
-                        | KeyCode::Char('h')
-                        | KeyCode::Char('H')
-                        | KeyCode::Char('?') => {
-                            current_mode = Mode::View;
-                        }
-                        _ => {}
-                    },
-                    Mode::Input => match key.code {
-                        KeyCode::Enter => {
-                            if !task_input.value().trim().is_empty() {
-                                match insert_task_at_selection_in_board(
+                            } else if archive_view {
+                                match key.code {
+                                    KeyCode::Char('A') | KeyCode::Char('a')
+                                        if key.modifiers.contains(KeyModifiers::SHIFT) =>
+                                    {
+                                        archive_view = false;
+                                        archive_state.select(None);
+                                        archive_scroll_offset = 0;
+                                        feedback_buffer = "Returned to Kanban view".to_string();
+                                    }
+                                    KeyCode::Char('q') => break,
+                                    KeyCode::Char('h')
+                                    | KeyCode::Char('H')
+                                    | KeyCode::Char('?') => {
+                                        current_mode = Mode::Help;
+                                    }
+                                    KeyCode::Up => {
+                                        let tasks = read_archived_task_entries(&board_dir)
+                                            .unwrap_or_default();
+                                        if !tasks.is_empty() {
+                                            let i = archive_state.selected().unwrap_or(0);
+                                            if i > 0 {
+                                                archive_state.select(Some(i - 1));
+                                            } else {
+                                                archive_state.select(Some(tasks.len() - 1));
+                                            }
+                                        }
+                                    }
+                                    KeyCode::Down => {
+                                        let tasks = read_archived_task_entries(&board_dir)
+                                            .unwrap_or_default();
+                                        if !tasks.is_empty() {
+                                            let i = archive_state.selected().unwrap_or(0);
+                                            if i < tasks.len() - 1 {
+                                                archive_state.select(Some(i + 1));
+                                            } else {
+                                                archive_state.select(Some(0));
+                                            }
+                                        }
+                                    }
+                                    _ => {
+                                        feedback_buffer =
+                                            "Archive view is read-only. Press A again to leave."
+                                                .to_string();
+                                    }
+                                }
+                            } else if let Some(direction) = tui_task_reorder_direction(&key) {
+                                feedback_buffer = reorder_selected_tui_task(
                                     &board_dir,
                                     statuses[selected_board],
-                                    &board_states[selected_board],
-                                    task_input.value(),
-                                    None,
-                                ) {
-                                    Ok(_) => {
-                                        feedback_buffer = "Task added successfully.".to_string()
+                                    &mut board_states[selected_board],
+                                    direction,
+                                );
+                            } else if tui_starts_reorganize_mode(&key) {
+                                current_mode = Mode::Reorganize;
+                                feedback_buffer =
+                                "Reorganize: press an Arrow to move the selected task (Esc cancels)."
+                                    .to_string();
+                            } else if key.modifiers.contains(KeyModifiers::SHIFT) {
+                                match key.code {
+                                    KeyCode::Char('A') | KeyCode::Char('a') => {
+                                        archive_view = true;
+                                        current_mode = Mode::View;
+                                        archive_scroll_offset = 0;
+                                        select_first_archive_task_if_present_in_board(
+                                            &board_dir,
+                                            &mut archive_state,
+                                        );
+                                        feedback_buffer =
+                                            "Archive view. Press A again to leave archive view."
+                                                .to_string();
                                     }
-                                    Err(e) => feedback_buffer = format!("Error: {}", e),
+                                    KeyCode::Char('B') | KeyCode::Char('b') => {
+                                        feedback_buffer = toggle_tui_backlog_column(
+                                            &board_dir,
+                                            &mut board_states,
+                                            &mut selected_board,
+                                            &mut backlog_visible,
+                                        );
+                                    }
+                                    KeyCode::Left => {
+                                        feedback_buffer = move_selected_tui_task_between_boards(
+                                            &board_dir,
+                                            &statuses,
+                                            &mut board_states,
+                                            &mut selected_board,
+                                            backlog_visible,
+                                            TuiTaskBoardMoveDirection::Left,
+                                        );
+                                    }
+                                    KeyCode::Right => {
+                                        feedback_buffer = move_selected_tui_task_between_boards(
+                                            &board_dir,
+                                            &statuses,
+                                            &mut board_states,
+                                            &mut selected_board,
+                                            backlog_visible,
+                                            TuiTaskBoardMoveDirection::Right,
+                                        );
+                                    }
+                                    _ => {}
                                 }
+                            } else if key.modifiers.contains(KeyModifiers::CONTROL)
+                                || key.modifiers.contains(KeyModifiers::ALT)
+                            {
+                                // Other Alt/Ctrl modifiers are not used for moving tasks.
+                                _ = ();
                             } else {
-                                feedback_buffer = "Task description cannot be empty.".to_string();
+                                match key.code {
+                                    KeyCode::Esc => {
+                                        let state = &mut board_states[selected_board];
+                                        state.select(None);
+                                        feedback_buffer = "Task unselected".to_string();
+                                    }
+                                    KeyCode::Char('B') => {
+                                        feedback_buffer = toggle_tui_backlog_column(
+                                            &board_dir,
+                                            &mut board_states,
+                                            &mut selected_board,
+                                            &mut backlog_visible,
+                                        );
+                                    }
+                                    KeyCode::Char('b') => {
+                                        feedback_buffer = match move_selected_tui_task_to_backlog(
+                                            &board_dir,
+                                            &statuses,
+                                            &mut board_states,
+                                            &mut selected_board,
+                                            backlog_visible,
+                                        ) {
+                                            Ok(message) => message,
+                                            Err(error) => format!("Error: {error}"),
+                                        };
+                                    }
+                                    KeyCode::Char('a') => {
+                                        feedback_buffer = match move_selected_tui_task_to_archive(
+                                            &board_dir,
+                                            &statuses,
+                                            &mut board_states,
+                                            selected_board,
+                                        ) {
+                                            Ok(message) => message,
+                                            Err(error) => format!("Error: {error}"),
+                                        };
+                                    }
+                                    KeyCode::Char('A') => {
+                                        archive_view = true;
+                                        current_mode = Mode::View;
+                                        archive_scroll_offset = 0;
+                                        select_first_archive_task_if_present_in_board(
+                                            &board_dir,
+                                            &mut archive_state,
+                                        );
+                                        feedback_buffer =
+                                            "Archive view. Press A again to leave archive view."
+                                                .to_string();
+                                    }
+                                    KeyCode::Char('l') | KeyCode::Char('L') => {
+                                        if agent_log_view.take().is_some() {
+                                            feedback_buffer = "Closed agent output log".to_string();
+                                            continue;
+                                        }
+
+                                        agent_panel.refresh(&active_root);
+                                        last_agent_panel_refresh = Instant::now();
+                                        match selected_tui_agent_log_view_for_path(
+                                            &mut agent_panel,
+                                            &active_root,
+                                        ) {
+                                            Ok(Some(log_view)) => {
+                                                let output_kind = if log_view.is_live {
+                                                    "live agent output"
+                                                } else {
+                                                    "latest agent output"
+                                                };
+                                                feedback_buffer = format!(
+                                                    "Showing {output_kind} for {}",
+                                                    log_view.project_name
+                                                );
+                                                agent_log_view = Some(log_view);
+                                                last_agent_log_refresh = Instant::now();
+                                            }
+                                            Ok(None) => {
+                                                feedback_buffer = if agent_panel
+                                                    .last_error
+                                                    .is_some()
+                                                {
+                                                    agent_panel
+                                                        .last_error
+                                                        .clone()
+                                                        .unwrap_or_default()
+                                                } else if agent_panel
+                                                    .selected_current_project_registration()
+                                                    .is_some()
+                                                {
+                                                    "Register current project before viewing agent output"
+                                                    .to_string()
+                                                } else {
+                                                    "No agent output recorded for current project"
+                                                        .to_string()
+                                                };
+                                            }
+                                            Err(e) => feedback_buffer = format!("Error: {}", e),
+                                        }
+                                    }
+                                    KeyCode::Char('q') => break,
+                                    KeyCode::Backspace => {
+                                        if board_stack.len() > 1 {
+                                            board_stack.pop();
+                                            selected_board = TODO_BOARD_INDEX;
+                                            for state in board_states.iter_mut() {
+                                                state.select(None);
+                                            }
+                                            let parent_board = board_stack
+                                                .last()
+                                                .cloned()
+                                                .unwrap_or_else(|| get_tasks_dir(&active_root));
+                                            select_first_task_if_present_in_board(
+                                                &parent_board,
+                                                statuses[selected_board],
+                                                &mut board_states[selected_board],
+                                            );
+                                            feedback_buffer =
+                                                "Returned to parent board".to_string();
+                                        } else {
+                                            feedback_buffer =
+                                                "Already at the top board".to_string();
+                                        }
+                                    }
+                                    KeyCode::Enter => {
+                                        if let Some((idx, entry)) = selected_task_entry_in_board(
+                                            &board_dir,
+                                            statuses[selected_board],
+                                            &board_states[selected_board],
+                                        ) {
+                                            match &entry.source {
+                                                TaskSource::Path { path, is_dir: true }
+                                                    if entry.has_subtasks =>
+                                                {
+                                                    ensure_board_store(path)?;
+                                                    board_stack.push(path.clone());
+                                                    selected_board = TODO_BOARD_INDEX;
+                                                    for state in board_states.iter_mut() {
+                                                        state.select(None);
+                                                    }
+                                                    select_first_task_if_present_in_board(
+                                                        path,
+                                                        statuses[selected_board],
+                                                        &mut board_states[selected_board],
+                                                    );
+                                                    feedback_buffer =
+                                                        "Opened subtask board".to_string();
+                                                }
+                                                _ => {
+                                                    current_mode = Mode::Edit;
+                                                    editing_task_idx = Some(idx + 1);
+                                                    task_input = TaskInput::new(
+                                                        entry.content.trim_end().to_string(),
+                                                    );
+                                                }
+                                            }
+                                        } else {
+                                            board_states[selected_board].select(None);
+                                            current_mode = Mode::Input;
+                                            task_input.reset();
+                                        }
+                                    }
+                                    KeyCode::Char('e') | KeyCode::Char('E') => {
+                                        if let Some((idx, entry)) = selected_task_entry_in_board(
+                                            &board_dir,
+                                            statuses[selected_board],
+                                            &board_states[selected_board],
+                                        ) {
+                                            current_mode = Mode::Edit;
+                                            editing_task_idx = Some(idx + 1);
+                                            task_input = TaskInput::new(
+                                                entry.content.trim_end().to_string(),
+                                            );
+                                        } else {
+                                            feedback_buffer = "No task selected".to_string();
+                                        }
+                                    }
+                                    KeyCode::Char(' ') => {
+                                        if selected_task_index_in_board(
+                                            &board_dir,
+                                            statuses[selected_board],
+                                            &board_states[selected_board],
+                                        )
+                                        .is_none()
+                                        {
+                                            board_states[selected_board].select(None);
+                                        }
+                                        current_mode = Mode::Input;
+                                        task_input.reset();
+                                    }
+                                    KeyCode::Char('0') => {
+                                        backlog_visible = true;
+                                        selected_board = BACKLOG_BOARD_INDEX;
+                                        for state in board_states.iter_mut() {
+                                            state.select(None);
+                                        }
+                                        select_first_task_if_present_in_board(
+                                            &board_dir,
+                                            statuses[selected_board],
+                                            &mut board_states[selected_board],
+                                        );
+                                        feedback_buffer =
+                                            "Backlog column shown and focused.".to_string();
+                                    }
+                                    KeyCode::Char('1') => {
+                                        selected_board = TODO_BOARD_INDEX;
+                                        for state in board_states.iter_mut() {
+                                            state.select(None);
+                                        }
+                                        select_first_task_if_present_in_board(
+                                            &board_dir,
+                                            statuses[selected_board],
+                                            &mut board_states[selected_board],
+                                        );
+                                    }
+                                    KeyCode::Char('2') => {
+                                        selected_board = 1;
+                                        for state in board_states.iter_mut() {
+                                            state.select(None);
+                                        }
+                                        select_first_task_if_present_in_board(
+                                            &board_dir,
+                                            statuses[selected_board],
+                                            &mut board_states[selected_board],
+                                        );
+                                    }
+                                    KeyCode::Char('3') => {
+                                        selected_board = DONE_BOARD_INDEX;
+                                        for state in board_states.iter_mut() {
+                                            state.select(None);
+                                        }
+                                        select_first_task_if_present_in_board(
+                                            &board_dir,
+                                            statuses[selected_board],
+                                            &mut board_states[selected_board],
+                                        );
+                                    }
+                                    KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Delete => {
+                                        if let Some(idx) = selected_task_index_in_board(
+                                            &board_dir,
+                                            statuses[selected_board],
+                                            &board_states[selected_board],
+                                        ) {
+                                            let status = statuses[selected_board];
+                                            match delete_task_in_board(
+                                                &board_dir,
+                                                status,
+                                                &(idx + 1).to_string(),
+                                            ) {
+                                                Ok(_) => {
+                                                    feedback_buffer = format!(
+                                                        "Deleted task {} from {}",
+                                                        idx + 1,
+                                                        status
+                                                    );
+                                                    board_states[selected_board].select(
+                                                        if idx > 0 { Some(idx - 1) } else { None },
+                                                    );
+                                                }
+                                                Err(e) => feedback_buffer = format!("Error: {}", e),
+                                            }
+                                        } else {
+                                            board_states[selected_board].select(None);
+                                            feedback_buffer =
+                                                "No task selected to delete".to_string();
+                                        }
+                                    }
+                                    KeyCode::Char('h')
+                                    | KeyCode::Char('H')
+                                    | KeyCode::Char('?') => {
+                                        current_mode = Mode::Help;
+                                    }
+                                    KeyCode::Up => {
+                                        let state = &mut board_states[selected_board];
+                                        let tasks = read_tasks_in_board(
+                                            &board_dir,
+                                            statuses[selected_board],
+                                        )
+                                        .unwrap_or_default();
+                                        if !tasks.is_empty() {
+                                            let i = state.selected().unwrap_or(0);
+                                            if i > 0 {
+                                                state.select(Some(i - 1));
+                                            } else {
+                                                state.select(Some(tasks.len() - 1));
+                                            }
+                                        }
+                                    }
+                                    KeyCode::Down => {
+                                        let state = &mut board_states[selected_board];
+                                        let tasks = read_tasks_in_board(
+                                            &board_dir,
+                                            statuses[selected_board],
+                                        )
+                                        .unwrap_or_default();
+                                        if !tasks.is_empty() {
+                                            let i = state.selected().unwrap_or(0);
+                                            if i < tasks.len() - 1 {
+                                                state.select(Some(i + 1));
+                                            } else {
+                                                state.select(Some(0));
+                                            }
+                                        }
+                                    }
+                                    KeyCode::Left => {
+                                        selected_board = wrapped_visible_tui_board(
+                                            selected_board,
+                                            backlog_visible,
+                                            -1,
+                                        );
+                                        for state in board_states.iter_mut() {
+                                            state.select(None);
+                                        }
+                                        select_first_task_if_present_in_board(
+                                            &board_dir,
+                                            statuses[selected_board],
+                                            &mut board_states[selected_board],
+                                        );
+                                    }
+                                    KeyCode::Right => {
+                                        selected_board = wrapped_visible_tui_board(
+                                            selected_board,
+                                            backlog_visible,
+                                            1,
+                                        );
+                                        for state in board_states.iter_mut() {
+                                            state.select(None);
+                                        }
+                                        select_first_task_if_present_in_board(
+                                            &board_dir,
+                                            statuses[selected_board],
+                                            &mut board_states[selected_board],
+                                        );
+                                    }
+                                    KeyCode::Char(c) if c.is_ascii_digit() => {
+                                        let new_pos = (c as u8 - b'0') as usize;
+                                        if let Some(idx) = selected_task_index_in_board(
+                                            &board_dir,
+                                            statuses[selected_board],
+                                            &board_states[selected_board],
+                                        ) {
+                                            if new_pos > 0 {
+                                                match reorder_task_in_board(
+                                                    &board_dir,
+                                                    statuses[selected_board],
+                                                    idx,
+                                                    new_pos - 1,
+                                                ) {
+                                                    Ok(_) => {
+                                                        feedback_buffer = format!(
+                                                            "Reordered task to position {}",
+                                                            new_pos
+                                                        )
+                                                    }
+                                                    Err(e) => {
+                                                        feedback_buffer = format!("Error: {}", e)
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            board_states[selected_board].select(None);
+                                            feedback_buffer = "No task selected".to_string();
+                                        }
+                                    }
+                                    _ => {}
+                                }
                             }
-                            current_mode = Mode::View;
-                            task_input.reset();
                         }
-                        KeyCode::Esc => {
+                        Mode::Reorganize => {
                             current_mode = Mode::View;
-                            task_input.reset();
+                            feedback_buffer = if matches!(key.code, KeyCode::Esc) {
+                                "Reorganize cancelled.".to_string()
+                            } else if let Some(direction) = tui_task_reorganize_direction(&key) {
+                                reorganize_selected_tui_task(
+                                    &board_dir,
+                                    &statuses,
+                                    &mut board_states,
+                                    &mut selected_board,
+                                    backlog_visible,
+                                    direction,
+                                )
+                            } else {
+                                "Reorganize cancelled: expected an Arrow.".to_string()
+                            };
                         }
-                        _ => handle_input_key(
-                            &mut task_input,
-                            key,
-                            " Add Task: ",
-                            input_available_width,
-                        ),
-                    },
-                    Mode::Edit => match key.code {
-                        KeyCode::Enter => {
-                            if !task_input.value().trim().is_empty() {
-                                if let Some(idx) = editing_task_idx {
-                                    match update_task_in_board(
+                        Mode::Help => match key.code {
+                            KeyCode::Enter
+                            | KeyCode::Esc
+                            | KeyCode::Char('h')
+                            | KeyCode::Char('H')
+                            | KeyCode::Char('?') => {
+                                current_mode = Mode::View;
+                            }
+                            _ => {}
+                        },
+                        Mode::Input => match key.code {
+                            KeyCode::Enter => {
+                                let task_value = task_input.submitted_value();
+                                if !task_value.trim().is_empty() {
+                                    match insert_task_at_selection_in_board(
                                         &board_dir,
                                         statuses[selected_board],
-                                        idx,
-                                        task_input.value(),
+                                        &board_states[selected_board],
+                                        &task_value,
+                                        None,
                                     ) {
                                         Ok(_) => {
-                                            feedback_buffer =
-                                                format!("Task {} updated successfully.", idx)
+                                            feedback_buffer = "Task added successfully.".to_string()
                                         }
                                         Err(e) => feedback_buffer = format!("Error: {}", e),
                                     }
+                                } else {
+                                    feedback_buffer =
+                                        "Task description cannot be empty.".to_string();
                                 }
-                            } else {
-                                feedback_buffer = "Task description cannot be empty.".to_string();
+                                current_mode = Mode::View;
+                                task_input.reset();
                             }
-                            current_mode = Mode::View;
-                            task_input.reset();
-                            editing_task_idx = None;
-                        }
-                        KeyCode::Esc => {
-                            current_mode = Mode::View;
-                            task_input.reset();
-                            editing_task_idx = None;
-                        }
-                        _ => handle_input_key(
-                            &mut task_input,
-                            key,
-                            " Edit Task: ",
-                            input_available_width,
-                        ),
-                    },
+                            KeyCode::Esc => {
+                                current_mode = Mode::View;
+                                task_input.reset();
+                            }
+                            _ => handle_input_key(
+                                &mut task_input.input,
+                                key,
+                                " Add Task: ",
+                                input_available_width,
+                            ),
+                        },
+                        Mode::Edit => match key.code {
+                            KeyCode::Enter => {
+                                let task_value = task_input.submitted_value();
+                                if !task_value.trim().is_empty() {
+                                    if let Some(idx) = editing_task_idx {
+                                        match update_task_in_board(
+                                            &board_dir,
+                                            statuses[selected_board],
+                                            idx,
+                                            &task_value,
+                                        ) {
+                                            Ok(_) => {
+                                                feedback_buffer =
+                                                    format!("Task {} updated successfully.", idx)
+                                            }
+                                            Err(e) => feedback_buffer = format!("Error: {}", e),
+                                        }
+                                    }
+                                } else {
+                                    feedback_buffer =
+                                        "Task description cannot be empty.".to_string();
+                                }
+                                current_mode = Mode::View;
+                                task_input.reset();
+                                editing_task_idx = None;
+                            }
+                            KeyCode::Esc => {
+                                current_mode = Mode::View;
+                                task_input.reset();
+                                editing_task_idx = None;
+                            }
+                            _ => handle_input_key(
+                                &mut task_input.input,
+                                key,
+                                " Edit Task: ",
+                                input_available_width,
+                            ),
+                        },
+                    }
                 }
+                _ => {}
             }
         }
     }
@@ -13409,5 +13621,59 @@ mod tests {
         );
 
         assert_eq!(input.cursor(), input.value().chars().count());
+    }
+
+    #[test]
+    fn task_input_collapses_multiline_paste_until_submission() {
+        let mut input = TaskInput::new("before ".to_string());
+        input.insert_paste("first\r\nsecond\r\nthird".to_string());
+        handle_input_key(
+            &mut input.input,
+            crossterm::event::KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE),
+            " Add Task: ",
+            80,
+        );
+
+        assert_eq!(input.display_value(), "before [Pasted Content 3 lines]!");
+        assert_eq!(input.submitted_value(), "before first\nsecond\nthird!");
+        assert_eq!(
+            input.display_cursor(),
+            input.display_value().chars().count()
+        );
+
+        let lines = styled_task_input_lines(" Add Task: ", &input, 80);
+        let blue_text: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .filter(|span| span.style.fg == Some(Color::Blue))
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(blue_text, "[Pasted Content 3 lines]");
+    }
+
+    #[test]
+    fn task_input_treats_a_paste_placeholder_as_one_editable_character() {
+        let mut input = TaskInput::default();
+        input.insert_paste("first\nsecond".to_string());
+
+        handle_input_key(
+            &mut input.input,
+            crossterm::event::KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+            " Add Task: ",
+            80,
+        );
+
+        assert_eq!(input.display_value(), "");
+        assert_eq!(input.submitted_value(), "");
+    }
+
+    #[test]
+    fn task_input_inserts_single_line_paste_directly() {
+        let mut input = TaskInput::new("before ".to_string());
+        input.insert_paste("one line".to_string());
+
+        assert_eq!(input.display_value(), "before one line");
+        assert_eq!(input.submitted_value(), "before one line");
+        assert!(input.pasted_content.is_empty());
     }
 }
