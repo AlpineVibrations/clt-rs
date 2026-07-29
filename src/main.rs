@@ -57,6 +57,7 @@ const AGENT_RUN_TIMEOUT_SECONDS_ENV: &str = "CLT_AGENT_RUN_TIMEOUT_SECONDS";
 const AGENT_DAEMON_MODE_ENV: &str = "CLT_AGENT_DAEMON_MODE";
 const AGENT_CODEX_PATH_ENV: &str = "CLT_AGENT_CODEX_PATH";
 const AGENT_SUCCESS_COOLDOWN_SECONDS_ENV: &str = "CLT_AGENT_SUCCESS_COOLDOWN_SECONDS";
+const XDG_RUNTIME_DIR_ENV: &str = "XDG_RUNTIME_DIR";
 const AGENT_DEFAULT_MAX_GLOBAL_JOBS: usize = 12;
 const AGENT_DEFAULT_FAILURE_BACKOFF_SECONDS: u64 = 5 * 60;
 const AGENT_DEFAULT_LEASE_TIMEOUT_SECONDS: u64 = 60 * 60;
@@ -1685,8 +1686,7 @@ fn launchd_user_domain_for_uid(uid: &str) -> Result<String> {
 }
 
 fn run_service_command(program: &str, args: &[&str]) -> Result<()> {
-    let status = Command::new(program)
-        .args(args)
+    let status = service_command(program, args)?
         .status()
         .with_context(|| format!("Failed to run {}", service_command_display(program, args)))?;
     if !status.success() {
@@ -1703,8 +1703,7 @@ fn run_service_command(program: &str, args: &[&str]) -> Result<()> {
 fn run_service_command_optional(program: &str, args: &[&str]) -> Result<bool> {
     // Status probes are called from the TUI refresh path, so child output must
     // never inherit the terminal and overwrite the alternate screen.
-    let status = Command::new(program)
-        .args(args)
+    let status = service_command(program, args)?
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -1714,8 +1713,7 @@ fn run_service_command_optional(program: &str, args: &[&str]) -> Result<bool> {
 }
 
 fn run_service_command_quiet(program: &str, args: &[&str]) -> Result<()> {
-    let status = Command::new(program)
-        .args(args)
+    let status = service_command(program, args)?
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -1729,6 +1727,60 @@ fn run_service_command_quiet(program: &str, args: &[&str]) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn service_command(program: &str, args: &[&str]) -> Result<Command> {
+    let mut command = Command::new(program);
+    command.args(args);
+
+    if program == "systemctl" && args.contains(&"--user") {
+        configure_systemd_user_command(&mut command)?;
+    }
+
+    Ok(command)
+}
+
+fn configure_systemd_user_command(command: &mut Command) -> Result<()> {
+    let inherited_runtime_dir = std::env::var_os(XDG_RUNTIME_DIR_ENV);
+    if inherited_runtime_dir
+        .as_deref()
+        .is_some_and(|value| !os_value_is_blank(value))
+    {
+        return Ok(());
+    }
+
+    let uid = current_user_id()?;
+    let runtime_dir = systemd_user_runtime_dir_for_uid(&uid)?;
+    let bus_path = runtime_dir.join("bus");
+    if !runtime_dir.is_dir() || !bus_path.exists() {
+        anyhow::bail!(
+            "Linux systemd user bus is unavailable at {}. Log in through a systemd/PAM user session, or enable lingering with `sudo loginctl enable-linger <user>` before managing the clt agent service.",
+            bus_path.display()
+        );
+    }
+    configure_systemd_user_command_with_runtime_dir(command, None, &uid)
+}
+
+fn configure_systemd_user_command_with_runtime_dir(
+    command: &mut Command,
+    inherited_runtime_dir: Option<&OsStr>,
+    uid: &str,
+) -> Result<()> {
+    if inherited_runtime_dir.is_some_and(|value| !os_value_is_blank(value)) {
+        return Ok(());
+    }
+
+    command.env(XDG_RUNTIME_DIR_ENV, systemd_user_runtime_dir_for_uid(uid)?);
+    Ok(())
+}
+
+fn systemd_user_runtime_dir_for_uid(uid: &str) -> Result<PathBuf> {
+    let uid = uid.trim();
+    if uid.is_empty() || !uid.chars().all(|ch| ch.is_ascii_digit()) {
+        anyhow::bail!("id -u produced an invalid user id: {uid}");
+    }
+
+    Ok(Path::new("/run/user").join(uid))
 }
 
 fn service_command_display(program: &str, args: &[&str]) -> String {
@@ -11388,6 +11440,54 @@ mod tests {
                 &["--user", "enable", "clt-agent.service"][..],
                 &["--user", "restart", "clt-agent.service"][..],
             ]
+        );
+    }
+
+    #[test]
+    fn systemd_user_runtime_dir_uses_numeric_uid() {
+        assert_eq!(
+            systemd_user_runtime_dir_for_uid(" 1000\n").unwrap(),
+            PathBuf::from("/run/user/1000")
+        );
+    }
+
+    #[test]
+    fn systemd_user_runtime_dir_rejects_invalid_uid() {
+        let err = systemd_user_runtime_dir_for_uid("not-a-uid")
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("invalid user id"));
+    }
+
+    #[test]
+    fn systemd_user_command_recovers_missing_runtime_dir() {
+        let mut command = Command::new("systemctl");
+
+        configure_systemd_user_command_with_runtime_dir(&mut command, None, "1000").unwrap();
+
+        let configured_runtime_dir = command
+            .get_envs()
+            .find(|(key, _)| *key == OsStr::new(XDG_RUNTIME_DIR_ENV))
+            .and_then(|(_, value)| value);
+        assert_eq!(configured_runtime_dir, Some(OsStr::new("/run/user/1000")));
+    }
+
+    #[test]
+    fn systemd_user_command_preserves_inherited_runtime_dir() {
+        let mut command = Command::new("systemctl");
+
+        configure_systemd_user_command_with_runtime_dir(
+            &mut command,
+            Some(OsStr::new("/custom/runtime")),
+            "1000",
+        )
+        .unwrap();
+
+        assert!(
+            command
+                .get_envs()
+                .all(|(key, _)| key != OsStr::new(XDG_RUNTIME_DIR_ENV))
         );
     }
 

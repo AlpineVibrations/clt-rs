@@ -200,6 +200,8 @@ On macOS, `start` installs a user `launchd` service named `com.alpinevibrations.
 
 Run `clt agent start` and `clt agent stop` as your normal user, not with `sudo`; these commands manage per-user services.
 
+On Linux, `clt` recovers the standard `/run/user/<uid>` systemd runtime directory when an SSH or non-interactive shell does not export `XDG_RUNTIME_DIR`. If the user bus is not running at all, log in through a systemd/PAM-managed session or ask an administrator to enable the always-on user manager with `sudo loginctl enable-linger "$USER"`, then start the service again.
+
 Inspect agent state and recent output:
 ```bash
 clt agent status
