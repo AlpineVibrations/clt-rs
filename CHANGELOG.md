@@ -10,6 +10,7 @@ Use this section while developing the next release.
 
 ### Added
 
+- Added the current local time to the agent projects pane's top border before the daemon status.
 - Added `clt shell-init bash|zsh` integration so quitting after opening a registered project can change the calling shell to that project's directory.
 - Added a first-class Backlog status for Markdown- and folder-backed boards, including CLI listing and status transitions.
 - Added a hidden-by-default Backlog TUI column: `b` sends the selected task to Backlog, `B` toggles the column, and `0` reveals and focuses it.

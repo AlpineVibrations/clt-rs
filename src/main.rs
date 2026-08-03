@@ -7359,8 +7359,25 @@ fn format_tui_agent_panel_top_status(
     enabled_count: usize,
     running_count: usize,
 ) -> String {
+    let current_time = Local::now().format("%H:%M").to_string();
+    format_tui_agent_panel_top_status_with_time(
+        &current_time,
+        daemon_status,
+        project_count,
+        enabled_count,
+        running_count,
+    )
+}
+
+fn format_tui_agent_panel_top_status_with_time(
+    current_time: &str,
+    daemon_status: &str,
+    project_count: usize,
+    enabled_count: usize,
+    running_count: usize,
+) -> String {
     format!(
-        " daemon status: {daemon_status}  {project_count} projects  {enabled_count} enabled  {running_count} running "
+        " {current_time}  daemon status: {daemon_status}  {project_count} projects  {enabled_count} enabled  {running_count} running "
     )
 }
 
@@ -10409,9 +10426,10 @@ mod tests {
     }
 
     #[test]
-    fn tui_agent_panel_top_status_includes_daemon_status() {
-        let status = format_tui_agent_panel_top_status("running", 3, 2, 1);
+    fn tui_agent_panel_top_status_includes_time_and_daemon_status() {
+        let status = format_tui_agent_panel_top_status_with_time("09:41", "running", 3, 2, 1);
 
+        assert!(status.starts_with(" 09:41  daemon status: running"));
         assert!(status.contains("daemon status: running"));
         assert!(status.contains("3 projects"));
         assert!(status.contains("2 enabled"));
