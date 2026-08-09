@@ -98,7 +98,7 @@ Use the existing task-management CLI tooling: clt.
 Your job for this run:
 
 1. Inspect the task board using the task CLI.
-2. Pick the next available TODO / ready task.
+2. Pick the next available unblocked TODO / ready task.
 3. If there are no available tasks, say exactly: NO_TASKS_LEFT
 4. If there is a task:
    - move it to doing
@@ -114,7 +114,9 @@ Your job for this run:
 Safety rules:
 - Do not overwrite unrelated user changes.
 - Before making edits, inspect the current repo state.
-- If the task is blocked or cannot be completed safely, update the task with a concise blocked note instead of forcing it.
+- During normal TODO selection, skip tasks whose latest dated state note is `BLOCKED YYYY-MM-DD:`.
+- Inspect task details when needed; a folder-backed task's list summary may not show its blocker notes.
+- If the task is blocked or cannot be completed safely, update it with a concise `BLOCKED YYYY-MM-DD:` note instead of forcing it.
 "#;
 const AGENT_GIT_COMMIT_PROMPT_APPENDIX: &str = r#"
 
@@ -137,6 +139,20 @@ Interrupted task recovery:
 - Resume and finish exactly one existing doing task.
 - Do not pick or move a TODO task; this recovery instruction replaces steps 2-4 above.
 - If there is no doing task to resume, say exactly: NO_TASKS_LEFT
+"#;
+const AGENT_RECOVER_BLOCKED_PROMPT_APPENDIX: &str = r#"
+
+Blocked-task monitor:
+- The scheduler found that every task across todo and doing is currently blocked; Todo does not have to be empty.
+- Review the existing blocker notes and choose exactly one blocked task from todo or doing that can be advanced.
+- If the selected task is in todo, move it to doing before working on it.
+- Try to resolve that task's blocker and finish the task, including the relevant checks.
+- Update the existing task; do not create a replacement task.
+- If the task is completed, add its completion note and move it to done.
+- If its blocker is resolved but the task should be retried through the normal workflow, add a newer `UNBLOCKED YYYY-MM-DD:` note and move that same task back to todo.
+- If it still cannot be completed safely, update its blocked note with what you tried and what is still needed, and leave it in doing.
+- Do not select backlog work. Stop after handling that one blocked task.
+- These recovery instructions replace steps 2-4 above.
 "#;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -326,7 +342,9 @@ struct AgentCleanSummary {
 struct AgentProjectScan {
     status: AgentProjectScanStatus,
     todo_count: usize,
+    blocked_todo_count: usize,
     doing_count: usize,
+    blocked_doing_count: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -355,6 +373,7 @@ struct AgentRunJob {
     project: agent_store::AgentProject,
     holder: String,
     task_selection: AgentTaskSelection,
+    blocked_task_count_before: usize,
 }
 
 struct AgentRunCompletion {
@@ -392,6 +411,7 @@ type AgentShutdownSignal = Arc<AtomicBool>;
 enum AgentTaskSelection {
     NextTodo,
     ResumeDoing,
+    RecoverBlocked,
 }
 
 impl AgentTaskSelection {
@@ -399,6 +419,7 @@ impl AgentTaskSelection {
         match self {
             Self::NextTodo => "next_todo",
             Self::ResumeDoing => "resume_doing",
+            Self::RecoverBlocked => "recover_blocked",
         }
     }
 }
@@ -430,6 +451,7 @@ enum AgentLeaseHolderLiveness {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum AgentProjectScanStatus {
     Pending,
+    Blocked,
     Empty,
     Missing,
     Uninitialized,
@@ -896,7 +918,7 @@ fn show_agent_status(store: &agent_store::TursoAgentStore) -> Result<()> {
         .collect();
     let pending_count = scans
         .iter()
-        .filter(|(_, scan)| scan.has_pending_task())
+        .filter(|(_, scan)| scan.has_schedulable_work())
         .count();
 
     println!("Agent status:");
@@ -968,10 +990,13 @@ fn format_agent_project_summary(
     let mut lines = vec![
         format!("{}. {} [{}]", project.id, project.name, state),
         format!(
-            "   queue     pending: {:<3} todo: {:<3} doing: {:<3} scan: {}",
+            "   queue     pending: {:<3} todo: {:<3} todo-ready: {:<3} todo-blocked: {:<3} doing: {:<3} doing-blocked: {:<3} scan: {}",
             scan.pending_signal(),
             scan.todo_count,
+            scan.available_todo_count(),
+            scan.blocked_todo_count,
             scan.doing_count,
+            scan.blocked_doing_count,
             scan.status_label()
         ),
     ];
@@ -996,6 +1021,10 @@ fn format_agent_project_summary(
         format!(
             "             failure:   {}",
             format_optional_agent_timestamp(project.last_failure_at.as_deref())
+        ),
+        format!(
+            "             blocked:   {}",
+            format_optional_agent_timestamp(project.last_blocked_recovery_at.as_deref())
         ),
         format!("   settings  git: {}", project.git_mode.label()),
         format!(
@@ -2220,32 +2249,47 @@ fn run_agent_scheduler_pass_with_max_global_jobs(
                 agent_lease_is_reclaimable(lease, reclaim_current_process_leases, now)
             });
         let task_selection = if resume_interrupted_task {
-            AgentTaskSelection::ResumeDoing
+            Some(AgentTaskSelection::ResumeDoing)
+        } else if scan.has_pending_task() {
+            Some(AgentTaskSelection::NextTodo)
+        } else if scan.all_actionable_tasks_blocked() {
+            Some(AgentTaskSelection::RecoverBlocked)
         } else {
-            AgentTaskSelection::NextTodo
+            None
         };
 
-        if !scan.has_pending_task() && !resume_interrupted_task {
+        let Some(task_selection) = task_selection else {
             println!(
-                "Project {}: action=idle reason=no_pending_tasks todo={} doing={} scan_status={} path={}",
+                "Project {}: action=idle reason=no_pending_tasks todo={} ready_todo={} blocked_todo={} doing={} blocked_doing={} scan_status={} path={}",
                 project.name,
                 scan.todo_count,
+                scan.available_todo_count(),
+                scan.blocked_todo_count,
                 scan.doing_count,
+                scan.blocked_doing_count,
                 scan.status_label(),
                 project.path.display()
             );
             continue;
-        }
+        };
 
-        if !resume_interrupted_task
-            && let Some(reason) =
-                agent_project_cooldown_reason(&project, now, success_cooldown, failure_backoff)
-        {
+        if let Some(reason) = agent_task_cooldown_reason(
+            &project,
+            task_selection,
+            now,
+            success_cooldown,
+            failure_backoff,
+        ) {
             println!(
-                "Project {}: action=skip reason=\"{}\" todo={} scan_status={} path={}",
+                "Project {}: action=skip reason=\"{}\" work={} todo={} ready_todo={} blocked_todo={} doing={} blocked_doing={} scan_status={} path={}",
                 project.name,
                 reason,
+                task_selection.label(),
                 scan.todo_count,
+                scan.available_todo_count(),
+                scan.blocked_todo_count,
+                scan.doing_count,
+                scan.blocked_doing_count,
                 scan.status_label(),
                 project.path.display()
             );
@@ -2256,12 +2300,16 @@ fn run_agent_scheduler_pass_with_max_global_jobs(
         if pass.active_agent_jobs + jobs.len() >= max_global_jobs {
             pass.deferred_projects += 1;
             println!(
-                "Project {}: action=defer reason=max_global_jobs_reached max_global_jobs={} active_agent_jobs={} todo={} doing={} scan_status={} path={}",
+                "Project {}: action=defer reason=max_global_jobs_reached max_global_jobs={} active_agent_jobs={} work={} todo={} ready_todo={} blocked_todo={} doing={} blocked_doing={} scan_status={} path={}",
                 project.name,
                 max_global_jobs,
                 pass.active_agent_jobs,
+                task_selection.label(),
                 scan.todo_count,
+                scan.available_todo_count(),
+                scan.blocked_todo_count,
                 scan.doing_count,
+                scan.blocked_doing_count,
                 scan.status_label(),
                 project.path.display()
             );
@@ -2302,11 +2350,14 @@ fn run_agent_scheduler_pass_with_max_global_jobs(
         }
 
         println!(
-            "Project {}: action=running work={} todo={} doing={} scan_status={} lease_holder={} lease_acquired_at={} lease_expires_at={} path={}",
+            "Project {}: action=running work={} todo={} ready_todo={} blocked_todo={} doing={} blocked_doing={} scan_status={} lease_holder={} lease_acquired_at={} lease_expires_at={} path={}",
             project.name,
             task_selection.label(),
             scan.todo_count,
+            scan.available_todo_count(),
+            scan.blocked_todo_count,
             scan.doing_count,
+            scan.blocked_doing_count,
             scan.status_label(),
             holder,
             format_agent_timestamp(&acquired_at),
@@ -2320,6 +2371,7 @@ fn run_agent_scheduler_pass_with_max_global_jobs(
             project,
             holder: holder.clone(),
             task_selection,
+            blocked_task_count_before: scan.blocked_task_count(),
         });
     }
 
@@ -2355,14 +2407,26 @@ fn run_agent_job(
     let finished_at = agent_timestamp();
 
     let (status, exit_code, log_dir, stdout_path, stderr_path, summary) = match run_result {
-        Ok(result) => (
-            result.status,
-            result.exit_code,
-            Some(result.log_dir.display().to_string()),
-            Some(result.stdout_path.display().to_string()),
-            Some(result.stderr_path.display().to_string()),
-            result.summary,
-        ),
+        Ok(mut result) => {
+            if matches!(result.status, "success" | "idle")
+                && blocked_recovery_made_no_progress(&job)
+            {
+                result.status = "blocked";
+                result.summary = format!(
+                    "Blocked-task recovery left all {} task(s) blocked across todo and doing; retry after the recovery backoff. Runner result: {}",
+                    job.blocked_task_count_before, result.summary
+                );
+            }
+
+            (
+                result.status,
+                result.exit_code,
+                Some(result.log_dir.display().to_string()),
+                Some(result.stdout_path.display().to_string()),
+                Some(result.stderr_path.display().to_string()),
+                result.summary,
+            )
+        }
         Err(err) => (
             "failure",
             None,
@@ -2401,6 +2465,16 @@ fn run_agent_job(
         stdout_path,
         stderr_path,
     })
+}
+
+fn blocked_recovery_made_no_progress(job: &AgentRunJob) -> bool {
+    if job.task_selection != AgentTaskSelection::RecoverBlocked {
+        return false;
+    }
+
+    let scan = scan_agent_project(&job.project.path);
+    scan.all_actionable_tasks_blocked()
+        && scan.blocked_task_count() >= job.blocked_task_count_before
 }
 
 fn release_agent_job_lease_for_shutdown(job: &AgentRunJob) -> Result<()> {
@@ -2444,6 +2518,7 @@ fn print_agent_run_failure_details(
 ) -> Result<()> {
     let summary_label = match status {
         "failure" | "timeout" => "run_failure_summary",
+        "blocked" => "run_blocked_summary",
         _ => return Ok(()),
     };
 
@@ -2713,8 +2788,14 @@ fn build_agent_codex_prompt(
             "\nTask workflow:\n- Use the $clt-task-management skill for the task-board workflow.\n",
         );
     }
-    if task_selection == AgentTaskSelection::ResumeDoing {
-        prompt.push_str(AGENT_RESUME_DOING_PROMPT_APPENDIX);
+    match task_selection {
+        AgentTaskSelection::NextTodo => {}
+        AgentTaskSelection::ResumeDoing => {
+            prompt.push_str(AGENT_RESUME_DOING_PROMPT_APPENDIX);
+        }
+        AgentTaskSelection::RecoverBlocked => {
+            prompt.push_str(AGENT_RECOVER_BLOCKED_PROMPT_APPENDIX);
+        }
     }
     match project.git_mode {
         AgentGitMode::Off => {}
@@ -2973,6 +3054,66 @@ enum AgentProcessWait {
     Interrupted(Option<ExitStatus>),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TaskBlockingState {
+    Blocked,
+    Unblocked,
+}
+
+fn task_entry_is_blocked(entry: &TaskEntry) -> bool {
+    let mut state = None;
+
+    for line in entry.content.lines() {
+        let heading = line.trim().trim_start_matches(['#', '-', '*', ' ']).trim();
+        if heading.eq_ignore_ascii_case("blocked note:") {
+            state = Some(TaskBlockingState::Blocked);
+        }
+        if let Some(line_state) = latest_task_blocking_state_on_line(line) {
+            state = Some(line_state);
+        }
+    }
+
+    state == Some(TaskBlockingState::Blocked)
+}
+
+fn latest_task_blocking_state_on_line(line: &str) -> Option<TaskBlockingState> {
+    let uppercase = line.to_ascii_uppercase();
+    let mut latest = None;
+
+    for (marker, state) in [
+        ("BLOCKED ", TaskBlockingState::Blocked),
+        ("UNBLOCKED ", TaskBlockingState::Unblocked),
+        ("COMPLETED ", TaskBlockingState::Unblocked),
+    ] {
+        for (index, matched) in uppercase.match_indices(marker) {
+            let has_word_boundary = uppercase[..index]
+                .chars()
+                .next_back()
+                .is_none_or(|ch| !ch.is_ascii_alphanumeric() && ch != '_');
+            let remainder = &uppercase.as_bytes()[index + matched.len()..];
+
+            if has_word_boundary
+                && starts_with_task_note_date(remainder)
+                && latest.is_none_or(|(latest_index, _)| index > latest_index)
+            {
+                latest = Some((index, state));
+            }
+        }
+    }
+
+    latest.map(|(_, state)| state)
+}
+
+fn starts_with_task_note_date(value: &[u8]) -> bool {
+    value.len() >= 11
+        && value[0..4].iter().all(u8::is_ascii_digit)
+        && value[4] == b'-'
+        && value[5..7].iter().all(u8::is_ascii_digit)
+        && value[7] == b'-'
+        && value[8..10].iter().all(u8::is_ascii_digit)
+        && value[10] == b':'
+}
+
 fn scan_agent_project(project_root: &Path) -> AgentProjectScan {
     if !project_root.exists() {
         return AgentProjectScan::missing();
@@ -2985,20 +3126,31 @@ fn scan_agent_project(project_root: &Path) -> AgentProjectScan {
     }
 
     let board_dir = get_tasks_dir(project_root);
-    let todo_count = match read_task_entries(&board_dir, "todo") {
-        Ok(entries) => entries.len(),
+    let todo_entries = match read_task_entries(&board_dir, "todo") {
+        Ok(entries) => entries,
         Err(err) => return AgentProjectScan::unavailable(err),
     };
-    let doing_count = match read_task_entries(&board_dir, "doing") {
-        Ok(entries) => entries.len(),
+    let doing_entries = match read_task_entries(&board_dir, "doing") {
+        Ok(entries) => entries,
         Err(err) => return AgentProjectScan::unavailable(err),
     };
+    let todo_count = todo_entries.len();
+    let blocked_todo_count = todo_entries
+        .iter()
+        .filter(|entry| task_entry_is_blocked(entry))
+        .count();
+    let doing_count = doing_entries.len();
+    let blocked_doing_count = doing_entries
+        .iter()
+        .filter(|entry| task_entry_is_blocked(entry))
+        .count();
 
-    if todo_count == 0 {
-        AgentProjectScan::empty_with_doing(doing_count)
-    } else {
-        AgentProjectScan::pending_with_doing(todo_count, doing_count)
-    }
+    AgentProjectScan::from_counts(
+        todo_count,
+        blocked_todo_count,
+        doing_count,
+        blocked_doing_count,
+    )
 }
 
 #[cfg(test)]
@@ -3009,35 +3161,52 @@ fn has_pending_agent_task(project_root: &Path) -> bool {
 impl AgentProjectScan {
     #[cfg(test)]
     fn pending(todo_count: usize) -> Self {
-        Self::pending_with_doing(todo_count, 0)
+        Self::from_counts(todo_count, 0, 0, 0)
     }
 
+    #[cfg(test)]
     fn pending_with_doing(todo_count: usize, doing_count: usize) -> Self {
+        Self::from_counts(todo_count, 0, doing_count, 0)
+    }
+
+    fn from_counts(
+        todo_count: usize,
+        blocked_todo_count: usize,
+        doing_count: usize,
+        blocked_doing_count: usize,
+    ) -> Self {
+        let available_todo_count = todo_count.saturating_sub(blocked_todo_count);
+        let task_count = todo_count.saturating_add(doing_count);
+        let blocked_task_count = blocked_todo_count.saturating_add(blocked_doing_count);
+        let status = if available_todo_count > 0 {
+            AgentProjectScanStatus::Pending
+        } else if task_count > 0 && blocked_task_count == task_count {
+            AgentProjectScanStatus::Blocked
+        } else {
+            AgentProjectScanStatus::Empty
+        };
+
         Self {
-            status: AgentProjectScanStatus::Pending,
+            status,
             todo_count,
+            blocked_todo_count,
             doing_count,
+            blocked_doing_count,
         }
     }
 
     #[cfg(test)]
     fn empty() -> Self {
-        Self::empty_with_doing(0)
-    }
-
-    fn empty_with_doing(doing_count: usize) -> Self {
-        Self {
-            status: AgentProjectScanStatus::Empty,
-            todo_count: 0,
-            doing_count,
-        }
+        Self::from_counts(0, 0, 0, 0)
     }
 
     fn missing() -> Self {
         Self {
             status: AgentProjectScanStatus::Missing,
             todo_count: 0,
+            blocked_todo_count: 0,
             doing_count: 0,
+            blocked_doing_count: 0,
         }
     }
 
@@ -3045,7 +3214,9 @@ impl AgentProjectScan {
         Self {
             status: AgentProjectScanStatus::Uninitialized,
             todo_count: 0,
+            blocked_todo_count: 0,
             doing_count: 0,
+            blocked_doing_count: 0,
         }
     }
 
@@ -3053,7 +3224,9 @@ impl AgentProjectScan {
         Self {
             status: AgentProjectScanStatus::Unavailable(err.to_string()),
             todo_count: 0,
+            blocked_todo_count: 0,
             doing_count: 0,
+            blocked_doing_count: 0,
         }
     }
 
@@ -3061,13 +3234,35 @@ impl AgentProjectScan {
         self.status == AgentProjectScanStatus::Pending
     }
 
+    fn all_actionable_tasks_blocked(&self) -> bool {
+        self.status == AgentProjectScanStatus::Blocked
+    }
+
+    fn available_todo_count(&self) -> usize {
+        self.todo_count.saturating_sub(self.blocked_todo_count)
+    }
+
+    fn blocked_task_count(&self) -> usize {
+        self.blocked_todo_count
+            .saturating_add(self.blocked_doing_count)
+    }
+
+    fn has_schedulable_work(&self) -> bool {
+        self.has_pending_task() || self.all_actionable_tasks_blocked()
+    }
+
     fn pending_signal(&self) -> &'static str {
-        if self.has_pending_task() { "yes" } else { "no" }
+        if self.has_schedulable_work() {
+            "yes"
+        } else {
+            "no"
+        }
     }
 
     fn status_label(&self) -> &str {
         match &self.status {
             AgentProjectScanStatus::Pending => "pending",
+            AgentProjectScanStatus::Blocked => "blocked",
             AgentProjectScanStatus::Empty => "empty",
             AgentProjectScanStatus::Missing => "missing",
             AgentProjectScanStatus::Uninitialized => "uninitialized",
@@ -3367,6 +3562,31 @@ fn agent_project_cooldown_reason(
         .map(|remaining| format!("success cooldown active for {remaining}s"))
 }
 
+fn agent_task_cooldown_reason(
+    project: &agent_store::AgentProject,
+    task_selection: AgentTaskSelection,
+    now: u64,
+    success_cooldown: Duration,
+    failure_backoff: Duration,
+) -> Option<String> {
+    if task_selection == AgentTaskSelection::ResumeDoing {
+        return None;
+    }
+
+    agent_project_cooldown_reason(project, now, success_cooldown, failure_backoff).or_else(|| {
+        (task_selection == AgentTaskSelection::RecoverBlocked)
+            .then(|| {
+                remaining_agent_delay(
+                    project.last_blocked_recovery_at.as_deref(),
+                    now,
+                    failure_backoff,
+                )
+            })
+            .flatten()
+            .map(|remaining| format!("blocked-task recovery backoff active for {remaining}s"))
+    })
+}
+
 fn remaining_agent_delay(last_at: Option<&str>, now: u64, delay: Duration) -> Option<u64> {
     let last_at = last_at?.parse::<u64>().ok()?;
     let ready_at = last_at.saturating_add(delay.as_secs());
@@ -3611,6 +3831,10 @@ mod agent_store {
                 "UPDATE projects SET git_mode = 'commit' WHERE git_commit_enabled != 0",
             ],
         },
+        AgentMigration {
+            version: 6,
+            statements: &["ALTER TABLE projects ADD COLUMN last_blocked_recovery_at TEXT"],
+        },
     ];
 
     pub(crate) struct TursoAgentStore {
@@ -3633,6 +3857,7 @@ mod agent_store {
         pub(crate) last_run_at: Option<String>,
         pub(crate) last_success_at: Option<String>,
         pub(crate) last_failure_at: Option<String>,
+        pub(crate) last_blocked_recovery_at: Option<String>,
         pub(crate) failure_count: i64,
     }
 
@@ -3790,7 +4015,8 @@ mod agent_store {
                 .query(
                     "SELECT id, path, name, enabled, git_mode, codex_model,
                             codex_reasoning_effort, codex_fast_enabled, last_scan_at, last_run_at,
-                            last_success_at, last_failure_at, failure_count
+                            last_success_at, last_failure_at, last_blocked_recovery_at,
+                            failure_count
                      FROM projects
                      ORDER BY name COLLATE NOCASE, path COLLATE NOCASE",
                     (),
@@ -3816,7 +4042,9 @@ mod agent_store {
                 let last_run_at = row_optional_text(&row, 9, "last_run_at")?;
                 let last_success_at = row_optional_text(&row, 10, "last_success_at")?;
                 let last_failure_at = row_optional_text(&row, 11, "last_failure_at")?;
-                let failure_count = row_integer(&row, 12, "failure_count")?;
+                let last_blocked_recovery_at =
+                    row_optional_text(&row, 12, "last_blocked_recovery_at")?;
+                let failure_count = row_integer(&row, 13, "failure_count")?;
 
                 projects.push(AgentProject {
                     id,
@@ -3831,6 +4059,7 @@ mod agent_store {
                     last_run_at,
                     last_success_at,
                     last_failure_at,
+                    last_blocked_recovery_at,
                     failure_count,
                 });
             }
@@ -4239,8 +4468,11 @@ mod agent_store {
                     "UPDATE projects
                      SET failure_count = 0,
                          last_failure_at = NULL,
+                         last_blocked_recovery_at = NULL,
                          updated_at = ?1
-                     WHERE failure_count <> 0 OR last_failure_at IS NOT NULL",
+                     WHERE failure_count <> 0
+                        OR last_failure_at IS NOT NULL
+                        OR last_blocked_recovery_at IS NOT NULL",
                     [cleaned_at],
                 )
                 .await
@@ -4489,6 +4721,7 @@ mod agent_store {
                      SET last_run_at = ?1,
                          last_success_at = ?1,
                          last_failure_at = NULL,
+                         last_blocked_recovery_at = NULL,
                          failure_count = 0,
                          updated_at = ?1
                      WHERE id = ?2",
@@ -4498,6 +4731,23 @@ mod agent_store {
                 .with_context(|| {
                     format!(
                         "Failed to update project {} after successful run",
+                        outcome.project_id
+                    )
+                })?;
+            }
+            "blocked" => {
+                conn.execute(
+                    "UPDATE projects
+                     SET last_run_at = ?1,
+                         last_blocked_recovery_at = ?1,
+                         updated_at = ?1
+                     WHERE id = ?2",
+                    params![finished_at, outcome.project_id],
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to update project {} after blocked-task recovery",
                         outcome.project_id
                     )
                 })?;
@@ -10067,6 +10317,7 @@ mod tests {
                 last_run_at: None,
                 last_success_at: None,
                 last_failure_at: None,
+                last_blocked_recovery_at: None,
                 failure_count: 0,
             },
             scan: AgentProjectScan::empty(),
@@ -11167,6 +11418,7 @@ mod tests {
             last_run_at: Some("last-run".to_string()),
             last_success_at: Some("last-success".to_string()),
             last_failure_at: None,
+            last_blocked_recovery_at: None,
             failure_count: 3,
         };
         let scan = AgentProjectScan::pending(2);
@@ -11175,11 +11427,12 @@ mod tests {
 
         let expected = [
             "7. demo-project [enabled]",
-            "   queue     pending: yes todo: 2   doing: 0   scan: pending",
+            "   queue     pending: yes todo: 2   todo-ready: 2   todo-blocked: 0   doing: 0   doing-blocked: 0   scan: pending",
             "   activity  last scan: last-scan",
             "             last run:  last-run",
             "             success:   last-success",
             "             failure:   -",
+            "             blocked:   -",
             "   settings  git: off",
             "             model: default  reasoning: default  fast: disabled",
             "   health    failures: 3",
@@ -11306,6 +11559,7 @@ mod tests {
             last_run_at: None,
             last_success_at: Some("100".to_string()),
             last_failure_at: None,
+            last_blocked_recovery_at: None,
             failure_count: 0,
         };
 
@@ -11330,6 +11584,57 @@ mod tests {
                 Duration::from_secs(300)
             ),
             Some("failure backoff active for 150s".to_string())
+        );
+    }
+
+    #[test]
+    fn blocked_task_recovery_uses_failure_backoff_without_delaying_todo_work() {
+        let project = agent_store::AgentProject {
+            id: 1,
+            path: PathBuf::from("/tmp/project"),
+            name: "project".to_string(),
+            enabled: true,
+            git_mode: AgentGitMode::Off,
+            codex_model: None,
+            codex_reasoning_effort: None,
+            codex_fast_enabled: false,
+            last_scan_at: None,
+            last_run_at: Some("100".to_string()),
+            last_success_at: None,
+            last_failure_at: None,
+            last_blocked_recovery_at: Some("100".to_string()),
+            failure_count: 0,
+        };
+
+        assert_eq!(
+            agent_task_cooldown_reason(
+                &project,
+                AgentTaskSelection::RecoverBlocked,
+                250,
+                Duration::from_secs(5),
+                Duration::from_secs(300),
+            ),
+            Some("blocked-task recovery backoff active for 150s".to_string())
+        );
+        assert_eq!(
+            agent_task_cooldown_reason(
+                &project,
+                AgentTaskSelection::NextTodo,
+                250,
+                Duration::from_secs(5),
+                Duration::from_secs(300),
+            ),
+            None
+        );
+        assert_eq!(
+            agent_task_cooldown_reason(
+                &project,
+                AgentTaskSelection::ResumeDoing,
+                101,
+                Duration::from_secs(5),
+                Duration::from_secs(300),
+            ),
+            None
         );
     }
 
@@ -11893,6 +12198,104 @@ mod tests {
         assert_eq!(scan.todo_count, 1);
         assert_eq!(scan.doing_count, 0);
         assert!(has_pending_agent_task(&root));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_scan_only_reports_blocked_when_every_doing_task_has_a_blocked_note() {
+        let root = temp_root("agent-scan-blocked-markdown");
+        init_tasks(&root, false).unwrap();
+        fs::write(
+            root.join("tasks/doing.md"),
+            "# Doing Tasks\n- first task — BLOCKED 2026-08-09: waiting on a fixture\n- second task\n",
+        )
+        .unwrap();
+
+        let partially_blocked = scan_agent_project(&root);
+
+        assert_eq!(partially_blocked.status, AgentProjectScanStatus::Empty);
+        assert_eq!(partially_blocked.doing_count, 2);
+        assert_eq!(partially_blocked.blocked_doing_count, 1);
+        assert!(!partially_blocked.all_actionable_tasks_blocked());
+
+        fs::write(
+            root.join("tasks/doing.md"),
+            "# Doing Tasks\n- first task — BLOCKED 2026-08-09: waiting on a fixture\n- second task — blocked 2026-08-09: same fixture\n",
+        )
+        .unwrap();
+
+        let all_blocked = scan_agent_project(&root);
+
+        assert_eq!(all_blocked.status, AgentProjectScanStatus::Blocked);
+        assert_eq!(all_blocked.blocked_doing_count, 2);
+        assert!(all_blocked.all_actionable_tasks_blocked());
+        assert!(all_blocked.has_schedulable_work());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_scan_skips_blocked_todos_until_a_newer_note_unblocks_them() {
+        let root = temp_root("agent-scan-blocked-todo");
+        init_tasks(&root, false).unwrap();
+        fs::write(
+            root.join("tasks/todo.md"),
+            "# Todo Tasks\n- first — BLOCKED 2026-08-09: dependency unavailable\n- second — BLOCKED 2026-08-09: fixture unavailable\n",
+        )
+        .unwrap();
+
+        let all_blocked = scan_agent_project(&root);
+
+        assert_eq!(all_blocked.status, AgentProjectScanStatus::Blocked);
+        assert_eq!(all_blocked.todo_count, 2);
+        assert_eq!(all_blocked.blocked_todo_count, 2);
+        assert_eq!(all_blocked.available_todo_count(), 0);
+        assert!(!all_blocked.has_pending_task());
+        assert!(all_blocked.all_actionable_tasks_blocked());
+
+        fs::write(
+            root.join("tasks/todo.md"),
+            "# Todo Tasks\n- first — BLOCKED 2026-08-09: dependency unavailable — UNBLOCKED 2026-08-09: dependency restored\n- second — BLOCKED 2026-08-09: fixture unavailable\n",
+        )
+        .unwrap();
+
+        let one_available = scan_agent_project(&root);
+
+        assert_eq!(one_available.status, AgentProjectScanStatus::Pending);
+        assert_eq!(one_available.todo_count, 2);
+        assert_eq!(one_available.blocked_todo_count, 1);
+        assert_eq!(one_available.available_todo_count(), 1);
+        assert!(one_available.has_pending_task());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_scan_detects_folder_task_blocked_note_headings_without_matching_titles() {
+        let root = temp_root("agent-scan-blocked-folder");
+        init_tasks(&root, true).unwrap();
+        fs::write(
+            root.join("tasks/doing/0001-waiting.md"),
+            "Waiting task.\n\nBlocked note:\n- BLOCKED 2026-08-09: dependency unavailable.\n",
+        )
+        .unwrap();
+
+        let blocked = scan_agent_project(&root);
+
+        assert_eq!(blocked.status, AgentProjectScanStatus::Blocked);
+        assert_eq!(blocked.blocked_doing_count, 1);
+
+        fs::write(
+            root.join("tasks/doing/0001-waiting.md"),
+            "Add blocked-task monitoring without a blocker note.\n",
+        )
+        .unwrap();
+
+        let title_only = scan_agent_project(&root);
+
+        assert_eq!(title_only.status, AgentProjectScanStatus::Empty);
+        assert_eq!(title_only.blocked_doing_count, 0);
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -12588,6 +12991,128 @@ mod tests {
     }
 
     #[test]
+    fn agent_scheduler_monitors_when_all_todo_and_doing_tasks_are_blocked() {
+        let root = temp_root("agent-recover-blocked");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        fs::write(
+            project_root.join("tasks/todo.md"),
+            "# Todo Tasks\n- queued — BLOCKED 2026-08-09: credentials unavailable\n",
+        )
+        .unwrap();
+        fs::write(
+            project_root.join("tasks/doing.md"),
+            "# Doing Tasks\n- first — BLOCKED 2026-08-09: dependency unavailable\n- second — BLOCKED 2026-08-09: tests cannot start\n",
+        )
+        .unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        drop(store);
+
+        let mut start = run_agent_scheduler_pass(&state_dir, false, &[]).unwrap();
+
+        assert_eq!(start.pass.pending_projects, 1);
+        assert_eq!(start.pass.runs_started, 1);
+        assert_eq!(start.jobs.len(), 1);
+        assert_eq!(
+            start.jobs[0].task_selection,
+            AgentTaskSelection::RecoverBlocked
+        );
+        assert_eq!(start.jobs[0].blocked_task_count_before, 3);
+
+        let runner = FakeAgentRunner::new(&state_dir, "success");
+        let shutdown = new_agent_shutdown_signal();
+        let completion = run_agent_job(start.jobs.pop().unwrap(), &runner, &shutdown).unwrap();
+
+        assert_eq!(completion.status, "blocked");
+        assert!(
+            completion
+                .summary
+                .contains("left all 3 task(s) blocked across todo and doing")
+        );
+
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert!(project.last_blocked_recovery_at.is_some());
+        assert_eq!(project.failure_count, 0);
+        drop(store);
+
+        let backed_off = run_agent_scheduler_pass(&state_dir, false, &[]).unwrap();
+        assert!(backed_off.jobs.is_empty());
+        assert_eq!(backed_off.pass.runs_started, 0);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_scheduler_prefers_todo_work_over_blocked_task_monitoring() {
+        let root = temp_root("agent-blocked-prefers-todo");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        fs::write(
+            project_root.join("tasks/todo.md"),
+            "# Todo Tasks\n- queued blocker — BLOCKED 2026-08-09: dependency unavailable\n- ready task\n",
+        )
+        .unwrap();
+        fs::write(
+            project_root.join("tasks/doing.md"),
+            "# Doing Tasks\n- waiting task — BLOCKED 2026-08-09: dependency unavailable\n",
+        )
+        .unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        drop(store);
+
+        let start = run_agent_scheduler_pass(&state_dir, false, &[]).unwrap();
+
+        assert_eq!(start.jobs.len(), 1);
+        assert_eq!(start.jobs[0].task_selection, AgentTaskSelection::NextTodo);
+        assert_eq!(start.jobs[0].blocked_task_count_before, 2);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_scheduler_leaves_unblocked_doing_work_for_its_owner() {
+        let root = temp_root("agent-unblocked-doing");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        fs::write(
+            project_root.join("tasks/todo.md"),
+            "# Todo Tasks\n- queued blocker — BLOCKED 2026-08-09: dependency unavailable\n",
+        )
+        .unwrap();
+        fs::write(
+            project_root.join("tasks/doing.md"),
+            "# Doing Tasks\n- manually active task\n",
+        )
+        .unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        drop(store);
+
+        let start = run_agent_scheduler_pass(&state_dir, false, &[]).unwrap();
+
+        assert!(start.jobs.is_empty());
+        assert_eq!(start.pass.pending_projects, 0);
+        assert_eq!(start.pass.runs_started, 0);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn agent_store_recovers_stale_leases() {
         let root = temp_root("agent-run-stale-lease");
         let state_dir = root.join("state/clt");
@@ -12780,6 +13305,19 @@ mod tests {
         store
             .record_run_outcome_blocking(agent_store::AgentRunOutcome {
                 project_id: project.id,
+                status: "blocked",
+                started_at: "150",
+                finished_at: Some("151"),
+                exit_code: Some(0),
+                log_dir: None,
+                stdout_path: None,
+                stderr_path: None,
+                summary: Some("still blocked"),
+            })
+            .unwrap();
+        store
+            .record_run_outcome_blocking(agent_store::AgentRunOutcome {
+                project_id: project.id,
                 status: "success",
                 started_at: "200",
                 finished_at: Some("201"),
@@ -12794,6 +13332,7 @@ mod tests {
         let project = store.list_projects_blocking().unwrap().remove(0);
         assert_eq!(project.failure_count, 0);
         assert_eq!(project.last_failure_at, None);
+        assert_eq!(project.last_blocked_recovery_at, None);
         assert_eq!(project.last_success_at.as_deref(), Some("201"));
 
         fs::remove_dir_all(root).unwrap();
@@ -12826,6 +13365,19 @@ mod tests {
             })
             .unwrap();
         store
+            .record_run_outcome_blocking(agent_store::AgentRunOutcome {
+                project_id: project.id,
+                status: "blocked",
+                started_at: "102",
+                finished_at: Some("103"),
+                exit_code: Some(0),
+                log_dir: Some("/tmp/logs"),
+                stdout_path: Some("/tmp/logs/run.out"),
+                stderr_path: Some("/tmp/logs/run.err"),
+                summary: Some("still blocked"),
+            })
+            .unwrap();
+        store
             .record_daemon_checkin_blocking("stale-daemon", "service", "90", "95", "99")
             .unwrap();
         fs::create_dir_all(state_dir.join("runs/project/run-1")).unwrap();
@@ -12838,6 +13390,7 @@ mod tests {
         let project = store.list_projects_blocking().unwrap().remove(0);
         assert_eq!(project.failure_count, 0);
         assert_eq!(project.last_failure_at, None);
+        assert_eq!(project.last_blocked_recovery_at, None);
         assert_eq!(store.run_count_blocking().unwrap(), 0);
         assert!(store.list_daemon_checkins_blocking().unwrap().is_empty());
         assert_eq!(fs::read_dir(state_dir.join("runs")).unwrap().count(), 0);
@@ -12876,6 +13429,7 @@ mod tests {
             last_run_at: None,
             last_success_at: None,
             last_failure_at: None,
+            last_blocked_recovery_at: None,
             failure_count: 0,
         };
 
@@ -12883,6 +13437,8 @@ mod tests {
             build_agent_codex_prompt(&project, AgentTaskSelection::NextTodo, true, true);
         assert!(base_prompt.contains("Use the existing task-management CLI tooling: clt."));
         assert!(base_prompt.contains("Use the $clt-task-management skill"));
+        assert!(base_prompt.contains("Pick the next available unblocked TODO"));
+        assert!(base_prompt.contains("skip tasks whose latest dated state note is `BLOCKED"));
         assert!(!base_prompt.contains("Embedded skill fallback:"));
         assert!(!base_prompt.contains("Interrupted task recovery:"));
         assert!(!base_prompt.contains("$git-commit"));
@@ -12911,6 +13467,17 @@ mod tests {
         assert!(recovery_prompt.contains("Interrupted task recovery:"));
         assert!(recovery_prompt.contains("Resume and finish exactly one existing doing task."));
         assert!(recovery_prompt.contains("Do not pick or move a TODO task"));
+
+        let blocked_prompt =
+            build_agent_codex_prompt(&project, AgentTaskSelection::RecoverBlocked, true, true);
+        assert!(blocked_prompt.contains("Blocked-task monitor:"));
+        assert!(blocked_prompt.contains("every task across todo and doing is currently blocked"));
+        assert!(blocked_prompt.contains("Todo does not have to be empty"));
+        assert!(blocked_prompt.contains("blocked task from todo or doing"));
+        assert!(blocked_prompt.contains("Update the existing task; do not create a replacement"));
+        assert!(blocked_prompt.contains("`UNBLOCKED YYYY-MM-DD:` note"));
+        assert!(blocked_prompt.contains("Stop after handling that one blocked task"));
+        assert!(!blocked_prompt.contains("Interrupted task recovery:"));
     }
 
     #[test]
@@ -12928,6 +13495,7 @@ mod tests {
             last_run_at: None,
             last_success_at: None,
             last_failure_at: None,
+            last_blocked_recovery_at: None,
             failure_count: 0,
         };
 
@@ -13055,6 +13623,7 @@ mod tests {
             last_run_at: None,
             last_success_at: None,
             last_failure_at: None,
+            last_blocked_recovery_at: None,
             failure_count: 0,
         };
         let runner =
@@ -13115,6 +13684,7 @@ mod tests {
             last_run_at: None,
             last_success_at: None,
             last_failure_at: None,
+            last_blocked_recovery_at: None,
             failure_count: 0,
         };
         let runner =

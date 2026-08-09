@@ -57,9 +57,10 @@ Registered projects must store:
 
 Agent scheduling must:
 *   Run at most one Codex task per project at a time.
-*   Skip paused projects, projects without pending `todo` work, and projects with active leases.
+*   Skip paused projects, projects without unblocked `todo` work or an all-blocked recovery state, and projects with active leases.
 *   Ignore `backlog` tasks until a user promotes them to `todo`.
 *   Prompt Codex to inspect the task board, move one task to `doing`, complete it, run relevant checks, update the task, mark it done when completed, and stop after one task.
+*   Skip currently blocked `todo` tasks during normal selection. When every task across `todo` and `doing` is blocked, run a one-task blocked-work recovery pass even if `todo` is not empty. Leave unmarked `doing` work alone and back off unchanged recovery attempts.
 *   Append the `$git-commit` skill instruction only when `git_commit_enabled` is true for that project.
 
 The agent CLI must expose:

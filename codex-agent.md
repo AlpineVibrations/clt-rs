@@ -245,6 +245,10 @@ The scheduler should:
 - Skip projects with an active non-expired lease.
 - Skip projects in failure backoff.
 - Prefer projects with pending `todo` tasks.
+- Skip blocked `todo` entries while any unblocked Todo work remains.
+- When every task across `todo` and `doing` is currently blocked, revisit one blocked task from either status and either finish it, requeue the same task with a newer `UNBLOCKED YYYY-MM-DD:` note after resolving its blocker, or refresh its blocked note.
+- Back off a blocked-task recovery that leaves the board unchanged so the monitor does not create a tight Codex retry loop.
+- Do not treat unmarked `doing` tasks as abandoned work without a stale or expired agent lease.
 - Ignore backlog-only projects until a task is promoted to `todo`.
 - Treat `NO_TASKS_LEFT` as a clean idle result.
 - Stop or mark failure on timeout.

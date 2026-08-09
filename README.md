@@ -106,7 +106,7 @@ Press `l` from the Kanban board to open the active project's live agent output, 
 Each registered project also has persisted Codex launch settings in the `CODEX` column. Enabled overrides are shown compactly as `model/thinking/fast`; settings that inherit the user's configuration are omitted, and `default` is shown when every setting is inherited. Press `f` to toggle Fast mode, `m` to cycle through the default and supported model choices, and `t` to cycle through the default, low, medium, high, extra-high, max, and ultra reasoning levels. These settings are applied to future automated runs; they do not change an agent process that is already running.
 
 ### Codex Agent
-`clt agent` can run Codex against enabled registered projects that have pending `todo` tasks. It can also recover a task left in `doing` when a previous agent lease belongs to a crashed process or has expired. Backlog tasks are deliberately ignored until they are promoted to Todo. Each project keeps its own repo-local `tasks/` board, while the agent stores cross-project runtime state in one central state directory.
+`clt agent` can run Codex against enabled registered projects that have unblocked `todo` tasks. It can also recover a task left in `doing` when a previous agent lease belongs to a crashed process or has expired. When every task across Todo and Doing is currently blocked, the scheduler starts a blocked-task monitor run even if Todo is not empty. Backlog tasks are deliberately ignored until they are promoted to Todo. Each project keeps its own repo-local `tasks/` board, while the agent stores cross-project runtime state in one central state directory.
 
 Before registering a project, initialize its task board and make sure the `codex` CLI is installed and authenticated. With no path, `register` uses the same project root that normal `clt` commands use:
 ```bash
@@ -181,7 +181,9 @@ Run one foreground scheduler pass:
 clt agent run --once
 ```
 
-The scheduler scans enabled projects, picks projects with pending `todo` tasks, takes an agent lease, and starts one Codex run at a time. Each Codex run is prompted to inspect the board, move one available task to `doing`, complete it, run relevant checks, update the task through `clt`, and stop after that single task. If a crashed run left a stale lease and a task in `doing`, the scheduler reclaims the lease and prompts the replacement run to resume that task before starting new work.
+The scheduler scans enabled projects, picks projects with pending unblocked `todo` tasks, takes an agent lease, and starts one Codex run at a time. Each normal Codex run is prompted to inspect the board, move one available task to `doing`, complete it, run relevant checks, update the task through `clt`, and stop after that single task. If a crashed run left a stale lease and a task in `doing`, the scheduler reclaims the lease and prompts the replacement run to resume that task before starting new work.
+
+Unblocked Todo work takes priority over blocked-task recovery, while blocked Todo entries are skipped during normal selection. When all tasks across Todo and Doing are blocked, a monitor run reviews the blocker notes and works on exactly one existing task from either status. It can complete that task, add a newer `UNBLOCKED YYYY-MM-DD:` note and return it to Todo after resolving its blocker, or update its blocked note with the latest attempt. The latest dated `BLOCKED`, `UNBLOCKED`, or `COMPLETED` state note determines whether a task is currently blocked. Successful recovery lets the ordinary scheduler carry on; if the board is unchanged, the run is recorded as `blocked` and another monitor attempt waits for `CLT_AGENT_FAILURE_BACKOFF_SECONDS` instead of creating a tight retry loop. Unmarked Doing tasks are left alone because they may belong to a human or another workflow.
 
 Automated runs start Codex with `--sandbox danger-full-access --ask-for-approval never` so tasks can update Git metadata without pausing for interactive approval. This removes the Codex command sandbox for the entire run. Register only trusted repositories, or run the agent inside an externally isolated container or VM.
 
@@ -212,7 +214,7 @@ clt agent resume .
 clt agent unregister .
 ```
 
-`clt agent clean` resets stored failure state, deletes recorded run history, removes agent run logs, and truncates background service logs. It keeps registered projects and task boards intact, and refuses to run while active Codex leases exist.
+`clt agent clean` resets stored failure and blocked-recovery state, deletes recorded run history, removes agent run logs, and truncates background service logs. It keeps registered projects and task boards intact, and refuses to run while active Codex leases exist.
 
 By default, agent state is stored at `~/Library/Application Support/clt` on macOS, `$XDG_STATE_HOME/clt` on Linux when `XDG_STATE_HOME` is set, or `~/.local/state/clt` otherwise. The state directory contains `agent.db`, scheduler run logs, and background service logs such as `agent-service.out` and `agent-service.err`. Override it with:
 ```bash
@@ -225,7 +227,7 @@ Useful runtime tuning variables are:
 - `CLT_AGENT_POLL_INTERVAL_SECONDS`: daemon delay between scheduler passes, default `15`.
 - `CLT_AGENT_RUN_TIMEOUT_SECONDS`: Codex process timeout, default `2700`.
 - `CLT_AGENT_LEASE_TIMEOUT_SECONDS`: active lease expiry, default `3600`.
-- `CLT_AGENT_FAILURE_BACKOFF_SECONDS`: delay after a failed project run, default `300`.
+- `CLT_AGENT_FAILURE_BACKOFF_SECONDS`: delay after a failed project run or an unchanged blocked-task recovery, default `300`.
 - `CLT_AGENT_SUCCESS_COOLDOWN_SECONDS`: delay after a successful project run, default `5`.
 - `CLT_AGENT_CODEX_PATH`: optional Codex executable override. By default, `clt agent start` verifies that `codex` works and the background service resolves `codex` from the stored `PATH` instead of pinning the executable's absolute location.
 - `CLT_AGENT_HEARTBEAT_TAIL`: print a short stderr tail on still-running heartbeats when set to `1`, `true`, `yes`, or `on`; default `false`.

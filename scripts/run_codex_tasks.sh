@@ -65,7 +65,7 @@ Use the existing task-management CLI tooling: clt.
 Your job for this run:
 
 1. Inspect the task board using the task CLI.
-2. Pick the next available TODO / ready task.
+2. Pick the next available unblocked TODO / ready task.
 3. If there are no available tasks, say exactly: NO_TASKS_LEFT
 4. If there is a task:
    - move it to doing
@@ -81,7 +81,9 @@ Your job for this run:
 Safety rules:
 - Do not overwrite unrelated user changes.
 - Before making edits, inspect the current repo state.
-- If the task is blocked or cannot be completed safely, update the task with a concise blocked note instead of forcing it.
+- During normal TODO selection, skip tasks whose latest dated state note is `BLOCKED YYYY-MM-DD:`.
+- Inspect task details when needed; a folder-backed task's list summary may not show its blocker notes.
+- If the task is blocked or cannot be completed safely, update it with a concise `BLOCKED YYYY-MM-DD:` note instead of forcing it.
 EOF
 )
 
