@@ -10,6 +10,7 @@ Use this section while developing the next release.
 
 ### Added
 
+- Added a Done-task shortcut to resume that task's automated Codex run interactively, returning to the same board after Codex exits.
 - Added blocked-task monitoring: blocked Todo entries are skipped during normal selection, and when every task across Todo and Doing is blocked, the agent revisits one existing blocker at a time and backs off unchanged recovery attempts.
 - Added the current local time to the agent projects pane's top border before the daemon status.
 - Added `clt shell-init bash|zsh` integration so quitting after opening a registered project can change the calling shell to that project's directory.

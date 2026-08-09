@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use ratatui::layout::{Alignment, Position, Rect};
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io::{self, Write, stdout};
+use std::io::{self, BufRead, BufReader, Write, stdout};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{
@@ -366,6 +366,7 @@ struct AgentRunResult {
     stdout_path: PathBuf,
     stderr_path: PathBuf,
     summary: String,
+    codex_session_id: Option<String>,
 }
 
 struct AgentRunJob {
@@ -374,6 +375,7 @@ struct AgentRunJob {
     holder: String,
     task_selection: AgentTaskSelection,
     blocked_task_count_before: usize,
+    done_task_contents_before: Vec<String>,
 }
 
 struct AgentRunCompletion {
@@ -1494,6 +1496,37 @@ fn agent_codex_command() -> PathBuf {
     agent_codex_path_env().unwrap_or_else(|| PathBuf::from("codex"))
 }
 
+fn configure_interactive_codex_resume_command(
+    command: &mut Command,
+    project_root: &Path,
+    session_id: &str,
+) {
+    command
+        .arg("resume")
+        .arg("--include-non-interactive")
+        .arg("--sandbox")
+        .arg("workspace-write")
+        .arg("--ask-for-approval")
+        .arg("on-request")
+        .arg("-C")
+        .arg(project_root)
+        .arg(session_id)
+        .current_dir(project_root);
+}
+
+fn resume_codex_session_interactively(project_root: &Path, session_id: &str) -> Result<ExitStatus> {
+    let codex_command = agent_codex_command();
+    let mut command = Command::new(&codex_command);
+    configure_interactive_codex_resume_command(&mut command, project_root, session_id);
+    command.status().with_context(|| {
+        format!(
+            "Failed to resume Codex session {session_id} with {} in {}",
+            codex_command.display(),
+            project_root.display()
+        )
+    })
+}
+
 fn agent_codex_path_env() -> Option<PathBuf> {
     std::env::var_os(AGENT_CODEX_PATH_ENV)
         .filter(|value| !os_value_is_blank(value.as_os_str()))
@@ -2365,6 +2398,7 @@ fn run_agent_scheduler_pass_with_max_global_jobs(
             project.path.display()
         );
 
+        let done_task_contents_before = completed_task_contents(&project.path).unwrap_or_default();
         pass.runs_started += 1;
         jobs.push(AgentRunJob {
             state_dir: state_dir.to_path_buf(),
@@ -2372,6 +2406,7 @@ fn run_agent_scheduler_pass_with_max_global_jobs(
             holder: holder.clone(),
             task_selection,
             blocked_task_count_before: scan.blocked_task_count(),
+            done_task_contents_before,
         });
     }
 
@@ -2406,7 +2441,16 @@ fn run_agent_job(
     let run_result = runner.run_project(&job.project, job.task_selection, shutdown);
     let finished_at = agent_timestamp();
 
-    let (status, exit_code, log_dir, stdout_path, stderr_path, summary) = match run_result {
+    let (
+        status,
+        exit_code,
+        log_dir,
+        stdout_path,
+        stderr_path,
+        summary,
+        codex_session_id,
+        completed_task_content,
+    ) = match run_result {
         Ok(mut result) => {
             if matches!(result.status, "success" | "idle")
                 && blocked_recovery_made_no_progress(&job)
@@ -2418,6 +2462,13 @@ fn run_agent_job(
                 );
             }
 
+            let completed_task_content = result.codex_session_id.as_ref().and_then(|_| {
+                newly_completed_task(&job.project.path, &job.done_task_contents_before)
+                    .ok()
+                    .flatten()
+                    .map(|entry| entry.content.trim_end().to_string())
+            });
+
             (
                 result.status,
                 result.exit_code,
@@ -2425,6 +2476,8 @@ fn run_agent_job(
                 Some(result.stdout_path.display().to_string()),
                 Some(result.stderr_path.display().to_string()),
                 result.summary,
+                result.codex_session_id,
+                completed_task_content,
             )
         }
         Err(err) => (
@@ -2434,6 +2487,8 @@ fn run_agent_job(
             None,
             None,
             format!("Codex runner failed before completion: {err:#}"),
+            None,
+            None,
         ),
     };
 
@@ -2452,6 +2507,8 @@ fn run_agent_job(
             stdout_path: stdout_path.as_deref(),
             stderr_path: stderr_path.as_deref(),
             summary: Some(&summary),
+            codex_session_id: codex_session_id.as_deref(),
+            task_content: completed_task_content.as_deref(),
         })
     })?;
     release_result?;
@@ -2464,6 +2521,61 @@ fn run_agent_job(
         summary,
         stdout_path,
         stderr_path,
+    })
+}
+
+fn completed_task_contents(project_root: &Path) -> Result<Vec<String>> {
+    Ok(read_task_entries(&get_tasks_dir(project_root), "done")?
+        .into_iter()
+        .map(|entry| entry.content)
+        .collect())
+}
+
+fn newly_completed_task(
+    project_root: &Path,
+    contents_before: &[String],
+) -> Result<Option<TaskEntry>> {
+    let entries_after = read_task_entries(&get_tasks_dir(project_root), "done")?;
+    Ok(newly_added_task_entry(contents_before, &entries_after).cloned())
+}
+
+fn newly_added_task_entry<'a>(
+    contents_before: &[String],
+    entries_after: &'a [TaskEntry],
+) -> Option<&'a TaskEntry> {
+    if entries_after.len() <= contents_before.len() {
+        return None;
+    }
+
+    if entries_after.len() == contents_before.len() + 1 {
+        for skipped in 0..entries_after.len() {
+            let matches_before = entries_after
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != skipped)
+                .map(|(_, entry)| entry.content.as_str())
+                .eq(contents_before.iter().map(String::as_str));
+            if matches_before {
+                return entries_after.get(skipped);
+            }
+        }
+    }
+
+    let mut remaining = std::collections::HashMap::<&str, usize>::new();
+    for content in contents_before {
+        *remaining.entry(content.as_str()).or_default() += 1;
+    }
+
+    entries_after.iter().find(|entry| {
+        let Some(count) = remaining.get_mut(entry.content.as_str()) else {
+            return true;
+        };
+        if *count == 0 {
+            true
+        } else {
+            *count -= 1;
+            false
+        }
     })
 }
 
@@ -2968,6 +3080,7 @@ impl AgentRunner for CodexAgentRunner {
                     stdout_path,
                     stderr_path,
                     summary,
+                    codex_session_id: None,
                 });
             }
         };
@@ -2989,10 +3102,11 @@ impl AgentRunner for CodexAgentRunner {
             },
             || shutdown.load(Ordering::SeqCst),
         )?;
+        let stdout = fs::read_to_string(&stdout_path).unwrap_or_default();
+        let codex_session_id = agent_codex_session_id_from_log(&stderr_path)?;
         let (status, exit_code, summary) = match wait_result {
             AgentProcessWait::Exited(exit_status) => {
                 let exit_code = exit_status.code().map(i64::from);
-                let stdout = fs::read_to_string(&stdout_path).unwrap_or_default();
                 if stdout.contains(AGENT_NO_TASKS_LEFT_MARKER) {
                     (
                         "idle",
@@ -3044,6 +3158,7 @@ impl AgentRunner for CodexAgentRunner {
             stdout_path,
             stderr_path,
             summary,
+            codex_session_id,
         })
     }
 }
@@ -3835,6 +3950,13 @@ mod agent_store {
             version: 6,
             statements: &["ALTER TABLE projects ADD COLUMN last_blocked_recovery_at TEXT"],
         },
+        AgentMigration {
+            version: 7,
+            statements: &[
+                "ALTER TABLE runs ADD COLUMN codex_session_id TEXT",
+                "ALTER TABLE runs ADD COLUMN task_content TEXT",
+            ],
+        },
     ];
 
     pub(crate) struct TursoAgentStore {
@@ -3871,6 +3993,8 @@ mod agent_store {
         pub(crate) stdout_path: Option<&'a str>,
         pub(crate) stderr_path: Option<&'a str>,
         pub(crate) summary: Option<&'a str>,
+        pub(crate) codex_session_id: Option<&'a str>,
+        pub(crate) task_content: Option<&'a str>,
     }
 
     pub(crate) struct AgentLeaseRecord {
@@ -4241,9 +4365,10 @@ mod agent_store {
             conn.execute(
                 "INSERT INTO runs (
                     project_id, status, started_at, finished_at, exit_code,
-                    log_dir, stdout_path, stderr_path, summary
+                    log_dir, stdout_path, stderr_path, summary, codex_session_id,
+                    task_content
                  )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     outcome.project_id,
                     outcome.status,
@@ -4253,7 +4378,9 @@ mod agent_store {
                     outcome.log_dir,
                     outcome.stdout_path,
                     outcome.stderr_path,
-                    outcome.summary
+                    outcome.summary,
+                    outcome.codex_session_id,
+                    outcome.task_content
                 ],
             )
             .await
@@ -4352,6 +4479,54 @@ mod agent_store {
                 stderr_path: row_optional_text(&row, 9, "stderr_path")?,
                 summary: row_optional_text(&row, 10, "summary")?,
             }))
+        }
+
+        pub(crate) fn codex_session_for_task_blocking(
+            &self,
+            project_root: &Path,
+            task_content: &str,
+        ) -> Result<Option<String>> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(self.codex_session_for_task(project_root, task_content))
+        }
+
+        async fn codex_session_for_task(
+            &self,
+            project_root: &Path,
+            task_content: &str,
+        ) -> Result<Option<String>> {
+            let conn = self.connect()?;
+            let project_path = project_root.display().to_string();
+            let mut rows = conn
+                .query(
+                    "SELECT r.codex_session_id
+                     FROM runs r
+                     JOIN projects p ON p.id = r.project_id
+                     WHERE p.path = ?1
+                       AND r.task_content = ?2
+                       AND r.codex_session_id IS NOT NULL
+                     ORDER BY r.id DESC
+                     LIMIT 1",
+                    params![project_path.as_str(), task_content],
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to find a Codex session for a completed task in {}",
+                        project_root.display()
+                    )
+                })?;
+
+            let Some(row) = rows
+                .next()
+                .await
+                .context("Failed to read completed task Codex session")?
+            else {
+                return Ok(None);
+            };
+
+            Ok(Some(row_text(&row, 0, "codex_session_id")?))
         }
 
         pub(crate) fn record_daemon_checkin_blocking(
@@ -6715,7 +6890,7 @@ fn tui_start_state(active_board: bool) -> TuiStartState {
             active_board,
             current_pane: TuiPane::Tasks,
             feedback_buffer: String::from(
-                "Kanban View! Tab switches to the agent projects pane, Enter opens a selected project there, Space toggles it ON/OFF, g cycles Git off/commit/push, m/f/t change its Codex model/fast/thinking settings, l shows the active project's agent output, Backspace returns to parent, Space creates a task on the board, a archives a task, A opens archive view, b moves a task to backlog, B toggles the backlog column, tap r then an Arrow to reorganize once, Shift+Arrows reorder or move tasks, Ctrl-P/N reorder up/down, 'd' deletes, 'q' quits.",
+                "Kanban View! Tab switches to the agent projects pane, Enter opens a selected project there, Space toggles it ON/OFF, g cycles Git off/commit/push, m/f/t change its Codex model/fast/thinking settings, c resumes a selected Done task in interactive Codex, l shows the active project's agent output, Backspace returns to parent, Space creates a task on the board, a archives a task, A opens archive view, b moves a task to backlog, B toggles the backlog column, tap r then an Arrow to reorganize once, Shift+Arrows reorder or move tasks, Ctrl-P/N reorder up/down, 'd' deletes, 'q' quits.",
             ),
         }
     } else {
@@ -7416,6 +7591,27 @@ fn tui_agent_panel_instructions() -> &'static str {
     "Up/Down selects, Enter opens/adds, Space toggles ON/OFF, g cycles Git off/commit/push, m cycles model, f toggles fast, t cycles thinking, l shows output."
 }
 
+fn parse_agent_codex_session_id(line: &str) -> Option<String> {
+    line.trim()
+        .strip_prefix("session id:")
+        .map(str::trim)
+        .filter(|session_id| !session_id.is_empty())
+        .map(str::to_string)
+}
+
+fn agent_codex_session_id_from_log(path: &Path) -> Result<Option<String>> {
+    let file = fs::File::open(path)
+        .with_context(|| format!("Failed to open recorded agent output {path:?}"))?;
+
+    for line in BufReader::new(file).lines().take(100) {
+        if let Some(session_id) = parse_agent_codex_session_id(&line?) {
+            return Ok(Some(session_id));
+        }
+    }
+
+    Ok(None)
+}
+
 fn tui_agent_log_title(log_view: &TuiAgentLogView) -> String {
     let status = if log_view.is_live { "LIVE" } else { "LATEST" };
     format!(
@@ -7455,6 +7651,14 @@ fn preferred_recorded_agent_output_path(run: agent_store::AgentRunRecord) -> Opt
     } else {
         run.stderr_path.map(PathBuf::from).or(stdout_path)
     }
+}
+
+fn codex_session_for_completed_task(
+    project_root: &Path,
+    task: &TaskEntry,
+) -> Result<Option<String>> {
+    let store = open_agent_store()?;
+    store.codex_session_for_task_blocking(project_root, task.content.trim_end())
 }
 
 fn selected_tui_agent_log_view(panel: &TuiAgentPanel) -> Result<Option<TuiAgentLogView>> {
@@ -8189,6 +8393,7 @@ fn tui_keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
 
 struct TerminalSession {
     keyboard_enhancement_enabled: bool,
+    active: bool,
 }
 
 impl TerminalSession {
@@ -8231,18 +8436,36 @@ impl TerminalSession {
 
         Ok(Self {
             keyboard_enhancement_enabled,
+            active: true,
         })
     }
-}
 
-impl Drop for TerminalSession {
-    fn drop(&mut self) {
+    fn suspend(&mut self) {
+        if !self.active {
+            return;
+        }
         if self.keyboard_enhancement_enabled {
             let _ = stdout().execute(PopKeyboardEnhancementFlags);
         }
         let _ = stdout().execute(DisableBracketedPaste);
         let _ = disable_raw_mode();
         let _ = stdout().execute(LeaveAlternateScreen);
+        let _ = stdout().flush();
+        self.active = false;
+    }
+
+    fn resume(&mut self, title: &str) -> Result<()> {
+        if self.active {
+            return Ok(());
+        }
+        *self = Self::enter(title)?;
+        Ok(())
+    }
+}
+
+impl Drop for TerminalSession {
+    fn drop(&mut self) {
+        self.suspend();
     }
 }
 
@@ -8574,7 +8797,7 @@ fn tui_view_without_active_board(root: &Path) -> Result<PathBuf> {
 fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Result<PathBuf> {
     // Setup terminal
     let title = app_title(root);
-    let _terminal_session = TerminalSession::enter(&title)?;
+    let mut terminal_session = TerminalSession::enter(&title)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
     let mut active_root = root.to_path_buf();
     let mut board_stack = if start_with_active_board {
@@ -9066,6 +9289,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                  [Enter]        - Open subtasks, edit selected task, or open selected agent project\n\
                                  [e]            - Edit selected task\n\
                                  [g]            - Cycle selected project's Git mode: off/commit/push\n\
+                                 [c]            - Resume selected Done task in interactive Codex\n\
                                  [l]            - Toggle active/selected project's live/current agent output\n\
                                  [a]            - Move selected task to archive\n\
                                  [A]            - Toggle archive view\n\
@@ -9593,6 +9817,64 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                             "Archive view. Press A again to leave archive view."
                                                 .to_string();
                                     }
+                                    KeyCode::Char('c') => {
+                                        if selected_board != DONE_BOARD_INDEX {
+                                            feedback_buffer =
+                                                "Codex sessions can be resumed from Done tasks."
+                                                    .to_string();
+                                            continue;
+                                        }
+
+                                        let Some((_, task)) = selected_task_entry_in_board(
+                                            &board_dir,
+                                            "done",
+                                            &board_states[DONE_BOARD_INDEX],
+                                        ) else {
+                                            feedback_buffer = "No Done task selected".to_string();
+                                            continue;
+                                        };
+
+                                        match codex_session_for_completed_task(&active_root, &task)
+                                        {
+                                            Ok(Some(session_id)) => {
+                                                agent_log_view = None;
+                                                terminal_session.suspend();
+                                                let resume_result =
+                                                    resume_codex_session_interactively(
+                                                        &active_root,
+                                                        &session_id,
+                                                    );
+                                                terminal_session
+                                                    .resume(&app_title(&active_root))?;
+                                                terminal.clear()?;
+                                                agent_panel.refresh(&active_root);
+                                                last_agent_panel_refresh = Instant::now();
+                                                normalize_board_selections_in_board(
+                                                    &board_dir,
+                                                    &statuses,
+                                                    &mut board_states,
+                                                );
+                                                feedback_buffer = match resume_result {
+                                                    Ok(status) if status.success() => format!(
+                                                        "Returned from Codex session for: {}",
+                                                        task_display_text(&task)
+                                                    ),
+                                                    Ok(status) => format!(
+                                                        "Codex session exited with status {status}"
+                                                    ),
+                                                    Err(error) => format!("Error: {error}"),
+                                                };
+                                            }
+                                            Ok(None) => {
+                                                feedback_buffer =
+                                                "No Codex session recorded for this task. Sessions are available for tasks completed by newer automated runs."
+                                                    .to_string();
+                                            }
+                                            Err(error) => {
+                                                feedback_buffer = format!("Error: {error}");
+                                            }
+                                        }
+                                    }
                                     KeyCode::Char('l') | KeyCode::Char('L') => {
                                         if agent_log_view.take().is_some() {
                                             feedback_buffer = "Closed agent output log".to_string();
@@ -10080,6 +10362,7 @@ mod tests {
                     stdout_path: log_root.join("runs/test-project/test.out"),
                     stderr_path: log_root.join("runs/test-project/test.err"),
                     summary: format!("fake {status} result"),
+                    codex_session_id: None,
                 },
                 ran_projects: Mutex::new(Vec::new()),
                 delay,
@@ -10476,6 +10759,74 @@ mod tests {
     }
 
     #[test]
+    fn agent_codex_session_id_parser_reads_the_exec_header() {
+        assert_eq!(
+            parse_agent_codex_session_id("session id: 019fe7ab-f267-76e3-b82c-d7c5705be8d1")
+                .as_deref(),
+            Some("019fe7ab-f267-76e3-b82c-d7c5705be8d1")
+        );
+        assert_eq!(parse_agent_codex_session_id("session id:"), None);
+        assert_eq!(parse_agent_codex_session_id("other output"), None);
+    }
+
+    #[test]
+    fn interactive_codex_resume_command_uses_safe_task_session_settings() {
+        let project_root = PathBuf::from("/tmp/project with spaces");
+        let mut command = Command::new("codex");
+
+        configure_interactive_codex_resume_command(&mut command, &project_root, "session-123");
+
+        let args: Vec<OsString> = command.get_args().map(OsStr::to_os_string).collect();
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("resume"),
+                OsString::from("--include-non-interactive"),
+                OsString::from("--sandbox"),
+                OsString::from("workspace-write"),
+                OsString::from("--ask-for-approval"),
+                OsString::from("on-request"),
+                OsString::from("-C"),
+                project_root.as_os_str().to_os_string(),
+                OsString::from("session-123"),
+            ]
+        );
+        assert_eq!(command.get_current_dir(), Some(project_root.as_path()));
+    }
+
+    #[test]
+    fn newly_added_done_task_is_found_even_when_its_content_matches_an_older_task() {
+        let before = vec!["duplicate task".to_string(), "older task".to_string()];
+        let after = vec![
+            task_entry_from_text(
+                TaskSource::MarkdownLine { line_index: 1 },
+                "duplicate task",
+                "duplicate task",
+                false,
+            ),
+            task_entry_from_text(
+                TaskSource::MarkdownLine { line_index: 2 },
+                "duplicate task",
+                "duplicate task",
+                false,
+            ),
+            task_entry_from_text(
+                TaskSource::MarkdownLine { line_index: 3 },
+                "older task",
+                "older task",
+                false,
+            ),
+        ];
+
+        let added = newly_added_task_entry(&before, &after).unwrap();
+
+        assert!(matches!(
+            added.source,
+            TaskSource::MarkdownLine { line_index: 1 }
+        ));
+    }
+
+    #[test]
     fn agent_log_console_expands_and_scrolls_to_latest_output() {
         assert_eq!(tui_feedback_console_height(40, 80, "short", false), 3);
         assert_eq!(
@@ -10643,6 +10994,8 @@ mod tests {
                     stdout_path: Some(stdout_path.to_str().unwrap()),
                     stderr_path: None,
                     summary: Some("completed"),
+                    codex_session_id: None,
+                    task_content: None,
                 })
                 .unwrap();
         }
@@ -11962,6 +12315,23 @@ mod tests {
             )
             .await
             .unwrap();
+            conn.execute(
+                "CREATE TABLE runs (
+                    id INTEGER PRIMARY KEY,
+                    project_id INTEGER NOT NULL REFERENCES projects(id),
+                    status TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    exit_code INTEGER,
+                    log_dir TEXT,
+                    stdout_path TEXT,
+                    stderr_path TEXT,
+                    summary TEXT
+                )",
+                (),
+            )
+            .await
+            .unwrap();
             for version in 1..=4 {
                 conn.execute(
                     "INSERT INTO schema_migrations (version, applied_at)
@@ -13113,6 +13483,41 @@ mod tests {
     }
 
     #[test]
+    fn completed_agent_run_records_its_codex_session_for_the_done_task() {
+        let root = temp_root("agent-task-codex-session");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        add_task(&project_root, "resumable task", None).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        drop(store);
+
+        let mut start = run_agent_scheduler_pass(&state_dir, false, &[]).unwrap();
+        assert_eq!(start.jobs.len(), 1);
+        move_task(&project_root, "todo", "doing", "1").unwrap();
+        move_task(&project_root, "doing", "done", "1").unwrap();
+
+        let mut runner = FakeAgentRunner::new(&state_dir, "success");
+        runner.result.codex_session_id = Some("session-for-task".to_string());
+        let shutdown = new_agent_shutdown_signal();
+        run_agent_job(start.jobs.pop().unwrap(), &runner, &shutdown).unwrap();
+
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        assert_eq!(
+            store
+                .codex_session_for_task_blocking(&project_root, "resumable task")
+                .unwrap()
+                .as_deref(),
+            Some("session-for-task")
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn agent_store_recovers_stale_leases() {
         let root = temp_root("agent-run-stale-lease");
         let state_dir = root.join("state/clt");
@@ -13198,6 +13603,8 @@ mod tests {
                 stdout_path: Some("/tmp/logs/run.out"),
                 stderr_path: Some("/tmp/logs/run.err"),
                 summary: Some("completed"),
+                codex_session_id: Some("session-123"),
+                task_content: Some("completed task"),
             })
             .unwrap();
 
@@ -13214,6 +13621,19 @@ mod tests {
         assert_eq!(runs[0].stdout_path.as_deref(), Some("/tmp/logs/run.out"));
         assert_eq!(runs[0].stderr_path.as_deref(), Some("/tmp/logs/run.err"));
         assert_eq!(runs[0].summary.as_deref(), Some("completed"));
+        assert_eq!(
+            store
+                .codex_session_for_task_blocking(&project_root, "completed task")
+                .unwrap()
+                .as_deref(),
+            Some("session-123")
+        );
+        assert_eq!(
+            store
+                .codex_session_for_task_blocking(&project_root, "different task")
+                .unwrap(),
+            None
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -13261,6 +13681,8 @@ mod tests {
                     stdout_path: Some(stdout_path),
                     stderr_path: None,
                     summary: Some("completed"),
+                    codex_session_id: None,
+                    task_content: None,
                 })
                 .unwrap();
         }
@@ -13300,6 +13722,8 @@ mod tests {
                 stdout_path: None,
                 stderr_path: None,
                 summary: Some("failed"),
+                codex_session_id: None,
+                task_content: None,
             })
             .unwrap();
         store
@@ -13313,6 +13737,8 @@ mod tests {
                 stdout_path: None,
                 stderr_path: None,
                 summary: Some("still blocked"),
+                codex_session_id: None,
+                task_content: None,
             })
             .unwrap();
         store
@@ -13326,6 +13752,8 @@ mod tests {
                 stdout_path: None,
                 stderr_path: None,
                 summary: Some("completed"),
+                codex_session_id: None,
+                task_content: None,
             })
             .unwrap();
 
@@ -13362,6 +13790,8 @@ mod tests {
                 stdout_path: Some("/tmp/logs/run.out"),
                 stderr_path: Some("/tmp/logs/run.err"),
                 summary: Some("failed"),
+                codex_session_id: None,
+                task_content: None,
             })
             .unwrap();
         store
@@ -13375,6 +13805,8 @@ mod tests {
                 stdout_path: Some("/tmp/logs/run.out"),
                 stderr_path: Some("/tmp/logs/run.err"),
                 summary: Some("still blocked"),
+                codex_session_id: None,
+                task_content: None,
             })
             .unwrap();
         store
@@ -13603,7 +14035,7 @@ mod tests {
         let fake_codex = root.join("fake-codex");
         fs::write(
             &fake_codex,
-            "#!/bin/sh\nprintf 'arg=%s\\n' \"$@\" >&2\nprintf 'NO_TASKS_LEFT\\n'\n",
+            "#!/bin/sh\nprintf 'arg=%s\\n' \"$@\" >&2\nprintf 'session id: session-42\\n' >&2\nprintf 'NO_TASKS_LEFT\\n'\n",
         )
         .unwrap();
         let mut permissions = fs::metadata(&fake_codex).unwrap().permissions();
@@ -13636,6 +14068,7 @@ mod tests {
 
         assert_eq!(result.status, "idle");
         assert_eq!(result.exit_code, Some(0));
+        assert_eq!(result.codex_session_id.as_deref(), Some("session-42"));
         assert!(result.log_dir.starts_with(state_dir.join("runs")));
         assert!(
             fs::read_to_string(&result.stdout_path)
