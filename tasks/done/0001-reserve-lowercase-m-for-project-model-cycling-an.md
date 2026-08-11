@@ -1,0 +1,3 @@
+Reserve lowercase m for project model cycling and open Models with uppercase M (TUI, UX)
+
+COMPLETED 2026-08-11: Restored lowercase m as the selected project's provider/model target cycle and assigned uppercase M to open and close the Models page, with Tab and Esc still returning from Models. Updated the TUI instructions, help, README, and changelog. Checks: cargo fmt -- --check; focused instruction test; cargo test -- --test-threads=1 (176 passed); cargo clippy --all-targets -- -D warnings; cargo build; manual TUI check confirmed lowercase m stays on Agent Projects, uppercase M opens Models, and uppercase M returns; git diff --check.

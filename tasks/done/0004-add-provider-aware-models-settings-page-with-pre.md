@@ -1,0 +1,3 @@
+Add provider-aware Models settings page with presets, favorites, defaults, and project overrides (FEATURE, AGENT, TUI)
+
+COMPLETED 2026-08-10: Added the persisted Models page with OpenAI/OpenRouter/Ollama/LM Studio presets, custom Responses-compatible providers, enabled/favorite model targets, a live-resolved CLT-wide default, atomic per-project provider/model overrides, environment-variable visibility without secret entry or `.env` writes, and explicit backup-protected Codex `config.toml` updates. Documented the workflow and added migration, catalog, config-preservation, and runner-precedence coverage. Checks: `cargo fmt -- --check`; `cargo test -- --test-threads=1` (175 passed); `cargo clippy --all-targets -- -D warnings`; `git diff --check`.

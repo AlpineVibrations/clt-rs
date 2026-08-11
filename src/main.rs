@@ -33,6 +33,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, ListItem, ListState, Paragraph},
 };
+use toml_edit::{DocumentMut, Item, Table, value};
 use tui_input::{Input, InputRequest};
 
 #[cfg(unix)]
@@ -56,6 +57,7 @@ const AGENT_POLL_INTERVAL_SECONDS_ENV: &str = "CLT_AGENT_POLL_INTERVAL_SECONDS";
 const AGENT_RUN_TIMEOUT_SECONDS_ENV: &str = "CLT_AGENT_RUN_TIMEOUT_SECONDS";
 const AGENT_DAEMON_MODE_ENV: &str = "CLT_AGENT_DAEMON_MODE";
 const AGENT_CODEX_PATH_ENV: &str = "CLT_AGENT_CODEX_PATH";
+const CODEX_HOME_ENV: &str = "CODEX_HOME";
 const AGENT_SUCCESS_COOLDOWN_SECONDS_ENV: &str = "CLT_AGENT_SUCCESS_COOLDOWN_SECONDS";
 const XDG_RUNTIME_DIR_ENV: &str = "XDG_RUNTIME_DIR";
 const AGENT_DEFAULT_MAX_GLOBAL_JOBS: usize = 12;
@@ -74,13 +76,6 @@ const GIT_COMMIT_SKILL_NAME: &str = "git-commit";
 const EMBEDDED_CLT_TASK_MANAGEMENT_SKILL: &str =
     include_str!("../skills/clt-task-management/SKILL.md");
 const EMBEDDED_GIT_COMMIT_SKILL: &str = include_str!("../skills/git-commit/SKILL.md");
-const AGENT_CODEX_MODELS: [&str; 5] = [
-    "",
-    "gpt-5.6",
-    "gpt-5.6-terra",
-    "gpt-5.4",
-    "gpt-5.3-codex-spark",
-];
 const AGENT_CODEX_REASONING_EFFORTS: [&str; 7] =
     ["", "low", "medium", "high", "xhigh", "max", "ultra"];
 const TUI_AGENT_PANEL_REFRESH_SECONDS: u64 = 2;
@@ -88,7 +83,47 @@ const TUI_AGENT_LOG_REFRESH_MILLIS: u64 = 500;
 const TUI_AGENT_TABLE_CODEX_LAST_RUN_GAP: &str = "   ";
 const TUI_AGENT_TABLE_CODEX_MAX_WIDTH: usize = 20;
 const TUI_NO_ACTIVE_BOARD_MESSAGE: &str =
-    "No active board. Open an initialized registered project from the agent projects pane.";
+    "No active board. Open a project from Agent Projects, or press M for Models.";
+
+#[derive(Clone, Copy)]
+struct AgentProviderPreset {
+    id: &'static str,
+    name: &'static str,
+    base_url: Option<&'static str>,
+    env_key: Option<&'static str>,
+    built_in: bool,
+}
+
+const AGENT_PROVIDER_PRESETS: [AgentProviderPreset; 4] = [
+    AgentProviderPreset {
+        id: "openai",
+        name: "OpenAI",
+        base_url: None,
+        env_key: Some("OPENAI_API_KEY"),
+        built_in: true,
+    },
+    AgentProviderPreset {
+        id: "openrouter",
+        name: "OpenRouter",
+        base_url: Some("https://openrouter.ai/api/v1"),
+        env_key: Some("OPENROUTER_API_KEY"),
+        built_in: false,
+    },
+    AgentProviderPreset {
+        id: "ollama",
+        name: "Ollama",
+        base_url: Some("http://localhost:11434/v1"),
+        env_key: None,
+        built_in: false,
+    },
+    AgentProviderPreset {
+        id: "lmstudio",
+        name: "LM Studio",
+        base_url: Some("http://localhost:1234/v1"),
+        env_key: None,
+        built_in: false,
+    },
+];
 const AGENT_LAUNCHD_LABEL: &str = "com.alpinevibrations.clt.agent";
 const AGENT_SYSTEMD_UNIT: &str = "clt-agent.service";
 const AGENT_CODEX_PROMPT_BASE: &str = r#"You are working in this repo.
@@ -1030,8 +1065,16 @@ fn format_agent_project_summary(
         ),
         format!("   settings  git: {}", project.git_mode.label()),
         format!(
-            "             model: {}  reasoning: {}  fast: {}",
-            project.codex_model.as_deref().unwrap_or("default"),
+            "             target: {}  reasoning: {}  fast: {}",
+            project
+                .codex_model
+                .as_deref()
+                .map(|model| format!(
+                    "{}/{}",
+                    project.codex_provider.as_deref().unwrap_or("openai"),
+                    model
+                ))
+                .unwrap_or_else(|| "CLT default".to_string()),
             project
                 .codex_reasoning_effort
                 .as_deref()
@@ -3035,7 +3078,26 @@ impl AgentRunner for CodexAgentRunner {
             .arg("danger-full-access")
             .arg("--ask-for-approval")
             .arg("never");
-        if let Some(model) = project.codex_model.as_deref() {
+        let model_target = if let Some(model_id) = project.codex_model.as_ref() {
+            agent_store::AgentModelDefaults {
+                provider_id: Some(
+                    project
+                        .codex_provider
+                        .clone()
+                        .unwrap_or_else(|| "openai".to_string()),
+                ),
+                model_id: Some(model_id.clone()),
+            }
+        } else {
+            open_agent_store_at(&self.state_dir)?.resolve_model_target_blocking(project)?
+        };
+        if let (Some(provider), Some(model)) = (
+            model_target.provider_id.as_deref(),
+            model_target.model_id.as_deref(),
+        ) {
+            command
+                .arg("--config")
+                .arg(format!("model_provider={provider:?}"));
             command.arg("--model").arg(model);
         }
         if let Some(reasoning_effort) = project.codex_reasoning_effort.as_deref() {
@@ -3861,6 +3923,151 @@ fn append_agent_log_line(path: &Path, line: &str) -> Result<()> {
     writeln!(file, "{line}").with_context(|| format!("Failed to write agent log {:?}", path))
 }
 
+fn codex_config_path() -> Result<PathBuf> {
+    let codex_home = std::env::var_os(CODEX_HOME_ENV)
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
+        .ok_or_else(|| {
+            anyhow::anyhow!("HOME or {CODEX_HOME_ENV} is required to find Codex config")
+        })?;
+    Ok(codex_home.join("config.toml"))
+}
+
+fn valid_codex_provider_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+}
+
+fn valid_environment_variable_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn mutate_codex_config_at(
+    path: &Path,
+    mutate: impl FnOnce(&mut DocumentMut) -> Result<()>,
+) -> Result<()> {
+    let original = if path.exists() {
+        fs::read_to_string(path).with_context(|| format!("Failed to read Codex config {path:?}"))?
+    } else {
+        String::new()
+    };
+    let mut document = if original.trim().is_empty() {
+        DocumentMut::new()
+    } else {
+        original
+            .parse::<DocumentMut>()
+            .with_context(|| format!("Codex config is not valid TOML: {path:?}"))?
+    };
+
+    mutate(&mut document)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Codex config path has no parent: {path:?}"))?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("Failed to create Codex config directory {parent:?}"))?;
+
+    if path.exists() {
+        let backup = parent.join("config.toml.clt.bak");
+        if !backup.exists() {
+            fs::copy(path, &backup)
+                .with_context(|| format!("Failed to back up Codex config to {backup:?}"))?;
+        }
+    }
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp_path = parent.join(format!(
+        ".config.toml.clt-{}-{nonce}.tmp",
+        std::process::id()
+    ));
+    fs::write(&temp_path, document.to_string())
+        .with_context(|| format!("Failed to write temporary Codex config {temp_path:?}"))?;
+    if let Err(error) = fs::rename(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error).with_context(|| format!("Failed to replace Codex config {path:?}"));
+    }
+    Ok(())
+}
+
+fn upsert_codex_provider_config_at(
+    path: &Path,
+    provider_id: &str,
+    name: &str,
+    base_url: &str,
+    env_key: Option<&str>,
+) -> Result<()> {
+    if !valid_codex_provider_id(provider_id) {
+        anyhow::bail!("Provider ID must use only ASCII letters, numbers, hyphens, or underscores");
+    }
+    if base_url.trim().is_empty() {
+        anyhow::bail!("A custom provider requires a base URL");
+    }
+
+    mutate_codex_config_at(path, |document| {
+        if !document.as_table().contains_key("model_providers") {
+            document["model_providers"] = Item::Table(Table::new());
+        }
+        let providers = document["model_providers"]
+            .as_table_mut()
+            .ok_or_else(|| anyhow::anyhow!("model_providers must be a TOML table"))?;
+        if !providers.contains_key(provider_id) {
+            providers[provider_id] = Item::Table(Table::new());
+        }
+        let provider = providers[provider_id]
+            .as_table_mut()
+            .ok_or_else(|| anyhow::anyhow!("model_providers.{provider_id} must be a TOML table"))?;
+        provider["name"] = value(name.trim());
+        provider["base_url"] = value(base_url.trim());
+        provider["wire_api"] = value("responses");
+        if let Some(env_key) = env_key.filter(|key| !key.trim().is_empty()) {
+            provider["env_key"] = value(env_key.trim());
+        } else {
+            provider.remove("env_key");
+        }
+        Ok(())
+    })
+}
+
+fn set_codex_default_config_at(path: &Path, provider_id: &str, model_id: &str) -> Result<()> {
+    if !valid_codex_provider_id(provider_id) || model_id.trim().is_empty() {
+        anyhow::bail!("A valid provider and model are required");
+    }
+    mutate_codex_config_at(path, |document| {
+        document["model_provider"] = value(provider_id);
+        document["model"] = value(model_id.trim());
+        Ok(())
+    })
+}
+
+fn read_codex_default_config_at(path: &Path) -> Result<(Option<String>, Option<String>)> {
+    if !path.exists() {
+        return Ok((None, None));
+    }
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("Failed to read Codex config {path:?}"))?;
+    let document = contents
+        .parse::<DocumentMut>()
+        .with_context(|| format!("Codex config is not valid TOML: {path:?}"))?;
+    Ok((
+        document
+            .get("model_provider")
+            .and_then(Item::as_str)
+            .map(str::to_string),
+        document
+            .get("model")
+            .and_then(Item::as_str)
+            .map(str::to_string),
+    ))
+}
+
 mod agent_store {
     use super::*;
     use turso::{Builder, Connection, Database, Value, params};
@@ -3957,6 +4164,61 @@ mod agent_store {
                 "ALTER TABLE runs ADD COLUMN task_content TEXT",
             ],
         },
+        AgentMigration {
+            version: 8,
+            statements: &[
+                "ALTER TABLE projects ADD COLUMN codex_provider TEXT",
+                "UPDATE projects SET codex_provider = 'openai' WHERE codex_model IS NOT NULL",
+                "CREATE TABLE IF NOT EXISTS model_providers (
+                    provider_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    base_url TEXT,
+                    env_key TEXT,
+                    built_in INTEGER NOT NULL DEFAULT 0,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )",
+                "CREATE TABLE IF NOT EXISTS model_targets (
+                    provider_id TEXT NOT NULL REFERENCES model_providers(provider_id),
+                    model_id TEXT NOT NULL,
+                    label TEXT NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    favorite INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (provider_id, model_id)
+                )",
+                "CREATE TABLE IF NOT EXISTS agent_settings (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    default_provider TEXT,
+                    default_model TEXT,
+                    updated_at TEXT NOT NULL
+                )",
+                "INSERT OR IGNORE INTO agent_settings (id, updated_at) VALUES (1, datetime('now'))",
+                "INSERT OR IGNORE INTO model_providers (
+                    provider_id, name, env_key, built_in, enabled, created_at, updated_at
+                 ) VALUES ('openai', 'OpenAI', 'OPENAI_API_KEY', 1, 1, datetime('now'), datetime('now'))",
+                "INSERT OR IGNORE INTO model_targets (
+                    provider_id, model_id, label, enabled, favorite, created_at, updated_at
+                 ) VALUES ('openai', 'gpt-5.6', 'GPT-5.6', 1, 1, datetime('now'), datetime('now'))",
+                "INSERT OR IGNORE INTO model_targets (
+                    provider_id, model_id, label, enabled, favorite, created_at, updated_at
+                 ) VALUES ('openai', 'gpt-5.6-terra', 'GPT-5.6 Terra', 1, 1, datetime('now'), datetime('now'))",
+                "INSERT OR IGNORE INTO model_targets (
+                    provider_id, model_id, label, enabled, favorite, created_at, updated_at
+                 ) VALUES ('openai', 'gpt-5.6-luna', 'GPT-5.6 Luna', 1, 0, datetime('now'), datetime('now'))",
+                "INSERT OR IGNORE INTO model_targets (
+                    provider_id, model_id, label, enabled, favorite, created_at, updated_at
+                 ) VALUES ('openai', 'gpt-5.5', 'GPT-5.5', 1, 0, datetime('now'), datetime('now'))",
+                "INSERT OR IGNORE INTO model_targets (
+                    provider_id, model_id, label, enabled, favorite, created_at, updated_at
+                 ) VALUES ('openai', 'gpt-5.4', 'GPT-5.4', 1, 0, datetime('now'), datetime('now'))",
+                "INSERT OR IGNORE INTO model_targets (
+                    provider_id, model_id, label, enabled, favorite, created_at, updated_at
+                 ) VALUES ('openai', 'gpt-5.3-codex-spark', 'GPT-5.3 Codex Spark', 1, 0, datetime('now'), datetime('now'))",
+            ],
+        },
     ];
 
     pub(crate) struct TursoAgentStore {
@@ -3972,6 +4234,7 @@ mod agent_store {
         pub(crate) name: String,
         pub(crate) enabled: bool,
         pub(crate) git_mode: AgentGitMode,
+        pub(crate) codex_provider: Option<String>,
         pub(crate) codex_model: Option<String>,
         pub(crate) codex_reasoning_effort: Option<String>,
         pub(crate) codex_fast_enabled: bool,
@@ -3981,6 +4244,31 @@ mod agent_store {
         pub(crate) last_failure_at: Option<String>,
         pub(crate) last_blocked_recovery_at: Option<String>,
         pub(crate) failure_count: i64,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(crate) struct AgentModelProvider {
+        pub(crate) id: String,
+        pub(crate) name: String,
+        pub(crate) base_url: Option<String>,
+        pub(crate) env_key: Option<String>,
+        pub(crate) built_in: bool,
+        pub(crate) enabled: bool,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(crate) struct AgentModelTarget {
+        pub(crate) provider_id: String,
+        pub(crate) model_id: String,
+        pub(crate) label: String,
+        pub(crate) enabled: bool,
+        pub(crate) favorite: bool,
+    }
+
+    #[derive(Clone, Debug, Default, Eq, PartialEq)]
+    pub(crate) struct AgentModelDefaults {
+        pub(crate) provider_id: Option<String>,
+        pub(crate) model_id: Option<String>,
     }
 
     pub(crate) struct AgentRunOutcome<'a> {
@@ -4137,7 +4425,7 @@ mod agent_store {
             let conn = self.connect()?;
             let mut rows = conn
                 .query(
-                    "SELECT id, path, name, enabled, git_mode, codex_model,
+                    "SELECT id, path, name, enabled, git_mode, codex_provider, codex_model,
                             codex_reasoning_effort, codex_fast_enabled, last_scan_at, last_run_at,
                             last_success_at, last_failure_at, last_blocked_recovery_at,
                             failure_count
@@ -4159,16 +4447,17 @@ mod agent_store {
                 let name = row_text(&row, 2, "name")?;
                 let enabled = row_integer(&row, 3, "enabled")? != 0;
                 let git_mode = AgentGitMode::from_database(&row_text(&row, 4, "git_mode")?)?;
-                let codex_model = row_optional_text(&row, 5, "codex_model")?;
-                let codex_reasoning_effort = row_optional_text(&row, 6, "codex_reasoning_effort")?;
-                let codex_fast_enabled = row_integer(&row, 7, "codex_fast_enabled")? != 0;
-                let last_scan_at = row_optional_text(&row, 8, "last_scan_at")?;
-                let last_run_at = row_optional_text(&row, 9, "last_run_at")?;
-                let last_success_at = row_optional_text(&row, 10, "last_success_at")?;
-                let last_failure_at = row_optional_text(&row, 11, "last_failure_at")?;
+                let codex_provider = row_optional_text(&row, 5, "codex_provider")?;
+                let codex_model = row_optional_text(&row, 6, "codex_model")?;
+                let codex_reasoning_effort = row_optional_text(&row, 7, "codex_reasoning_effort")?;
+                let codex_fast_enabled = row_integer(&row, 8, "codex_fast_enabled")? != 0;
+                let last_scan_at = row_optional_text(&row, 9, "last_scan_at")?;
+                let last_run_at = row_optional_text(&row, 10, "last_run_at")?;
+                let last_success_at = row_optional_text(&row, 11, "last_success_at")?;
+                let last_failure_at = row_optional_text(&row, 12, "last_failure_at")?;
                 let last_blocked_recovery_at =
-                    row_optional_text(&row, 12, "last_blocked_recovery_at")?;
-                let failure_count = row_integer(&row, 13, "failure_count")?;
+                    row_optional_text(&row, 13, "last_blocked_recovery_at")?;
+                let failure_count = row_integer(&row, 14, "failure_count")?;
 
                 projects.push(AgentProject {
                     id,
@@ -4176,6 +4465,7 @@ mod agent_store {
                     name,
                     enabled,
                     git_mode,
+                    codex_provider,
                     codex_model,
                     codex_reasoning_effort,
                     codex_fast_enabled,
@@ -4833,6 +5123,7 @@ mod agent_store {
         pub(crate) fn set_project_codex_settings_blocking(
             &self,
             project_id: i64,
+            provider: Option<&str>,
             model: Option<&str>,
             reasoning_effort: Option<&str>,
             fast_enabled: bool,
@@ -4841,6 +5132,7 @@ mod agent_store {
                 .context("Failed to create async runtime for agent store")?
                 .block_on(self.set_project_codex_settings(
                     project_id,
+                    provider,
                     model,
                     reasoning_effort,
                     fast_enabled,
@@ -4850,6 +5142,7 @@ mod agent_store {
         async fn set_project_codex_settings(
             &self,
             project_id: i64,
+            provider: Option<&str>,
             model: Option<&str>,
             reasoning_effort: Option<&str>,
             fast_enabled: bool,
@@ -4858,12 +5151,14 @@ mod agent_store {
             let changed = conn
                 .execute(
                     "UPDATE projects
-                     SET codex_model = ?1,
-                         codex_reasoning_effort = ?2,
-                         codex_fast_enabled = ?3,
-                         updated_at = ?4
-                     WHERE id = ?5",
+                     SET codex_provider = ?1,
+                         codex_model = ?2,
+                         codex_reasoning_effort = ?3,
+                         codex_fast_enabled = ?4,
+                         updated_at = ?5
+                     WHERE id = ?6",
                     params![
+                        provider,
                         model,
                         reasoning_effort,
                         if fast_enabled { 1_i64 } else { 0_i64 },
@@ -4875,6 +5170,284 @@ mod agent_store {
                 .with_context(|| format!("Failed to set project {} Codex settings", project_id))?;
 
             Ok(changed > 0)
+        }
+
+        pub(crate) fn list_model_providers_blocking(&self) -> Result<Vec<AgentModelProvider>> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(async {
+                    let conn = self.connect()?;
+                    let mut rows = conn
+                        .query(
+                            "SELECT provider_id, name, base_url, env_key, built_in, enabled
+                             FROM model_providers
+                             ORDER BY built_in DESC, name COLLATE NOCASE, provider_id COLLATE NOCASE",
+                            (),
+                        )
+                        .await
+                        .context("Failed to list model providers")?;
+                    let mut providers = Vec::new();
+                    while let Some(row) = rows.next().await.context("Failed to read model provider")? {
+                        providers.push(AgentModelProvider {
+                            id: row_text(&row, 0, "provider_id")?,
+                            name: row_text(&row, 1, "name")?,
+                            base_url: row_optional_text(&row, 2, "base_url")?,
+                            env_key: row_optional_text(&row, 3, "env_key")?,
+                            built_in: row_integer(&row, 4, "built_in")? != 0,
+                            enabled: row_integer(&row, 5, "enabled")? != 0,
+                        });
+                    }
+                    Ok(providers)
+                })
+        }
+
+        pub(crate) fn list_model_targets_blocking(
+            &self,
+            provider_id: Option<&str>,
+        ) -> Result<Vec<AgentModelTarget>> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(async {
+                    let conn = self.connect()?;
+                    let mut rows = conn
+                        .query(
+                            "SELECT provider_id, model_id, label, enabled, favorite
+                             FROM model_targets
+                             WHERE (?1 IS NULL OR provider_id = ?1)
+                             ORDER BY favorite DESC, label COLLATE NOCASE, model_id COLLATE NOCASE",
+                            [provider_id],
+                        )
+                        .await
+                        .context("Failed to list model targets")?;
+                    let mut targets = Vec::new();
+                    while let Some(row) =
+                        rows.next().await.context("Failed to read model target")?
+                    {
+                        targets.push(AgentModelTarget {
+                            provider_id: row_text(&row, 0, "provider_id")?,
+                            model_id: row_text(&row, 1, "model_id")?,
+                            label: row_text(&row, 2, "label")?,
+                            enabled: row_integer(&row, 3, "enabled")? != 0,
+                            favorite: row_integer(&row, 4, "favorite")? != 0,
+                        });
+                    }
+                    Ok(targets)
+                })
+        }
+
+        pub(crate) fn list_enabled_model_targets_blocking(&self) -> Result<Vec<AgentModelTarget>> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(async {
+                    let conn = self.connect()?;
+                    let mut rows = conn
+                        .query(
+                            "SELECT t.provider_id, t.model_id, t.label, t.enabled, t.favorite
+                             FROM model_targets t
+                             JOIN model_providers p ON p.provider_id = t.provider_id
+                             WHERE p.enabled != 0 AND t.enabled != 0
+                             ORDER BY t.favorite DESC, p.name COLLATE NOCASE,
+                                      t.label COLLATE NOCASE, t.model_id COLLATE NOCASE",
+                            (),
+                        )
+                        .await
+                        .context("Failed to list enabled model targets")?;
+                    let mut targets = Vec::new();
+                    while let Some(row) =
+                        rows.next().await.context("Failed to read model target")?
+                    {
+                        targets.push(AgentModelTarget {
+                            provider_id: row_text(&row, 0, "provider_id")?,
+                            model_id: row_text(&row, 1, "model_id")?,
+                            label: row_text(&row, 2, "label")?,
+                            enabled: row_integer(&row, 3, "enabled")? != 0,
+                            favorite: row_integer(&row, 4, "favorite")? != 0,
+                        });
+                    }
+                    Ok(targets)
+                })
+        }
+
+        pub(crate) fn model_defaults_blocking(&self) -> Result<AgentModelDefaults> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(async {
+                    let conn = self.connect()?;
+                    let mut rows = conn
+                        .query(
+                            "SELECT default_provider, default_model FROM agent_settings WHERE id = 1",
+                            (),
+                        )
+                        .await
+                        .context("Failed to read model defaults")?;
+                    let Some(row) = rows.next().await.context("Failed to read model defaults")? else {
+                        return Ok(AgentModelDefaults::default());
+                    };
+                    Ok(AgentModelDefaults {
+                        provider_id: row_optional_text(&row, 0, "default_provider")?,
+                        model_id: row_optional_text(&row, 1, "default_model")?,
+                    })
+                })
+        }
+
+        pub(crate) fn resolve_model_target_blocking(
+            &self,
+            project: &AgentProject,
+        ) -> Result<AgentModelDefaults> {
+            if let Some(model_id) = project.codex_model.as_ref() {
+                return Ok(AgentModelDefaults {
+                    provider_id: Some(
+                        project
+                            .codex_provider
+                            .clone()
+                            .unwrap_or_else(|| "openai".to_string()),
+                    ),
+                    model_id: Some(model_id.clone()),
+                });
+            }
+            self.model_defaults_blocking()
+        }
+
+        pub(crate) fn upsert_model_provider_blocking(
+            &self,
+            provider: &AgentModelProvider,
+        ) -> Result<()> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(async {
+                    let conn = self.connect()?;
+                    conn.execute(
+                        "INSERT INTO model_providers (
+                            provider_id, name, base_url, env_key, built_in, enabled,
+                            created_at, updated_at
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'), datetime('now'))
+                         ON CONFLICT(provider_id) DO UPDATE SET
+                            name = excluded.name,
+                            base_url = excluded.base_url,
+                            env_key = excluded.env_key,
+                            built_in = excluded.built_in,
+                            enabled = excluded.enabled,
+                            updated_at = datetime('now')",
+                        params![
+                            provider.id.as_str(),
+                            provider.name.as_str(),
+                            provider.base_url.as_deref(),
+                            provider.env_key.as_deref(),
+                            if provider.built_in { 1_i64 } else { 0_i64 },
+                            if provider.enabled { 1_i64 } else { 0_i64 },
+                        ],
+                    )
+                    .await
+                    .with_context(|| format!("Failed to save model provider {}", provider.id))?;
+                    Ok(())
+                })
+        }
+
+        pub(crate) fn upsert_model_target_blocking(&self, target: &AgentModelTarget) -> Result<()> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(async {
+                    let conn = self.connect()?;
+                    conn.execute(
+                        "INSERT INTO model_targets (
+                            provider_id, model_id, label, enabled, favorite,
+                            created_at, updated_at
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'), datetime('now'))
+                         ON CONFLICT(provider_id, model_id) DO UPDATE SET
+                            label = excluded.label,
+                            enabled = excluded.enabled,
+                            favorite = excluded.favorite,
+                            updated_at = datetime('now')",
+                        params![
+                            target.provider_id.as_str(),
+                            target.model_id.as_str(),
+                            target.label.as_str(),
+                            if target.enabled { 1_i64 } else { 0_i64 },
+                            if target.favorite { 1_i64 } else { 0_i64 },
+                        ],
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Failed to save model target {}/{}",
+                            target.provider_id, target.model_id
+                        )
+                    })?;
+                    Ok(())
+                })
+        }
+
+        pub(crate) fn set_model_provider_enabled_blocking(
+            &self,
+            provider_id: &str,
+            enabled: bool,
+        ) -> Result<bool> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(async {
+                    let conn = self.connect()?;
+                    let changed = conn
+                        .execute(
+                            "UPDATE model_providers SET enabled = ?1, updated_at = datetime('now')
+                             WHERE provider_id = ?2",
+                            params![if enabled { 1_i64 } else { 0_i64 }, provider_id],
+                        )
+                        .await
+                        .with_context(|| format!("Failed to update provider {provider_id}"))?;
+                    Ok(changed > 0)
+                })
+        }
+
+        pub(crate) fn set_model_target_flags_blocking(
+            &self,
+            provider_id: &str,
+            model_id: &str,
+            enabled: bool,
+            favorite: bool,
+        ) -> Result<bool> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(async {
+                    let conn = self.connect()?;
+                    let changed = conn
+                        .execute(
+                            "UPDATE model_targets
+                             SET enabled = ?1, favorite = ?2, updated_at = datetime('now')
+                             WHERE provider_id = ?3 AND model_id = ?4",
+                            params![
+                                if enabled { 1_i64 } else { 0_i64 },
+                                if favorite { 1_i64 } else { 0_i64 },
+                                provider_id,
+                                model_id,
+                            ],
+                        )
+                        .await
+                        .with_context(|| {
+                            format!("Failed to update model {provider_id}/{model_id}")
+                        })?;
+                    Ok(changed > 0)
+                })
+        }
+
+        pub(crate) fn set_model_default_blocking(
+            &self,
+            provider_id: &str,
+            model_id: &str,
+        ) -> Result<()> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(async {
+                    let conn = self.connect()?;
+                    conn.execute(
+                        "UPDATE agent_settings
+                         SET default_provider = ?1, default_model = ?2, updated_at = datetime('now')
+                         WHERE id = 1",
+                        params![provider_id, model_id],
+                    )
+                    .await
+                    .context("Failed to set CLT default model")?;
+                    Ok(())
+                })
         }
     }
 
@@ -6876,6 +7449,16 @@ fn styled_task_input_lines(label: &str, input: &TaskInput, width: usize) -> Vec<
 enum TuiPane {
     Tasks,
     AgentProjects,
+    Models,
+}
+
+fn tui_pane_after_tab(current: TuiPane, active_board: bool) -> TuiPane {
+    match current {
+        TuiPane::Tasks => TuiPane::AgentProjects,
+        TuiPane::AgentProjects if active_board => TuiPane::Tasks,
+        TuiPane::AgentProjects => TuiPane::AgentProjects,
+        TuiPane::Models => TuiPane::AgentProjects,
+    }
 }
 
 struct TuiStartState {
@@ -6890,7 +7473,7 @@ fn tui_start_state(active_board: bool) -> TuiStartState {
             active_board,
             current_pane: TuiPane::Tasks,
             feedback_buffer: String::from(
-                "Kanban View! Tab switches to the agent projects pane, Enter opens a selected project there, Space toggles it ON/OFF, g cycles Git off/commit/push, m/f/t change its Codex model/fast/thinking settings, c resumes a selected Done task in interactive Codex, l shows the active project's agent output, Backspace returns to parent, Space creates a task on the board, a archives a task, A opens archive view, b moves a task to backlog, B toggles the backlog column, tap r then an Arrow to reorganize once, Shift+Arrows reorder or move tasks, Ctrl-P/N reorder up/down, 'd' deletes, 'q' quits.",
+                "Kanban View! Tab toggles between the task board and agent projects. From Agent Projects, m cycles the selected project's target and M opens Models. Enter opens a selected project, Space toggles it ON/OFF, g cycles Git off/commit/push, f/t change its Codex fast/thinking settings, c resumes a selected Done task in interactive Codex, l shows agent output, Backspace returns to parent, Space creates a task on the board, a archives a task, A opens archive view, b moves a task to backlog, B toggles the backlog column, tap r then an Arrow to reorganize once, Shift+Arrows reorder or move tasks, Ctrl-P/N reorder up/down, 'd' deletes, 'q' quits.",
             ),
         }
     } else {
@@ -6951,6 +7534,79 @@ struct TuiAgentPanel {
     state: ListState,
     scroll_offset: usize,
     last_error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TuiModelsFocus {
+    Providers,
+    Models,
+}
+
+struct TuiModelsPanel {
+    providers: Vec<agent_store::AgentModelProvider>,
+    models: Vec<agent_store::AgentModelTarget>,
+    defaults: agent_store::AgentModelDefaults,
+    codex_default: String,
+    focus: TuiModelsFocus,
+    provider_state: ListState,
+    model_state: ListState,
+    last_error: Option<String>,
+}
+
+enum TuiModelInputKind {
+    AddModel {
+        provider_id: String,
+    },
+    CustomProvider {
+        step: usize,
+        provider_id: String,
+        name: String,
+        base_url: String,
+    },
+}
+
+struct TuiModelInput {
+    kind: TuiModelInputKind,
+    input: Input,
+}
+
+impl TuiModelInput {
+    fn add_model(provider_id: String) -> Self {
+        Self {
+            kind: TuiModelInputKind::AddModel { provider_id },
+            input: Input::default(),
+        }
+    }
+
+    fn custom_provider() -> Self {
+        Self {
+            kind: TuiModelInputKind::CustomProvider {
+                step: 0,
+                provider_id: String::new(),
+                name: String::new(),
+                base_url: String::new(),
+            },
+            input: Input::default(),
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match &self.kind {
+            TuiModelInputKind::AddModel { .. } => " Model ID: ",
+            TuiModelInputKind::CustomProvider { step, .. } => match step {
+                0 => " Provider ID: ",
+                1 => " Display Name: ",
+                2 => " Base URL: ",
+                _ => " API Key Env Var (optional): ",
+            },
+        }
+    }
+
+    fn insert_paste(&mut self, content: &str) {
+        for ch in content.chars().filter(|ch| *ch != '\r' && *ch != '\n') {
+            self.input.handle(InputRequest::InsertChar(ch));
+        }
+    }
 }
 
 struct TuiAgentLogView {
@@ -7204,6 +7860,398 @@ impl TuiAgentPanel {
             .saturating_add(viewport_height.saturating_sub(1));
         if selected_idx > last_visible {
             self.scroll_offset = selected_idx.saturating_sub(viewport_height.saturating_sub(1));
+        }
+    }
+}
+
+impl TuiModelsPanel {
+    fn new() -> Self {
+        let mut panel = Self {
+            providers: Vec::new(),
+            models: Vec::new(),
+            defaults: agent_store::AgentModelDefaults::default(),
+            codex_default: "not explicitly set".to_string(),
+            focus: TuiModelsFocus::Providers,
+            provider_state: ListState::default(),
+            model_state: ListState::default(),
+            last_error: None,
+        };
+        panel.refresh();
+        panel
+    }
+
+    fn selected_provider(&self) -> Option<&agent_store::AgentModelProvider> {
+        self.provider_state
+            .selected()
+            .and_then(|index| self.providers.get(index))
+    }
+
+    fn selected_model(&self) -> Option<&agent_store::AgentModelTarget> {
+        self.model_state
+            .selected()
+            .and_then(|index| self.models.get(index))
+    }
+
+    fn refresh(&mut self) {
+        let selected_provider = self.selected_provider().map(|provider| provider.id.clone());
+        let selected_model = self.selected_model().map(|model| model.model_id.clone());
+        let result = (|| -> Result<_> {
+            let store = open_agent_store()?;
+            let providers = store.list_model_providers_blocking()?;
+            let defaults = store.model_defaults_blocking()?;
+            Ok((store, providers, defaults))
+        })();
+        let (store, providers, defaults) = match result {
+            Ok(value) => value,
+            Err(error) => {
+                self.last_error = Some(error.to_string());
+                return;
+            }
+        };
+
+        self.providers = providers;
+        self.defaults = defaults;
+        self.codex_default =
+            match codex_config_path().and_then(|path| read_codex_default_config_at(&path)) {
+                Ok((Some(provider), Some(model))) => format!("{provider}/{model}"),
+                Ok((_, Some(model))) => model,
+                Ok(_) => "not explicitly set".to_string(),
+                Err(error) => format!("config error: {error}"),
+            };
+        let provider_index = selected_provider
+            .as_ref()
+            .and_then(|id| {
+                self.providers
+                    .iter()
+                    .position(|provider| &provider.id == id)
+            })
+            .unwrap_or(0);
+        if self.providers.is_empty() {
+            self.provider_state.select(None);
+            self.models.clear();
+            self.model_state.select(None);
+        } else {
+            self.provider_state.select(Some(provider_index));
+            let provider_id = self.providers[provider_index].id.clone();
+            match store.list_model_targets_blocking(Some(&provider_id)) {
+                Ok(models) => {
+                    self.models = models;
+                    let model_index = selected_model
+                        .as_ref()
+                        .and_then(|id| self.models.iter().position(|model| &model.model_id == id))
+                        .unwrap_or(0);
+                    self.model_state
+                        .select((!self.models.is_empty()).then_some(model_index));
+                    self.last_error = None;
+                }
+                Err(error) => self.last_error = Some(error.to_string()),
+            }
+        }
+    }
+
+    fn refresh_models(&mut self) {
+        let selected_model = self.selected_model().map(|model| model.model_id.clone());
+        let Some(provider_id) = self.selected_provider().map(|provider| provider.id.clone()) else {
+            self.models.clear();
+            self.model_state.select(None);
+            return;
+        };
+        match open_agent_store().and_then(|store| {
+            self.defaults = store.model_defaults_blocking()?;
+            store.list_model_targets_blocking(Some(&provider_id))
+        }) {
+            Ok(models) => {
+                self.models = models;
+                let index = selected_model
+                    .as_ref()
+                    .and_then(|id| self.models.iter().position(|model| &model.model_id == id))
+                    .unwrap_or(0);
+                self.model_state
+                    .select((!self.models.is_empty()).then_some(index));
+                self.last_error = None;
+            }
+            Err(error) => self.last_error = Some(error.to_string()),
+        }
+    }
+
+    fn select_previous(&mut self) {
+        match self.focus {
+            TuiModelsFocus::Providers => {
+                let len = self.providers.len();
+                if len > 0 {
+                    let index = self.provider_state.selected().unwrap_or(0);
+                    self.provider_state
+                        .select(Some(if index == 0 { len - 1 } else { index - 1 }));
+                    self.refresh_models();
+                }
+            }
+            TuiModelsFocus::Models => {
+                let len = self.models.len();
+                if len > 0 {
+                    let index = self.model_state.selected().unwrap_or(0);
+                    self.model_state
+                        .select(Some(if index == 0 { len - 1 } else { index - 1 }));
+                }
+            }
+        }
+    }
+
+    fn select_next(&mut self) {
+        match self.focus {
+            TuiModelsFocus::Providers => {
+                let len = self.providers.len();
+                if len > 0 {
+                    let index = self.provider_state.selected().unwrap_or(0);
+                    self.provider_state.select(Some((index + 1) % len));
+                    self.refresh_models();
+                }
+            }
+            TuiModelsFocus::Models => {
+                let len = self.models.len();
+                if len > 0 {
+                    let index = self.model_state.selected().unwrap_or(0);
+                    self.model_state.select(Some((index + 1) % len));
+                }
+            }
+        }
+    }
+}
+
+fn add_tui_model_provider_preset(panel: &mut TuiModelsPanel, index: usize) -> Result<String> {
+    let preset = AGENT_PROVIDER_PRESETS
+        .get(index)
+        .ok_or_else(|| anyhow::anyhow!("Unknown provider preset"))?;
+    if let Some(base_url) = preset.base_url {
+        upsert_codex_provider_config_at(
+            &codex_config_path()?,
+            preset.id,
+            preset.name,
+            base_url,
+            preset.env_key,
+        )?;
+    }
+    let store = open_agent_store()?;
+    store.upsert_model_provider_blocking(&agent_store::AgentModelProvider {
+        id: preset.id.to_string(),
+        name: preset.name.to_string(),
+        base_url: preset.base_url.map(str::to_string),
+        env_key: preset.env_key.map(str::to_string),
+        built_in: preset.built_in,
+        enabled: true,
+    })?;
+    if preset.id == "openrouter" {
+        store.upsert_model_target_blocking(&agent_store::AgentModelTarget {
+            provider_id: preset.id.to_string(),
+            model_id: "openai/gpt-5.6".to_string(),
+            label: "OpenAI GPT-5.6".to_string(),
+            enabled: true,
+            favorite: false,
+        })?;
+    }
+    panel.refresh();
+    if let Some(index) = panel
+        .providers
+        .iter()
+        .position(|provider| provider.id == preset.id)
+    {
+        panel.provider_state.select(Some(index));
+        panel.refresh_models();
+    }
+    Ok(format!("Added/enabled {} provider preset", preset.name))
+}
+
+fn toggle_tui_models_enabled(panel: &mut TuiModelsPanel) -> Result<String> {
+    let store = open_agent_store()?;
+    let message = match panel.focus {
+        TuiModelsFocus::Providers => {
+            let provider = panel
+                .selected_provider()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("No provider selected"))?;
+            store.set_model_provider_enabled_blocking(&provider.id, !provider.enabled)?;
+            format!(
+                "{} provider {}",
+                if provider.enabled {
+                    "Disabled"
+                } else {
+                    "Enabled"
+                },
+                provider.name
+            )
+        }
+        TuiModelsFocus::Models => {
+            let model = panel
+                .selected_model()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("No model selected"))?;
+            store.set_model_target_flags_blocking(
+                &model.provider_id,
+                &model.model_id,
+                !model.enabled,
+                model.favorite,
+            )?;
+            format!(
+                "{} model {}/{}",
+                if model.enabled {
+                    "Hidden"
+                } else {
+                    "Made available"
+                },
+                model.provider_id,
+                model.model_id
+            )
+        }
+    };
+    panel.refresh();
+    Ok(message)
+}
+
+fn toggle_tui_model_favorite(panel: &mut TuiModelsPanel) -> Result<String> {
+    let model = panel
+        .selected_model()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("Select a model first"))?;
+    open_agent_store()?.set_model_target_flags_blocking(
+        &model.provider_id,
+        &model.model_id,
+        model.enabled,
+        !model.favorite,
+    )?;
+    panel.refresh_models();
+    Ok(format!(
+        "{} favorite: {}/{}",
+        if model.favorite { "Removed" } else { "Added" },
+        model.provider_id,
+        model.model_id
+    ))
+}
+
+fn set_tui_model_default(panel: &mut TuiModelsPanel) -> Result<String> {
+    let model = panel
+        .selected_model()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("Select a model first"))?;
+    let store = open_agent_store()?;
+    store.set_model_provider_enabled_blocking(&model.provider_id, true)?;
+    store.set_model_target_flags_blocking(
+        &model.provider_id,
+        &model.model_id,
+        true,
+        model.favorite,
+    )?;
+    store.set_model_default_blocking(&model.provider_id, &model.model_id)?;
+    panel.refresh_models();
+    Ok(format!(
+        "New CLT runs default to {}/{}; existing runs are unchanged",
+        model.provider_id, model.model_id
+    ))
+}
+
+fn set_tui_codex_default(panel: &mut TuiModelsPanel) -> Result<String> {
+    let model = panel
+        .selected_model()
+        .ok_or_else(|| anyhow::anyhow!("Select a model first"))?;
+    let path = codex_config_path()?;
+    set_codex_default_config_at(&path, &model.provider_id, &model.model_id)?;
+    let provider_id = model.provider_id.clone();
+    let model_id = model.model_id.clone();
+    panel.refresh();
+    Ok(format!(
+        "Updated Codex top-level default in {} to {}/{}",
+        path.display(),
+        provider_id,
+        model_id
+    ))
+}
+
+fn submit_tui_model_input(
+    model_input: &mut TuiModelInput,
+    panel: &mut TuiModelsPanel,
+) -> Result<Option<String>> {
+    let entered = model_input.input.value().trim().to_string();
+    match &mut model_input.kind {
+        TuiModelInputKind::AddModel { provider_id } => {
+            if entered.is_empty() {
+                anyhow::bail!("Model ID cannot be empty");
+            }
+            open_agent_store()?.upsert_model_target_blocking(&agent_store::AgentModelTarget {
+                provider_id: provider_id.clone(),
+                model_id: entered.clone(),
+                label: entered.clone(),
+                enabled: true,
+                favorite: false,
+            })?;
+            panel.refresh_models();
+            Ok(Some(format!("Added model {provider_id}/{entered}")))
+        }
+        TuiModelInputKind::CustomProvider {
+            step,
+            provider_id,
+            name,
+            base_url,
+        } => {
+            match *step {
+                0 => {
+                    if !valid_codex_provider_id(&entered) {
+                        anyhow::bail!(
+                            "Provider ID must use only letters, numbers, hyphens, or underscores"
+                        );
+                    }
+                    if panel
+                        .providers
+                        .iter()
+                        .any(|provider| provider.id == entered)
+                    {
+                        anyhow::bail!(
+                            "Provider ID already exists; choose it from the list or use another ID"
+                        );
+                    }
+                    *provider_id = entered;
+                }
+                1 => {
+                    if entered.is_empty() {
+                        anyhow::bail!("Display name cannot be empty");
+                    }
+                    *name = entered;
+                }
+                2 => {
+                    if !entered.starts_with("http://") && !entered.starts_with("https://") {
+                        anyhow::bail!("Base URL must start with http:// or https://");
+                    }
+                    *base_url = entered;
+                }
+                _ => {
+                    if !entered.is_empty() && !valid_environment_variable_name(&entered) {
+                        anyhow::bail!(
+                            "Environment variable must use the standard NAME_WITH_UNDERSCORES form"
+                        );
+                    }
+                    let env_key = (!entered.is_empty()).then_some(entered.as_str());
+                    upsert_codex_provider_config_at(
+                        &codex_config_path()?,
+                        provider_id,
+                        name,
+                        base_url,
+                        env_key,
+                    )?;
+                    open_agent_store()?.upsert_model_provider_blocking(
+                        &agent_store::AgentModelProvider {
+                            id: provider_id.clone(),
+                            name: name.clone(),
+                            base_url: Some(base_url.clone()),
+                            env_key: env_key.map(str::to_string),
+                            built_in: false,
+                            enabled: true,
+                        },
+                    )?;
+                    let message = format!("Added custom Responses provider {name} ({provider_id})");
+                    panel.refresh();
+                    return Ok(Some(message));
+                }
+            }
+            *step += 1;
+            model_input.input = Input::default();
+            Ok(None)
         }
     }
 }
@@ -7473,6 +8521,7 @@ fn next_agent_codex_setting(current: Option<&str>, choices: &[&str]) -> Option<S
 fn update_selected_tui_agent_codex_settings(
     panel: &mut TuiAgentPanel,
     active_root: &Path,
+    provider: Option<String>,
     model: Option<String>,
     reasoning_effort: Option<String>,
     fast_enabled: bool,
@@ -7484,6 +8533,7 @@ fn update_selected_tui_agent_codex_settings(
     let store = open_agent_store()?;
     let changed = store.set_project_codex_settings_blocking(
         project_id,
+        provider.as_deref(),
         model.as_deref(),
         reasoning_effort.as_deref(),
         fast_enabled,
@@ -7499,11 +8549,30 @@ fn cycle_selected_tui_agent_codex_model(
     let Some(project) = panel.selected_project().map(|entry| entry.project.clone()) else {
         return Ok("No registered project selected".to_string());
     };
-    let model = next_agent_codex_setting(project.codex_model.as_deref(), &AGENT_CODEX_MODELS);
-    let label = model.as_deref().unwrap_or("default").to_string();
+    let store = open_agent_store()?;
+    let targets = store.list_enabled_model_targets_blocking()?;
+    let current_idx = project.codex_model.as_ref().and_then(|model| {
+        let provider = project.codex_provider.as_deref().unwrap_or("openai");
+        targets
+            .iter()
+            .position(|target| target.provider_id == provider && target.model_id == *model)
+            .map(|index| index + 1)
+    });
+    let next_idx = (current_idx.unwrap_or(0) + 1) % (targets.len() + 1);
+    let (provider, model, label) = if next_idx == 0 {
+        (None, None, "CLT default".to_string())
+    } else {
+        let target = &targets[next_idx - 1];
+        (
+            Some(target.provider_id.clone()),
+            Some(target.model_id.clone()),
+            format!("{}/{}", target.provider_id, target.model_id),
+        )
+    };
     let changed = update_selected_tui_agent_codex_settings(
         panel,
         active_root,
+        provider,
         model,
         project.codex_reasoning_effort,
         project.codex_fast_enabled,
@@ -7534,6 +8603,7 @@ fn cycle_selected_tui_agent_codex_reasoning(
     let changed = update_selected_tui_agent_codex_settings(
         panel,
         active_root,
+        project.codex_provider,
         project.codex_model,
         reasoning,
         project.codex_fast_enabled,
@@ -7560,6 +8630,7 @@ fn toggle_selected_tui_agent_codex_fast(
     let changed = update_selected_tui_agent_codex_settings(
         panel,
         active_root,
+        project.codex_provider,
         project.codex_model,
         project.codex_reasoning_effort,
         fast_enabled,
@@ -7588,7 +8659,7 @@ fn tui_agent_log_refresh_interval() -> Duration {
 }
 
 fn tui_agent_panel_instructions() -> &'static str {
-    "Up/Down selects, Enter opens/adds, Space toggles ON/OFF, g cycles Git off/commit/push, m cycles model, f toggles fast, t cycles thinking, l shows output."
+    "Up/Down selects, Enter opens/adds, Space toggles ON/OFF, g cycles Git off/commit/push, m cycles the selected target, M opens Models, f toggles fast, t cycles thinking, l shows output. Tab returns to Kanban."
 }
 
 fn parse_agent_codex_session_id(line: &str) -> Option<String> {
@@ -7878,12 +8949,16 @@ fn active_board_marker(is_current_board: bool) -> &'static str {
     if is_current_board { "*" } else { "" }
 }
 
-fn compact_agent_model_setting(model: Option<&str>) -> String {
+fn compact_agent_model_setting(provider: Option<&str>, model: Option<&str>) -> String {
     let model = model.unwrap_or("default");
-    model
+    let compact = model
         .strip_prefix("gpt-")
         .unwrap_or(model)
-        .replace("-codex", "")
+        .replace("-codex", "");
+    match provider.filter(|provider| *provider != "openai") {
+        Some(provider) => format!("{provider}:{compact}"),
+        None => compact,
+    }
 }
 
 fn compact_agent_thinking_setting(thinking: Option<&str>) -> &str {
@@ -7895,6 +8970,7 @@ fn compact_agent_thinking_setting(thinking: Option<&str>) -> &str {
 }
 
 fn compact_agent_codex_settings(
+    provider: Option<&str>,
     model: Option<&str>,
     thinking: Option<&str>,
     fast_enabled: bool,
@@ -7902,7 +8978,7 @@ fn compact_agent_codex_settings(
     let mut settings = Vec::new();
 
     if model.is_some() {
-        settings.push(compact_agent_model_setting(model));
+        settings.push(compact_agent_model_setting(provider, model));
     }
     if thinking.is_some() {
         settings.push(compact_agent_thinking_setting(thinking).to_string());
@@ -7923,6 +8999,7 @@ fn agent_codex_column_width(projects: &[TuiAgentProject], include_registration: 
         .iter()
         .map(|item| {
             compact_agent_codex_settings(
+                item.project.codex_provider.as_deref(),
                 item.project.codex_model.as_deref(),
                 item.project.codex_reasoning_effort.as_deref(),
                 item.project.codex_fast_enabled,
@@ -7982,6 +9059,7 @@ fn format_agent_project_table_row(
     let runtime_state = item.runtime_state.label();
     let git = item.project.git_mode.tui_label();
     let codex = compact_agent_codex_settings(
+        item.project.codex_provider.as_deref(),
         item.project.codex_model.as_deref(),
         item.project.codex_reasoning_effort.as_deref(),
         item.project.codex_fast_enabled,
@@ -8367,6 +9445,204 @@ fn render_tui_agent_panel(
             height: 1,
         };
         f.render_widget(Paragraph::new(text).style(style), item_area);
+    }
+}
+
+fn tui_models_instructions() -> &'static str {
+    "Models: Left/Right changes column; Up/Down selects. Space enables/hides. f favorites a model; d sets the CLT default; c explicitly writes the Codex top-level default. a adds a model; n adds a custom Responses endpoint. Presets: 1 OpenAI, 2 OpenRouter, 3 Ollama, 4 LM Studio. M, Tab, or Esc returns to Agent Projects. API keys are read from the displayed environment variables and are never entered or written here."
+}
+
+fn provider_env_status(provider: &agent_store::AgentModelProvider) -> String {
+    match provider.env_key.as_deref() {
+        Some(key) => {
+            let visible = std::env::var_os(key)
+                .is_some_and(|value| !value.to_string_lossy().trim().is_empty());
+            format!("{key}:{}", if visible { "visible" } else { "missing" })
+        }
+        None => "no API key".to_string(),
+    }
+}
+
+fn render_tui_models_panel(
+    f: &mut ratatui::Frame<'_>,
+    area: Rect,
+    panel: &TuiModelsPanel,
+    text_color: Color,
+    c_highlight: Color,
+) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
+        .split(area);
+    let clt_default = match (
+        panel.defaults.provider_id.as_deref(),
+        panel.defaults.model_id.as_deref(),
+    ) {
+        (Some(provider), Some(model)) => format!("{provider}/{model}"),
+        _ => "Codex config".to_string(),
+    };
+    let default_label = format!(
+        " CLT default: {clt_default} | Codex: {} ",
+        panel.codex_default
+    );
+    let provider_focused = panel.focus == TuiModelsFocus::Providers;
+    let provider_block = Block::default()
+        .title(if provider_focused {
+            " Providers  <<<<<< * >>>>>> "
+        } else {
+            " Providers "
+        })
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if provider_focused {
+            Color::Yellow
+        } else {
+            Color::Indexed(244)
+        }));
+    let provider_inner = provider_block.inner(chunks[0]);
+    f.render_widget(provider_block, chunks[0]);
+
+    if let Some(error) = panel.last_error.as_deref() {
+        f.render_widget(
+            Paragraph::new(error).style(Style::default().fg(Color::Red)),
+            provider_inner,
+        );
+        return;
+    }
+
+    let provider_selected = panel.provider_state.selected();
+    let provider_height = provider_inner.height as usize;
+    let provider_offset = provider_selected
+        .unwrap_or(0)
+        .saturating_sub(provider_height.saturating_sub(1));
+    for (index, provider) in panel
+        .providers
+        .iter()
+        .enumerate()
+        .skip(provider_offset)
+        .take(provider_height)
+    {
+        let row = format!(
+            "{} {} {:<16} {:<12} {} {}",
+            if provider.enabled { "ON " } else { "OFF" },
+            if provider.built_in {
+                "BUILTIN"
+            } else {
+                "CUSTOM "
+            },
+            provider.name,
+            provider.id,
+            provider_env_status(provider),
+            provider.base_url.as_deref().unwrap_or("Codex built-in")
+        );
+        let style = if Some(index) == provider_selected {
+            if provider_focused {
+                Style::default().fg(Color::Black).bg(c_highlight)
+            } else {
+                Style::default().fg(Color::White).bg(Color::DarkGray)
+            }
+        } else if provider.enabled {
+            Style::default().fg(text_color)
+        } else {
+            Style::default().fg(Color::Indexed(244))
+        };
+        f.render_widget(
+            Paragraph::new(truncate_to_width(&row, provider_inner.width as usize)).style(style),
+            Rect::new(
+                provider_inner.x,
+                provider_inner.y + (index - provider_offset) as u16,
+                provider_inner.width,
+                1,
+            ),
+        );
+    }
+
+    let models_focused = panel.focus == TuiModelsFocus::Models;
+    let selected_provider_name = panel
+        .selected_provider()
+        .map(|provider| provider.name.as_str())
+        .unwrap_or("No provider");
+    let models_block = Block::default()
+        .title(if models_focused {
+            format!(" {selected_provider_name} Models  <<<<<< * >>>>>> ")
+        } else {
+            format!(" {selected_provider_name} Models ")
+        })
+        .title(Line::from(default_label).alignment(Alignment::Right))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if models_focused {
+            Color::Yellow
+        } else {
+            Color::Indexed(244)
+        }));
+    let models_inner = models_block.inner(chunks[1]);
+    f.render_widget(models_block, chunks[1]);
+
+    if models_inner.height > 0 {
+        let detail = panel
+            .selected_provider()
+            .map(|provider| {
+                format!(
+                    "Endpoint: {}  Auth: {}  Wire API: responses",
+                    provider.base_url.as_deref().unwrap_or("Codex built-in"),
+                    provider_env_status(provider)
+                )
+            })
+            .unwrap_or_default();
+        f.render_widget(
+            Paragraph::new(truncate_to_width(&detail, models_inner.width as usize))
+                .style(Style::default().fg(Color::Indexed(244))),
+            Rect::new(models_inner.x, models_inner.y, models_inner.width, 1),
+        );
+    }
+    let models_list_inner = Rect::new(
+        models_inner.x,
+        models_inner.y.saturating_add(1),
+        models_inner.width,
+        models_inner.height.saturating_sub(1),
+    );
+
+    let model_selected = panel.model_state.selected();
+    let models_height = models_list_inner.height as usize;
+    let models_offset = model_selected
+        .unwrap_or(0)
+        .saturating_sub(models_height.saturating_sub(1));
+    for (index, model) in panel
+        .models
+        .iter()
+        .enumerate()
+        .skip(models_offset)
+        .take(models_height)
+    {
+        let is_default = panel.defaults.provider_id.as_deref() == Some(model.provider_id.as_str())
+            && panel.defaults.model_id.as_deref() == Some(model.model_id.as_str());
+        let row = format!(
+            "{} {} {} {:<24} {}",
+            if model.enabled { "ON " } else { "OFF" },
+            if model.favorite { "★" } else { " " },
+            if is_default { "DEFAULT" } else { "       " },
+            model.label,
+            model.model_id
+        );
+        let style = if Some(index) == model_selected {
+            if models_focused {
+                Style::default().fg(Color::Black).bg(c_highlight)
+            } else {
+                Style::default().fg(Color::White).bg(Color::DarkGray)
+            }
+        } else if model.enabled {
+            Style::default().fg(text_color)
+        } else {
+            Style::default().fg(Color::Indexed(244))
+        };
+        f.render_widget(
+            Paragraph::new(truncate_to_width(&row, models_list_inner.width as usize)).style(style),
+            Rect::new(
+                models_list_inner.x,
+                models_list_inner.y + (index - models_offset) as u16,
+                models_list_inner.width,
+                1,
+            ),
+        );
     }
 }
 
@@ -8815,6 +10091,8 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
     let mut backlog_visible = false;
     let mut current_pane = start_state.current_pane;
     let mut agent_panel = TuiAgentPanel::new(&active_root);
+    let mut models_panel = TuiModelsPanel::new();
+    let mut model_input: Option<TuiModelInput> = None;
     let mut last_agent_panel_refresh = Instant::now();
     let mut agent_log_view: Option<TuiAgentLogView> = None;
     let mut last_agent_log_refresh = Instant::now();
@@ -8887,6 +10165,8 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                 (tui_agent_log_title(log_view), None)
             } else if current_pane == TuiPane::AgentProjects {
                 ("Agent Projects Console".to_string(), None)
+            } else if current_pane == TuiPane::Models {
+                ("Models Console".to_string(), None)
             } else if archive_view {
                 (format!("{board_title} Archive Console"), None)
             } else if !backlog_visible {
@@ -8902,8 +10182,9 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
             };
 
             // Calculate input height if in Input or Edit mode
-            let input_height =
-                if matches!(current_mode, Mode::Input) || matches!(current_mode, Mode::Edit) {
+            let input_height = if model_input.is_some() {
+                3
+            } else if matches!(current_mode, Mode::Input) || matches!(current_mode, Mode::Edit) {
                     let label = if matches!(current_mode, Mode::Input) {
                         " Add Task: "
                     } else {
@@ -8921,9 +10202,9 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                         input_cursor_offset_at(&full_text, available_width, cursor_idx).1 as usize;
                     // Height = content rows + 2 (for top and bottom borders)
                     (lines.max(cursor_row + 1) + 2).max(3) as u16
-                } else {
-                    0
-                };
+            } else {
+                0
+            };
 
             let console_height = {
                 let (console_content, _) = tui_console_content(
@@ -8958,6 +10239,14 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                     &mut agent_panel,
                     &active_root,
                     true,
+                    text_color,
+                    c_highlight,
+                );
+            } else if current_pane == TuiPane::Models {
+                render_tui_models_panel(
+                    f,
+                    content_area,
+                    &models_panel,
                     text_color,
                     c_highlight,
                 );
@@ -9219,7 +10508,28 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                 }
             }
 
-            if matches!(current_mode, Mode::Input) || matches!(current_mode, Mode::Edit) {
+            if let Some(model_input) = model_input.as_ref() {
+                let label = model_input.label();
+                let input_text = format!("{}{}", label, model_input.input.value());
+                let input_paragraph = Paragraph::new(input_text.as_str())
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title("Models Input (Enter advances/saves, Esc cancels)"),
+                    )
+                    .style(Style::default().fg(Color::White));
+                f.render_widget(input_paragraph, main_layout[1]);
+                let cursor = label.chars().count() + model_input.input.visual_cursor();
+                let input_inner = main_layout[1].inner(ratatui::layout::Margin {
+                    horizontal: 1,
+                    vertical: 1,
+                });
+                f.set_cursor_position(Position::new(
+                    input_inner.x
+                        + (cursor as u16).min(input_inner.width.saturating_sub(1)),
+                    input_inner.y,
+                ));
+            } else if matches!(current_mode, Mode::Input) || matches!(current_mode, Mode::Edit) {
                 let label = if matches!(current_mode, Mode::Input) {
                     " Add Task: "
                 } else {
@@ -9297,7 +10607,11 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                  [B]            - Show/hide backlog column\n\
                                  [Backspace]    - Return to parent board\n\
                                  [d/Del]        - Delete selected task\n\
-                                 [Tab]          - Switch between task board and agent projects panes\n\
+                                 [Tab]          - Toggle task board and agent projects\n\
+                                 [Agent m/M]    - Cycle selected target / open Models\n\
+                                 [Models a/n]   - Add model / custom Responses provider\n\
+                                 [Models 1-4]   - Add OpenAI/OpenRouter/Ollama/LM Studio preset\n\
+                                 [Models d/c]   - Set CLT default / explicitly set Codex default\n\
                                  [Arrows]       - Navigate boards and tasks\n\
                                  [r, then Arrow] - Reorganize task once (Esc cancels)\n\
                                  [Shift+Arrows] - Reorder/Move tasks\n\
@@ -9338,22 +10652,59 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
         #[allow(clippy::collapsible_if)]
         if event::poll(std::time::Duration::from_millis(100))? {
             match event::read()? {
+                Event::Paste(content) if model_input.is_some() => {
+                    if let Some(input) = model_input.as_mut() {
+                        input.insert_paste(&content);
+                    }
+                }
                 Event::Paste(content) if matches!(current_mode, Mode::Input | Mode::Edit) => {
                     task_input.insert_paste(content);
                 }
                 Event::Key(key) => {
                     let input_available_width = terminal.size()?.width.saturating_sub(2) as usize;
+                    if let Some(input) = model_input.as_mut() {
+                        match key.code {
+                            KeyCode::Esc => {
+                                model_input = None;
+                                feedback_buffer = "Models input cancelled".to_string();
+                            }
+                            KeyCode::Enter => {
+                                match submit_tui_model_input(input, &mut models_panel) {
+                                    Ok(Some(message)) => {
+                                        model_input = None;
+                                        feedback_buffer = message;
+                                    }
+                                    Ok(None) => {
+                                        feedback_buffer = format!(
+                                            "Continue custom provider: enter {}",
+                                            input.label().trim().trim_end_matches(':')
+                                        );
+                                    }
+                                    Err(error) => feedback_buffer = format!("Error: {error}"),
+                                }
+                            }
+                            _ => {
+                                let label = input.label();
+                                handle_input_key(
+                                    &mut input.input,
+                                    key,
+                                    label,
+                                    input_available_width,
+                                )
+                            }
+                        }
+                        continue;
+                    }
                     match current_mode {
                         Mode::View => {
                             if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
-                                let no_active_board =
-                                    current_pane == TuiPane::AgentProjects && !active_board;
-                                current_pane = if current_pane == TuiPane::Tasks {
+                                let previous_pane = current_pane;
+                                current_pane = tui_pane_after_tab(current_pane, active_board);
+                                if previous_pane == TuiPane::Tasks {
                                     agent_panel.refresh(&active_root);
                                     agent_panel.select_project_for_path(&active_root);
                                     last_agent_panel_refresh = Instant::now();
-                                    TuiPane::AgentProjects
-                                } else if active_board {
+                                } else if current_pane == TuiPane::Tasks {
                                     if agent_log_view.is_some() {
                                         agent_panel.select_project_for_path(&active_root);
                                         sync_open_tui_agent_log_view(
@@ -9362,13 +10713,8 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                         );
                                         last_agent_log_refresh = Instant::now();
                                     }
-                                    TuiPane::Tasks
-                                } else {
-                                    TuiPane::AgentProjects
-                                };
-                                feedback_buffer = if no_active_board {
-                                    TUI_NO_ACTIVE_BOARD_MESSAGE.to_string()
-                                } else if current_pane == TuiPane::AgentProjects {
+                                }
+                                feedback_buffer = if current_pane == TuiPane::AgentProjects {
                                     tui_agent_panel_instructions().to_string()
                                 } else {
                                     "Task board pane.".to_string()
@@ -9377,6 +10723,87 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                 && agent_log_view.take().is_some()
                             {
                                 feedback_buffer = "Closed agent output log".to_string();
+                            } else if current_pane == TuiPane::Models {
+                                match key.code {
+                                    KeyCode::Esc | KeyCode::Char('M') => {
+                                        current_pane = TuiPane::AgentProjects;
+                                        feedback_buffer =
+                                            tui_agent_panel_instructions().to_string();
+                                    }
+                                    KeyCode::Char('q') => break,
+                                    KeyCode::Char('h')
+                                    | KeyCode::Char('H')
+                                    | KeyCode::Char('?') => current_mode = Mode::Help,
+                                    KeyCode::Left => {
+                                        models_panel.focus = TuiModelsFocus::Providers;
+                                        feedback_buffer = tui_models_instructions().to_string();
+                                    }
+                                    KeyCode::Right => {
+                                        models_panel.focus = TuiModelsFocus::Models;
+                                        feedback_buffer = tui_models_instructions().to_string();
+                                    }
+                                    KeyCode::Up => models_panel.select_previous(),
+                                    KeyCode::Down => models_panel.select_next(),
+                                    KeyCode::Char(' ') => {
+                                        feedback_buffer =
+                                            match toggle_tui_models_enabled(&mut models_panel) {
+                                                Ok(message) => message,
+                                                Err(error) => format!("Error: {error}"),
+                                            };
+                                    }
+                                    KeyCode::Char('f') | KeyCode::Char('F') => {
+                                        models_panel.focus = TuiModelsFocus::Models;
+                                        feedback_buffer =
+                                            match toggle_tui_model_favorite(&mut models_panel) {
+                                                Ok(message) => message,
+                                                Err(error) => format!("Error: {error}"),
+                                            };
+                                    }
+                                    KeyCode::Char('d') | KeyCode::Char('D') => {
+                                        models_panel.focus = TuiModelsFocus::Models;
+                                        feedback_buffer =
+                                            match set_tui_model_default(&mut models_panel) {
+                                                Ok(message) => message,
+                                                Err(error) => format!("Error: {error}"),
+                                            };
+                                    }
+                                    KeyCode::Char('c') | KeyCode::Char('C') => {
+                                        models_panel.focus = TuiModelsFocus::Models;
+                                        feedback_buffer =
+                                            match set_tui_codex_default(&mut models_panel) {
+                                                Ok(message) => message,
+                                                Err(error) => format!("Error: {error}"),
+                                            };
+                                    }
+                                    KeyCode::Char('a') | KeyCode::Char('A') => {
+                                        if let Some(provider) = models_panel.selected_provider() {
+                                            model_input =
+                                                Some(TuiModelInput::add_model(provider.id.clone()));
+                                            feedback_buffer =
+                                                format!("Add a model ID for {}", provider.name);
+                                        } else {
+                                            feedback_buffer =
+                                                "Add a provider before adding a model".to_string();
+                                        }
+                                    }
+                                    KeyCode::Char('n') | KeyCode::Char('N') => {
+                                        model_input = Some(TuiModelInput::custom_provider());
+                                        feedback_buffer =
+                                            "Custom providers must support the Responses API"
+                                                .to_string();
+                                    }
+                                    KeyCode::Char(digit @ '1'..='4') => {
+                                        let index = digit as usize - '1' as usize;
+                                        feedback_buffer = match add_tui_model_provider_preset(
+                                            &mut models_panel,
+                                            index,
+                                        ) {
+                                            Ok(message) => message,
+                                            Err(error) => format!("Error: {error}"),
+                                        };
+                                    }
+                                    _ => feedback_buffer = tui_models_instructions().to_string(),
+                                }
                             } else if current_pane == TuiPane::AgentProjects {
                                 match key.code {
                                     KeyCode::Esc => {
@@ -9538,7 +10965,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                             Err(e) => feedback_buffer = format!("Error: {}", e),
                                         }
                                     }
-                                    KeyCode::Char('m') | KeyCode::Char('M') => {
+                                    KeyCode::Char('m') => {
                                         if agent_panel
                                             .selected_current_project_registration()
                                             .is_some()
@@ -9559,6 +10986,11 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                             }
                                             Err(e) => feedback_buffer = format!("Error: {}", e),
                                         }
+                                    }
+                                    KeyCode::Char('M') => {
+                                        models_panel.refresh();
+                                        current_pane = TuiPane::Models;
+                                        feedback_buffer = tui_models_instructions().to_string();
                                     }
                                     KeyCode::Char('f') | KeyCode::Char('F') => {
                                         if agent_panel
@@ -10593,6 +12025,7 @@ mod tests {
                 name: name.to_string(),
                 enabled: true,
                 git_mode: AgentGitMode::Off,
+                codex_provider: None,
                 codex_model: None,
                 codex_reasoning_effort: None,
                 codex_fast_enabled: false,
@@ -10751,7 +12184,8 @@ mod tests {
         );
         assert!(!tui_agent_panel_instructions().contains("Auto-refreshes"));
         assert!(!tui_agent_panel_instructions().contains("r refresh"));
-        assert!(tui_agent_panel_instructions().contains("m cycles model"));
+        assert!(tui_agent_panel_instructions().contains("m cycles the selected target"));
+        assert!(tui_agent_panel_instructions().contains("M opens Models"));
         assert!(tui_agent_panel_instructions().contains("f toggles fast"));
         assert!(tui_agent_panel_instructions().contains("t cycles thinking"));
         assert!(tui_agent_panel_instructions().contains("l shows output"));
@@ -11219,16 +12653,28 @@ mod tests {
 
     #[test]
     fn compact_codex_settings_omit_disabled_overrides() {
-        assert_eq!(compact_agent_codex_settings(None, None, false), "default");
         assert_eq!(
-            compact_agent_codex_settings(Some("gpt-5.6"), Some("high"), false),
+            compact_agent_codex_settings(None, None, None, false),
+            "default"
+        );
+        assert_eq!(
+            compact_agent_codex_settings(None, Some("gpt-5.6"), Some("high"), false),
             "5.6/high"
         );
         assert_eq!(
-            compact_agent_codex_settings(None, Some("high"), false),
+            compact_agent_codex_settings(None, None, Some("high"), false),
             "high"
         );
-        assert_eq!(compact_agent_codex_settings(None, None, true), "fast");
+        assert_eq!(compact_agent_codex_settings(None, None, None, true), "fast");
+        assert_eq!(
+            compact_agent_codex_settings(
+                Some("openrouter"),
+                Some("anthropic/claude-sonnet-4"),
+                None,
+                false,
+            ),
+            "openrouter:anthropic/claude-sonnet-4"
+        );
     }
 
     #[test]
@@ -11260,17 +12706,11 @@ mod tests {
     }
 
     #[test]
-    fn codex_setting_cycles_return_to_project_defaults() {
+    fn codex_reasoning_setting_cycles_return_to_project_default() {
         assert_eq!(
             AGENT_CODEX_REASONING_EFFORTS,
             ["", "low", "medium", "high", "xhigh", "max", "ultra"]
         );
-
-        let mut model = None;
-        for _ in 0..AGENT_CODEX_MODELS.len() {
-            model = next_agent_codex_setting(model.as_deref(), &AGENT_CODEX_MODELS);
-        }
-        assert_eq!(model, None);
 
         let mut reasoning = None;
         for _ in 0..AGENT_CODEX_REASONING_EFFORTS.len() {
@@ -11548,6 +12988,26 @@ mod tests {
     }
 
     #[test]
+    fn tab_toggles_kanban_and_agent_projects_without_cycling_models() {
+        assert_eq!(
+            tui_pane_after_tab(TuiPane::Tasks, true),
+            TuiPane::AgentProjects
+        );
+        assert_eq!(
+            tui_pane_after_tab(TuiPane::AgentProjects, true),
+            TuiPane::Tasks
+        );
+        assert_eq!(
+            tui_pane_after_tab(TuiPane::AgentProjects, false),
+            TuiPane::AgentProjects
+        );
+        assert_eq!(
+            tui_pane_after_tab(TuiPane::Models, true),
+            TuiPane::AgentProjects
+        );
+    }
+
+    #[test]
     fn agent_register_command_accepts_optional_path() {
         let cli = Cli::try_parse_from(["clt", "agent", "register", "."]).unwrap();
 
@@ -11764,6 +13224,7 @@ mod tests {
             name: "demo-project".to_string(),
             enabled: true,
             git_mode: AgentGitMode::Off,
+            codex_provider: None,
             codex_model: None,
             codex_reasoning_effort: None,
             codex_fast_enabled: false,
@@ -11787,7 +13248,7 @@ mod tests {
             "             failure:   -",
             "             blocked:   -",
             "   settings  git: off",
-            "             model: default  reasoning: default  fast: disabled",
+            "             target: CLT default  reasoning: default  fast: disabled",
             "   health    failures: 3",
             "   path      /tmp/demo-project",
         ]
@@ -11905,6 +13366,7 @@ mod tests {
             name: "project".to_string(),
             enabled: true,
             git_mode: AgentGitMode::Off,
+            codex_provider: None,
             codex_model: None,
             codex_reasoning_effort: None,
             codex_fast_enabled: false,
@@ -11948,6 +13410,7 @@ mod tests {
             name: "project".to_string(),
             enabled: true,
             git_mode: AgentGitMode::Off,
+            codex_provider: None,
             codex_model: None,
             codex_reasoning_effort: None,
             codex_fast_enabled: false,
@@ -12261,6 +13724,9 @@ mod tests {
             "runs",
             "leases",
             "daemon_checkins",
+            "model_providers",
+            "model_targets",
+            "agent_settings",
         ] {
             assert!(
                 store.table_exists_blocking(table).unwrap(),
@@ -12521,6 +13987,7 @@ mod tests {
             store
                 .set_project_codex_settings_blocking(
                     project.id,
+                    Some("openai"),
                     Some("gpt-5.6-terra"),
                     Some("high"),
                     true,
@@ -12528,9 +13995,139 @@ mod tests {
                 .unwrap()
         );
         let project = store.list_projects_blocking().unwrap().remove(0);
+        assert_eq!(project.codex_provider.as_deref(), Some("openai"));
         assert_eq!(project.codex_model.as_deref(), Some("gpt-5.6-terra"));
         assert_eq!(project.codex_reasoning_effort.as_deref(), Some("high"));
         assert!(project.codex_fast_enabled);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_store_persists_provider_catalog_favorites_and_clt_default() {
+        let root = temp_root("agent-model-catalog");
+        let state_dir = root.join("state/clt");
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+
+        let providers = store.list_model_providers_blocking().unwrap();
+        assert_eq!(providers[0].id, "openai");
+        assert!(providers[0].enabled);
+        let openai_models = store.list_model_targets_blocking(Some("openai")).unwrap();
+        assert!(
+            openai_models
+                .iter()
+                .any(|model| { model.model_id == "gpt-5.6" && model.enabled && model.favorite })
+        );
+        assert_eq!(
+            store.model_defaults_blocking().unwrap(),
+            agent_store::AgentModelDefaults::default()
+        );
+
+        let provider = agent_store::AgentModelProvider {
+            id: "openrouter".to_string(),
+            name: "OpenRouter".to_string(),
+            base_url: Some("https://openrouter.ai/api/v1".to_string()),
+            env_key: Some("OPENROUTER_API_KEY".to_string()),
+            built_in: false,
+            enabled: true,
+        };
+        store.upsert_model_provider_blocking(&provider).unwrap();
+        let target = agent_store::AgentModelTarget {
+            provider_id: "openrouter".to_string(),
+            model_id: "anthropic/claude-sonnet-4".to_string(),
+            label: "Claude Sonnet 4".to_string(),
+            enabled: true,
+            favorite: true,
+        };
+        store.upsert_model_target_blocking(&target).unwrap();
+        store
+            .set_model_default_blocking(&target.provider_id, &target.model_id)
+            .unwrap();
+
+        assert_eq!(
+            store.model_defaults_blocking().unwrap(),
+            agent_store::AgentModelDefaults {
+                provider_id: Some("openrouter".to_string()),
+                model_id: Some("anthropic/claude-sonnet-4".to_string()),
+            }
+        );
+        assert!(
+            store
+                .list_enabled_model_targets_blocking()
+                .unwrap()
+                .contains(&target)
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn codex_config_edits_preserve_existing_content_and_create_backup() {
+        let root = temp_root("codex-config-model-provider");
+        let config_path = root.join("codex/config.toml");
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        fs::write(
+            &config_path,
+            "# keep this comment\napproval_policy = \"never\"\n\n[projects.\"/tmp/demo\"]\ntrust_level = \"trusted\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_codex_default_config_at(&config_path).unwrap(),
+            (None, None),
+            "optional top-level defaults must not be indexed as required TOML keys"
+        );
+
+        upsert_codex_provider_config_at(
+            &config_path,
+            "openrouter",
+            "OpenRouter",
+            "https://openrouter.ai/api/v1",
+            Some("OPENROUTER_API_KEY"),
+        )
+        .unwrap();
+        set_codex_default_config_at(&config_path, "openrouter", "anthropic/claude-sonnet-4")
+            .unwrap();
+
+        let updated = fs::read_to_string(&config_path).unwrap();
+        let parsed = updated.parse::<DocumentMut>().unwrap();
+        assert!(updated.contains("# keep this comment"));
+        assert_eq!(parsed["approval_policy"].as_str(), Some("never"));
+        assert_eq!(
+            parsed["projects"]["/tmp/demo"]["trust_level"].as_str(),
+            Some("trusted")
+        );
+        assert_eq!(
+            parsed["model_providers"]["openrouter"]["wire_api"].as_str(),
+            Some("responses")
+        );
+        assert_eq!(
+            parsed["model_providers"]["openrouter"]["env_key"].as_str(),
+            Some("OPENROUTER_API_KEY")
+        );
+        assert_eq!(parsed["model_provider"].as_str(), Some("openrouter"));
+        assert_eq!(parsed["model"].as_str(), Some("anthropic/claude-sonnet-4"));
+        assert!(
+            config_path
+                .parent()
+                .unwrap()
+                .join("config.toml.clt.bak")
+                .is_file()
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn codex_config_edit_rejects_invalid_toml_without_overwriting_it() {
+        let root = temp_root("codex-config-invalid");
+        let config_path = root.join("config.toml");
+        let invalid = "model = [not valid";
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&config_path, invalid).unwrap();
+
+        assert!(set_codex_default_config_at(&config_path, "openai", "gpt-5.6").is_err());
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), invalid);
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -13854,6 +15451,7 @@ mod tests {
             name: "project".to_string(),
             enabled: true,
             git_mode: AgentGitMode::Off,
+            codex_provider: None,
             codex_model: None,
             codex_reasoning_effort: None,
             codex_fast_enabled: false,
@@ -13920,6 +15518,7 @@ mod tests {
             name: "project".to_string(),
             enabled: true,
             git_mode: AgentGitMode::Off,
+            codex_provider: None,
             codex_model: None,
             codex_reasoning_effort: None,
             codex_fast_enabled: false,
@@ -14048,6 +15647,7 @@ mod tests {
             name: "Project With Spaces".to_string(),
             enabled: true,
             git_mode: AgentGitMode::Off,
+            codex_provider: Some("openai".to_string()),
             codex_model: Some("gpt-5.6-terra".to_string()),
             codex_reasoning_effort: Some("high".to_string()),
             codex_fast_enabled: true,
@@ -14077,9 +15677,66 @@ mod tests {
         );
         let stderr = fs::read_to_string(&result.stderr_path).unwrap();
         assert!(stderr.contains(
-            "arg=--sandbox\narg=danger-full-access\narg=--ask-for-approval\narg=never\narg=--model\narg=gpt-5.6-terra\narg=--config\narg=model_reasoning_effort=\"high\"\narg=--enable\narg=fast_mode\narg=--config\narg=service_tier=\"fast\"\narg=exec\narg=-C\n"
+            "arg=--sandbox\narg=danger-full-access\narg=--ask-for-approval\narg=never\narg=--config\narg=model_provider=\"openai\"\narg=--model\narg=gpt-5.6-terra\narg=--config\narg=model_reasoning_effort=\"high\"\narg=--enable\narg=fast_mode\narg=--config\narg=service_tier=\"fast\"\narg=exec\narg=-C\n"
         ));
         assert!(stderr.contains(&format!("arg={}\n", project_root.display())));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_runner_resolves_the_latest_clt_default_for_new_runs() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_root("agent-codex-runner-default");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .set_model_default_blocking("openrouter", "anthropic/claude-sonnet-4")
+            .unwrap();
+
+        let fake_codex = root.join("fake-codex");
+        fs::write(
+            &fake_codex,
+            "#!/bin/sh\nprintf 'arg=%s\\n' \"$@\" >&2\nprintf 'NO_TASKS_LEFT\\n'\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&fake_codex).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_codex, permissions).unwrap();
+
+        let project = agent_store::AgentProject {
+            id: 44,
+            path: project_root,
+            name: "Default Target Project".to_string(),
+            enabled: true,
+            git_mode: AgentGitMode::Off,
+            codex_provider: None,
+            codex_model: None,
+            codex_reasoning_effort: None,
+            codex_fast_enabled: false,
+            last_scan_at: None,
+            last_run_at: None,
+            last_success_at: None,
+            last_failure_at: None,
+            last_blocked_recovery_at: None,
+            failure_count: 0,
+        };
+        let runner = CodexAgentRunner::with_command(state_dir, Duration::from_secs(5), fake_codex);
+        let result = runner
+            .run_project(
+                &project,
+                AgentTaskSelection::NextTodo,
+                &new_agent_shutdown_signal(),
+            )
+            .unwrap();
+        let stderr = fs::read_to_string(result.stderr_path).unwrap();
+
+        assert!(stderr.contains("arg=model_provider=\"openrouter\"\n"));
+        assert!(stderr.contains("arg=--model\narg=anthropic/claude-sonnet-4\n"));
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -14110,6 +15767,7 @@ mod tests {
             name: "Shutdown Project".to_string(),
             enabled: true,
             git_mode: AgentGitMode::Off,
+            codex_provider: None,
             codex_model: None,
             codex_reasoning_effort: None,
             codex_fast_enabled: false,

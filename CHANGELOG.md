@@ -10,6 +10,8 @@ Use this section while developing the next release.
 
 ### Added
 
+- Added a TUI Models page with provider presets, custom Responses-compatible endpoints, enabled model targets, favorites, a CLT-wide default, and per-project provider/model overrides.
+- Added explicit, backup-protected Codex `config.toml` actions for custom provider definitions and the user's top-level default while keeping API keys exclusively in environment variables.
 - Added a Done-task shortcut to resume that task's automated Codex run interactively, returning to the same board after Codex exits.
 - Added blocked-task monitoring: blocked Todo entries are skipped during normal selection, and when every task across Todo and Doing is blocked, the agent revisits one existing blocker at a time and backs off unchanged recovery attempts.
 - Added the current local time to the agent projects pane's top border before the daemon status.
@@ -30,6 +32,7 @@ Use this section while developing the next release.
 
 ### Changed
 
+- Restored `Tab` as a direct Kanban/Agent Projects toggle; lowercase `m` retains quick per-project target cycling, while uppercase `M` opens the Models page from Agent Projects.
 - Git commit-and-push automation now pulls with the user's configured merge or rebase strategy instead of forcing a rebase.
 - Moving a folder-backed task into a Markdown-backed status now expands the destination status to a folder and preserves the old Markdown file as `status.md.bak`.
 - Right-aligned the hidden Backlog count and shortcut in the task console title.
