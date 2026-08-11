@@ -32,6 +32,7 @@ Use this section while developing the next release.
 
 ### Changed
 
+- Added aligned, labeled provider/model columns to the Models page, replacing unexplained favorite stars with `FAV` values and marking CLT and Codex defaults independently.
 - Restored `Tab` as a direct Kanban/Agent Projects toggle; lowercase `m` retains quick per-project target cycling, while uppercase `M` opens the Models page from Agent Projects.
 - Git commit-and-push automation now pulls with the user's configured merge or rebase strategy instead of forcing a rebase.
 - Moving a folder-backed task into a Markdown-backed status now expands the destination status to a folder and preserves the old Markdown file as `status.md.bak`.

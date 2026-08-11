@@ -7547,6 +7547,8 @@ struct TuiModelsPanel {
     models: Vec<agent_store::AgentModelTarget>,
     defaults: agent_store::AgentModelDefaults,
     codex_default: String,
+    codex_default_provider: Option<String>,
+    codex_default_model: Option<String>,
     focus: TuiModelsFocus,
     provider_state: ListState,
     model_state: ListState,
@@ -7871,6 +7873,8 @@ impl TuiModelsPanel {
             models: Vec::new(),
             defaults: agent_store::AgentModelDefaults::default(),
             codex_default: "not explicitly set".to_string(),
+            codex_default_provider: None,
+            codex_default_model: None,
             focus: TuiModelsFocus::Providers,
             provider_state: ListState::default(),
             model_state: ListState::default(),
@@ -7911,13 +7915,22 @@ impl TuiModelsPanel {
 
         self.providers = providers;
         self.defaults = defaults;
-        self.codex_default =
-            match codex_config_path().and_then(|path| read_codex_default_config_at(&path)) {
-                Ok((Some(provider), Some(model))) => format!("{provider}/{model}"),
-                Ok((_, Some(model))) => model,
-                Ok(_) => "not explicitly set".to_string(),
-                Err(error) => format!("config error: {error}"),
-            };
+        match codex_config_path().and_then(|path| read_codex_default_config_at(&path)) {
+            Ok((provider, model)) => {
+                self.codex_default = match (&provider, &model) {
+                    (Some(provider), Some(model)) => format!("{provider}/{model}"),
+                    (_, Some(model)) => model.clone(),
+                    _ => "not explicitly set".to_string(),
+                };
+                self.codex_default_provider = provider;
+                self.codex_default_model = model;
+            }
+            Err(error) => {
+                self.codex_default = format!("config error: {error}");
+                self.codex_default_provider = None;
+                self.codex_default_model = None;
+            }
+        }
         let provider_index = selected_provider
             .as_ref()
             .and_then(|id| {
@@ -7933,7 +7946,18 @@ impl TuiModelsPanel {
         } else {
             self.provider_state.select(Some(provider_index));
             let provider_id = self.providers[provider_index].id.clone();
-            match store.list_model_targets_blocking(Some(&provider_id)) {
+            match store
+                .list_model_targets_blocking(Some(&provider_id))
+                .and_then(|mut models| {
+                    include_codex_default_model_target(
+                        &store,
+                        &provider_id,
+                        self.codex_default_provider.as_deref(),
+                        self.codex_default_model.as_deref(),
+                        &mut models,
+                    )?;
+                    Ok(models)
+                }) {
                 Ok(models) => {
                     self.models = models;
                     let model_index = selected_model
@@ -7958,7 +7982,15 @@ impl TuiModelsPanel {
         };
         match open_agent_store().and_then(|store| {
             self.defaults = store.model_defaults_blocking()?;
-            store.list_model_targets_blocking(Some(&provider_id))
+            let mut models = store.list_model_targets_blocking(Some(&provider_id))?;
+            include_codex_default_model_target(
+                &store,
+                &provider_id,
+                self.codex_default_provider.as_deref(),
+                self.codex_default_model.as_deref(),
+                &mut models,
+            )?;
+            Ok(models)
         }) {
             Ok(models) => {
                 self.models = models;
@@ -9449,7 +9481,7 @@ fn render_tui_agent_panel(
 }
 
 fn tui_models_instructions() -> &'static str {
-    "Models: Left/Right changes column; Up/Down selects. Space enables/hides. f favorites a model; d sets the CLT default; c explicitly writes the Codex top-level default. a adds a model; n adds a custom Responses endpoint. Presets: 1 OpenAI, 2 OpenRouter, 3 Ollama, 4 LM Studio. M, Tab, or Esc returns to Agent Projects. API keys are read from the displayed environment variables and are never entered or written here."
+    "Models columns: USE=available, FAV=favorite, CLT=effective CLT default, CODEX=Codex config default. CLT follows CODEX when no CLT override is set. Left/Right changes pane; Up/Down selects; Space enables/hides; f toggles favorite; d sets CLT; c sets Codex. a adds a model; n adds a custom Responses endpoint. Presets: 1 OpenAI, 2 OpenRouter, 3 Ollama, 4 LM Studio. M, Tab, or Esc returns. API keys come only from environment variables."
 }
 
 fn provider_env_status(provider: &agent_store::AgentModelProvider) -> String {
@@ -9461,6 +9493,108 @@ fn provider_env_status(provider: &agent_store::AgentModelProvider) -> String {
         }
         None => "no API key".to_string(),
     }
+}
+
+fn tui_models_provider_header() -> &'static str {
+    "USE TYPE    PROVIDER (ID)"
+}
+
+fn include_codex_default_model_target(
+    store: &agent_store::TursoAgentStore,
+    selected_provider_id: &str,
+    codex_provider_id: Option<&str>,
+    codex_model_id: Option<&str>,
+    models: &mut Vec<agent_store::AgentModelTarget>,
+) -> Result<()> {
+    let codex_provider_id = codex_provider_id.unwrap_or("openai");
+    let Some(codex_model_id) = codex_model_id else {
+        return Ok(());
+    };
+    if selected_provider_id != codex_provider_id
+        || models
+            .iter()
+            .any(|model| model.provider_id == codex_provider_id && model.model_id == codex_model_id)
+    {
+        return Ok(());
+    }
+
+    let target = agent_store::AgentModelTarget {
+        provider_id: codex_provider_id.to_string(),
+        model_id: codex_model_id.to_string(),
+        label: codex_model_id.to_string(),
+        enabled: true,
+        favorite: false,
+    };
+    store.upsert_model_target_blocking(&target)?;
+    let insertion_index = models
+        .iter()
+        .position(|model| !model.favorite)
+        .unwrap_or(models.len());
+    models.insert(insertion_index, target);
+    Ok(())
+}
+
+fn tui_models_provider_row(provider: &agent_store::AgentModelProvider) -> String {
+    format!(
+        "{:<3} {:<7} {} ({})",
+        if provider.enabled { "ON" } else { "OFF" },
+        if provider.built_in {
+            "BUILTIN"
+        } else {
+            "CUSTOM"
+        },
+        provider.name,
+        provider.id
+    )
+}
+
+fn tui_models_model_header() -> String {
+    format!(
+        "{:<3} {:<3} {:<3} {:<5} {:<16} {}",
+        "USE", "FAV", "CLT", "CODEX", "MODEL", "ID"
+    )
+}
+
+fn tui_model_matches_clt_default(
+    defaults: &agent_store::AgentModelDefaults,
+    codex_provider_id: Option<&str>,
+    codex_model_id: Option<&str>,
+    model: &agent_store::AgentModelTarget,
+) -> bool {
+    match (
+        defaults.provider_id.as_deref(),
+        defaults.model_id.as_deref(),
+    ) {
+        (Some(provider_id), Some(model_id)) => {
+            provider_id == model.provider_id && model_id == model.model_id
+        }
+        _ => tui_model_matches_codex_default(codex_provider_id, codex_model_id, model),
+    }
+}
+
+fn tui_model_matches_codex_default(
+    provider_id: Option<&str>,
+    model_id: Option<&str>,
+    model: &agent_store::AgentModelTarget,
+) -> bool {
+    let provider_id = provider_id.unwrap_or("openai");
+    model_id == Some(model.model_id.as_str()) && provider_id == model.provider_id
+}
+
+fn tui_models_model_row(
+    model: &agent_store::AgentModelTarget,
+    is_clt_default: bool,
+    is_codex_default: bool,
+) -> String {
+    format!(
+        "{:<3} {:<3} {:<3} {:<5} {:<16} {}",
+        if model.enabled { "ON" } else { "OFF" },
+        if model.favorite { "YES" } else { "-" },
+        if is_clt_default { "YES" } else { "-" },
+        if is_codex_default { "YES" } else { "-" },
+        model.label,
+        model.model_id
+    )
 }
 
 fn render_tui_models_panel(
@@ -9509,8 +9643,24 @@ fn render_tui_models_panel(
         return;
     }
 
+    if provider_inner.height > 0 {
+        f.render_widget(
+            Paragraph::new(truncate_to_width(
+                tui_models_provider_header(),
+                provider_inner.width as usize,
+            ))
+            .style(Style::default().fg(Color::Cyan)),
+            Rect::new(provider_inner.x, provider_inner.y, provider_inner.width, 1),
+        );
+    }
+    let provider_list_inner = Rect::new(
+        provider_inner.x,
+        provider_inner.y.saturating_add(1),
+        provider_inner.width,
+        provider_inner.height.saturating_sub(1),
+    );
     let provider_selected = panel.provider_state.selected();
-    let provider_height = provider_inner.height as usize;
+    let provider_height = provider_list_inner.height as usize;
     let provider_offset = provider_selected
         .unwrap_or(0)
         .saturating_sub(provider_height.saturating_sub(1));
@@ -9521,19 +9671,7 @@ fn render_tui_models_panel(
         .skip(provider_offset)
         .take(provider_height)
     {
-        let row = format!(
-            "{} {} {:<16} {:<12} {} {}",
-            if provider.enabled { "ON " } else { "OFF" },
-            if provider.built_in {
-                "BUILTIN"
-            } else {
-                "CUSTOM "
-            },
-            provider.name,
-            provider.id,
-            provider_env_status(provider),
-            provider.base_url.as_deref().unwrap_or("Codex built-in")
-        );
+        let row = tui_models_provider_row(provider);
         let style = if Some(index) == provider_selected {
             if provider_focused {
                 Style::default().fg(Color::Black).bg(c_highlight)
@@ -9546,11 +9684,12 @@ fn render_tui_models_panel(
             Style::default().fg(Color::Indexed(244))
         };
         f.render_widget(
-            Paragraph::new(truncate_to_width(&row, provider_inner.width as usize)).style(style),
+            Paragraph::new(truncate_to_width(&row, provider_list_inner.width as usize))
+                .style(style),
             Rect::new(
-                provider_inner.x,
-                provider_inner.y + (index - provider_offset) as u16,
-                provider_inner.width,
+                provider_list_inner.x,
+                provider_list_inner.y + (index - provider_offset) as u16,
+                provider_list_inner.width,
                 1,
             ),
         );
@@ -9582,9 +9721,10 @@ fn render_tui_models_panel(
             .selected_provider()
             .map(|provider| {
                 format!(
-                    "Endpoint: {}  Auth: {}  Wire API: responses",
-                    provider.base_url.as_deref().unwrap_or("Codex built-in"),
-                    provider_env_status(provider)
+                    "Provider: {}  Auth: {}  Endpoint: {}  Wire: responses",
+                    provider.id,
+                    provider_env_status(provider),
+                    provider.base_url.as_deref().unwrap_or("Codex built-in")
                 )
             })
             .unwrap_or_default();
@@ -9594,11 +9734,24 @@ fn render_tui_models_panel(
             Rect::new(models_inner.x, models_inner.y, models_inner.width, 1),
         );
     }
+    if models_inner.height > 1 {
+        let header = tui_models_model_header();
+        f.render_widget(
+            Paragraph::new(truncate_to_width(&header, models_inner.width as usize))
+                .style(Style::default().fg(Color::Cyan)),
+            Rect::new(
+                models_inner.x,
+                models_inner.y.saturating_add(1),
+                models_inner.width,
+                1,
+            ),
+        );
+    }
     let models_list_inner = Rect::new(
         models_inner.x,
-        models_inner.y.saturating_add(1),
+        models_inner.y.saturating_add(2),
         models_inner.width,
-        models_inner.height.saturating_sub(1),
+        models_inner.height.saturating_sub(2),
     );
 
     let model_selected = panel.model_state.selected();
@@ -9613,15 +9766,19 @@ fn render_tui_models_panel(
         .skip(models_offset)
         .take(models_height)
     {
-        let is_default = panel.defaults.provider_id.as_deref() == Some(model.provider_id.as_str())
-            && panel.defaults.model_id.as_deref() == Some(model.model_id.as_str());
-        let row = format!(
-            "{} {} {} {:<24} {}",
-            if model.enabled { "ON " } else { "OFF" },
-            if model.favorite { "★" } else { " " },
-            if is_default { "DEFAULT" } else { "       " },
-            model.label,
-            model.model_id
+        let row = tui_models_model_row(
+            model,
+            tui_model_matches_clt_default(
+                &panel.defaults,
+                panel.codex_default_provider.as_deref(),
+                panel.codex_default_model.as_deref(),
+                model,
+            ),
+            tui_model_matches_codex_default(
+                panel.codex_default_provider.as_deref(),
+                panel.codex_default_model.as_deref(),
+                model,
+            ),
         );
         let style = if Some(index) == model_selected {
             if models_focused {
@@ -14058,6 +14215,121 @@ mod tests {
                 .contains(&target)
         );
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tui_models_rows_have_labeled_columns_and_independent_defaults() {
+        let provider = agent_store::AgentModelProvider {
+            id: "openai".to_string(),
+            name: "OpenAI".to_string(),
+            base_url: None,
+            env_key: None,
+            built_in: true,
+            enabled: true,
+        };
+        assert_eq!(
+            tui_models_provider_header()
+                .split_whitespace()
+                .collect::<Vec<_>>(),
+            ["USE", "TYPE", "PROVIDER", "(ID)"]
+        );
+        assert_eq!(
+            tui_models_provider_row(&provider)
+                .split_whitespace()
+                .collect::<Vec<_>>(),
+            ["ON", "BUILTIN", "OpenAI", "(openai)"]
+        );
+
+        let model = agent_store::AgentModelTarget {
+            provider_id: "openai".to_string(),
+            model_id: "gpt-5.6".to_string(),
+            label: "GPT-5.6".to_string(),
+            enabled: true,
+            favorite: true,
+        };
+        let defaults = agent_store::AgentModelDefaults {
+            provider_id: Some("openai".to_string()),
+            model_id: Some("gpt-5.6".to_string()),
+        };
+        assert!(tui_model_matches_clt_default(
+            &defaults,
+            None,
+            Some("a-different-codex-model"),
+            &model
+        ));
+        assert!(tui_model_matches_clt_default(
+            &agent_store::AgentModelDefaults::default(),
+            None,
+            Some("gpt-5.6"),
+            &model
+        ));
+        assert!(tui_model_matches_codex_default(
+            None,
+            Some("gpt-5.6"),
+            &model
+        ));
+        assert_eq!(
+            tui_models_model_header()
+                .split_whitespace()
+                .collect::<Vec<_>>(),
+            ["USE", "FAV", "CLT", "CODEX", "MODEL", "ID"]
+        );
+        let row = tui_models_model_row(&model, true, true);
+        assert_eq!(
+            row.split_whitespace().collect::<Vec<_>>(),
+            ["ON", "YES", "YES", "YES", "GPT-5.6", "gpt-5.6"]
+        );
+        assert!(!row.contains('★'));
+
+        let same_id_on_openrouter = agent_store::AgentModelTarget {
+            provider_id: "openrouter".to_string(),
+            ..model
+        };
+        assert!(!tui_model_matches_codex_default(
+            None,
+            Some("gpt-5.6"),
+            &same_id_on_openrouter
+        ));
+        assert!(tui_model_matches_codex_default(
+            Some("openrouter"),
+            Some("gpt-5.6"),
+            &same_id_on_openrouter
+        ));
+
+        let root = temp_root("tui-import-codex-default-model");
+        let store = agent_store::TursoAgentStore::open_blocking(&root).unwrap();
+        let mut models = store.list_model_targets_blocking(Some("openai")).unwrap();
+        include_codex_default_model_target(
+            &store,
+            "openai",
+            None,
+            Some("gpt-config-only"),
+            &mut models,
+        )
+        .unwrap();
+        include_codex_default_model_target(
+            &store,
+            "openai",
+            None,
+            Some("gpt-config-only"),
+            &mut models,
+        )
+        .unwrap();
+        assert_eq!(
+            models
+                .iter()
+                .filter(|model| model.model_id == "gpt-config-only")
+                .count(),
+            1
+        );
+        assert!(
+            store
+                .list_model_targets_blocking(Some("openai"))
+                .unwrap()
+                .iter()
+                .any(|model| model.model_id == "gpt-config-only" && model.enabled)
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -1,0 +1,3 @@
+Clarify Models screen with aligned headers and labeled favorite markers (TUI, UX)
+
+COMPLETED 2026-08-11: Added aligned USE/TYPE/PROVIDER and USE/FAV/CLT/CODEX/MODEL/ID headers, replaced unexplained favorite stars with FAV=YES, marked Codex and effective CLT defaults independently, and imported a configured Codex default into its known provider catalog when missing so its row is visible. Updated the Models console guidance, README, and changelog. Checks: focused Models row/default/import test; cargo test -- --test-threads=1 (177 passed); cargo clippy --all-targets -- -D warnings; cargo build; git diff --check; live 80x24 TUI verification confirmed the configured gpt-5.6-sol row shows CLT=YES and CODEX=YES while inherited.
