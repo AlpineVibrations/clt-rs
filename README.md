@@ -35,6 +35,12 @@ Ensure you have Rust and Cargo installed.
 cargo install clt-rs
 ```
 
+After upgrading `clt`, restart the background agent so the running service uses the newly installed binary:
+
+```bash
+clt agent start
+```
+
 ### Shell integration
 
 A command cannot directly change the directory of the shell that launched it, so `clt` provides a small shell wrapper for project switching. Add the appropriate line to your shell configuration:
