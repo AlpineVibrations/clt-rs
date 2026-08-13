@@ -411,6 +411,13 @@ struct AgentRunJob {
     task_selection: AgentTaskSelection,
     blocked_task_count_before: usize,
     done_task_contents_before: Vec<String>,
+    blocked_task_snapshots_before: Vec<BlockedTaskSnapshot>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct BlockedTaskSnapshot {
+    status: &'static str,
+    content: String,
 }
 
 struct AgentRunCompletion {
@@ -2442,6 +2449,8 @@ fn run_agent_scheduler_pass_with_max_global_jobs(
         );
 
         let done_task_contents_before = completed_task_contents(&project.path).unwrap_or_default();
+        let blocked_task_snapshots_before =
+            blocked_task_snapshots(&project.path).unwrap_or_default();
         pass.runs_started += 1;
         jobs.push(AgentRunJob {
             state_dir: state_dir.to_path_buf(),
@@ -2450,6 +2459,7 @@ fn run_agent_scheduler_pass_with_max_global_jobs(
             task_selection,
             blocked_task_count_before: scan.blocked_task_count(),
             done_task_contents_before,
+            blocked_task_snapshots_before,
         });
     }
 
@@ -2492,7 +2502,7 @@ fn run_agent_job(
         stderr_path,
         summary,
         codex_session_id,
-        completed_task_content,
+        task_content,
     ) = match run_result {
         Ok(mut result) => {
             if matches!(result.status, "success" | "idle")
@@ -2505,11 +2515,22 @@ fn run_agent_job(
                 );
             }
 
-            let completed_task_content = result.codex_session_id.as_ref().and_then(|_| {
-                newly_completed_task(&job.project.path, &job.done_task_contents_before)
+            let task_content = result.codex_session_id.as_ref().and_then(|_| {
+                let completed =
+                    newly_completed_task(&job.project.path, &job.done_task_contents_before)
+                        .ok()
+                        .flatten()
+                        .map(|entry| entry.content.trim_end().to_string());
+
+                completed.or_else(|| {
+                    blocked_task_content_after_run(
+                        &job.project.path,
+                        &job.blocked_task_snapshots_before,
+                        job.task_selection != AgentTaskSelection::NextTodo,
+                    )
                     .ok()
                     .flatten()
-                    .map(|entry| entry.content.trim_end().to_string())
+                })
             });
 
             (
@@ -2520,7 +2541,7 @@ fn run_agent_job(
                 Some(result.stderr_path.display().to_string()),
                 result.summary,
                 result.codex_session_id,
-                completed_task_content,
+                task_content,
             )
         }
         Err(err) => (
@@ -2551,7 +2572,7 @@ fn run_agent_job(
             stderr_path: stderr_path.as_deref(),
             summary: Some(&summary),
             codex_session_id: codex_session_id.as_deref(),
-            task_content: completed_task_content.as_deref(),
+            task_content: task_content.as_deref(),
         })
     })?;
     release_result?;
@@ -2572,6 +2593,57 @@ fn completed_task_contents(project_root: &Path) -> Result<Vec<String>> {
         .into_iter()
         .map(|entry| entry.content)
         .collect())
+}
+
+fn blocked_task_snapshots(project_root: &Path) -> Result<Vec<BlockedTaskSnapshot>> {
+    let board_dir = get_tasks_dir(project_root);
+    let mut snapshots = Vec::new();
+
+    for status in ["todo", "doing"] {
+        snapshots.extend(
+            read_task_entries(&board_dir, status)?
+                .into_iter()
+                .filter(task_entry_is_blocked)
+                .map(|entry| BlockedTaskSnapshot {
+                    status,
+                    content: entry.content.trim_end().to_string(),
+                }),
+        );
+    }
+
+    Ok(snapshots)
+}
+
+fn blocked_task_content_after_run(
+    project_root: &Path,
+    snapshots_before: &[BlockedTaskSnapshot],
+    allow_unchanged_single_task: bool,
+) -> Result<Option<String>> {
+    let snapshots_after = blocked_task_snapshots(project_root)?;
+    let mut remaining = std::collections::HashMap::<&BlockedTaskSnapshot, usize>::new();
+    for snapshot in snapshots_before {
+        *remaining.entry(snapshot).or_default() += 1;
+    }
+
+    let changed_task = snapshots_after.iter().find(|snapshot| {
+        let Some(count) = remaining.get_mut(snapshot) else {
+            return true;
+        };
+        if *count == 0 {
+            true
+        } else {
+            *count -= 1;
+            false
+        }
+    });
+
+    Ok(changed_task
+        .or_else(|| {
+            (allow_unchanged_single_task && snapshots_after.len() == 1)
+                .then(|| snapshots_after.first())
+                .flatten()
+        })
+        .map(|snapshot| snapshot.content.clone()))
 }
 
 fn newly_completed_task(
@@ -4803,7 +4875,7 @@ mod agent_store {
                 .await
                 .with_context(|| {
                     format!(
-                        "Failed to find a Codex session for a completed task in {}",
+                        "Failed to find a Codex session for a task in {}",
                         project_root.display()
                     )
                 })?;
@@ -4811,7 +4883,7 @@ mod agent_store {
             let Some(row) = rows
                 .next()
                 .await
-                .context("Failed to read completed task Codex session")?
+                .context("Failed to read task Codex session")?
             else {
                 return Ok(None);
             };
@@ -7473,7 +7545,7 @@ fn tui_start_state(active_board: bool) -> TuiStartState {
             active_board,
             current_pane: TuiPane::Tasks,
             feedback_buffer: String::from(
-                "Kanban View! Tab toggles between the task board and agent projects. From Agent Projects, m cycles the selected project's target and M opens Models. Enter opens a selected project, Space toggles it ON/OFF, g cycles Git off/commit/push, f/t change its Codex fast/thinking settings, c resumes a selected Done task in interactive Codex, l shows agent output, Backspace returns to parent, Space creates a task on the board, a archives a task, A opens archive view, b moves a task to backlog, B toggles the backlog column, tap r then an Arrow to reorganize once, Shift+Arrows reorder or move tasks, Ctrl-P/N reorder up/down, 'd' deletes, 'q' quits.",
+                "Kanban View! Tab toggles between the task board and agent projects. From Agent Projects, m cycles the selected project's target and M opens Models. Enter opens a selected project, Space toggles it ON/OFF, g cycles Git off/commit/push, f/t change its Codex fast/thinking settings, c resumes a selected Done or blocked task in interactive Codex, l shows agent output, Backspace returns to parent, Space creates a task on the board, a archives a task, A opens archive view, b moves a task to backlog, B toggles the backlog column, tap r then an Arrow to reorganize once, Shift+Arrows reorder or move tasks, Ctrl-P/N reorder up/down, 'd' deletes, 'q' quits.",
             ),
         }
     } else {
@@ -8756,10 +8828,11 @@ fn preferred_recorded_agent_output_path(run: agent_store::AgentRunRecord) -> Opt
     }
 }
 
-fn codex_session_for_completed_task(
-    project_root: &Path,
-    task: &TaskEntry,
-) -> Result<Option<String>> {
+fn task_supports_interactive_codex_resume(status: &str, task: &TaskEntry) -> bool {
+    status == "done" || matches!(status, "todo" | "doing") && task_entry_is_blocked(task)
+}
+
+fn codex_session_for_task(project_root: &Path, task: &TaskEntry) -> Result<Option<String>> {
     let store = open_agent_store()?;
     store.codex_session_for_task_blocking(project_root, task.content.trim_end())
 }
@@ -10756,7 +10829,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                  [Enter]        - Open subtasks, edit selected task, or open selected agent project\n\
                                  [e]            - Edit selected task\n\
                                  [g]            - Cycle selected project's Git mode: off/commit/push\n\
-                                 [c]            - Resume selected Done task in interactive Codex\n\
+                                 [c]            - Resume selected Done or blocked task in interactive Codex\n\
                                  [l]            - Toggle active/selected project's live/current agent output\n\
                                  [a]            - Move selected task to archive\n\
                                  [A]            - Toggle archive view\n\
@@ -11407,24 +11480,27 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                                 .to_string();
                                     }
                                     KeyCode::Char('c') => {
-                                        if selected_board != DONE_BOARD_INDEX {
+                                        let selected_status = statuses[selected_board];
+                                        let Some((_, task)) = selected_task_entry_in_board(
+                                            &board_dir,
+                                            selected_status,
+                                            &board_states[selected_board],
+                                        ) else {
+                                            feedback_buffer = "No task selected".to_string();
+                                            continue;
+                                        };
+
+                                        if !task_supports_interactive_codex_resume(
+                                            selected_status,
+                                            &task,
+                                        ) {
                                             feedback_buffer =
-                                                "Codex sessions can be resumed from Done tasks."
+                                                "Codex sessions can be resumed from Done or blocked tasks."
                                                     .to_string();
                                             continue;
                                         }
 
-                                        let Some((_, task)) = selected_task_entry_in_board(
-                                            &board_dir,
-                                            "done",
-                                            &board_states[DONE_BOARD_INDEX],
-                                        ) else {
-                                            feedback_buffer = "No Done task selected".to_string();
-                                            continue;
-                                        };
-
-                                        match codex_session_for_completed_task(&active_root, &task)
-                                        {
+                                        match codex_session_for_task(&active_root, &task) {
                                             Ok(Some(session_id)) => {
                                                 agent_log_view = None;
                                                 terminal_session.suspend();
@@ -11456,7 +11532,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                             }
                                             Ok(None) => {
                                                 feedback_buffer =
-                                                "No Codex session recorded for this task. Sessions are available for tasks completed by newer automated runs."
+                                                "No Codex session recorded for this task. Sessions are available for tasks handled by newer automated runs."
                                                     .to_string();
                                             }
                                             Err(error) => {
@@ -12383,6 +12459,34 @@ mod tests {
             ]
         );
         assert_eq!(command.get_current_dir(), Some(project_root.as_path()));
+    }
+
+    #[test]
+    fn interactive_codex_resume_accepts_done_and_currently_blocked_tasks() {
+        let done = task_entry_from_text(
+            TaskSource::MarkdownLine { line_index: 1 },
+            "finished task",
+            "finished task",
+            false,
+        );
+        let blocked = task_entry_from_text(
+            TaskSource::MarkdownLine { line_index: 1 },
+            "waiting task",
+            "waiting task — BLOCKED 2026-08-13: dependency unavailable",
+            false,
+        );
+        let unblocked = task_entry_from_text(
+            TaskSource::MarkdownLine { line_index: 1 },
+            "ready again",
+            "ready again — BLOCKED 2026-08-12: waiting — UNBLOCKED 2026-08-13: restored",
+            false,
+        );
+
+        assert!(task_supports_interactive_codex_resume("done", &done));
+        assert!(task_supports_interactive_codex_resume("todo", &blocked));
+        assert!(task_supports_interactive_codex_resume("doing", &blocked));
+        assert!(!task_supports_interactive_codex_resume("todo", &unblocked));
+        assert!(!task_supports_interactive_codex_resume("backlog", &blocked));
     }
 
     #[test]
@@ -15381,6 +15485,46 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("session-for-task")
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn blocked_agent_run_records_its_codex_session_for_the_blocked_task() {
+        let root = temp_root("agent-blocked-task-codex-session");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        add_task(&project_root, "resumable blocker", None).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        drop(store);
+
+        let mut start = run_agent_scheduler_pass(&state_dir, false, &[]).unwrap();
+        assert_eq!(start.jobs.len(), 1);
+        move_task(&project_root, "todo", "doing", "1").unwrap();
+        let blocked_content = "resumable blocker — BLOCKED 2026-08-13: dependency unavailable";
+        fs::write(
+            project_root.join("tasks/doing.md"),
+            format!("# Doing Tasks\n- {blocked_content}\n"),
+        )
+        .unwrap();
+
+        let mut runner = FakeAgentRunner::new(&state_dir, "success");
+        runner.result.codex_session_id = Some("session-for-blocked-task".to_string());
+        let shutdown = new_agent_shutdown_signal();
+        run_agent_job(start.jobs.pop().unwrap(), &runner, &shutdown).unwrap();
+
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        assert_eq!(
+            store
+                .codex_session_for_task_blocking(&project_root, blocked_content)
+                .unwrap()
+                .as_deref(),
+            Some("session-for-blocked-task")
         );
 
         fs::remove_dir_all(root).unwrap();
