@@ -7835,6 +7835,16 @@ impl TuiAgentPanel {
                         self.state.select(Some(0));
                         return;
                     }
+
+                    if let Some(project_idx) = self
+                        .projects
+                        .iter()
+                        .position(|project| project.project.path == path)
+                    {
+                        self.state
+                            .select(Some(self.project_start_index() + project_idx));
+                        return;
+                    }
                 }
                 TuiAgentPanelRowIdentity::Project(project_id) => {
                     if let Some(project_idx) = self
@@ -12295,6 +12305,41 @@ mod tests {
 
         assert_eq!(panel.state.selected(), Some(2));
         assert_eq!(panel.scroll_offset, 0);
+    }
+
+    #[test]
+    fn tui_agent_panel_refresh_selects_a_newly_registered_current_project() {
+        let active_root = PathBuf::from("/tmp/beta");
+        let mut panel = TuiAgentPanel {
+            projects: vec![
+                tui_agent_project_for_test(1, "alpha"),
+                tui_agent_project_for_test(3, "gamma"),
+            ],
+            current_project_registration: Some(TuiCurrentProjectRegistration {
+                path: active_root.clone(),
+                name: "beta".to_string(),
+            }),
+            daemon_status: "not-installed".to_string(),
+            state: ListState::default(),
+            scroll_offset: 0,
+            last_error: None,
+        };
+        panel.state.select(Some(0));
+        let selected_row = panel.selected_row_identity();
+        let snapshot = TuiAgentPanelSnapshot {
+            projects: vec![
+                tui_agent_project_for_test(1, "alpha"),
+                tui_agent_project_for_test(2, "beta"),
+                tui_agent_project_for_test(3, "gamma"),
+            ],
+            daemon_status: "running".to_string(),
+        };
+
+        panel.apply_refresh_result(&active_root, selected_row, Ok(snapshot));
+
+        assert_eq!(panel.state.selected(), Some(1));
+        assert_eq!(panel.selected_project().unwrap().project.name, "beta");
+        assert!(panel.current_project_registration.is_none());
     }
 
     #[test]
