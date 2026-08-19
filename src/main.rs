@@ -4109,6 +4109,43 @@ fn upsert_codex_provider_config_at(
     })
 }
 
+fn remove_codex_provider_config_at(path: &Path, provider_id: &str) -> Result<bool> {
+    if !valid_codex_provider_id(provider_id) {
+        anyhow::bail!("Provider ID must use only ASCII letters, numbers, hyphens, or underscores");
+    }
+    if !path.exists() {
+        return Ok(false);
+    }
+
+    let mut changed = false;
+    mutate_codex_config_at(path, |document| {
+        let remove_empty_providers_table = match document.get_mut("model_providers") {
+            Some(item) => {
+                let providers = item
+                    .as_table_mut()
+                    .ok_or_else(|| anyhow::anyhow!("model_providers must be a TOML table"))?;
+                changed |= providers.remove(provider_id).is_some();
+                providers.is_empty()
+            }
+            None => false,
+        };
+        if remove_empty_providers_table {
+            document.as_table_mut().remove("model_providers");
+        }
+        if document
+            .get("model_provider")
+            .and_then(Item::as_str)
+            .is_some_and(|configured| configured == provider_id)
+        {
+            document.as_table_mut().remove("model_provider");
+            document.as_table_mut().remove("model");
+            changed = true;
+        }
+        Ok(())
+    })?;
+    Ok(changed)
+}
+
 fn set_codex_default_config_at(path: &Path, provider_id: &str, model_id: &str) -> Result<()> {
     if !valid_codex_provider_id(provider_id) || model_id.trim().is_empty() {
         anyhow::bail!("A valid provider and model are required");
@@ -5451,6 +5488,61 @@ mod agent_store {
                     .await
                     .with_context(|| format!("Failed to save model provider {}", provider.id))?;
                     Ok(())
+                })
+        }
+
+        pub(crate) fn delete_model_provider_blocking(&self, provider_id: &str) -> Result<bool> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(async {
+                    let mut conn = self.connect()?;
+                    let transaction = conn.transaction().await.with_context(|| {
+                        format!("Failed to begin deleting provider {provider_id}")
+                    })?;
+                    transaction
+                        .execute(
+                            "UPDATE projects
+                             SET codex_provider = NULL, codex_model = NULL,
+                                 updated_at = datetime('now')
+                             WHERE codex_provider = ?1",
+                            [provider_id],
+                        )
+                        .await
+                        .with_context(|| {
+                            format!("Failed to clear project settings for provider {provider_id}")
+                        })?;
+                    transaction
+                        .execute(
+                            "UPDATE agent_settings
+                             SET default_provider = NULL, default_model = NULL,
+                                 updated_at = datetime('now')
+                             WHERE default_provider = ?1",
+                            [provider_id],
+                        )
+                        .await
+                        .with_context(|| {
+                            format!("Failed to clear the default for provider {provider_id}")
+                        })?;
+                    transaction
+                        .execute(
+                            "DELETE FROM model_targets WHERE provider_id = ?1",
+                            [provider_id],
+                        )
+                        .await
+                        .with_context(|| {
+                            format!("Failed to delete models for provider {provider_id}")
+                        })?;
+                    let deleted = transaction
+                        .execute(
+                            "DELETE FROM model_providers WHERE provider_id = ?1",
+                            [provider_id],
+                        )
+                        .await
+                        .with_context(|| format!("Failed to delete provider {provider_id}"))?;
+                    transaction.commit().await.with_context(|| {
+                        format!("Failed to commit deleting provider {provider_id}")
+                    })?;
+                    Ok(deleted > 0)
                 })
         }
 
@@ -7572,6 +7664,13 @@ fn tui_pane_after_tab(current: TuiPane, active_board: bool) -> TuiPane {
     }
 }
 
+fn tui_models_return_pane(opened_from: TuiPane) -> TuiPane {
+    match opened_from {
+        TuiPane::Tasks => TuiPane::Tasks,
+        TuiPane::AgentProjects | TuiPane::Models => TuiPane::AgentProjects,
+    }
+}
+
 struct TuiStartState {
     active_board: bool,
     current_pane: TuiPane,
@@ -7584,7 +7683,7 @@ fn tui_start_state(active_board: bool) -> TuiStartState {
             active_board,
             current_pane: TuiPane::Tasks,
             feedback_buffer: String::from(
-                "Kanban View! Tab toggles between the task board and agent projects. From Agent Projects, m cycles the selected project's target and M opens Models. Enter opens a selected project, Space toggles it ON/OFF, g cycles Git off/commit/push, f/t change its Codex fast/thinking settings, c resumes a selected Done or blocked task in interactive Codex, l shows agent output, Backspace returns to parent, Space creates a task on the board, a archives a task, A opens archive view, b moves a task to backlog, B toggles the backlog column, tap r then an Arrow to reorganize once, Shift+Arrows reorder or move tasks, Ctrl-P/N reorder up/down, 'd' deletes, 'q' quits.",
+                "Kanban View! Tab toggles between the task board and agent projects. Uppercase M opens Models from either pane; lowercase m cycles the selected Agent Project target. Enter opens a selected project, Space toggles it ON/OFF, g cycles Git off/commit/push, f/t change its Codex fast/thinking settings, c resumes a selected Done or blocked task in interactive Codex, l shows agent output, Backspace returns to parent, Space creates a task on the board, a archives a task, A opens archive view, b moves a task to backlog, B toggles the backlog column, tap r then an Arrow to reorganize once, Shift+Arrows reorder or move tasks, Ctrl-P/N reorder up/down, 'd' deletes, 'q' quits.",
             ),
         }
     } else {
@@ -8395,6 +8494,41 @@ fn add_tui_model_provider_preset(panel: &mut TuiModelsPanel, index: usize) -> Re
         });
     }
     Ok(added)
+}
+
+fn remove_tui_model_provider(panel: &mut TuiModelsPanel) -> Result<String> {
+    if panel.focus != TuiModelsFocus::Providers {
+        anyhow::bail!("Press Left to select a provider before removing it");
+    }
+    let provider = panel
+        .selected_provider()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("No provider selected"))?;
+    if provider.built_in {
+        anyhow::bail!(
+            "{} is built in and cannot be removed; press Space to disable it",
+            provider.name
+        );
+    }
+
+    let store = open_agent_store()?;
+    if !store.delete_model_provider_blocking(&provider.id)? {
+        anyhow::bail!("Provider {} no longer exists", provider.name);
+    }
+    let config_cleanup =
+        codex_config_path().and_then(|path| remove_codex_provider_config_at(&path, &provider.id));
+    panel.refresh();
+
+    Ok(match config_cleanup {
+        Ok(_) => format!(
+            "Removed provider {} and its models; affected project/default selections now follow CLT defaults",
+            provider.name
+        ),
+        Err(error) => format!(
+            "Removed provider {} and its models, but Codex config cleanup failed: {error}",
+            provider.name
+        ),
+    })
 }
 
 fn toggle_tui_models_enabled(panel: &mut TuiModelsPanel) -> Result<String> {
@@ -9782,7 +9916,7 @@ fn render_tui_agent_panel(
 }
 
 fn tui_models_instructions() -> &'static str {
-    "Add a provider with 1 OpenAI, 2 OpenRouter, 3 Ollama, 4 LM Studio, or n local/custom. Local endpoints discover /models automatically; r refreshes. New models start OFF: Right, Up/Down, then Space chooses them. a manually adds an ID. f favorites; d sets CLT; c sets Codex. M, Tab, or Esc returns. API keys come only from environment variables."
+    "Add a provider with 1 OpenAI, 2 OpenRouter, 3 Ollama, 4 LM Studio, or n local/custom. Select a non-built-in provider on the left and press x/Delete to remove it. Local endpoints discover /models automatically; r refreshes. New models start OFF: Right, Up/Down, then Space chooses them. a manually adds an ID. f favorites; d sets CLT; c sets Codex. M, Tab, or Esc returns to the previous pane. API keys come only from environment variables."
 }
 
 fn provider_env_status(provider: &agent_store::AgentModelProvider) -> String {
@@ -10584,6 +10718,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
     let mut archive_view = false;
     let mut backlog_visible = false;
     let mut current_pane = start_state.current_pane;
+    let mut models_return_pane = tui_models_return_pane(current_pane);
     let mut agent_panel = TuiAgentPanel::new(&active_root);
     let mut models_panel = TuiModelsPanel::new();
     let mut model_input: Option<TuiModelInput> = None;
@@ -11102,9 +11237,11 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                  [Backspace]    - Return to parent board\n\
                                  [d/Del]        - Delete selected task\n\
                                  [Tab]          - Toggle task board and agent projects\n\
-                                 [Agent m/M]    - Cycle selected target / open Models\n\
+                                 [Agent m]      - Cycle selected target\n\
+                                 [M]            - Open Models from Tasks or Agent Projects\n\
                                  [Models n/r/a] - Add endpoint / discover models / manually add ID\n\
                                  [Models 1-4]   - Add OpenAI/OpenRouter/Ollama/LM Studio preset\n\
+                                 [Models x/Del] - Remove selected non-built-in provider\n\
                                  [Models d/c]   - Set CLT default / explicitly set Codex default\n\
                                  [Arrows]       - Navigate boards and tasks\n\
                                  [r, then Arrow] - Reorganize task once (Esc cancels)\n\
@@ -11190,7 +11327,11 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                         Mode::View => {
                             if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
                                 let previous_pane = current_pane;
-                                current_pane = tui_pane_after_tab(current_pane, active_board);
+                                current_pane = if previous_pane == TuiPane::Models {
+                                    models_return_pane
+                                } else {
+                                    tui_pane_after_tab(current_pane, active_board)
+                                };
                                 if previous_pane == TuiPane::Tasks {
                                     agent_panel.refresh(&active_root);
                                     agent_panel.select_project_for_path(&active_root);
@@ -11217,9 +11358,13 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                             } else if current_pane == TuiPane::Models {
                                 match key.code {
                                     KeyCode::Esc | KeyCode::Char('M') => {
-                                        current_pane = TuiPane::AgentProjects;
-                                        feedback_buffer =
-                                            tui_agent_panel_instructions().to_string();
+                                        current_pane = models_return_pane;
+                                        feedback_buffer = if current_pane == TuiPane::AgentProjects
+                                        {
+                                            tui_agent_panel_instructions().to_string()
+                                        } else {
+                                            "Task board pane.".to_string()
+                                        };
                                     }
                                     KeyCode::Char('q') => break,
                                     KeyCode::Char('h')
@@ -11238,6 +11383,13 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                     KeyCode::Char(' ') => {
                                         feedback_buffer =
                                             match toggle_tui_models_enabled(&mut models_panel) {
+                                                Ok(message) => message,
+                                                Err(error) => format!("Error: {error}"),
+                                            };
+                                    }
+                                    KeyCode::Char('x') | KeyCode::Char('X') | KeyCode::Delete => {
+                                        feedback_buffer =
+                                            match remove_tui_model_provider(&mut models_panel) {
                                                 Ok(message) => message,
                                                 Err(error) => format!("Error: {error}"),
                                             };
@@ -11490,6 +11642,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                         }
                                     }
                                     KeyCode::Char('M') => {
+                                        models_return_pane = tui_models_return_pane(current_pane);
                                         models_panel.refresh();
                                         current_pane = TuiPane::Models;
                                         feedback_buffer = tui_models_instructions().to_string();
@@ -11640,6 +11793,11 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                                 .to_string();
                                     }
                                 }
+                            } else if matches!(key.code, KeyCode::Char('M')) {
+                                models_return_pane = tui_models_return_pane(current_pane);
+                                models_panel.refresh();
+                                current_pane = TuiPane::Models;
+                                feedback_buffer = tui_models_instructions().to_string();
                             } else if let Some(direction) = tui_task_reorder_direction(&key) {
                                 feedback_buffer = reorder_selected_tui_task(
                                     &board_dir,
@@ -13573,6 +13731,11 @@ mod tests {
             tui_pane_after_tab(TuiPane::Models, true),
             TuiPane::AgentProjects
         );
+        assert_eq!(tui_models_return_pane(TuiPane::Tasks), TuiPane::Tasks);
+        assert_eq!(
+            tui_models_return_pane(TuiPane::AgentProjects),
+            TuiPane::AgentProjects
+        );
     }
 
     #[test]
@@ -14644,6 +14807,76 @@ mod tests {
     }
 
     #[test]
+    fn agent_store_deletes_provider_models_and_dependent_selections() {
+        let root = temp_root("agent-model-provider-delete");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        let provider = agent_store::AgentModelProvider {
+            id: "local-delete".to_string(),
+            name: "Local Delete".to_string(),
+            base_url: Some("http://localhost:9090/v1".to_string()),
+            env_key: None,
+            built_in: false,
+            enabled: true,
+        };
+        let model = agent_store::AgentModelTarget {
+            provider_id: provider.id.clone(),
+            model_id: "local-model".to_string(),
+            label: "Local Model".to_string(),
+            enabled: true,
+            favorite: true,
+        };
+        store.upsert_model_provider_blocking(&provider).unwrap();
+        store.upsert_model_target_blocking(&model).unwrap();
+        store
+            .set_project_codex_settings_blocking(
+                project.id,
+                Some(&provider.id),
+                Some(&model.model_id),
+                Some("high"),
+                true,
+            )
+            .unwrap();
+        store
+            .set_model_default_blocking(&provider.id, &model.model_id)
+            .unwrap();
+
+        assert!(store.delete_model_provider_blocking(&provider.id).unwrap());
+        assert!(!store.delete_model_provider_blocking(&provider.id).unwrap());
+        assert!(
+            !store
+                .list_model_providers_blocking()
+                .unwrap()
+                .iter()
+                .any(|candidate| candidate.id == provider.id)
+        );
+        assert!(
+            store
+                .list_model_targets_blocking(Some(&provider.id))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store.model_defaults_blocking().unwrap(),
+            agent_store::AgentModelDefaults::default()
+        );
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert_eq!(project.codex_provider, None);
+        assert_eq!(project.codex_model, None);
+        assert_eq!(project.codex_reasoning_effort.as_deref(), Some("high"));
+        assert!(project.codex_fast_enabled);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn agent_store_migrates_plain_gpt_5_6_selections_to_sol() {
         let root = temp_root("agent-model-gpt-5-6-sol-migration");
         let state_dir = root.join("state/clt");
@@ -14894,6 +15127,7 @@ mod tests {
         assert!(parse_openai_model_ids(&serde_json::json!({"models": []})).is_err());
         assert!(tui_models_add_provider_menu().contains("[3] Ollama"));
         assert!(tui_models_instructions().contains("r refreshes"));
+        assert!(tui_models_instructions().contains("x/Delete to remove"));
         let mut input = TuiModelInput::custom_provider();
         if let TuiModelInputKind::CustomProvider { step, .. } = &mut input.kind {
             *step = 1;
@@ -15039,6 +15273,20 @@ mod tests {
                 .join("config.toml.clt.bak")
                 .is_file()
         );
+
+        assert!(remove_codex_provider_config_at(&config_path, "openrouter").unwrap());
+        let removed = fs::read_to_string(&config_path)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(removed["approval_policy"].as_str(), Some("never"));
+        assert_eq!(
+            removed["projects"]["/tmp/demo"]["trust_level"].as_str(),
+            Some("trusted")
+        );
+        assert!(removed.get("model_providers").is_none());
+        assert!(removed.get("model_provider").is_none());
+        assert!(removed.get("model").is_none());
 
         fs::remove_dir_all(root).unwrap();
     }

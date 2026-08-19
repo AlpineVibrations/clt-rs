@@ -11,6 +11,7 @@ Use this section while developing the next release.
 ### Added
 
 - Added a TUI Models page with provider presets, custom Responses-compatible endpoints, enabled model targets, favorites, a CLT-wide default, and per-project provider/model overrides.
+- Added `x`/`Delete` removal for non-built-in providers on the Models page, including dependent model, selection, and Codex configuration cleanup.
 - Added explicit, backup-protected Codex `config.toml` actions for custom provider definitions and the user's top-level default while keeping API keys exclusively in environment variables.
 - Added a Done-or-blocked-task shortcut to resume that task's automated Codex run interactively, returning to the same board after Codex exits.
 - Added blocked-task monitoring: blocked Todo entries are skipped during normal selection, and when every task across Todo and Doing is blocked, the agent revisits one existing blocker at a time and backs off unchanged recovery attempts.
@@ -35,7 +36,7 @@ Use this section while developing the next release.
 - Made local OpenAI-compatible endpoint setup preset-led and self-discovering: Ollama and LM Studio load their model catalogs automatically, custom endpoints generate their provider IDs, the API-root prompt explains `/v1` and rejects complete operation URLs, `/models` results are presented as explicit opt-in choices, and model discovery can be refreshed from the Models page.
 - Replaced the plain GPT-5.6 entry in the built-in OpenAI catalog with the explicit GPT-5.6 Sol model while preserving existing selections and defaults during migration.
 - Added aligned, labeled provider/model columns to the Models page, replacing unexplained favorite stars with `FAV` values and marking CLT and Codex defaults independently.
-- Restored `Tab` as a direct Kanban/Agent Projects toggle; lowercase `m` retains quick per-project target cycling, while uppercase `M` opens the Models page from Agent Projects.
+- Restored `Tab` as a direct Kanban/Agent Projects toggle; lowercase `m` retains quick per-project target cycling, while uppercase `M` opens the Models page from either Tasks or Agent Projects and returns to the originating pane.
 - Git commit-and-push automation now pulls with the user's configured merge or rebase strategy instead of forcing a rebase.
 - Moving a folder-backed task into a Markdown-backed status now expands the destination status to a folder and preserves the old Markdown file as `status.md.bak`.
 - Right-aligned the hidden Backlog count and shortcut in the task console title.
