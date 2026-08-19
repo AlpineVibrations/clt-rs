@@ -32,6 +32,8 @@ Use this section while developing the next release.
 
 ### Changed
 
+- Made local OpenAI-compatible endpoint setup preset-led and self-discovering: Ollama and LM Studio load their model catalogs automatically, custom endpoints generate their provider IDs, the API-root prompt explains `/v1` and rejects complete operation URLs, `/models` results are presented as explicit opt-in choices, and model discovery can be refreshed from the Models page.
+- Replaced the plain GPT-5.6 entry in the built-in OpenAI catalog with the explicit GPT-5.6 Sol model while preserving existing selections and defaults during migration.
 - Added aligned, labeled provider/model columns to the Models page, replacing unexplained favorite stars with `FAV` values and marking CLT and Codex defaults independently.
 - Restored `Tab` as a direct Kanban/Agent Projects toggle; lowercase `m` retains quick per-project target cycling, while uppercase `M` opens the Models page from Agent Projects.
 - Git commit-and-push automation now pulls with the user's configured merge or rebase strategy instead of forcing a rebase.

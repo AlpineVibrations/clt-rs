@@ -1,0 +1,5 @@
+Discover and select models when adding local OpenAI-compatible endpoints (FEATURE, AGENT, TUI)
+
+Completion note:
+
+COMPLETED 2026-08-19: Made provider presets visible in the Models pane, simplified custom local endpoint setup to friendly name/base URL/optional key environment variable, added authenticated OpenAI-compatible `/models` discovery with Ollama and LM Studio auto-discovery plus `r` refresh, and imported newly found models as explicit OFF choices without changing existing selections or favorites. Kept manual model-ID entry as a fallback, documented the workflow, and stabilized the shutdown runner test by initializing its store before its timer. Checks: focused parser, persistence, and loopback HTTP tests; `cargo test --offline -- --test-threads=1` outside the process-restricted sandbox (183 passed); `cargo clippy --offline --all-targets -- -D warnings`; `cargo build --offline`; `cargo fmt -- --check`; `git diff --check`; live 80x24 TUI verification confirmed the preset menu and simplified endpoint-name prompt.

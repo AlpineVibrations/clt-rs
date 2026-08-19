@@ -82,6 +82,7 @@ const TUI_AGENT_PANEL_REFRESH_SECONDS: u64 = 2;
 const TUI_AGENT_LOG_REFRESH_MILLIS: u64 = 500;
 const TUI_AGENT_TABLE_CODEX_LAST_RUN_GAP: &str = "   ";
 const TUI_AGENT_TABLE_CODEX_MAX_WIDTH: usize = 20;
+const TUI_MODEL_DISCOVERY_TIMEOUT_SECONDS: u64 = 5;
 const TUI_NO_ACTIVE_BOARD_MESSAGE: &str =
     "No active board. Open a project from Agent Projects, or press M for Models.";
 
@@ -4288,7 +4289,45 @@ mod agent_store {
                  ) VALUES ('openai', 'gpt-5.4', 'GPT-5.4', 1, 0, datetime('now'), datetime('now'))",
                 "INSERT OR IGNORE INTO model_targets (
                     provider_id, model_id, label, enabled, favorite, created_at, updated_at
-                 ) VALUES ('openai', 'gpt-5.3-codex-spark', 'GPT-5.3 Codex Spark', 1, 0, datetime('now'), datetime('now'))",
+                ) VALUES ('openai', 'gpt-5.3-codex-spark', 'GPT-5.3 Codex Spark', 1, 0, datetime('now'), datetime('now'))",
+            ],
+        },
+        AgentMigration {
+            version: 9,
+            statements: &[
+                "INSERT OR IGNORE INTO model_targets (
+                    provider_id, model_id, label, enabled, favorite, created_at, updated_at
+                 ) SELECT provider_id, 'gpt-5.6-sol', 'GPT-5.6 Sol', enabled, favorite,
+                          created_at, datetime('now')
+                   FROM model_targets
+                  WHERE provider_id = 'openai' AND model_id = 'gpt-5.6'",
+                "INSERT OR IGNORE INTO model_targets (
+                    provider_id, model_id, label, enabled, favorite, created_at, updated_at
+                 ) VALUES ('openai', 'gpt-5.6-sol', 'GPT-5.6 Sol', 1, 1, datetime('now'), datetime('now'))",
+                "UPDATE model_targets
+                    SET enabled = MAX(enabled, COALESCE((
+                            SELECT enabled FROM model_targets AS alias
+                             WHERE alias.provider_id = 'openai'
+                               AND alias.model_id = 'gpt-5.6'
+                        ), 0)),
+                        favorite = MAX(favorite, COALESCE((
+                            SELECT favorite FROM model_targets AS alias
+                             WHERE alias.provider_id = 'openai'
+                               AND alias.model_id = 'gpt-5.6'
+                        ), 0)),
+                        label = 'GPT-5.6 Sol',
+                        updated_at = datetime('now')
+                  WHERE provider_id = 'openai' AND model_id = 'gpt-5.6-sol'",
+                "UPDATE projects
+                    SET codex_model = 'gpt-5.6-sol', updated_at = datetime('now')
+                  WHERE COALESCE(codex_provider, 'openai') = 'openai'
+                    AND codex_model = 'gpt-5.6'",
+                "UPDATE agent_settings
+                    SET default_model = 'gpt-5.6-sol', updated_at = datetime('now')
+                  WHERE COALESCE(default_provider, 'openai') = 'openai'
+                    AND default_model = 'gpt-5.6'",
+                "DELETE FROM model_targets
+                  WHERE provider_id = 'openai' AND model_id = 'gpt-5.6'",
             ],
         },
     ];
@@ -7668,10 +7707,24 @@ impl TuiModelInput {
         match &self.kind {
             TuiModelInputKind::AddModel { .. } => " Model ID: ",
             TuiModelInputKind::CustomProvider { step, .. } => match step {
-                0 => " Provider ID: ",
-                1 => " Display Name: ",
-                2 => " Base URL: ",
+                0 => " Endpoint Name: ",
+                1 => " API Base URL (usually .../v1): ",
                 _ => " API Key Env Var (optional): ",
+            },
+        }
+    }
+
+    fn guidance(&self) -> &'static str {
+        match &self.kind {
+            TuiModelInputKind::AddModel { .. } => "Enter the exact model ID used by the endpoint",
+            TuiModelInputKind::CustomProvider { step, .. } => match step {
+                0 => "Enter a friendly name, for example My Local Server",
+                1 => {
+                    "Enter the API root, for example http://127.0.0.1:9090/v1; do not include /chat, /models, or /responses"
+                }
+                _ => {
+                    "Enter an API-key environment variable name, or press Enter if none is required"
+                }
             },
         }
     }
@@ -8131,6 +8184,167 @@ impl TuiModelsPanel {
     }
 }
 
+fn custom_provider_id(name: &str, providers: &[agent_store::AgentModelProvider]) -> String {
+    let mut stem = String::new();
+    let mut pending_separator = false;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            if pending_separator && !stem.is_empty() {
+                stem.push('-');
+            }
+            stem.push(ch.to_ascii_lowercase());
+            pending_separator = false;
+        } else {
+            pending_separator = true;
+        }
+    }
+    if stem.is_empty() {
+        stem = "local".to_string();
+    }
+
+    let mut candidate = stem.clone();
+    let mut suffix = 2;
+    while providers.iter().any(|provider| provider.id == candidate) {
+        candidate = format!("{stem}-{suffix}");
+        suffix += 1;
+    }
+    candidate
+}
+
+fn openai_models_url(base_url: &str) -> String {
+    let base_url = base_url.trim().trim_end_matches('/');
+    if base_url.ends_with("/models") {
+        base_url.to_string()
+    } else {
+        format!("{base_url}/models")
+    }
+}
+
+fn normalize_openai_api_base_url(input: &str) -> Result<String> {
+    let base_url = input.trim().trim_end_matches('/');
+    if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
+        anyhow::bail!("API base URL must start with http:// or https://");
+    }
+    if base_url.contains(['?', '#']) {
+        anyhow::bail!("API base URL cannot contain a query string or fragment");
+    }
+
+    let lowercase = base_url.to_ascii_lowercase();
+    let operation_paths = ["/chat", "/chat/completions", "/models", "/responses"];
+    if operation_paths
+        .iter()
+        .any(|operation| lowercase.ends_with(operation))
+    {
+        anyhow::bail!(
+            "Enter the API root (for example http://127.0.0.1:9090/v1), not a /chat, /chat/completions, /models, or /responses URL"
+        );
+    }
+
+    Ok(base_url.to_string())
+}
+
+fn parse_openai_model_ids(value: &serde_json::Value) -> Result<Vec<String>> {
+    let data = value
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            anyhow::anyhow!("the response does not contain an OpenAI-style data list")
+        })?;
+    let mut model_ids = data
+        .iter()
+        .filter_map(|model| model.get("id").and_then(serde_json::Value::as_str))
+        .map(str::trim)
+        .filter(|model_id| !model_id.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    model_ids.sort_by_key(|model_id| model_id.to_ascii_lowercase());
+    model_ids.dedup();
+    if model_ids.is_empty() {
+        anyhow::bail!("the endpoint returned no model IDs");
+    }
+    Ok(model_ids)
+}
+
+fn discover_openai_model_ids(base_url: &str, api_key: Option<&str>) -> Result<Vec<String>> {
+    let url = openai_models_url(base_url);
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(
+            TUI_MODEL_DISCOVERY_TIMEOUT_SECONDS,
+        )))
+        .build();
+    let agent: ureq::Agent = config.into();
+    let mut request = agent.get(&url).header("Accept", "application/json");
+    if let Some(api_key) = api_key {
+        request = request.header("Authorization", format!("Bearer {api_key}"));
+    }
+    let mut response = request
+        .call()
+        .with_context(|| format!("could not query {url}"))?;
+    let value = response
+        .body_mut()
+        .read_json::<serde_json::Value>()
+        .with_context(|| format!("{url} did not return valid JSON"))?;
+    parse_openai_model_ids(&value)
+}
+
+fn save_discovered_model_ids(
+    store: &agent_store::TursoAgentStore,
+    provider_id: &str,
+    model_ids: &[String],
+) -> Result<usize> {
+    let existing = store.list_model_targets_blocking(Some(provider_id))?;
+    let mut added = 0;
+    for model_id in model_ids {
+        if existing.iter().any(|model| model.model_id == *model_id) {
+            continue;
+        }
+        store.upsert_model_target_blocking(&agent_store::AgentModelTarget {
+            provider_id: provider_id.to_string(),
+            model_id: model_id.clone(),
+            label: model_id.clone(),
+            enabled: false,
+            favorite: false,
+        })?;
+        added += 1;
+    }
+    Ok(added)
+}
+
+fn discover_tui_provider_models(panel: &mut TuiModelsPanel) -> Result<String> {
+    let provider = panel
+        .selected_provider()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("Select a provider first"))?;
+    let base_url = provider
+        .base_url
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("{} uses Codex's built-in model catalog", provider.name))?;
+    let api_key = match provider.env_key.as_deref() {
+        Some(env_key) => Some(
+            std::env::var(env_key)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "{env_key} is not set; export it, restart CLT, then press r again"
+                    )
+                })?,
+        ),
+        None => None,
+    };
+    let model_ids = discover_openai_model_ids(base_url, api_key.as_deref())?;
+    let store = open_agent_store()?;
+    let added = save_discovered_model_ids(&store, &provider.id, &model_ids)?;
+    panel.refresh_models();
+    panel.focus = TuiModelsFocus::Models;
+    Ok(format!(
+        "Found {} models for {}; {} new models start OFF. Choose with Up/Down and Space",
+        model_ids.len(),
+        provider.name,
+        added
+    ))
+}
+
 fn add_tui_model_provider_preset(panel: &mut TuiModelsPanel, index: usize) -> Result<String> {
     let preset = AGENT_PROVIDER_PRESETS
         .get(index)
@@ -8171,7 +8385,16 @@ fn add_tui_model_provider_preset(panel: &mut TuiModelsPanel, index: usize) -> Re
         panel.provider_state.select(Some(index));
         panel.refresh_models();
     }
-    Ok(format!("Added/enabled {} provider preset", preset.name))
+    let added = format!("Added/enabled {} provider preset", preset.name);
+    if matches!(preset.id, "ollama" | "lmstudio") {
+        return Ok(match discover_tui_provider_models(panel) {
+            Ok(discovered) => format!("{added}. {discovered}"),
+            Err(error) => format!(
+                "{added}, but model discovery failed: {error}. Start the server, then press r to retry"
+            ),
+        });
+    }
+    Ok(added)
 }
 
 fn toggle_tui_models_enabled(panel: &mut TuiModelsPanel) -> Result<String> {
@@ -8306,33 +8529,14 @@ fn submit_tui_model_input(
         } => {
             match *step {
                 0 => {
-                    if !valid_codex_provider_id(&entered) {
-                        anyhow::bail!(
-                            "Provider ID must use only letters, numbers, hyphens, or underscores"
-                        );
-                    }
-                    if panel
-                        .providers
-                        .iter()
-                        .any(|provider| provider.id == entered)
-                    {
-                        anyhow::bail!(
-                            "Provider ID already exists; choose it from the list or use another ID"
-                        );
-                    }
-                    *provider_id = entered;
-                }
-                1 => {
                     if entered.is_empty() {
-                        anyhow::bail!("Display name cannot be empty");
+                        anyhow::bail!("Endpoint name cannot be empty");
                     }
+                    *provider_id = custom_provider_id(&entered, &panel.providers);
                     *name = entered;
                 }
-                2 => {
-                    if !entered.starts_with("http://") && !entered.starts_with("https://") {
-                        anyhow::bail!("Base URL must start with http:// or https://");
-                    }
-                    *base_url = entered;
+                1 => {
+                    *base_url = normalize_openai_api_base_url(&entered)?;
                 }
                 _ => {
                     if !entered.is_empty() && !valid_environment_variable_name(&entered) {
@@ -8358,8 +8562,22 @@ fn submit_tui_model_input(
                             enabled: true,
                         },
                     )?;
-                    let message = format!("Added custom Responses provider {name} ({provider_id})");
                     panel.refresh();
+                    if let Some(index) = panel
+                        .providers
+                        .iter()
+                        .position(|provider| provider.id == *provider_id)
+                    {
+                        panel.provider_state.select(Some(index));
+                        panel.refresh_models();
+                    }
+                    let added = format!("Added local endpoint {name} ({provider_id})");
+                    let message = match discover_tui_provider_models(panel) {
+                        Ok(discovered) => format!("{added}. {discovered}"),
+                        Err(error) => format!(
+                            "{added}, but model discovery failed: {error}. Press r to retry or a to add a model ID"
+                        ),
+                    };
                     return Ok(Some(message));
                 }
             }
@@ -9564,7 +9782,7 @@ fn render_tui_agent_panel(
 }
 
 fn tui_models_instructions() -> &'static str {
-    "Models columns: USE=available, FAV=favorite, CLT=effective CLT default, CODEX=Codex config default. CLT follows CODEX when no CLT override is set. Left/Right changes pane; Up/Down selects; Space enables/hides; f toggles favorite; d sets CLT; c sets Codex. a adds a model; n adds a custom Responses endpoint. Presets: 1 OpenAI, 2 OpenRouter, 3 Ollama, 4 LM Studio. M, Tab, or Esc returns. API keys come only from environment variables."
+    "Add a provider with 1 OpenAI, 2 OpenRouter, 3 Ollama, 4 LM Studio, or n local/custom. Local endpoints discover /models automatically; r refreshes. New models start OFF: Right, Up/Down, then Space chooses them. a manually adds an ID. f favorites; d sets CLT; c sets Codex. M, Tab, or Esc returns. API keys come only from environment variables."
 }
 
 fn provider_env_status(provider: &agent_store::AgentModelProvider) -> String {
@@ -9580,6 +9798,10 @@ fn provider_env_status(provider: &agent_store::AgentModelProvider) -> String {
 
 fn tui_models_provider_header() -> &'static str {
     "USE TYPE    PROVIDER (ID)"
+}
+
+fn tui_models_add_provider_menu() -> &'static str {
+    "ADD PROVIDER PRESET\n[1] OpenAI   [2] OpenRouter\n[3] Ollama   [4] LM Studio\n[n] Local/custom endpoint"
 }
 
 fn include_codex_default_model_target(
@@ -9726,21 +9948,45 @@ fn render_tui_models_panel(
         return;
     }
 
-    if provider_inner.height > 0 {
+    let add_menu_height = provider_inner.height.min(4);
+    if add_menu_height > 0 {
+        f.render_widget(
+            Paragraph::new(tui_models_add_provider_menu())
+                .style(Style::default().fg(Color::LightGreen)),
+            Rect::new(
+                provider_inner.x,
+                provider_inner.y,
+                provider_inner.width,
+                add_menu_height,
+            ),
+        );
+    }
+    if provider_inner.height > add_menu_height {
         f.render_widget(
             Paragraph::new(truncate_to_width(
                 tui_models_provider_header(),
                 provider_inner.width as usize,
             ))
             .style(Style::default().fg(Color::Cyan)),
-            Rect::new(provider_inner.x, provider_inner.y, provider_inner.width, 1),
+            Rect::new(
+                provider_inner.x,
+                provider_inner.y.saturating_add(add_menu_height),
+                provider_inner.width,
+                1,
+            ),
         );
     }
     let provider_list_inner = Rect::new(
         provider_inner.x,
-        provider_inner.y.saturating_add(1),
+        provider_inner
+            .y
+            .saturating_add(add_menu_height)
+            .saturating_add(1),
         provider_inner.width,
-        provider_inner.height.saturating_sub(1),
+        provider_inner
+            .height
+            .saturating_sub(add_menu_height)
+            .saturating_sub(1),
     );
     let provider_selected = panel.provider_state.selected();
     let provider_height = provider_list_inner.height as usize;
@@ -9804,7 +10050,7 @@ fn render_tui_models_panel(
             .selected_provider()
             .map(|provider| {
                 format!(
-                    "Provider: {}  Auth: {}  Endpoint: {}  Wire: responses",
+                    "Provider: {}  Auth: {}  Endpoint: {}  [r] discover  Wire: responses",
                     provider.id,
                     provider_env_status(provider),
                     provider.base_url.as_deref().unwrap_or("Codex built-in")
@@ -9836,6 +10082,14 @@ fn render_tui_models_panel(
         models_inner.width,
         models_inner.height.saturating_sub(2),
     );
+
+    if panel.models.is_empty() && models_list_inner.height > 0 {
+        f.render_widget(
+            Paragraph::new("No models yet. Press r to discover or a to add a model ID.")
+                .style(Style::default().fg(Color::Yellow)),
+            models_list_inner,
+        );
+    }
 
     let model_selected = panel.model_state.selected();
     let models_height = models_list_inner.height as usize;
@@ -10849,7 +11103,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                  [d/Del]        - Delete selected task\n\
                                  [Tab]          - Toggle task board and agent projects\n\
                                  [Agent m/M]    - Cycle selected target / open Models\n\
-                                 [Models a/n]   - Add model / custom Responses provider\n\
+                                 [Models n/r/a] - Add endpoint / discover models / manually add ID\n\
                                  [Models 1-4]   - Add OpenAI/OpenRouter/Ollama/LM Studio preset\n\
                                  [Models d/c]   - Set CLT default / explicitly set Codex default\n\
                                  [Arrows]       - Navigate boards and tasks\n\
@@ -10915,10 +11169,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                         feedback_buffer = message;
                                     }
                                     Ok(None) => {
-                                        feedback_buffer = format!(
-                                            "Continue custom provider: enter {}",
-                                            input.label().trim().trim_end_matches(':')
-                                        );
+                                        feedback_buffer = input.guidance().to_string();
                                     }
                                     Err(error) => feedback_buffer = format!("Error: {error}"),
                                 }
@@ -11026,11 +11277,22 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                                 "Add a provider before adding a model".to_string();
                                         }
                                     }
+                                    KeyCode::Char('r') | KeyCode::Char('R') => {
+                                        feedback_buffer =
+                                            match discover_tui_provider_models(&mut models_panel) {
+                                                Ok(message) => message,
+                                                Err(error) => {
+                                                    format!("Model discovery failed: {error}")
+                                                }
+                                            };
+                                    }
                                     KeyCode::Char('n') | KeyCode::Char('N') => {
                                         model_input = Some(TuiModelInput::custom_provider());
-                                        feedback_buffer =
-                                            "Custom providers must support the Responses API"
-                                                .to_string();
+                                        feedback_buffer = model_input
+                                            .as_ref()
+                                            .expect("custom provider input was just created")
+                                            .guidance()
+                                            .to_string();
                                     }
                                     KeyCode::Char(digit @ '1'..='4') => {
                                         let index = digit as usize - '1' as usize;
@@ -14320,9 +14582,23 @@ mod tests {
         assert!(providers[0].enabled);
         let openai_models = store.list_model_targets_blocking(Some("openai")).unwrap();
         assert!(
-            openai_models
+            openai_models.iter().any(|model| {
+                model.model_id == "gpt-5.6-sol" && model.enabled && model.favorite
+            })
+        );
+        assert!(
+            !openai_models
                 .iter()
-                .any(|model| { model.model_id == "gpt-5.6" && model.enabled && model.favorite })
+                .any(|model| model.model_id == "gpt-5.6")
+        );
+        let gpt_5_6_models = openai_models
+            .iter()
+            .filter(|model| model.model_id.starts_with("gpt-5.6"))
+            .map(|model| model.model_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            gpt_5_6_models,
+            std::collections::BTreeSet::from(["gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"])
         );
         assert_eq!(
             store.model_defaults_blocking().unwrap(),
@@ -14362,6 +14638,85 @@ mod tests {
                 .list_enabled_model_targets_blocking()
                 .unwrap()
                 .contains(&target)
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_store_migrates_plain_gpt_5_6_selections_to_sol() {
+        let root = temp_root("agent-model-gpt-5-6-sol-migration");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        store
+            .upsert_model_target_blocking(&agent_store::AgentModelTarget {
+                provider_id: "openai".to_string(),
+                model_id: "gpt-5.6".to_string(),
+                label: "GPT-5.6".to_string(),
+                enabled: true,
+                favorite: true,
+            })
+            .unwrap();
+        store
+            .upsert_model_target_blocking(&agent_store::AgentModelTarget {
+                provider_id: "openai".to_string(),
+                model_id: "gpt-5.6-sol".to_string(),
+                label: "GPT-5.6 Sol".to_string(),
+                enabled: false,
+                favorite: false,
+            })
+            .unwrap();
+        store
+            .set_project_codex_settings_blocking(
+                project.id,
+                Some("openai"),
+                Some("gpt-5.6"),
+                None,
+                false,
+            )
+            .unwrap();
+        store
+            .set_model_default_blocking("openai", "gpt-5.6")
+            .unwrap();
+        drop(store);
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let db =
+                turso::Builder::new_local(state_dir.join(AGENT_DB_FILE).to_string_lossy().as_ref())
+                    .build()
+                    .await
+                    .unwrap();
+            db.connect()
+                .unwrap()
+                .execute("DELETE FROM schema_migrations WHERE version = 9", ())
+                .await
+                .unwrap();
+        });
+
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        let models = store.list_model_targets_blocking(Some("openai")).unwrap();
+        let sol = models
+            .iter()
+            .find(|model| model.model_id == "gpt-5.6-sol")
+            .unwrap();
+        assert!(sol.enabled && sol.favorite);
+        assert!(!models.iter().any(|model| model.model_id == "gpt-5.6"));
+        assert_eq!(
+            store.list_projects_blocking().unwrap()[0]
+                .codex_model
+                .as_deref(),
+            Some("gpt-5.6-sol")
+        );
+        assert_eq!(
+            store.model_defaults_blocking().unwrap().model_id.as_deref(),
+            Some("gpt-5.6-sol")
         );
 
         fs::remove_dir_all(root).unwrap();
@@ -14480,6 +14835,155 @@ mod tests {
                 .any(|model| model.model_id == "gpt-config-only" && model.enabled)
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn local_model_endpoint_helpers_create_stable_ids_and_parse_openai_catalogs() {
+        let providers = vec![agent_store::AgentModelProvider {
+            id: "my-local-server".to_string(),
+            name: "Existing".to_string(),
+            base_url: None,
+            env_key: None,
+            built_in: false,
+            enabled: true,
+        }];
+        assert_eq!(
+            custom_provider_id("My Local Server", &providers),
+            "my-local-server-2"
+        );
+        assert_eq!(custom_provider_id("🦙", &[]), "local");
+        assert_eq!(
+            openai_models_url("http://localhost:11434/v1/"),
+            "http://localhost:11434/v1/models"
+        );
+        assert_eq!(
+            openai_models_url("http://localhost:11434/v1/models"),
+            "http://localhost:11434/v1/models"
+        );
+        assert_eq!(
+            normalize_openai_api_base_url(" http://127.0.0.1:9090/v1/ ").unwrap(),
+            "http://127.0.0.1:9090/v1"
+        );
+        assert_eq!(
+            normalize_openai_api_base_url("http://127.0.0.1:9090").unwrap(),
+            "http://127.0.0.1:9090"
+        );
+        for operation_url in [
+            "http://localhost:9090/chat",
+            "http://localhost:9090/v1/chat/completions",
+            "http://localhost:9090/v1/models",
+            "http://localhost:9090/v1/responses",
+        ] {
+            assert!(
+                normalize_openai_api_base_url(operation_url).is_err(),
+                "accepted operation URL {operation_url}"
+            );
+        }
+
+        let model_ids = parse_openai_model_ids(&serde_json::json!({
+            "object": "list",
+            "data": [
+                {"id": "zeta"},
+                {"id": " alpha "},
+                {"id": "zeta"},
+                {"not_an_id": "ignored"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(model_ids, ["alpha", "zeta"]);
+        assert!(parse_openai_model_ids(&serde_json::json!({"models": []})).is_err());
+        assert!(tui_models_add_provider_menu().contains("[3] Ollama"));
+        assert!(tui_models_instructions().contains("r refreshes"));
+        let mut input = TuiModelInput::custom_provider();
+        if let TuiModelInputKind::CustomProvider { step, .. } = &mut input.kind {
+            *step = 1;
+        }
+        assert!(input.label().contains("usually .../v1"));
+        assert!(input.guidance().contains("http://127.0.0.1:9090/v1"));
+        assert!(input.guidance().contains("do not include /chat"));
+    }
+
+    #[test]
+    fn discovered_models_start_off_and_existing_choices_are_preserved() {
+        let root = temp_root("discovered-model-choices");
+        let store = agent_store::TursoAgentStore::open_blocking(&root).unwrap();
+        let provider = agent_store::AgentModelProvider {
+            id: "local-test".to_string(),
+            name: "Local Test".to_string(),
+            base_url: Some("http://localhost:8080/v1".to_string()),
+            env_key: None,
+            built_in: false,
+            enabled: true,
+        };
+        store.upsert_model_provider_blocking(&provider).unwrap();
+        store
+            .upsert_model_target_blocking(&agent_store::AgentModelTarget {
+                provider_id: provider.id.clone(),
+                model_id: "already-selected".to_string(),
+                label: "Already Selected".to_string(),
+                enabled: true,
+                favorite: true,
+            })
+            .unwrap();
+
+        assert_eq!(
+            save_discovered_model_ids(
+                &store,
+                &provider.id,
+                &["already-selected".to_string(), "new-model".to_string()]
+            )
+            .unwrap(),
+            1
+        );
+        let models = store
+            .list_model_targets_blocking(Some(&provider.id))
+            .unwrap();
+        let existing = models
+            .iter()
+            .find(|model| model.model_id == "already-selected")
+            .unwrap();
+        let discovered = models
+            .iter()
+            .find(|model| model.model_id == "new-model")
+            .unwrap();
+        assert!(existing.enabled && existing.favorite);
+        assert!(!discovered.enabled && !discovered.favorite);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn model_discovery_queries_v1_models_with_bearer_auth() {
+        let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("failed to start model discovery test server: {error}"),
+        };
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut bytes = [0_u8; 4096];
+            let read = std::io::Read::read(&mut stream, &mut bytes).unwrap();
+            let request = String::from_utf8_lossy(&bytes[..read]);
+            assert!(request.starts_with("GET /v1/models HTTP/1.1"));
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer test-key")
+            );
+            let body = r#"{"object":"list","data":[{"id":"llama3.2"},{"id":"qwen3"}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            std::io::Write::write_all(&mut stream, response.as_bytes()).unwrap();
+        });
+
+        let model_ids =
+            discover_openai_model_ids(&format!("http://{address}/v1"), Some("test-key")).unwrap();
+        server.join().unwrap();
+        assert_eq!(model_ids, ["llama3.2", "qwen3"]);
     }
 
     #[test]
@@ -16211,11 +16715,16 @@ mod tests {
         let state_dir = root.join("state/clt");
         let project_root = root.join("project");
         fs::create_dir_all(&project_root).unwrap();
+        agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
 
         let fake_codex = root.join("fake-codex");
+        let started_marker = root.join("fake-codex-started");
         fs::write(
             &fake_codex,
-            "#!/bin/sh\nprintf 'arg=%s\\n' \"$@\" >&2\nprintf 'started\\n'\nsleep 10\n",
+            format!(
+                "#!/bin/sh\nprintf 'arg=%s\\n' \"$@\" >&2\nprintf 'started\\n'\nprintf 'started\\n' > \"{}\"\nsleep 10\n",
+                started_marker.display()
+            ),
         )
         .unwrap();
         let mut permissions = fs::metadata(&fake_codex).unwrap().permissions();
@@ -16244,7 +16753,10 @@ mod tests {
         let shutdown = new_agent_shutdown_signal();
         let shutdown_thread_signal = Arc::clone(&shutdown);
         thread::spawn(move || {
-            thread::sleep(Duration::from_millis(100));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !started_marker.exists() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
             shutdown_thread_signal.store(true, Ordering::SeqCst);
         });
 
