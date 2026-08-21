@@ -4157,6 +4157,7 @@ fn remove_codex_provider_config_at(path: &Path, provider_id: &str) -> Result<boo
         {
             document.as_table_mut().remove("model_provider");
             document.as_table_mut().remove("model");
+            document.as_table_mut().remove("model_reasoning_effort");
             changed = true;
         }
         Ok(())
@@ -4164,13 +4165,24 @@ fn remove_codex_provider_config_at(path: &Path, provider_id: &str) -> Result<boo
     Ok(changed)
 }
 
-fn set_codex_default_config_at(path: &Path, provider_id: &str, model_id: &str) -> Result<()> {
+fn set_codex_default_config_at(
+    path: &Path,
+    provider_id: &str,
+    model_id: &str,
+    reasoning_effort: Option<&str>,
+) -> Result<()> {
     if !valid_codex_provider_id(provider_id) || model_id.trim().is_empty() {
         anyhow::bail!("A valid provider and model are required");
     }
     mutate_codex_config_at(path, |document| {
         document["model_provider"] = value(provider_id);
         document["model"] = value(model_id.trim());
+        if let Some(reasoning_effort) = reasoning_effort.filter(|effort| !effort.trim().is_empty())
+        {
+            document["model_reasoning_effort"] = value(reasoning_effort.trim());
+        } else {
+            document.as_table_mut().remove("model_reasoning_effort");
+        }
         Ok(())
     })
 }
@@ -4194,6 +4206,31 @@ fn read_codex_default_config_at(path: &Path) -> Result<(Option<String>, Option<S
             .and_then(Item::as_str)
             .map(str::to_string),
     ))
+}
+
+fn set_codex_model_reasoning_if_default_at(
+    path: &Path,
+    provider_id: &str,
+    model_id: &str,
+    reasoning_effort: Option<&str>,
+) -> Result<bool> {
+    let (configured_provider, configured_model) = read_codex_default_config_at(path)?;
+    if configured_provider.as_deref().unwrap_or("openai") != provider_id
+        || configured_model.as_deref() != Some(model_id)
+    {
+        return Ok(false);
+    }
+
+    mutate_codex_config_at(path, |document| {
+        if let Some(reasoning_effort) = reasoning_effort.filter(|effort| !effort.trim().is_empty())
+        {
+            document["model_reasoning_effort"] = value(reasoning_effort.trim());
+        } else {
+            document.as_table_mut().remove("model_reasoning_effort");
+        }
+        Ok(())
+    })?;
+    Ok(true)
 }
 
 mod agent_store {
@@ -8722,11 +8759,29 @@ fn cycle_tui_model_reasoning(panel: &mut TuiModelsPanel) -> Result<String> {
             model.model_id
         );
     }
-    panel.refresh_models();
-    Ok(format!(
+    let updated_codex_default = if tui_model_matches_codex_default(
+        panel.codex_default_provider.as_deref(),
+        panel.codex_default_model.as_deref(),
+        &model,
+    ) {
+        set_codex_model_reasoning_if_default_at(
+            &codex_config_path()?,
+            &model.provider_id,
+            &model.model_id,
+            reasoning.as_deref(),
+        )?
+    } else {
+        false
+    };
+    panel.refresh();
+    let mut message = format!(
         "Default reasoning for {}/{}: {}",
         model.provider_id, model.model_id, label
-    ))
+    );
+    if updated_codex_default {
+        message.push_str("; updated the Codex top-level default");
+    }
+    Ok(message)
 }
 
 fn set_tui_model_default(panel: &mut TuiModelsPanel) -> Result<String> {
@@ -8753,17 +8808,25 @@ fn set_tui_model_default(panel: &mut TuiModelsPanel) -> Result<String> {
 fn set_tui_codex_default(panel: &mut TuiModelsPanel) -> Result<String> {
     let model = panel
         .selected_model()
+        .cloned()
         .ok_or_else(|| anyhow::anyhow!("Select a model first"))?;
     let path = codex_config_path()?;
-    set_codex_default_config_at(&path, &model.provider_id, &model.model_id)?;
+    set_codex_default_config_at(
+        &path,
+        &model.provider_id,
+        &model.model_id,
+        model.reasoning_effort.as_deref(),
+    )?;
     let provider_id = model.provider_id.clone();
     let model_id = model.model_id.clone();
+    let reasoning = model.reasoning_effort.as_deref().unwrap_or("system");
     panel.refresh();
     Ok(format!(
-        "Updated Codex top-level default in {} to {}/{}",
+        "Updated Codex top-level default in {} to {}/{} with {} reasoning",
         path.display(),
         provider_id,
-        model_id
+        model_id,
+        reasoning
     ))
 }
 
@@ -15561,8 +15624,13 @@ mod tests {
             Some("OPENROUTER_API_KEY"),
         )
         .unwrap();
-        set_codex_default_config_at(&config_path, "openrouter", "anthropic/claude-sonnet-4")
-            .unwrap();
+        set_codex_default_config_at(
+            &config_path,
+            "openrouter",
+            "anthropic/claude-sonnet-4",
+            Some("low"),
+        )
+        .unwrap();
 
         let updated = fs::read_to_string(&config_path).unwrap();
         let parsed = updated.parse::<DocumentMut>().unwrap();
@@ -15582,6 +15650,7 @@ mod tests {
         );
         assert_eq!(parsed["model_provider"].as_str(), Some("openrouter"));
         assert_eq!(parsed["model"].as_str(), Some("anthropic/claude-sonnet-4"));
+        assert_eq!(parsed["model_reasoning_effort"].as_str(), Some("low"));
         assert!(
             config_path
                 .parent()
@@ -15589,6 +15658,55 @@ mod tests {
                 .join("config.toml.clt.bak")
                 .is_file()
         );
+
+        assert!(
+            !set_codex_model_reasoning_if_default_at(
+                &config_path,
+                "openrouter",
+                "another-model",
+                Some("high")
+            )
+            .unwrap()
+        );
+        assert!(
+            set_codex_model_reasoning_if_default_at(
+                &config_path,
+                "openrouter",
+                "anthropic/claude-sonnet-4",
+                Some("high")
+            )
+            .unwrap()
+        );
+        let updated_reasoning = fs::read_to_string(&config_path)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(
+            updated_reasoning["model_reasoning_effort"].as_str(),
+            Some("high")
+        );
+        assert!(
+            set_codex_model_reasoning_if_default_at(
+                &config_path,
+                "openrouter",
+                "anthropic/claude-sonnet-4",
+                None
+            )
+            .unwrap()
+        );
+        let system_reasoning = fs::read_to_string(&config_path)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert!(system_reasoning.get("model_reasoning_effort").is_none());
+
+        set_codex_default_config_at(
+            &config_path,
+            "openrouter",
+            "anthropic/claude-sonnet-4",
+            Some("low"),
+        )
+        .unwrap();
 
         assert!(remove_codex_provider_config_at(&config_path, "openrouter").unwrap());
         let removed = fs::read_to_string(&config_path)
@@ -15603,6 +15721,7 @@ mod tests {
         assert!(removed.get("model_providers").is_none());
         assert!(removed.get("model_provider").is_none());
         assert!(removed.get("model").is_none());
+        assert!(removed.get("model_reasoning_effort").is_none());
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -15615,7 +15734,9 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(&config_path, invalid).unwrap();
 
-        assert!(set_codex_default_config_at(&config_path, "openai", "gpt-5.6").is_err());
+        assert!(
+            set_codex_default_config_at(&config_path, "openai", "gpt-5.6", Some("low")).is_err()
+        );
         assert_eq!(fs::read_to_string(&config_path).unwrap(), invalid);
 
         fs::remove_dir_all(root).unwrap();
