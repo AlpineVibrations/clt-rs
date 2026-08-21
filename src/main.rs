@@ -7816,6 +7816,12 @@ struct TuiCurrentProjectRegistration {
     name: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TuiAgentProjectRemoval {
+    path: PathBuf,
+    name: String,
+}
+
 enum TuiAgentPanelRow<'a> {
     RegisterCurrentProject(&'a TuiCurrentProjectRegistration),
     Project(&'a TuiAgentProject),
@@ -8102,6 +8108,17 @@ impl TuiAgentPanel {
             .filter(|idx| *idx < row_count)
             .unwrap_or(0);
         self.state.select(Some(idx));
+    }
+
+    fn select_nearest_row(&mut self, preferred_idx: usize) {
+        let row_count = self.row_count();
+        if row_count == 0 {
+            self.state.select(None);
+            self.scroll_offset = 0;
+        } else {
+            self.state.select(Some(preferred_idx.min(row_count - 1)));
+            self.scroll_offset = self.scroll_offset.min(row_count - 1);
+        }
     }
 
     fn select_project_for_path(&mut self, path: &Path) -> bool {
@@ -9044,6 +9061,58 @@ fn register_selected_current_project(
     }
 }
 
+fn selected_tui_agent_project_removal(panel: &TuiAgentPanel) -> Option<TuiAgentProjectRemoval> {
+    panel
+        .selected_project()
+        .map(|entry| TuiAgentProjectRemoval {
+            path: entry.project.path.clone(),
+            name: entry.project.name.clone(),
+        })
+}
+
+fn tui_agent_project_removal_prompt(removal: &TuiAgentProjectRemoval) -> String {
+    format!(
+        "Remove agent project '{}' from the list? Press y to confirm; n or Esc cancels.",
+        removal.name
+    )
+}
+
+fn remove_tui_agent_project(
+    panel: &mut TuiAgentPanel,
+    active_root: &Path,
+    removal: &TuiAgentProjectRemoval,
+) -> Result<String> {
+    let store = open_agent_store()?;
+    remove_tui_agent_project_with_store(panel, active_root, removal, &store)
+}
+
+fn remove_tui_agent_project_with_store(
+    panel: &mut TuiAgentPanel,
+    active_root: &Path,
+    removal: &TuiAgentProjectRemoval,
+    store: &agent_store::TursoAgentStore,
+) -> Result<String> {
+    let selected_idx = panel.state.selected().unwrap_or(0);
+    let removed = store.unregister_project_blocking(&removal.path)?;
+
+    if removed {
+        panel
+            .projects
+            .retain(|entry| entry.project.path != removal.path);
+        panel.current_project_registration =
+            current_project_registration(active_root, &panel.projects);
+        panel.last_error = None;
+        panel.select_nearest_row(selected_idx);
+        Ok(format!("Removed agent project: {}", removal.name))
+    } else {
+        panel.refresh(active_root);
+        Ok(format!(
+            "Project is no longer registered: {}",
+            removal.path.display()
+        ))
+    }
+}
+
 fn toggle_selected_tui_agent_project(
     panel: &mut TuiAgentPanel,
     active_root: &Path,
@@ -9241,7 +9310,7 @@ fn tui_agent_log_refresh_interval() -> Duration {
 }
 
 fn tui_agent_panel_instructions() -> &'static str {
-    "Up/Down selects, Enter opens/adds, Space toggles ON/OFF, g cycles Git off/commit/push, m cycles the selected target, M opens Models, f toggles fast, t cycles thinking, l shows output. Tab returns to Kanban."
+    "Up/Down selects, Enter opens/adds, Space toggles ON/OFF, Delete removes with confirmation, g cycles Git off/commit/push, m cycles the selected target, M opens Models, f toggles fast, t cycles thinking, l shows output. Tab returns to Kanban."
 }
 
 fn parse_agent_codex_session_id(line: &str) -> Option<String> {
@@ -10840,6 +10909,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
     let mut agent_panel = TuiAgentPanel::new(&active_root);
     let mut models_panel = TuiModelsPanel::new();
     let mut model_input: Option<TuiModelInput> = None;
+    let mut pending_agent_project_removal: Option<TuiAgentProjectRemoval> = None;
     let mut last_agent_panel_refresh = Instant::now();
     let mut agent_log_view: Option<TuiAgentLogView> = None;
     let mut last_agent_log_refresh = Instant::now();
@@ -11354,6 +11424,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                  [B]            - Show/hide backlog column\n\
                                  [Backspace]    - Return to parent board\n\
                                  [d/Del]        - Delete selected task\n\
+                                 [Agent Del]    - Remove selected project after confirmation\n\
                                  [Tab]          - Toggle task board and agent projects\n\
                                  [Agent m]      - Cycle selected target\n\
                                  [M]            - Open Models from Tasks or Agent Projects\n\
@@ -11411,6 +11482,31 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                 }
                 Event::Key(key) => {
                     let input_available_width = terminal.size()?.width.saturating_sub(2) as usize;
+                    if let Some(removal) = pending_agent_project_removal.take() {
+                        match key.code {
+                            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                                feedback_buffer = match remove_tui_agent_project(
+                                    &mut agent_panel,
+                                    &active_root,
+                                    &removal,
+                                ) {
+                                    Ok(message) => {
+                                        last_agent_panel_refresh = Instant::now();
+                                        message
+                                    }
+                                    Err(error) => format!("Error: {error}"),
+                                };
+                            }
+                            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                                feedback_buffer = format!("Kept agent project: {}", removal.name);
+                            }
+                            _ => {
+                                feedback_buffer = tui_agent_project_removal_prompt(&removal);
+                                pending_agent_project_removal = Some(removal);
+                            }
+                        }
+                        continue;
+                    }
                     if let Some(input) = model_input.as_mut() {
                         match key.code {
                             KeyCode::Esc => {
@@ -11600,6 +11696,20 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                     | KeyCode::Char('H')
                                     | KeyCode::Char('?') => {
                                         current_mode = Mode::Help;
+                                    }
+                                    KeyCode::Delete => {
+                                        if let Some(removal) =
+                                            selected_tui_agent_project_removal(&agent_panel)
+                                        {
+                                            agent_log_view = None;
+                                            feedback_buffer =
+                                                tui_agent_project_removal_prompt(&removal);
+                                            pending_agent_project_removal = Some(removal);
+                                        } else {
+                                            feedback_buffer =
+                                                "No registered project selected to remove"
+                                                    .to_string();
+                                        }
                                     }
                                     KeyCode::Enter => {
                                         if agent_panel
@@ -12854,6 +12964,27 @@ mod tests {
     }
 
     #[test]
+    fn tui_agent_panel_selects_nearest_row_after_removal() {
+        let mut panel = TuiAgentPanel {
+            projects: vec![
+                tui_agent_project_for_test(1, "alpha"),
+                tui_agent_project_for_test(2, "beta"),
+            ],
+            current_project_registration: None,
+            daemon_status: "not-installed".to_string(),
+            state: ListState::default(),
+            scroll_offset: 1,
+            last_error: None,
+        };
+
+        panel.projects.pop();
+        panel.select_nearest_row(1);
+
+        assert_eq!(panel.state.selected(), Some(0));
+        assert_eq!(panel.scroll_offset, 0);
+    }
+
+    #[test]
     fn tui_agent_panel_refresh_selects_a_newly_registered_current_project() {
         let active_root = PathBuf::from("/tmp/beta");
         let mut panel = TuiAgentPanel {
@@ -13014,6 +13145,49 @@ mod tests {
         assert!(tui_agent_panel_instructions().contains("t cycles thinking"));
         assert!(tui_agent_panel_instructions().contains("l shows output"));
         assert!(tui_agent_panel_instructions().contains("g cycles Git off/commit/push"));
+        assert!(tui_agent_panel_instructions().contains("Delete removes with confirmation"));
+    }
+
+    #[test]
+    fn tui_agent_project_removal_requires_confirmation_and_only_unregisters() {
+        let root = temp_root("tui-agent-remove");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        let mut panel = TuiAgentPanel {
+            projects: vec![TuiAgentProject {
+                project,
+                scan: AgentProjectScan::empty(),
+                runtime_state: TuiAgentRuntimeState::Idle,
+            }],
+            current_project_registration: None,
+            daemon_status: "not-installed".to_string(),
+            state: ListState::default(),
+            scroll_offset: 0,
+            last_error: None,
+        };
+        panel.state.select(Some(0));
+
+        let removal = selected_tui_agent_project_removal(&panel).unwrap();
+        assert!(tui_agent_project_removal_prompt(&removal).contains("Press y to confirm"));
+        let message =
+            remove_tui_agent_project_with_store(&mut panel, &project_root, &removal, &store)
+                .unwrap();
+
+        assert_eq!(message, "Removed agent project: project");
+        assert!(store.list_projects_blocking().unwrap().is_empty());
+        assert!(project_root.exists());
+        assert!(panel.projects.is_empty());
+        assert!(panel.selected_current_project_registration().is_some());
+        assert_eq!(panel.state.selected(), Some(0));
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

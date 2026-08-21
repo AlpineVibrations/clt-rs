@@ -10,6 +10,7 @@ Use this section while developing the next release.
 
 ### Added
 
+- Added confirmed `Delete`-key removal for registered projects in the Agent Projects pane without deleting project files.
 - Added a TUI Models page with provider presets, custom Responses-compatible endpoints, enabled model targets, favorites, a CLT-wide default, and per-project provider/model overrides.
 - Added `x`/`Delete` removal for non-built-in providers on the Models page, including dependent model, selection, and Codex configuration cleanup.
 - Added explicit, backup-protected Codex `config.toml` actions for custom provider definitions and the user's top-level default while keeping API keys exclusively in environment variables.
