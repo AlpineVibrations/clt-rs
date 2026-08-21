@@ -4541,6 +4541,7 @@ mod agent_store {
             })?;
             let db_path = state_dir.join(AGENT_DB_FILE);
             let db = Builder::new_local(db_path.to_string_lossy().as_ref())
+                .experimental_multiprocess_wal(true)
                 .build()
                 .await
                 .with_context(|| format!("Failed to open agent database {:?}", db_path))?;
@@ -14829,6 +14830,45 @@ mod tests {
         }
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    const AGENT_STORE_MULTIPROCESS_STATE_DIR_ENV: &str =
+        "CLT_TEST_AGENT_STORE_MULTIPROCESS_STATE_DIR";
+
+    #[test]
+    fn agent_store_allows_a_second_process_to_open_the_database() {
+        let root = temp_root("agent-store-multiprocess");
+        let state_dir = root.join("state/clt");
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+
+        let child_output = Command::new(std::env::current_exe().unwrap())
+            .arg("tests::agent_store_multiprocess_child_opens_database")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(AGENT_STORE_MULTIPROCESS_STATE_DIR_ENV, &state_dir)
+            .output()
+            .unwrap();
+
+        assert!(
+            child_output.status.success(),
+            "second process failed to open agent store: stdout={}; stderr={}",
+            String::from_utf8_lossy(&child_output.stdout),
+            String::from_utf8_lossy(&child_output.stderr)
+        );
+        assert!(store.table_exists_blocking("projects").unwrap());
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_store_multiprocess_child_opens_database() {
+        let Some(state_dir) = std::env::var_os(AGENT_STORE_MULTIPROCESS_STATE_DIR_ENV) else {
+            return;
+        };
+
+        let store = agent_store::TursoAgentStore::open_blocking(Path::new(&state_dir)).unwrap();
+        assert!(store.table_exists_blocking("projects").unwrap());
     }
 
     #[test]
