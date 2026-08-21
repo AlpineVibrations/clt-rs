@@ -3151,6 +3151,7 @@ impl AgentRunner for CodexAgentRunner {
             .arg("danger-full-access")
             .arg("--ask-for-approval")
             .arg("never");
+        let store = open_agent_store_at(&self.state_dir)?;
         let model_target = if let Some(model_id) = project.codex_model.as_ref() {
             agent_store::AgentModelDefaults {
                 provider_id: Some(
@@ -3162,7 +3163,7 @@ impl AgentRunner for CodexAgentRunner {
                 model_id: Some(model_id.clone()),
             }
         } else {
-            open_agent_store_at(&self.state_dir)?.resolve_model_target_blocking(project)?
+            store.resolve_model_target_blocking(project)?
         };
         if let (Some(provider), Some(model)) = (
             model_target.provider_id.as_deref(),
@@ -3173,7 +3174,24 @@ impl AgentRunner for CodexAgentRunner {
                 .arg(format!("model_provider={provider:?}"));
             command.arg("--model").arg(model);
         }
-        if let Some(reasoning_effort) = project.codex_reasoning_effort.as_deref() {
+        let model_reasoning_effort = if project.codex_reasoning_effort.is_none() {
+            match (
+                model_target.provider_id.as_deref(),
+                model_target.model_id.as_deref(),
+            ) {
+                (Some(provider), Some(model)) => {
+                    store.model_target_reasoning_blocking(provider, model)?
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(reasoning_effort) = project
+            .codex_reasoning_effort
+            .as_deref()
+            .or(model_reasoning_effort.as_deref())
+        {
             command
                 .arg("--config")
                 .arg(format!("model_reasoning_effort=\"{reasoning_effort}\""));
@@ -4367,6 +4385,10 @@ mod agent_store {
                   WHERE provider_id = 'openai' AND model_id = 'gpt-5.6'",
             ],
         },
+        AgentMigration {
+            version: 10,
+            statements: &["ALTER TABLE model_targets ADD COLUMN reasoning_effort TEXT"],
+        },
     ];
 
     pub(crate) struct TursoAgentStore {
@@ -4411,6 +4433,7 @@ mod agent_store {
         pub(crate) label: String,
         pub(crate) enabled: bool,
         pub(crate) favorite: bool,
+        pub(crate) reasoning_effort: Option<String>,
     }
 
     #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -5359,7 +5382,7 @@ mod agent_store {
                     let conn = self.connect()?;
                     let mut rows = conn
                         .query(
-                            "SELECT provider_id, model_id, label, enabled, favorite
+                            "SELECT provider_id, model_id, label, enabled, favorite, reasoning_effort
                              FROM model_targets
                              WHERE (?1 IS NULL OR provider_id = ?1)
                              ORDER BY favorite DESC, label COLLATE NOCASE, model_id COLLATE NOCASE",
@@ -5377,6 +5400,7 @@ mod agent_store {
                             label: row_text(&row, 2, "label")?,
                             enabled: row_integer(&row, 3, "enabled")? != 0,
                             favorite: row_integer(&row, 4, "favorite")? != 0,
+                            reasoning_effort: row_optional_text(&row, 5, "reasoning_effort")?,
                         });
                     }
                     Ok(targets)
@@ -5390,7 +5414,8 @@ mod agent_store {
                     let conn = self.connect()?;
                     let mut rows = conn
                         .query(
-                            "SELECT t.provider_id, t.model_id, t.label, t.enabled, t.favorite
+                            "SELECT t.provider_id, t.model_id, t.label, t.enabled, t.favorite,
+                                    t.reasoning_effort
                              FROM model_targets t
                              JOIN model_providers p ON p.provider_id = t.provider_id
                              WHERE p.enabled != 0 AND t.enabled != 0
@@ -5410,6 +5435,7 @@ mod agent_store {
                             label: row_text(&row, 2, "label")?,
                             enabled: row_integer(&row, 3, "enabled")? != 0,
                             favorite: row_integer(&row, 4, "favorite")? != 0,
+                            reasoning_effort: row_optional_text(&row, 5, "reasoning_effort")?,
                         });
                     }
                     Ok(targets)
@@ -5454,6 +5480,37 @@ mod agent_store {
                 });
             }
             self.model_defaults_blocking()
+        }
+
+        pub(crate) fn model_target_reasoning_blocking(
+            &self,
+            provider_id: &str,
+            model_id: &str,
+        ) -> Result<Option<String>> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(async {
+                    let conn = self.connect()?;
+                    let mut rows = conn
+                        .query(
+                            "SELECT reasoning_effort
+                             FROM model_targets
+                             WHERE provider_id = ?1 AND model_id = ?2",
+                            params![provider_id, model_id],
+                        )
+                        .await
+                        .with_context(|| {
+                            format!("Failed to read model {provider_id}/{model_id} reasoning")
+                        })?;
+                    let Some(row) = rows
+                        .next()
+                        .await
+                        .context("Failed to read model reasoning")?
+                    else {
+                        return Ok(None);
+                    };
+                    row_optional_text(&row, 0, "reasoning_effort")
+                })
         }
 
         pub(crate) fn upsert_model_provider_blocking(
@@ -5553,13 +5610,14 @@ mod agent_store {
                     let conn = self.connect()?;
                     conn.execute(
                         "INSERT INTO model_targets (
-                            provider_id, model_id, label, enabled, favorite,
+                            provider_id, model_id, label, enabled, favorite, reasoning_effort,
                             created_at, updated_at
-                         ) VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'), datetime('now'))
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'), datetime('now'))
                          ON CONFLICT(provider_id, model_id) DO UPDATE SET
                             label = excluded.label,
                             enabled = excluded.enabled,
                             favorite = excluded.favorite,
+                            reasoning_effort = excluded.reasoning_effort,
                             updated_at = datetime('now')",
                         params![
                             target.provider_id.as_str(),
@@ -5567,6 +5625,7 @@ mod agent_store {
                             target.label.as_str(),
                             if target.enabled { 1_i64 } else { 0_i64 },
                             if target.favorite { 1_i64 } else { 0_i64 },
+                            target.reasoning_effort.as_deref(),
                         ],
                     )
                     .await
@@ -5627,6 +5686,31 @@ mod agent_store {
                         .await
                         .with_context(|| {
                             format!("Failed to update model {provider_id}/{model_id}")
+                        })?;
+                    Ok(changed > 0)
+                })
+        }
+
+        pub(crate) fn set_model_target_reasoning_blocking(
+            &self,
+            provider_id: &str,
+            model_id: &str,
+            reasoning_effort: Option<&str>,
+        ) -> Result<bool> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(async {
+                    let conn = self.connect()?;
+                    let changed = conn
+                        .execute(
+                            "UPDATE model_targets
+                             SET reasoning_effort = ?1, updated_at = datetime('now')
+                             WHERE provider_id = ?2 AND model_id = ?3",
+                            params![reasoning_effort, provider_id, model_id],
+                        )
+                        .await
+                        .with_context(|| {
+                            format!("Failed to update model {provider_id}/{model_id} reasoning")
                         })?;
                     Ok(changed > 0)
                 })
@@ -8403,6 +8487,7 @@ fn save_discovered_model_ids(
             label: model_id.clone(),
             enabled: false,
             favorite: false,
+            reasoning_effort: None,
         })?;
         added += 1;
     }
@@ -8473,6 +8558,7 @@ fn add_tui_model_provider_preset(panel: &mut TuiModelsPanel, index: usize) -> Re
             label: "OpenAI GPT-5.6".to_string(),
             enabled: true,
             favorite: false,
+            reasoning_effort: None,
         })?;
     }
     panel.refresh();
@@ -8597,6 +8683,35 @@ fn toggle_tui_model_favorite(panel: &mut TuiModelsPanel) -> Result<String> {
     ))
 }
 
+fn cycle_tui_model_reasoning(panel: &mut TuiModelsPanel) -> Result<String> {
+    let model = panel
+        .selected_model()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("Select a model first"))?;
+    let reasoning = next_agent_codex_setting(
+        model.reasoning_effort.as_deref(),
+        &AGENT_CODEX_REASONING_EFFORTS,
+    );
+    let label = reasoning.as_deref().unwrap_or("system").to_string();
+    let changed = open_agent_store()?.set_model_target_reasoning_blocking(
+        &model.provider_id,
+        &model.model_id,
+        reasoning.as_deref(),
+    )?;
+    if !changed {
+        anyhow::bail!(
+            "Model {}/{} no longer exists",
+            model.provider_id,
+            model.model_id
+        );
+    }
+    panel.refresh_models();
+    Ok(format!(
+        "Default reasoning for {}/{}: {}",
+        model.provider_id, model.model_id, label
+    ))
+}
+
 fn set_tui_model_default(panel: &mut TuiModelsPanel) -> Result<String> {
     let model = panel
         .selected_model()
@@ -8651,6 +8766,7 @@ fn submit_tui_model_input(
                 label: entered.clone(),
                 enabled: true,
                 favorite: false,
+                reasoning_effort: None,
             })?;
             panel.refresh_models();
             Ok(Some(format!("Added model {provider_id}/{entered}")))
@@ -9916,7 +10032,7 @@ fn render_tui_agent_panel(
 }
 
 fn tui_models_instructions() -> &'static str {
-    "Add a provider with 1 OpenAI, 2 OpenRouter, 3 Ollama, 4 LM Studio, or n local/custom. Select a non-built-in provider on the left and press x/Delete to remove it. Local endpoints discover /models automatically; r refreshes. New models start OFF: Right, Up/Down, then Space chooses them. a manually adds an ID. f favorites; d sets CLT; c sets Codex. M, Tab, or Esc returns to the previous pane. API keys come only from environment variables."
+    "Add a provider with 1 OpenAI, 2 OpenRouter, 3 Ollama, 4 LM Studio, or n local/custom. Select a non-built-in provider on the left and press x/Delete to remove it. Local endpoints discover /models automatically; r refreshes. New models start OFF: Right, Up/Down, then Space chooses them. a manually adds an ID. f favorites; t cycles model reasoning; d sets CLT; c sets Codex. M, Tab, or Esc returns to the previous pane. API keys come only from environment variables."
 }
 
 fn provider_env_status(provider: &agent_store::AgentModelProvider) -> String {
@@ -9963,6 +10079,7 @@ fn include_codex_default_model_target(
         label: codex_model_id.to_string(),
         enabled: true,
         favorite: false,
+        reasoning_effort: None,
     };
     store.upsert_model_target_blocking(&target)?;
     let insertion_index = models
@@ -9989,8 +10106,8 @@ fn tui_models_provider_row(provider: &agent_store::AgentModelProvider) -> String
 
 fn tui_models_model_header() -> String {
     format!(
-        "{:<3} {:<3} {:<3} {:<5} {:<16} {}",
-        "USE", "FAV", "CLT", "CODEX", "MODEL", "ID"
+        "{:<3} {:<3} {:<3} {:<5} {:<7} {:<16} {}",
+        "USE", "FAV", "CLT", "CODEX", "THINK", "MODEL", "ID"
     )
 }
 
@@ -10026,11 +10143,12 @@ fn tui_models_model_row(
     is_codex_default: bool,
 ) -> String {
     format!(
-        "{:<3} {:<3} {:<3} {:<5} {:<16} {}",
+        "{:<3} {:<3} {:<3} {:<5} {:<7} {:<16} {}",
         if model.enabled { "ON" } else { "OFF" },
         if model.favorite { "YES" } else { "-" },
         if is_clt_default { "YES" } else { "-" },
         if is_codex_default { "YES" } else { "-" },
+        model.reasoning_effort.as_deref().unwrap_or("system"),
         model.label,
         model.model_id
     )
@@ -11398,6 +11516,14 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                         models_panel.focus = TuiModelsFocus::Models;
                                         feedback_buffer =
                                             match toggle_tui_model_favorite(&mut models_panel) {
+                                                Ok(message) => message,
+                                                Err(error) => format!("Error: {error}"),
+                                            };
+                                    }
+                                    KeyCode::Char('t') | KeyCode::Char('T') => {
+                                        models_panel.focus = TuiModelsFocus::Models;
+                                        feedback_buffer =
+                                            match cycle_tui_model_reasoning(&mut models_panel) {
                                                 Ok(message) => message,
                                                 Err(error) => format!("Error: {error}"),
                                             };
@@ -14783,8 +14909,16 @@ mod tests {
             label: "Claude Sonnet 4".to_string(),
             enabled: true,
             favorite: true,
+            reasoning_effort: Some("high".to_string()),
         };
         store.upsert_model_target_blocking(&target).unwrap();
+        assert_eq!(
+            store
+                .model_target_reasoning_blocking(&target.provider_id, &target.model_id)
+                .unwrap()
+                .as_deref(),
+            Some("high")
+        );
         store
             .set_model_default_blocking(&target.provider_id, &target.model_id)
             .unwrap();
@@ -14832,6 +14966,7 @@ mod tests {
             label: "Local Model".to_string(),
             enabled: true,
             favorite: true,
+            reasoning_effort: None,
         };
         store.upsert_model_provider_blocking(&provider).unwrap();
         store.upsert_model_target_blocking(&model).unwrap();
@@ -14895,6 +15030,7 @@ mod tests {
                 label: "GPT-5.6".to_string(),
                 enabled: true,
                 favorite: true,
+                reasoning_effort: None,
             })
             .unwrap();
         store
@@ -14904,6 +15040,7 @@ mod tests {
                 label: "GPT-5.6 Sol".to_string(),
                 enabled: false,
                 favorite: false,
+                reasoning_effort: None,
             })
             .unwrap();
         store
@@ -14984,6 +15121,7 @@ mod tests {
             label: "GPT-5.6".to_string(),
             enabled: true,
             favorite: true,
+            reasoning_effort: None,
         };
         let defaults = agent_store::AgentModelDefaults {
             provider_id: Some("openai".to_string()),
@@ -15010,12 +15148,12 @@ mod tests {
             tui_models_model_header()
                 .split_whitespace()
                 .collect::<Vec<_>>(),
-            ["USE", "FAV", "CLT", "CODEX", "MODEL", "ID"]
+            ["USE", "FAV", "CLT", "CODEX", "THINK", "MODEL", "ID"]
         );
         let row = tui_models_model_row(&model, true, true);
         assert_eq!(
             row.split_whitespace().collect::<Vec<_>>(),
-            ["ON", "YES", "YES", "YES", "GPT-5.6", "gpt-5.6"]
+            ["ON", "YES", "YES", "YES", "system", "GPT-5.6", "gpt-5.6"]
         );
         assert!(!row.contains('★'));
 
@@ -15128,6 +15266,7 @@ mod tests {
         assert!(tui_models_add_provider_menu().contains("[3] Ollama"));
         assert!(tui_models_instructions().contains("r refreshes"));
         assert!(tui_models_instructions().contains("x/Delete to remove"));
+        assert!(tui_models_instructions().contains("t cycles model reasoning"));
         let mut input = TuiModelInput::custom_provider();
         if let TuiModelInputKind::CustomProvider { step, .. } = &mut input.kind {
             *step = 1;
@@ -15157,6 +15296,7 @@ mod tests {
                 label: "Already Selected".to_string(),
                 enabled: true,
                 favorite: true,
+                reasoning_effort: Some("medium".to_string()),
             })
             .unwrap();
 
@@ -15181,7 +15321,9 @@ mod tests {
             .find(|model| model.model_id == "new-model")
             .unwrap();
         assert!(existing.enabled && existing.favorite);
+        assert_eq!(existing.reasoning_effort.as_deref(), Some("medium"));
         assert!(!discovered.enabled && !discovered.favorite);
+        assert_eq!(discovered.reasoning_effort, None);
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -16843,6 +16985,10 @@ mod tests {
         let state_dir = root.join("state/clt");
         let project_root = root.join("project");
         fs::create_dir_all(&project_root).unwrap();
+        agent_store::TursoAgentStore::open_blocking(&state_dir)
+            .unwrap()
+            .set_model_target_reasoning_blocking("openai", "gpt-5.6-terra", Some("low"))
+            .unwrap();
 
         let fake_codex = root.join("fake-codex");
         fs::write(
@@ -16892,6 +17038,7 @@ mod tests {
         assert!(stderr.contains(
             "arg=--sandbox\narg=danger-full-access\narg=--ask-for-approval\narg=never\narg=--config\narg=model_provider=\"openai\"\narg=--model\narg=gpt-5.6-terra\narg=--config\narg=model_reasoning_effort=\"high\"\narg=--enable\narg=fast_mode\narg=--config\narg=service_tier=\"fast\"\narg=exec\narg=-C\n"
         ));
+        assert!(!stderr.contains("arg=model_reasoning_effort=\"low\"\n"));
         assert!(stderr.contains(&format!("arg={}\n", project_root.display())));
 
         fs::remove_dir_all(root).unwrap();
@@ -16907,6 +17054,26 @@ mod tests {
         let project_root = root.join("project");
         fs::create_dir_all(&project_root).unwrap();
         let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .upsert_model_provider_blocking(&agent_store::AgentModelProvider {
+                id: "openrouter".to_string(),
+                name: "OpenRouter".to_string(),
+                base_url: Some("https://openrouter.ai/api/v1".to_string()),
+                env_key: Some("OPENROUTER_API_KEY".to_string()),
+                built_in: false,
+                enabled: true,
+            })
+            .unwrap();
+        store
+            .upsert_model_target_blocking(&agent_store::AgentModelTarget {
+                provider_id: "openrouter".to_string(),
+                model_id: "anthropic/claude-sonnet-4".to_string(),
+                label: "Claude Sonnet 4".to_string(),
+                enabled: true,
+                favorite: true,
+                reasoning_effort: Some("high".to_string()),
+            })
+            .unwrap();
         store
             .set_model_default_blocking("openrouter", "anthropic/claude-sonnet-4")
             .unwrap();
@@ -16950,6 +17117,7 @@ mod tests {
 
         assert!(stderr.contains("arg=model_provider=\"openrouter\"\n"));
         assert!(stderr.contains("arg=--model\narg=anthropic/claude-sonnet-4\n"));
+        assert!(stderr.contains("arg=model_reasoning_effort=\"high\"\n"));
 
         fs::remove_dir_all(root).unwrap();
     }
