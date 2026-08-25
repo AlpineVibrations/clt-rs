@@ -2500,72 +2500,49 @@ fn run_agent_job(
     let run_result = runner.run_project(&job.project, job.task_selection, shutdown);
     let finished_at = agent_timestamp();
 
-    let (
-        status,
-        exit_code,
-        log_dir,
-        stdout_path,
-        stderr_path,
-        summary,
-        codex_session_id,
-        task_content,
-    ) = match run_result {
-        Ok(mut result) => {
-            if matches!(result.status, "success" | "idle")
-                && blocked_recovery_made_no_progress(&job)
-            {
-                result.status = "blocked";
-                result.summary = format!(
-                    "Blocked-task recovery left all {} task(s) blocked across todo and doing; retry after the recovery backoff. Runner result: {}",
-                    job.blocked_task_count_before, result.summary
-                );
+    let (status, exit_code, log_dir, stdout_path, stderr_path, summary, codex_session_id) =
+        match run_result {
+            Ok(mut result) => {
+                if matches!(result.status, "success" | "idle")
+                    && blocked_recovery_made_no_progress(&job)
+                {
+                    result.status = "blocked";
+                    result.summary = format!(
+                        "Blocked-task recovery left all {} task(s) blocked across todo and doing; retry after the recovery backoff. Runner result: {}",
+                        job.blocked_task_count_before, result.summary
+                    );
+                }
+
+                if let Some(session_id) = result.codex_session_id.as_deref()
+                    && let Err(error) = attach_codex_session_after_run(&job, session_id)
+                {
+                    result.status = "failure";
+                    result.summary = format!(
+                        "{} Failed to persist the Codex session marker on the task: {error:#}",
+                        result.summary
+                    );
+                }
+
+                (
+                    result.status,
+                    result.exit_code,
+                    Some(result.log_dir.display().to_string()),
+                    Some(result.stdout_path.display().to_string()),
+                    Some(result.stderr_path.display().to_string()),
+                    result.summary,
+                    result.codex_session_id,
+                )
             }
-
-            let task_content = result.codex_session_id.as_deref().and_then(|session_id| {
-                let completed =
-                    newly_completed_task(&job.project.path, &job.done_task_contents_before)
-                        .ok()
-                        .flatten()
-                        .map(|entry| ("done", entry));
-
-                completed
-                    .or_else(|| {
-                        blocked_task_after_run(
-                            &job.project.path,
-                            &job.blocked_task_snapshots_before,
-                            job.task_selection != AgentTaskSelection::NextTodo,
-                        )
-                        .ok()
-                        .flatten()
-                    })
-                    .map(|(status, entry)| {
-                        attach_codex_session_to_task(&job.project.path, status, &entry, session_id)
-                            .unwrap_or_else(|_| entry.content.trim_end().to_string())
-                    })
-            });
-
-            (
-                result.status,
-                result.exit_code,
-                Some(result.log_dir.display().to_string()),
-                Some(result.stdout_path.display().to_string()),
-                Some(result.stderr_path.display().to_string()),
-                result.summary,
-                result.codex_session_id,
-                task_content,
-            )
-        }
-        Err(err) => (
-            "failure",
-            None,
-            None,
-            None,
-            None,
-            format!("Codex runner failed before completion: {err:#}"),
-            None,
-            None,
-        ),
-    };
+            Err(err) => (
+                "failure",
+                None,
+                None,
+                None,
+                None,
+                format!("Codex runner failed before completion: {err:#}"),
+                None,
+            ),
+        };
 
     let release_result = with_agent_store_at(&job.state_dir, |store| {
         store.release_lease_blocking(job.project.id, &job.holder)
@@ -2583,7 +2560,6 @@ fn run_agent_job(
             stderr_path: stderr_path.as_deref(),
             summary: Some(&summary),
             codex_session_id: codex_session_id.as_deref(),
-            task_content: task_content.as_deref(),
         })
     })?;
     release_result?;
@@ -2597,6 +2573,25 @@ fn run_agent_job(
         stdout_path,
         stderr_path,
     })
+}
+
+fn attach_codex_session_after_run(job: &AgentRunJob, session_id: &str) -> Result<()> {
+    let completed = newly_completed_task(&job.project.path, &job.done_task_contents_before)?
+        .map(|entry| ("done", entry));
+    let task = match completed {
+        Some(task) => Some(task),
+        None => blocked_task_after_run(
+            &job.project.path,
+            &job.blocked_task_snapshots_before,
+            job.task_selection != AgentTaskSelection::NextTodo,
+        )?,
+    };
+
+    if let Some((status, entry)) = task {
+        attach_codex_session_to_task(&job.project.path, status, &entry, session_id)?;
+    }
+
+    Ok(())
 }
 
 fn completed_task_contents(project_root: &Path) -> Result<Vec<String>> {
@@ -4449,6 +4444,10 @@ mod agent_store {
             version: 10,
             statements: &["ALTER TABLE model_targets ADD COLUMN reasoning_effort TEXT"],
         },
+        AgentMigration {
+            version: 11,
+            statements: &["ALTER TABLE runs DROP COLUMN task_content"],
+        },
     ];
 
     pub(crate) struct TursoAgentStore {
@@ -4513,7 +4512,6 @@ mod agent_store {
         pub(crate) stderr_path: Option<&'a str>,
         pub(crate) summary: Option<&'a str>,
         pub(crate) codex_session_id: Option<&'a str>,
-        pub(crate) task_content: Option<&'a str>,
     }
 
     pub(crate) struct AgentLeaseRecord {
@@ -4887,10 +4885,9 @@ mod agent_store {
             conn.execute(
                 "INSERT INTO runs (
                     project_id, status, started_at, finished_at, exit_code,
-                    log_dir, stdout_path, stderr_path, summary, codex_session_id,
-                    task_content
+                    log_dir, stdout_path, stderr_path, summary, codex_session_id
                  )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     outcome.project_id,
                     outcome.status,
@@ -4901,8 +4898,7 @@ mod agent_store {
                     outcome.stdout_path,
                     outcome.stderr_path,
                     outcome.summary,
-                    outcome.codex_session_id,
-                    outcome.task_content
+                    outcome.codex_session_id
                 ],
             )
             .await
@@ -5001,54 +4997,6 @@ mod agent_store {
                 stderr_path: row_optional_text(&row, 9, "stderr_path")?,
                 summary: row_optional_text(&row, 10, "summary")?,
             }))
-        }
-
-        pub(crate) fn codex_session_for_task_blocking(
-            &self,
-            project_root: &Path,
-            task_content: &str,
-        ) -> Result<Option<String>> {
-            tokio::runtime::Runtime::new()
-                .context("Failed to create async runtime for agent store")?
-                .block_on(self.codex_session_for_task(project_root, task_content))
-        }
-
-        async fn codex_session_for_task(
-            &self,
-            project_root: &Path,
-            task_content: &str,
-        ) -> Result<Option<String>> {
-            let conn = self.connect()?;
-            let project_path = project_root.display().to_string();
-            let mut rows = conn
-                .query(
-                    "SELECT r.codex_session_id
-                     FROM runs r
-                     JOIN projects p ON p.id = r.project_id
-                     WHERE p.path = ?1
-                       AND r.task_content = ?2
-                       AND r.codex_session_id IS NOT NULL
-                     ORDER BY r.id DESC
-                     LIMIT 1",
-                    params![project_path.as_str(), task_content],
-                )
-                .await
-                .with_context(|| {
-                    format!(
-                        "Failed to find a Codex session for a task in {}",
-                        project_root.display()
-                    )
-                })?;
-
-            let Some(row) = rows
-                .next()
-                .await
-                .context("Failed to read task Codex session")?
-            else {
-                return Ok(None);
-            };
-
-            Ok(Some(row_text(&row, 0, "codex_session_id")?))
         }
 
         pub(crate) fn record_daemon_checkin_blocking(
@@ -5220,6 +5168,48 @@ mod agent_store {
             .await?;
 
             Ok(count == 1)
+        }
+
+        #[cfg(test)]
+        pub(crate) fn runs_has_task_content_column_blocking(&self) -> Result<bool> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(async {
+                    let conn = self.connect()?;
+                    let count = query_count(
+                        &conn,
+                        "SELECT COUNT(*)
+                           FROM pragma_table_info('runs')
+                          WHERE name = 'task_content'",
+                        (),
+                    )
+                    .await?;
+                    Ok(count == 1)
+                })
+        }
+
+        #[cfg(test)]
+        pub(crate) fn latest_codex_session_id_blocking(&self) -> Result<Option<String>> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(async {
+                    let conn = self.connect()?;
+                    let mut rows = conn
+                        .query(
+                            "SELECT codex_session_id FROM runs ORDER BY id DESC LIMIT 1",
+                            (),
+                        )
+                        .await
+                        .context("Failed to read the latest Codex session ID")?;
+                    let Some(row) = rows
+                        .next()
+                        .await
+                        .context("Failed to read the latest Codex session ID row")?
+                    else {
+                        return Ok(None);
+                    };
+                    row_optional_text(&row, 0, "codex_session_id")
+                })
         }
 
         #[cfg(test)]
@@ -6351,7 +6341,7 @@ fn first_sentence(content: &str) -> Option<String> {
 }
 
 fn codex_session_id_from_task_content(content: &str) -> Option<&str> {
-    let marker = content.trim_end().split_whitespace().next_back()?;
+    let marker = content.split_whitespace().next_back()?;
     let session_id = marker.strip_prefix(CODEX_TASK_SESSION_PREFIX)?;
 
     (!session_id.is_empty()
@@ -9557,13 +9547,8 @@ fn task_supports_interactive_codex_resume(status: &str, task: &TaskEntry) -> boo
     status == "done" || matches!(status, "todo" | "doing") && task_entry_is_blocked(task)
 }
 
-fn codex_session_for_task(project_root: &Path, task: &TaskEntry) -> Result<Option<String>> {
-    if let Some(session_id) = codex_session_id_from_task_content(&task.content) {
-        return Ok(Some(session_id.to_string()));
-    }
-
-    let store = open_agent_store()?;
-    store.codex_session_for_task_blocking(project_root, task.content.trim_end())
+fn codex_session_for_task(task: &TaskEntry) -> Option<String> {
+    codex_session_id_from_task_content(&task.content).map(str::to_string)
 }
 
 fn selected_tui_agent_log_view(panel: &TuiAgentPanel) -> Result<Option<TuiAgentLogView>> {
@@ -12370,8 +12355,8 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                             continue;
                                         }
 
-                                        match codex_session_for_task(&active_root, &task) {
-                                            Ok(Some(session_id)) => {
+                                        match codex_session_for_task(&task) {
+                                            Some(session_id) => {
                                                 agent_log_view = None;
                                                 terminal_session.suspend();
                                                 let resume_result =
@@ -12400,13 +12385,10 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                                     Err(error) => format!("Error: {error}"),
                                                 };
                                             }
-                                            Ok(None) => {
+                                            None => {
                                                 feedback_buffer =
                                                     "No Codex session linked to this task."
                                                         .to_string();
-                                            }
-                                            Err(error) => {
-                                                feedback_buffer = format!("Error: {error}");
                                             }
                                         }
                                     }
@@ -13790,7 +13772,6 @@ mod tests {
                     stderr_path: None,
                     summary: Some("completed"),
                     codex_session_id: None,
-                    task_content: None,
                 })
                 .unwrap();
         }
@@ -15114,6 +15095,7 @@ mod tests {
                 "missing table {table}"
             );
         }
+        assert!(!store.runs_has_task_content_column_blocking().unwrap());
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -17050,13 +17032,70 @@ mod tests {
             codex_session_id_from_task_content(&done_task.content),
             Some("session-for-task")
         );
+        assert_eq!(
+            codex_session_for_task(&done_task).as_deref(),
+            Some("session-for-task")
+        );
 
         let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
         assert_eq!(
-            store
-                .codex_session_for_task_blocking(&project_root, &done_task.content)
-                .unwrap()
-                .as_deref(),
+            store.latest_codex_session_id_blocking().unwrap().as_deref(),
+            Some("session-for-task")
+        );
+
+        let mut markerless_task = done_task;
+        markerless_task.content = "resumable task".to_string();
+        assert_eq!(codex_session_for_task(&markerless_task), None);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_agent_run_reports_a_session_marker_write_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_root("agent-task-codex-session-write-failure");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        add_task(&project_root, "resumable task", None).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        drop(store);
+
+        let mut start = run_agent_scheduler_pass(&state_dir, false, &[]).unwrap();
+        move_task(&project_root, "todo", "doing", "1").unwrap();
+        move_task(&project_root, "doing", "done", "1").unwrap();
+        let done_path = project_root.join("tasks/done.md");
+        let mut permissions = fs::metadata(&done_path).unwrap().permissions();
+        permissions.set_mode(0o444);
+        fs::set_permissions(&done_path, permissions).unwrap();
+
+        let mut runner = FakeAgentRunner::new(&state_dir, "success");
+        runner.result.codex_session_id = Some("session-for-task".to_string());
+        let shutdown = new_agent_shutdown_signal();
+        let completion = run_agent_job(start.jobs.pop().unwrap(), &runner, &shutdown).unwrap();
+
+        let mut permissions = fs::metadata(&done_path).unwrap().permissions();
+        permissions.set_mode(0o644);
+        fs::set_permissions(&done_path, permissions).unwrap();
+        assert_eq!(completion.status, "failure");
+        assert!(
+            completion
+                .summary
+                .contains("Failed to persist the Codex session marker on the task")
+        );
+        assert_eq!(
+            fs::read_to_string(&done_path).unwrap(),
+            "# Done Tasks\n- resumable task\n"
+        );
+
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        assert_eq!(
+            store.latest_codex_session_id_blocking().unwrap().as_deref(),
             Some("session-for-task")
         );
 
@@ -17106,10 +17145,7 @@ mod tests {
 
         let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
         assert_eq!(
-            store
-                .codex_session_for_task_blocking(&project_root, &blocked_task.content)
-                .unwrap()
-                .as_deref(),
+            store.latest_codex_session_id_blocking().unwrap().as_deref(),
             Some("session-for-blocked-task")
         );
 
@@ -17203,7 +17239,6 @@ mod tests {
                 stderr_path: Some("/tmp/logs/run.err"),
                 summary: Some("completed"),
                 codex_session_id: Some("session-123"),
-                task_content: Some("completed task"),
             })
             .unwrap();
 
@@ -17221,17 +17256,8 @@ mod tests {
         assert_eq!(runs[0].stderr_path.as_deref(), Some("/tmp/logs/run.err"));
         assert_eq!(runs[0].summary.as_deref(), Some("completed"));
         assert_eq!(
-            store
-                .codex_session_for_task_blocking(&project_root, "completed task")
-                .unwrap()
-                .as_deref(),
+            store.latest_codex_session_id_blocking().unwrap().as_deref(),
             Some("session-123")
-        );
-        assert_eq!(
-            store
-                .codex_session_for_task_blocking(&project_root, "different task")
-                .unwrap(),
-            None
         );
 
         fs::remove_dir_all(root).unwrap();
@@ -17281,7 +17307,6 @@ mod tests {
                     stderr_path: None,
                     summary: Some("completed"),
                     codex_session_id: None,
-                    task_content: None,
                 })
                 .unwrap();
         }
@@ -17322,7 +17347,6 @@ mod tests {
                 stderr_path: None,
                 summary: Some("failed"),
                 codex_session_id: None,
-                task_content: None,
             })
             .unwrap();
         store
@@ -17337,7 +17361,6 @@ mod tests {
                 stderr_path: None,
                 summary: Some("still blocked"),
                 codex_session_id: None,
-                task_content: None,
             })
             .unwrap();
         store
@@ -17352,7 +17375,6 @@ mod tests {
                 stderr_path: None,
                 summary: Some("completed"),
                 codex_session_id: None,
-                task_content: None,
             })
             .unwrap();
 
@@ -17390,7 +17412,6 @@ mod tests {
                 stderr_path: Some("/tmp/logs/run.err"),
                 summary: Some("failed"),
                 codex_session_id: None,
-                task_content: None,
             })
             .unwrap();
         store
@@ -17405,7 +17426,6 @@ mod tests {
                 stderr_path: Some("/tmp/logs/run.err"),
                 summary: Some("still blocked"),
                 codex_session_id: None,
-                task_content: None,
             })
             .unwrap();
         store

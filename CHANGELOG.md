@@ -35,6 +35,7 @@ Use this section while developing the next release.
 
 ### Changed
 
+- Made embedded `codex:<session-id>` task markers the sole interactive-resume link, removed mutable task-text associations from the agent database, and made marker persistence failures visible as failed runs.
 - Made the TUI task-board console help show task controls instead of Agent Projects controls.
 - Changed the portable `r` task-reorganization shortcut into a sticky mode with yellow task-board borders and a visible mode title; arrows keep reorganizing tasks until `r` or `Esc` exits.
 - Made local OpenAI-compatible endpoint setup preset-led and self-discovering: Ollama and LM Studio load their model catalogs automatically, custom endpoints generate their provider IDs, the API-root prompt explains `/v1` and rejects complete operation URLs, `/models` results are presented as explicit opt-in choices, and model discovery can be refreshed from the Models page.
