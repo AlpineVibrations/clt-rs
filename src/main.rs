@@ -7834,14 +7834,16 @@ struct TuiStartState {
     feedback_buffer: String,
 }
 
+fn tui_task_board_instructions() -> &'static str {
+    "Arrows navigate boards and tasks, Enter opens subtasks or edits the selected task, Space creates a task, e edits, c resumes a selected Done or blocked task in Codex, Backspace returns to the parent board, a archives, A opens Archive, b moves to Backlog, B shows/hides Backlog, r enters Reorganize mode, Shift+Arrows move/reorder, Ctrl-P/N reorder, d/Delete deletes, l shows agent output, Tab opens Agent Projects, M opens Models, h/? opens Help, q quits."
+}
+
 fn tui_start_state(active_board: bool) -> TuiStartState {
     if active_board {
         TuiStartState {
             active_board,
             current_pane: TuiPane::Tasks,
-            feedback_buffer: String::from(
-                "Kanban View! Tab toggles between the task board and agent projects. Uppercase M opens Models from either pane; lowercase m cycles the selected Agent Project target. Enter opens a selected project, Space toggles it ON/OFF, g cycles Git off/commit/push, f/t change its Codex fast/thinking settings, c resumes a selected Done or blocked task in interactive Codex, l shows agent output, Backspace returns to parent, Space creates a task on the board, a archives a task, A opens archive view, b moves a task to backlog, B toggles the backlog column, r toggles sticky Reorganize mode, Shift+Arrows reorder or move tasks, Ctrl-P/N reorder up/down, 'd' deletes, 'q' quits.",
-            ),
+            feedback_buffer: tui_task_board_instructions().to_string(),
         }
     } else {
         TuiStartState {
@@ -11696,7 +11698,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                 feedback_buffer = if current_pane == TuiPane::AgentProjects {
                                     tui_agent_panel_instructions().to_string()
                                 } else {
-                                    "Task board pane.".to_string()
+                                    tui_task_board_instructions().to_string()
                                 };
                             } else if matches!(key.code, KeyCode::Esc)
                                 && agent_log_view.take().is_some()
@@ -11710,7 +11712,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                         {
                                             tui_agent_panel_instructions().to_string()
                                         } else {
-                                            "Task board pane.".to_string()
+                                            tui_task_board_instructions().to_string()
                                         };
                                     }
                                     KeyCode::Char('q') => break,
@@ -11805,7 +11807,8 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                     KeyCode::Esc => {
                                         if active_board {
                                             current_pane = TuiPane::Tasks;
-                                            feedback_buffer = "Task board pane.".to_string();
+                                            feedback_buffer =
+                                                tui_task_board_instructions().to_string();
                                         } else {
                                             feedback_buffer =
                                                 TUI_NO_ACTIVE_BOARD_MESSAGE.to_string();
@@ -14161,7 +14164,22 @@ mod tests {
 
         assert!(state.active_board);
         assert_eq!(state.current_pane, TuiPane::Tasks);
-        assert!(state.feedback_buffer.contains("Kanban View"));
+        assert_eq!(state.feedback_buffer, tui_task_board_instructions());
+    }
+
+    #[test]
+    fn tui_task_board_instructions_only_describe_task_page_controls() {
+        let instructions = tui_task_board_instructions();
+
+        assert!(instructions.contains("Space creates a task"));
+        assert!(instructions.contains("e edits"));
+        assert!(instructions.contains("r enters Reorganize mode"));
+        assert!(instructions.contains("Tab opens Agent Projects"));
+        assert!(!instructions.contains("toggles ON/OFF"));
+        assert!(!instructions.contains("cycles Git"));
+        assert!(!instructions.contains("cycles the selected target"));
+        assert!(!instructions.contains("toggles fast"));
+        assert!(!instructions.contains("cycles thinking"));
     }
 
     #[test]
