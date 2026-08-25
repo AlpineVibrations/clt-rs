@@ -10,6 +10,7 @@ Use this section while developing the next release.
 
 ### Added
 
+- Added `/goal`-prefixed task support for automated Codex runs, including explicit goals feature enablement and prompt guidance that removes the directive from the persistent goal objective.
 - Added confirmed `Delete`-key removal for registered projects in the Agent Projects pane without deleting project files.
 - Added a TUI Models page with provider presets, custom Responses-compatible endpoints, enabled model targets, favorites, a CLT-wide default, and per-project provider/model overrides.
 - Added `x`/`Delete` removal for non-built-in providers on the Models page, including dependent model, selection, and Codex configuration cleanup.
@@ -49,6 +50,7 @@ Use this section while developing the next release.
 
 ### Fixed
 
+- Fixed prompt construction in the bundled task-runner script under the macOS-provided Bash 3.2.
 - Registering the current project from the Agent Projects pane now keeps the cursor on that project after it moves into the alphabetically sorted project list.
 - Added portable task-reorganization shortcuts for terminals that do not distinguish Shift+Arrow: `Ctrl-P`/`Ctrl-N` reorder vertically, and `r` toggles a keyboard-driven reorganization mode.
 - Documented the Terminal.app profile mappings required to preserve Shift+Up and Shift+Down task reordering through SSH and tmux.

@@ -200,9 +200,17 @@ clt agent run --once
 
 The scheduler scans enabled projects, picks projects with pending unblocked `todo` tasks, takes an agent lease, and starts one Codex run at a time. Each normal Codex run is prompted to inspect the board, move one available task to `doing`, complete it, run relevant checks, update the task through `clt`, and stop after that single task. If a crashed run left a stale lease and a task in `doing`, the scheduler reclaims the lease and prompts the replacement run to resume that task before starting new work.
 
+Prefix a Todo task with `/goal` when it needs a persistent objective for long-running work. Automated runs enable Codex goals, remove the leading directive from the goal objective, and ask Codex to create the goal before working on the task. The directive must be the task's first non-whitespace token and must be followed by a non-empty objective; `/goal` elsewhere in a task remains ordinary text.
+
+```bash
+clt add "/goal Migrate the authentication module and stop when all tests pass"
+```
+
+Use this for one durable objective with a verifiable stopping condition; keep quick fixes and unrelated task lists as normal Todo items. See the [official OpenAI goal guide](https://learn.chatgpt.com/use-cases/follow-goals) for goal-writing guidance.
+
 Unblocked Todo work takes priority over blocked-task recovery, while blocked Todo entries are skipped during normal selection. When all tasks across Todo and Doing are blocked, a monitor run reviews the blocker notes and works on exactly one existing task from either status. It can complete that task, add a newer `UNBLOCKED YYYY-MM-DD:` note and return it to Todo after resolving its blocker, or update its blocked note with the latest attempt. The latest dated `BLOCKED`, `UNBLOCKED`, or `COMPLETED` state note determines whether a task is currently blocked. Successful recovery lets the ordinary scheduler carry on; if the board is unchanged, the run is recorded as `blocked` and another monitor attempt waits for `CLT_AGENT_FAILURE_BACKOFF_SECONDS` instead of creating a tight retry loop. Unmarked Doing tasks are left alone because they may belong to a human or another workflow.
 
-Automated runs start Codex with `--sandbox danger-full-access --ask-for-approval never` so tasks can update Git metadata without pausing for interactive approval. This removes the Codex command sandbox for the entire run. Register only trusted repositories, or run the agent inside an externally isolated container or VM.
+Automated runs start Codex with `--sandbox danger-full-access --ask-for-approval never --enable goals` so tasks can update Git metadata without pausing for interactive approval and `/goal` tasks can create persistent goals. This removes the Codex command sandbox for the entire run. Register only trusted repositories, or run the agent inside an externally isolated container or VM.
 
 Run the scheduler continuously in the foreground:
 ```bash

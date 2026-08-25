@@ -138,6 +138,10 @@ Your job for this run:
 3. If there are no available tasks, say exactly: NO_TASKS_LEFT
 4. If there is a task:
    - move it to doing
+   - inspect its full content before starting work
+   - if the first non-whitespace token is exactly `/goal`, treat that as an explicit Goal mode request: remove that token, trim the remaining task content, create a persistent goal from the result without including `/goal` in the goal objective, and then work toward it
+   - if `/goal` has no non-empty objective after it, add a concise `BLOCKED YYYY-MM-DD:` note explaining that the goal objective is missing and stop
+   - do not create a goal when `/goal` appears anywhere except at the start of the task content
    - complete that task
    - run the relevant checks/tests
    - update the task using the task CLI
@@ -3150,7 +3154,9 @@ impl AgentRunner for CodexAgentRunner {
             .arg("--sandbox")
             .arg("danger-full-access")
             .arg("--ask-for-approval")
-            .arg("never");
+            .arg("never")
+            .arg("--enable")
+            .arg("goals");
         let store = open_agent_store_at(&self.state_dir)?;
         let model_target = if let Some(model_id) = project.codex_model.as_ref() {
             agent_store::AgentModelDefaults {
@@ -17275,6 +17281,10 @@ mod tests {
         assert!(base_prompt.contains("Use the existing task-management CLI tooling: clt."));
         assert!(base_prompt.contains("Use the $clt-task-management skill"));
         assert!(base_prompt.contains("Pick the next available unblocked TODO"));
+        assert!(base_prompt.contains("the first non-whitespace token is exactly `/goal`"));
+        assert!(base_prompt.contains("without including `/goal` in the goal objective"));
+        assert!(base_prompt.contains("do not create a goal when `/goal` appears anywhere except"));
+        assert!(base_prompt.contains("the goal objective is missing"));
         assert!(base_prompt.contains("skip tasks whose latest dated state note is `BLOCKED"));
         assert!(!base_prompt.contains("Embedded skill fallback:"));
         assert!(!base_prompt.contains("Interrupted task recovery:"));
@@ -17488,7 +17498,7 @@ mod tests {
         );
         let stderr = fs::read_to_string(&result.stderr_path).unwrap();
         assert!(stderr.contains(
-            "arg=--sandbox\narg=danger-full-access\narg=--ask-for-approval\narg=never\narg=--config\narg=model_provider=\"openai\"\narg=--model\narg=gpt-5.6-terra\narg=--config\narg=model_reasoning_effort=\"high\"\narg=--enable\narg=fast_mode\narg=--config\narg=service_tier=\"fast\"\narg=exec\narg=-C\n"
+            "arg=--sandbox\narg=danger-full-access\narg=--ask-for-approval\narg=never\narg=--enable\narg=goals\narg=--config\narg=model_provider=\"openai\"\narg=--model\narg=gpt-5.6-terra\narg=--config\narg=model_reasoning_effort=\"high\"\narg=--enable\narg=fast_mode\narg=--config\narg=service_tier=\"fast\"\narg=exec\narg=-C\n"
         ));
         assert!(!stderr.contains("arg=model_reasoning_effort=\"low\"\n"));
         assert!(stderr.contains(&format!("arg={}\n", project_root.display())));
@@ -17634,7 +17644,9 @@ mod tests {
 
         assert_eq!(result.status, "interrupted");
         let stderr = fs::read_to_string(&result.stderr_path).unwrap();
-        assert!(stderr.contains("arg=--disable\narg=fast_mode\narg=exec\n"));
+        assert!(
+            stderr.contains("arg=--enable\narg=goals\narg=--disable\narg=fast_mode\narg=exec\n")
+        );
         assert!(stderr.contains("agent is shutting down"));
 
         fs::remove_dir_all(root).unwrap();

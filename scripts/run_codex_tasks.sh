@@ -57,7 +57,8 @@ while true; do
   OUT_FILE="$LOG_DIR/$RUN_ID.out"
   ERR_FILE="$LOG_DIR/$RUN_ID.err"
 
-  PROMPT=$(cat <<'EOF'
+  PROMPT=""
+  IFS= read -r -d '' PROMPT <<'EOF' || true
 You are working in this repo.
 
 Use the existing task-management CLI tooling: clt.
@@ -69,6 +70,10 @@ Your job for this run:
 3. If there are no available tasks, say exactly: NO_TASKS_LEFT
 4. If there is a task:
    - move it to doing
+   - inspect its full content before starting work
+   - if the first non-whitespace token is exactly `/goal`, treat that as an explicit Goal mode request: remove that token, trim the remaining task content, create a persistent goal from the result without including `/goal` in the goal objective, and then work toward it
+   - if `/goal` has no non-empty objective after it, add a concise `BLOCKED YYYY-MM-DD:` note explaining that the goal objective is missing and stop
+   - do not create a goal when `/goal` appears anywhere except at the start of the task content
    - complete that task
    - run the relevant checks/tests
    - update the task using the task CLI
@@ -85,7 +90,6 @@ Safety rules:
 - Inspect task details when needed; a folder-backed task's list summary may not show its blocker notes.
 - If the task is blocked or cannot be completed safely, update it with a concise `BLOCKED YYYY-MM-DD:` note instead of forcing it.
 EOF
-)
 
   set +e
 
@@ -94,6 +98,7 @@ EOF
   "$TIMEOUT_CMD" "$TIMEOUT" codex \
     --sandbox danger-full-access \
     --ask-for-approval never \
+    --enable goals \
     exec -C "$PWD" "$PROMPT" \
     > >(tee "$OUT_FILE") \
     2> >(tee "$ERR_FILE" >&2)
