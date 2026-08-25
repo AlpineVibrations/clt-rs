@@ -71,6 +71,7 @@ const AGENT_DEFAULT_RUN_TIMEOUT_SECONDS: u64 = 45 * 60;
 const AGENT_DEFAULT_SUCCESS_COOLDOWN_SECONDS: u64 = 5;
 const AGENT_DAEMON_CHECKIN_STALE_SECONDS: u64 = 45;
 const AGENT_NO_TASKS_LEFT_MARKER: &str = "NO_TASKS_LEFT";
+const CODEX_TASK_SESSION_PREFIX: &str = "codex:";
 const CLT_TASK_MANAGEMENT_SKILL_NAME: &str = "clt-task-management";
 const GIT_COMMIT_SKILL_NAME: &str = "git-commit";
 const EMBEDDED_CLT_TASK_MANAGEMENT_SKILL: &str =
@@ -2520,22 +2521,27 @@ fn run_agent_job(
                 );
             }
 
-            let task_content = result.codex_session_id.as_ref().and_then(|_| {
+            let task_content = result.codex_session_id.as_deref().and_then(|session_id| {
                 let completed =
                     newly_completed_task(&job.project.path, &job.done_task_contents_before)
                         .ok()
                         .flatten()
-                        .map(|entry| entry.content.trim_end().to_string());
+                        .map(|entry| ("done", entry));
 
-                completed.or_else(|| {
-                    blocked_task_content_after_run(
-                        &job.project.path,
-                        &job.blocked_task_snapshots_before,
-                        job.task_selection != AgentTaskSelection::NextTodo,
-                    )
-                    .ok()
-                    .flatten()
-                })
+                completed
+                    .or_else(|| {
+                        blocked_task_after_run(
+                            &job.project.path,
+                            &job.blocked_task_snapshots_before,
+                            job.task_selection != AgentTaskSelection::NextTodo,
+                        )
+                        .ok()
+                        .flatten()
+                    })
+                    .map(|(status, entry)| {
+                        attach_codex_session_to_task(&job.project.path, status, &entry, session_id)
+                            .unwrap_or_else(|_| entry.content.trim_end().to_string())
+                    })
             });
 
             (
@@ -2601,37 +2607,48 @@ fn completed_task_contents(project_root: &Path) -> Result<Vec<String>> {
 }
 
 fn blocked_task_snapshots(project_root: &Path) -> Result<Vec<BlockedTaskSnapshot>> {
+    Ok(blocked_tasks(project_root)?
+        .into_iter()
+        .map(|(status, entry)| BlockedTaskSnapshot {
+            status,
+            content: entry.content.trim_end().to_string(),
+        })
+        .collect())
+}
+
+fn blocked_tasks(project_root: &Path) -> Result<Vec<(&'static str, TaskEntry)>> {
     let board_dir = get_tasks_dir(project_root);
-    let mut snapshots = Vec::new();
+    let mut tasks = Vec::new();
 
     for status in ["todo", "doing"] {
-        snapshots.extend(
+        tasks.extend(
             read_task_entries(&board_dir, status)?
                 .into_iter()
                 .filter(task_entry_is_blocked)
-                .map(|entry| BlockedTaskSnapshot {
-                    status,
-                    content: entry.content.trim_end().to_string(),
-                }),
+                .map(|entry| (status, entry)),
         );
     }
 
-    Ok(snapshots)
+    Ok(tasks)
 }
 
-fn blocked_task_content_after_run(
+fn blocked_task_after_run(
     project_root: &Path,
     snapshots_before: &[BlockedTaskSnapshot],
     allow_unchanged_single_task: bool,
-) -> Result<Option<String>> {
-    let snapshots_after = blocked_task_snapshots(project_root)?;
-    let mut remaining = std::collections::HashMap::<&BlockedTaskSnapshot, usize>::new();
+) -> Result<Option<(&'static str, TaskEntry)>> {
+    let tasks_after = blocked_tasks(project_root)?;
+    let mut remaining = std::collections::HashMap::<BlockedTaskSnapshot, usize>::new();
     for snapshot in snapshots_before {
-        *remaining.entry(snapshot).or_default() += 1;
+        *remaining.entry(snapshot.clone()).or_default() += 1;
     }
 
-    let changed_task = snapshots_after.iter().find(|snapshot| {
-        let Some(count) = remaining.get_mut(snapshot) else {
+    let changed_task = tasks_after.iter().find(|(status, entry)| {
+        let snapshot = BlockedTaskSnapshot {
+            status,
+            content: entry.content.trim_end().to_string(),
+        };
+        let Some(count) = remaining.get_mut(&snapshot) else {
             return true;
         };
         if *count == 0 {
@@ -2644,11 +2661,11 @@ fn blocked_task_content_after_run(
 
     Ok(changed_task
         .or_else(|| {
-            (allow_unchanged_single_task && snapshots_after.len() == 1)
-                .then(|| snapshots_after.first())
+            (allow_unchanged_single_task && tasks_after.len() == 1)
+                .then(|| tasks_after.first())
                 .flatten()
         })
-        .map(|snapshot| snapshot.content.clone()))
+        .cloned())
 }
 
 fn newly_completed_task(
@@ -6333,8 +6350,38 @@ fn first_sentence(content: &str) -> Option<String> {
     Some(normalized[..end_idx].trim().to_string())
 }
 
+fn codex_session_id_from_task_content(content: &str) -> Option<&str> {
+    let marker = content.trim_end().split_whitespace().next_back()?;
+    let session_id = marker.strip_prefix(CODEX_TASK_SESSION_PREFIX)?;
+
+    (!session_id.is_empty()
+        && session_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'))
+    .then_some(session_id)
+}
+
+fn task_content_without_codex_session(content: &str) -> &str {
+    let trimmed = content.trim_end();
+    let Some(session_id) = codex_session_id_from_task_content(trimmed) else {
+        return trimmed;
+    };
+    let marker_len = CODEX_TASK_SESSION_PREFIX.len() + session_id.len();
+
+    trimmed[..trimmed.len() - marker_len].trim_end()
+}
+
+fn task_content_with_codex_session(content: &str, session_id: &str) -> String {
+    let content = task_content_without_codex_session(content);
+    if content.is_empty() {
+        format!("{CODEX_TASK_SESSION_PREFIX}{session_id}")
+    } else {
+        format!("{content} {CODEX_TASK_SESSION_PREFIX}{session_id}")
+    }
+}
+
 fn normalize_task_text(content: &str) -> String {
-    content
+    task_content_without_codex_session(content)
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
@@ -6900,34 +6947,58 @@ fn update_task_in_board(
     new_description: &str,
 ) -> Result<()> {
     let entry = task_entry_at(board_dir, status, task_index)?;
+    let updated_content = match codex_session_id_from_task_content(&entry.content) {
+        Some(session_id) => task_content_with_codex_session(new_description, session_id),
+        None => new_description.trim_end().to_string(),
+    };
 
-    match entry.source {
+    write_task_entry_content(board_dir, status, &entry, &updated_content)
+}
+
+fn write_task_entry_content(
+    board_dir: &Path,
+    status: &str,
+    entry: &TaskEntry,
+    content: &str,
+) -> Result<()> {
+    match &entry.source {
         TaskSource::MarkdownLine { line_index } => {
             let StatusStore::MarkdownFile(path) = get_status_store(board_dir, status)? else {
                 anyhow::bail!("Task storage changed while updating task.");
             };
-            let content = fs::read_to_string(&path).context("Failed to read file")?;
-            let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
+            let stored_content = fs::read_to_string(&path).context("Failed to read file")?;
+            let mut lines: Vec<String> = stored_content.lines().map(str::to_string).collect();
 
-            if line_index >= lines.len() {
-                anyhow::bail!("Task index {} out of range", task_index);
+            if *line_index >= lines.len() {
+                anyhow::bail!("Task storage changed while updating task.");
             }
 
-            lines[line_index] = format!("- {}", new_description);
+            lines[*line_index] = format!("- {content}");
             write_lines(&path, &lines)?;
         }
         TaskSource::Path { path, is_dir } => {
-            let target_path = if is_dir {
-                directory_task_detail_path(&path)
+            let target_path = if *is_dir {
+                directory_task_detail_path(path)
             } else {
-                path
+                path.clone()
             };
-            fs::write(&target_path, format!("{}\n", new_description.trim_end()))
+            fs::write(&target_path, format!("{}\n", content.trim_end()))
                 .with_context(|| format!("Failed to write task file {:?}", target_path))?;
         }
     }
 
     Ok(())
+}
+
+fn attach_codex_session_to_task(
+    project_root: &Path,
+    status: &str,
+    entry: &TaskEntry,
+    session_id: &str,
+) -> Result<String> {
+    let content = task_content_with_codex_session(&entry.content, session_id);
+    write_task_entry_content(&get_tasks_dir(project_root), status, entry, &content)?;
+    Ok(content)
 }
 
 fn reorder_task_in_board(
@@ -9487,6 +9558,10 @@ fn task_supports_interactive_codex_resume(status: &str, task: &TaskEntry) -> boo
 }
 
 fn codex_session_for_task(project_root: &Path, task: &TaskEntry) -> Result<Option<String>> {
+    if let Some(session_id) = codex_session_id_from_task_content(&task.content) {
+        return Ok(Some(session_id.to_string()));
+    }
+
     let store = open_agent_store()?;
     store.codex_session_for_task_blocking(project_root, task.content.trim_end())
 }
@@ -12327,8 +12402,8 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                             }
                                             Ok(None) => {
                                                 feedback_buffer =
-                                                "No Codex session recorded for this task. Sessions are available for tasks handled by newer automated runs."
-                                                    .to_string();
+                                                    "No Codex session linked to this task."
+                                                        .to_string();
                                             }
                                             Err(error) => {
                                                 feedback_buffer = format!("Error: {error}");
@@ -12435,7 +12510,10 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                                     current_mode = Mode::Edit;
                                                     editing_task_idx = Some(idx + 1);
                                                     task_input = TaskInput::new(
-                                                        entry.content.trim_end().to_string(),
+                                                        task_content_without_codex_session(
+                                                            &entry.content,
+                                                        )
+                                                        .to_string(),
                                                     );
                                                 }
                                             }
@@ -12454,7 +12532,8 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                             current_mode = Mode::Edit;
                                             editing_task_idx = Some(idx + 1);
                                             task_input = TaskInput::new(
-                                                entry.content.trim_end().to_string(),
+                                                task_content_without_codex_session(&entry.content)
+                                                    .to_string(),
                                             );
                                         } else {
                                             feedback_buffer = "No task selected".to_string();
@@ -13368,6 +13447,93 @@ mod tests {
         );
         assert_eq!(parse_agent_codex_session_id("session id:"), None);
         assert_eq!(parse_agent_codex_session_id("other output"), None);
+    }
+
+    #[test]
+    fn terminal_codex_session_marker_is_parsed_and_hidden_from_task_text() {
+        let content = "Fix keyboard navigation — COMPLETED 2026-08-25: done codex:019fe7ab-f267-76e3-b82c-d7c5705be8d1\n";
+
+        assert_eq!(
+            codex_session_id_from_task_content(content),
+            Some("019fe7ab-f267-76e3-b82c-d7c5705be8d1")
+        );
+        assert_eq!(
+            task_content_without_codex_session(content),
+            "Fix keyboard navigation — COMPLETED 2026-08-25: done"
+        );
+        assert_eq!(
+            normalize_task_text(content),
+            "Fix keyboard navigation — COMPLETED 2026-08-25: done"
+        );
+        assert_eq!(
+            codex_session_id_from_task_content("codex:session-123 is mentioned in the task"),
+            None
+        );
+        assert_eq!(codex_session_id_from_task_content("task codex:"), None);
+    }
+
+    #[test]
+    fn task_edit_hides_and_preserves_terminal_codex_session_marker() {
+        let root = temp_root("edit-codex-session-marker");
+        init_tasks(&root, false).unwrap();
+        fs::write(
+            root.join("tasks/done.md"),
+            "# Done Tasks\n- original task codex:session-123\n",
+        )
+        .unwrap();
+        let board_dir = root.join("tasks");
+        let entry = read_task_entries(&board_dir, "done").unwrap().remove(0);
+
+        assert_eq!(task_display_text(&entry), "original task");
+        assert_eq!(task_full_display_text(&entry), "original task");
+        assert_eq!(
+            task_content_without_codex_session(&entry.content),
+            "original task"
+        );
+
+        update_task_in_board(&board_dir, "done", 1, "edited task").unwrap();
+
+        assert_eq!(
+            fs::read_to_string(root.join("tasks/done.md")).unwrap(),
+            "# Done Tasks\n- edited task codex:session-123\n"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn folder_task_stores_codex_session_marker_without_displaying_it() {
+        let root = temp_root("folder-codex-session-marker");
+        init_tasks(&root, true).unwrap();
+        let done_path = root.join("tasks/done/0001-finished-task.md");
+        fs::write(&done_path, "Finished task.\n\nCompletion details.\n").unwrap();
+        let board_dir = root.join("tasks");
+        let entry = read_task_entries(&board_dir, "done").unwrap().remove(0);
+
+        let content = attach_codex_session_to_task(&root, "done", &entry, "session-456").unwrap();
+
+        assert_eq!(
+            content,
+            "Finished task.\n\nCompletion details. codex:session-456"
+        );
+        assert_eq!(
+            fs::read_to_string(&done_path).unwrap(),
+            "Finished task.\n\nCompletion details. codex:session-456\n"
+        );
+        let entry = read_task_entries(&board_dir, "done").unwrap().remove(0);
+        assert_eq!(task_display_text(&entry), "Finished task.");
+        assert_eq!(
+            task_full_display_text(&entry),
+            "Finished task. Completion details."
+        );
+
+        update_task_in_board(&board_dir, "done", 1, "Edited task.\n\nNew details.").unwrap();
+        assert_eq!(
+            fs::read_to_string(&done_path).unwrap(),
+            "Edited task.\n\nNew details. codex:session-456\n"
+        );
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -16875,10 +17041,20 @@ mod tests {
         let shutdown = new_agent_shutdown_signal();
         run_agent_job(start.jobs.pop().unwrap(), &runner, &shutdown).unwrap();
 
+        let done_task = read_task_entries(&get_tasks_dir(&project_root), "done")
+            .unwrap()
+            .remove(0);
+        assert_eq!(done_task.content, "resumable task codex:session-for-task");
+        assert_eq!(task_display_text(&done_task), "resumable task");
+        assert_eq!(
+            codex_session_id_from_task_content(&done_task.content),
+            Some("session-for-task")
+        );
+
         let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
         assert_eq!(
             store
-                .codex_session_for_task_blocking(&project_root, "resumable task")
+                .codex_session_for_task_blocking(&project_root, &done_task.content)
                 .unwrap()
                 .as_deref(),
             Some("session-for-task")
@@ -16915,10 +17091,23 @@ mod tests {
         let shutdown = new_agent_shutdown_signal();
         run_agent_job(start.jobs.pop().unwrap(), &runner, &shutdown).unwrap();
 
+        let blocked_task = read_task_entries(&get_tasks_dir(&project_root), "doing")
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            blocked_task.content,
+            format!("{blocked_content} codex:session-for-blocked-task")
+        );
+        assert_eq!(task_display_text(&blocked_task), blocked_content);
+        assert_eq!(
+            codex_session_id_from_task_content(&blocked_task.content),
+            Some("session-for-blocked-task")
+        );
+
         let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
         assert_eq!(
             store
-                .codex_session_for_task_blocking(&project_root, blocked_content)
+                .codex_session_for_task_blocking(&project_root, &blocked_task.content)
                 .unwrap()
                 .as_deref(),
             Some("session-for-blocked-task")
