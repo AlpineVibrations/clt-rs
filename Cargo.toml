@@ -1,6 +1,6 @@
 [package]
 name = "clt-rs"
-version = "0.3.12"
+version = "0.3.13"
 edition = "2024"
 description = "File-backed task manager with a TUI Kanban board and multi-project Codex agent registry"
 license = "MIT"
