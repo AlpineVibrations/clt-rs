@@ -10200,7 +10200,7 @@ fn render_tui_agent_panel(
 }
 
 fn tui_models_instructions() -> &'static str {
-    "Add a provider with 1 OpenAI, 2 OpenRouter, 3 Ollama, 4 LM Studio, or n local/custom. Select a non-built-in provider on the left and press x/Delete to remove it. Local endpoints discover /models automatically; r refreshes. New models start OFF: Right, Up/Down, then Space chooses them. a manually adds an ID. f favorites; t cycles model reasoning; d sets CLT; c sets Codex. M, Tab, or Esc returns to the previous pane. API keys come only from environment variables."
+    "n adds a provider. Select a non-built-in provider on the left and press x/Delete to remove it. Local endpoints discover /models automatically; r refreshes. New models start OFF: Right, Up/Down, then Space chooses them. a manually adds an ID. f favorites; t cycles model reasoning; d sets CLT; c sets Codex. M, Tab, or Esc returns to the previous pane. API keys come only from environment variables."
 }
 
 fn provider_env_status(provider: &agent_store::AgentModelProvider) -> String {
@@ -10218,8 +10218,12 @@ fn tui_models_provider_header() -> &'static str {
     "USE TYPE    PROVIDER (ID)"
 }
 
-fn tui_models_add_provider_menu() -> &'static str {
-    "ADD PROVIDER PRESET\n[1] OpenAI   [2] OpenRouter\n[3] Ollama   [4] LM Studio\n[n] Local/custom endpoint"
+fn tui_models_add_provider_hint() -> &'static str {
+    "[n] Add provider"
+}
+
+fn tui_models_provider_choice_prompt() -> &'static str {
+    "Add provider: [1] OpenAI  [2] OpenRouter  [3] Ollama  [4] LM Studio  [5] Local/custom endpoint  [Esc] Cancel"
 }
 
 fn include_codex_default_model_target(
@@ -10368,20 +10372,20 @@ fn render_tui_models_panel(
         return;
     }
 
-    let add_menu_height = provider_inner.height.min(4);
-    if add_menu_height > 0 {
+    let add_hint_height = provider_inner.height.min(1);
+    if add_hint_height > 0 {
         f.render_widget(
-            Paragraph::new(tui_models_add_provider_menu())
+            Paragraph::new(tui_models_add_provider_hint())
                 .style(Style::default().fg(Color::LightGreen)),
             Rect::new(
                 provider_inner.x,
                 provider_inner.y,
                 provider_inner.width,
-                add_menu_height,
+                add_hint_height,
             ),
         );
     }
-    if provider_inner.height > add_menu_height {
+    if provider_inner.height > add_hint_height {
         f.render_widget(
             Paragraph::new(truncate_to_width(
                 tui_models_provider_header(),
@@ -10390,7 +10394,7 @@ fn render_tui_models_panel(
             .style(Style::default().fg(Color::Cyan)),
             Rect::new(
                 provider_inner.x,
-                provider_inner.y.saturating_add(add_menu_height),
+                provider_inner.y.saturating_add(add_hint_height),
                 provider_inner.width,
                 1,
             ),
@@ -10400,12 +10404,12 @@ fn render_tui_models_panel(
         provider_inner.x,
         provider_inner
             .y
-            .saturating_add(add_menu_height)
+            .saturating_add(add_hint_height)
             .saturating_add(1),
         provider_inner.width,
         provider_inner
             .height
-            .saturating_sub(add_menu_height)
+            .saturating_sub(add_hint_height)
             .saturating_sub(1),
     );
     let provider_selected = panel.provider_state.selected();
@@ -11008,6 +11012,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
     let mut agent_panel = TuiAgentPanel::new(&active_root);
     let mut models_panel = TuiModelsPanel::new();
     let mut model_input: Option<TuiModelInput> = None;
+    let mut awaiting_model_provider_choice = false;
     let mut pending_agent_project_removal: Option<TuiAgentProjectRemoval> = None;
     let mut last_agent_panel_refresh = Instant::now();
     let mut agent_log_view: Option<TuiAgentLogView> = None;
@@ -11527,8 +11532,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                  [Tab]          - Toggle task board and agent projects\n\
                                  [Agent m]      - Cycle selected target\n\
                                  [M]            - Open Models from Tasks or Agent Projects\n\
-                                 [Models n/r/a] - Add endpoint / discover models / manually add ID\n\
-                                 [Models 1-4]   - Add OpenAI/OpenRouter/Ollama/LM Studio preset\n\
+                                 [Models n/r/a] - Add provider / discover models / manually add ID\n\
                                  [Models x/Del] - Remove selected non-built-in provider\n\
                                  [Models d/c]   - Set CLT default / explicitly set Codex default\n\
                                  [Arrows]       - Navigate boards and tasks\n\
@@ -11602,6 +11606,36 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                             _ => {
                                 feedback_buffer = tui_agent_project_removal_prompt(&removal);
                                 pending_agent_project_removal = Some(removal);
+                            }
+                        }
+                        continue;
+                    }
+                    if awaiting_model_provider_choice {
+                        match key.code {
+                            KeyCode::Esc => {
+                                awaiting_model_provider_choice = false;
+                                feedback_buffer = "Provider selection cancelled".to_string();
+                            }
+                            KeyCode::Char(digit @ '1'..='4') => {
+                                awaiting_model_provider_choice = false;
+                                let index = digit as usize - '1' as usize;
+                                feedback_buffer =
+                                    match add_tui_model_provider_preset(&mut models_panel, index) {
+                                        Ok(message) => message,
+                                        Err(error) => format!("Error: {error}"),
+                                    };
+                            }
+                            KeyCode::Char('5') => {
+                                awaiting_model_provider_choice = false;
+                                model_input = Some(TuiModelInput::custom_provider());
+                                feedback_buffer = model_input
+                                    .as_ref()
+                                    .expect("custom provider input was just created")
+                                    .guidance()
+                                    .to_string();
+                            }
+                            _ => {
+                                feedback_buffer = tui_models_provider_choice_prompt().to_string();
                             }
                         }
                         continue;
@@ -11760,22 +11794,9 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                             };
                                     }
                                     KeyCode::Char('n') | KeyCode::Char('N') => {
-                                        model_input = Some(TuiModelInput::custom_provider());
-                                        feedback_buffer = model_input
-                                            .as_ref()
-                                            .expect("custom provider input was just created")
-                                            .guidance()
-                                            .to_string();
-                                    }
-                                    KeyCode::Char(digit @ '1'..='4') => {
-                                        let index = digit as usize - '1' as usize;
-                                        feedback_buffer = match add_tui_model_provider_preset(
-                                            &mut models_panel,
-                                            index,
-                                        ) {
-                                            Ok(message) => message,
-                                            Err(error) => format!("Error: {error}"),
-                                        };
+                                        awaiting_model_provider_choice = true;
+                                        feedback_buffer =
+                                            tui_models_provider_choice_prompt().to_string();
                                     }
                                     _ => feedback_buffer = tui_models_instructions().to_string(),
                                 }
@@ -15615,7 +15636,10 @@ mod tests {
         .unwrap();
         assert_eq!(model_ids, ["alpha", "zeta"]);
         assert!(parse_openai_model_ids(&serde_json::json!({"models": []})).is_err());
-        assert!(tui_models_add_provider_menu().contains("[3] Ollama"));
+        assert_eq!(tui_models_add_provider_hint(), "[n] Add provider");
+        assert!(tui_models_provider_choice_prompt().contains("[3] Ollama"));
+        assert!(tui_models_provider_choice_prompt().contains("[5] Local/custom"));
+        assert!(!tui_models_instructions().contains("1 OpenAI"));
         assert!(tui_models_instructions().contains("r refreshes"));
         assert!(tui_models_instructions().contains("x/Delete to remove"));
         assert!(tui_models_instructions().contains("t cycles model reasoning"));
