@@ -62,29 +62,20 @@ clt add "Task description" ["Optional metadata"]
 ```
 
 ### 3. Listing Tasks
-Always list tasks before performing index-based operations to ensure the correct `task_index` is used.
+Always list the relevant status before performing index-based operations to ensure the correct `task_index` is used. Prefer status-scoped listings so unrelated tasks do not consume context.
 ```bash
-clt list          # List all tasks across all statuses
-clt list backlog  # List captured work that is not ready
 clt list todo     # List only todo tasks
 clt list doing    # List only doing tasks
 clt list done     # List only done tasks
+clt list backlog  # List backlog only when the current work requires it
+clt list          # List all statuses only when a whole-board view is necessary
 ```
 
 **Sample output:**
 ```
---- BACKLOG ---
-1. Investigate a future migration
-
 --- TODO ---
 1. Fix login bug
 2. Add dark mode
-
---- DOING ---
-1. Refactor auth module
-
---- DONE ---
-1. Set up CI pipeline
 ```
 
 Each section lists tasks with a 1-based index scoped to that status. An empty section displays the header with no items beneath it. Always use the index relative to its section — index `1` in `BACKLOG`, index `1` in `TODO`, and index `1` in `DOING` refer to different tasks.
@@ -121,6 +112,7 @@ clt delete <status> <index>
 
 - **Root Awareness**: Be aware that `clt` operates relative to the git root by default. If you need to manage tasks in a specific subdirectory that is not the git root, use the `--local` flag.
 - **Verify Indices**: Task indices are dynamic. Always run `clt list <status>` immediately before a `status`, `done`, or `delete` command to avoid modifying the wrong task.
+- **Keep Listings Scoped**: During normal task execution, list only the status needed for the current decision. Do not load the backlog unless the user asks for it or the work specifically requires backlog triage, inspection, promotion, or a whole-board diagnosis. Large unrelated backlogs consume context and can distract from actionable `todo` and `doing` work.
 - **Preserve Existing Tasks**: Never delete, reorder, or rewrite `clt` tasks unless explicitly asked. Other people may add todos while you are working, and those are real tasks, not noise.
 - **Backlog Is Not Actionable**: Do not start or automatically select backlog tasks. Work on one only after the user or project workflow promotes it to `todo`.
 - **Default Storage Mode**: Use regular Markdown-file mode for agent-created task lists unless the user explicitly asks for expanded folder-backed tasks. Do not run `clt init --folders` or `clt expand` just because a task has some detail.
@@ -195,15 +187,9 @@ clt done doing 1
 
 **8. Verify the final state:**
 ```bash
-clt list
+clt list done
 ```
 ```
---- BACKLOG ---
-
---- TODO ---
-
---- DOING ---
-
 --- DONE ---
 1. Fix memory leak in parser — COMPLETED 2026-07-13: Corrected parser ownership; checks: `cargo test parser`.
 ```
