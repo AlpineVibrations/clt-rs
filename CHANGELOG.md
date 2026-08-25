@@ -35,6 +35,7 @@ Use this section while developing the next release.
 
 ### Changed
 
+- Automated commit and commit-and-push runs now use the isolated `CLT Agent <clt-agent@localhost>` Git author and committer identity without modifying Git configuration.
 - Made embedded `codex:<session-id>` task markers the sole interactive-resume link, removed mutable task-text associations from the agent database, and made marker persistence failures visible as failed runs.
 - Made the TUI task-board console help show task controls instead of Agent Projects controls.
 - Changed the portable `r` task-reorganization shortcut into a sticky mode with yellow task-board borders and a visible mode title; arrows keep reorganizing tasks until `r` or `Esc` exits.

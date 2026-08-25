@@ -74,6 +74,8 @@ const AGENT_NO_TASKS_LEFT_MARKER: &str = "NO_TASKS_LEFT";
 const CODEX_TASK_SESSION_PREFIX: &str = "codex:";
 const CLT_TASK_MANAGEMENT_SKILL_NAME: &str = "clt-task-management";
 const GIT_COMMIT_SKILL_NAME: &str = "git-commit";
+const AGENT_GIT_IDENTITY_NAME: &str = "CLT Agent";
+const AGENT_GIT_IDENTITY_EMAIL: &str = "clt-agent@localhost";
 const EMBEDDED_CLT_TASK_MANAGEMENT_SKILL: &str =
     include_str!("../skills/clt-task-management/SKILL.md");
 const EMBEDDED_GIT_COMMIT_SKILL: &str = include_str!("../skills/git-commit/SKILL.md");
@@ -164,6 +166,7 @@ const AGENT_GIT_COMMIT_PROMPT_APPENDIX: &str = r#"
 Git commit:
 - After completing and verifying the task, use the $git-commit skill to create one git commit for the completed work.
 - Include the code changes and related task-board updates in the commit when they are part of the same logical change.
+- The scheduler supplies the isolated Git identity `CLT Agent <clt-agent@localhost>` for clear automated-commit attribution; do not change Git configuration.
 - Do not commit when there are no tasks left, the task is blocked, checks fail, or the work cannot be completed safely.
 "#;
 const AGENT_GIT_PUSH_PROMPT_APPENDIX: &str = r#"
@@ -3231,6 +3234,7 @@ impl AgentRunner for CodexAgentRunner {
             .current_dir(&project.path)
             .stdout(Stdio::from(stdout_file))
             .stderr(Stdio::from(stderr_file));
+        configure_agent_git_identity(&mut command, project.git_mode);
         configure_agent_child_command(&mut command);
 
         let spawn_result = command.spawn();
@@ -3976,6 +3980,18 @@ fn configure_agent_child_command(command: &mut Command) {
     {
         command.process_group(0);
     }
+}
+
+fn configure_agent_git_identity(command: &mut Command, git_mode: AgentGitMode) {
+    if git_mode == AgentGitMode::Off {
+        return;
+    }
+
+    command
+        .env("GIT_AUTHOR_NAME", AGENT_GIT_IDENTITY_NAME)
+        .env("GIT_AUTHOR_EMAIL", AGENT_GIT_IDENTITY_EMAIL)
+        .env("GIT_COMMITTER_NAME", AGENT_GIT_IDENTITY_NAME)
+        .env("GIT_COMMITTER_EMAIL", AGENT_GIT_IDENTITY_EMAIL);
 }
 
 fn stop_agent_child_process(child: &mut Child) -> Result<Option<ExitStatus>> {
@@ -17504,6 +17520,8 @@ mod tests {
         let commit_prompt =
             build_agent_codex_prompt(&project, AgentTaskSelection::NextTodo, true, true);
         assert!(commit_prompt.contains("$git-commit"));
+        assert!(commit_prompt.contains("CLT Agent <clt-agent@localhost>"));
+        assert!(commit_prompt.contains("do not change Git configuration"));
         assert!(commit_prompt.contains("Do not commit when there are no tasks left"));
         assert!(!commit_prompt.contains("Git push:"));
 
@@ -17534,6 +17552,32 @@ mod tests {
         assert!(blocked_prompt.contains("`UNBLOCKED YYYY-MM-DD:` note"));
         assert!(blocked_prompt.contains("Stop after handling that one blocked task"));
         assert!(!blocked_prompt.contains("Interrupted task recovery:"));
+    }
+
+    #[test]
+    fn agent_git_identity_is_scoped_to_commit_modes() {
+        let mut off_command = Command::new("codex");
+        configure_agent_git_identity(&mut off_command, AgentGitMode::Off);
+        assert!(off_command.get_envs().next().is_none());
+
+        for mode in [AgentGitMode::Commit, AgentGitMode::CommitAndPush] {
+            let mut command = Command::new("codex");
+            configure_agent_git_identity(&mut command, mode);
+
+            for (key, expected) in [
+                ("GIT_AUTHOR_NAME", AGENT_GIT_IDENTITY_NAME),
+                ("GIT_AUTHOR_EMAIL", AGENT_GIT_IDENTITY_EMAIL),
+                ("GIT_COMMITTER_NAME", AGENT_GIT_IDENTITY_NAME),
+                ("GIT_COMMITTER_EMAIL", AGENT_GIT_IDENTITY_EMAIL),
+            ] {
+                let value = command
+                    .get_envs()
+                    .find(|(name, _)| *name == OsStr::new(key))
+                    .and_then(|(_, value)| value)
+                    .and_then(OsStr::to_str);
+                assert_eq!(value, Some(expected), "unexpected value for {key}");
+            }
+        }
     }
 
     #[test]

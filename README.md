@@ -184,7 +184,7 @@ clt agent git-commit push ~/code/project-a
 clt agent git-commit disable ~/code/project-a
 ```
 
-`enable` selects commit-only mode, `push` selects commit-and-push mode, and `disable` turns Git automation off. The scheduler adds matching instructions to the Codex prompt after task completion and verification. Existing enabled registrations migrate to commit-only mode. In the TUI, the modes appear as `COM`, `PUSH`, and `OFF` in the `GIT` column.
+`enable` selects commit-only mode, `push` selects commit-and-push mode, and `disable` turns Git automation off. The scheduler adds matching instructions to the Codex prompt after task completion and verification. Commits from either enabled mode use `CLT Agent <clt-agent@localhost>` as both author and committer so automated work is recognizable without changing repository or global Git configuration. Existing enabled registrations migrate to commit-only mode. In the TUI, the modes appear as `COM`, `PUSH`, and `OFF` in the `GIT` column.
 
 Agent-facing workflow skills are included in the repository's `skills/` directory:
 
