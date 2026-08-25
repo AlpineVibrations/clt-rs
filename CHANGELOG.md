@@ -34,6 +34,7 @@ Use this section while developing the next release.
 
 ### Changed
 
+- Changed the portable `r` task-reorganization shortcut into a sticky mode with yellow task-board borders and a visible mode title; arrows keep reorganizing tasks until `r` or `Esc` exits.
 - Made local OpenAI-compatible endpoint setup preset-led and self-discovering: Ollama and LM Studio load their model catalogs automatically, custom endpoints generate their provider IDs, the API-root prompt explains `/v1` and rejects complete operation URLs, `/models` results are presented as explicit opt-in choices, and model discovery can be refreshed from the Models page.
 - Replaced the plain GPT-5.6 entry in the built-in OpenAI catalog with the explicit GPT-5.6 Sol model while preserving existing selections and defaults during migration.
 - Added aligned, labeled provider/model columns to the Models page, replacing unexplained favorite stars with `FAV` values and marking CLT and Codex defaults independently.
@@ -48,7 +49,7 @@ Use this section while developing the next release.
 ### Fixed
 
 - Registering the current project from the Agent Projects pane now keeps the cursor on that project after it moves into the alphabetically sorted project list.
-- Added portable task-reorganization shortcuts for terminals that do not distinguish Shift+Arrow: `Ctrl-P`/`Ctrl-N` reorder vertically, and tapping `r` before any arrow performs one reorganization move.
+- Added portable task-reorganization shortcuts for terminals that do not distinguish Shift+Arrow: `Ctrl-P`/`Ctrl-N` reorder vertically, and `r` toggles a keyboard-driven reorganization mode.
 - Documented the Terminal.app profile mappings required to preserve Shift+Up and Shift+Down task reordering through SSH and tmux.
 - The agent projects pane now detects and restarts a stale background service while leaving explicitly stopped services alone; Linux services also restart after unexpected clean exits.
 - Agent scheduling now reclaims crashed or expired leases and resumes the interrupted `doing` task instead of leaving it stranded.

@@ -7379,6 +7379,13 @@ enum TuiTaskBoardMoveDirection {
     Right,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TuiReorganizeInput {
+    Exit,
+    Move(TuiTaskReorganizeDirection),
+    Ignore,
+}
+
 fn tui_task_reorder_direction(key: &crossterm::event::KeyEvent) -> Option<TuiTaskReorderDirection> {
     match key.code {
         KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
@@ -7409,9 +7416,37 @@ fn tui_task_reorganize_direction(
     }
 }
 
-fn tui_starts_reorganize_mode(key: &crossterm::event::KeyEvent) -> bool {
+fn tui_toggles_reorganize_mode(key: &crossterm::event::KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char('r' | 'R'))
         && key.modifiers.difference(KeyModifiers::SHIFT).is_empty()
+}
+
+fn tui_reorganize_input(key: &crossterm::event::KeyEvent) -> TuiReorganizeInput {
+    if matches!(key.code, KeyCode::Esc) || tui_toggles_reorganize_mode(key) {
+        TuiReorganizeInput::Exit
+    } else if let Some(direction) = tui_task_reorganize_direction(key) {
+        TuiReorganizeInput::Move(direction)
+    } else {
+        TuiReorganizeInput::Ignore
+    }
+}
+
+fn tui_task_column_title(title: &str, selected: bool, reorganizing: bool) -> String {
+    if selected && reorganizing {
+        format!(" REORGANIZE MODE: {title} [r/Esc exits] ")
+    } else if selected {
+        format!("{title}   <<<<<< * >>>>>>     ")
+    } else {
+        title.to_string()
+    }
+}
+
+fn tui_task_column_border_color(default_color: Color, reorganizing: bool) -> Color {
+    if reorganizing {
+        Color::Yellow
+    } else {
+        default_color
+    }
 }
 
 fn reorder_selected_tui_task(
@@ -7805,7 +7840,7 @@ fn tui_start_state(active_board: bool) -> TuiStartState {
             active_board,
             current_pane: TuiPane::Tasks,
             feedback_buffer: String::from(
-                "Kanban View! Tab toggles between the task board and agent projects. Uppercase M opens Models from either pane; lowercase m cycles the selected Agent Project target. Enter opens a selected project, Space toggles it ON/OFF, g cycles Git off/commit/push, f/t change its Codex fast/thinking settings, c resumes a selected Done or blocked task in interactive Codex, l shows agent output, Backspace returns to parent, Space creates a task on the board, a archives a task, A opens archive view, b moves a task to backlog, B toggles the backlog column, tap r then an Arrow to reorganize once, Shift+Arrows reorder or move tasks, Ctrl-P/N reorder up/down, 'd' deletes, 'q' quits.",
+                "Kanban View! Tab toggles between the task board and agent projects. Uppercase M opens Models from either pane; lowercase m cycles the selected Agent Project target. Enter opens a selected project, Space toggles it ON/OFF, g cycles Git off/commit/push, f/t change its Codex fast/thinking settings, c resumes a selected Done or blocked task in interactive Codex, l shows agent output, Backspace returns to parent, Space creates a task on the board, a archives a task, A opens archive view, b moves a task to backlog, B toggles the backlog column, r toggles sticky Reorganize mode, Shift+Arrows reorder or move tasks, Ctrl-P/N reorder up/down, 'd' deletes, 'q' quits.",
             ),
         }
     } else {
@@ -11292,22 +11327,22 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                         Style::default().fg(Color::White).bg(Color::DarkGray)
                     };
 
+                    let reorganizing = matches!(current_mode, Mode::Reorganize);
                     let block = Block::default()
-                        .title(format!(
-                            "{} {}",
+                        .title(tui_task_column_title(
                             titles[board_index],
-                            if selected_board == board_index {
-                                "  <<<<<< * >>>>>>     "
-                            } else {
-                                ""
-                            }
+                            selected_board == board_index,
+                            reorganizing,
                         ))
                         .title(
                             Line::from(vec![Span::raw(format!(" {} ", tasks.len()))])
                                 .alignment(Alignment::Right),
                         )
                         .borders(Borders::ALL)
-                        .border_style(Style::default().fg(colors[board_index]));
+                        .border_style(Style::default().fg(tui_task_column_border_color(
+                            colors[board_index],
+                            reorganizing,
+                        )));
 
                     let inner_area = block.inner(chunks[column_index]);
                     keep_selected_task_visible(
@@ -11497,7 +11532,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                  [Models x/Del] - Remove selected non-built-in provider\n\
                                  [Models d/c]   - Set CLT default / explicitly set Codex default\n\
                                  [Arrows]       - Navigate boards and tasks\n\
-                                 [r, then Arrow] - Reorganize task once (Esc cancels)\n\
+                                 [r]            - Toggle sticky Reorganize mode (r/Esc exits)\n\
                                  [Shift+Arrows] - Reorder/Move tasks\n\
                                  [Ctrl-P/N]     - Reorder task Up/Down\n\
                                  [0, 1, 2, 3]   - Focus Backlog/To Do/Doing/Done\n\
@@ -12105,10 +12140,10 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                     &mut board_states[selected_board],
                                     direction,
                                 );
-                            } else if tui_starts_reorganize_mode(&key) {
+                            } else if tui_toggles_reorganize_mode(&key) {
                                 current_mode = Mode::Reorganize;
                                 feedback_buffer =
-                                "Reorganize: press an Arrow to move the selected task (Esc cancels)."
+                                "Reorganize mode active: use Arrows to move tasks; press r or Esc to exit."
                                     .to_string();
                             } else if key.modifiers.contains(KeyModifiers::SHIFT) {
                                 match key.code {
@@ -12586,23 +12621,25 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                 }
                             }
                         }
-                        Mode::Reorganize => {
-                            current_mode = Mode::View;
-                            feedback_buffer = if matches!(key.code, KeyCode::Esc) {
-                                "Reorganize cancelled.".to_string()
-                            } else if let Some(direction) = tui_task_reorganize_direction(&key) {
-                                reorganize_selected_tui_task(
+                        Mode::Reorganize => match tui_reorganize_input(&key) {
+                            TuiReorganizeInput::Exit => {
+                                current_mode = Mode::View;
+                                feedback_buffer = "Reorganize mode exited.".to_string();
+                            }
+                            TuiReorganizeInput::Move(direction) => {
+                                feedback_buffer = reorganize_selected_tui_task(
                                     &board_dir,
                                     &statuses,
                                     &mut board_states,
                                     &mut selected_board,
                                     backlog_visible,
                                     direction,
-                                )
-                            } else {
-                                "Reorganize cancelled: expected an Arrow.".to_string()
-                            };
-                        }
+                                );
+                            }
+                            TuiReorganizeInput::Ignore => {
+                                feedback_buffer = "Reorganize mode active: use Arrows to move tasks; press r or Esc to exit.".to_string();
+                            }
+                        },
                         Mode::Help => match key.code {
                             KeyCode::Enter
                             | KeyCode::Esc
@@ -12863,15 +12900,15 @@ mod tests {
     fn tui_reorganize_prefix_and_arrows_are_unambiguous() {
         let key = |code, modifiers| crossterm::event::KeyEvent::new(code, modifiers);
 
-        assert!(tui_starts_reorganize_mode(&key(
+        assert!(tui_toggles_reorganize_mode(&key(
             KeyCode::Char('r'),
             KeyModifiers::NONE
         )));
-        assert!(tui_starts_reorganize_mode(&key(
+        assert!(tui_toggles_reorganize_mode(&key(
             KeyCode::Char('R'),
             KeyModifiers::SHIFT
         )));
-        assert!(!tui_starts_reorganize_mode(&key(
+        assert!(!tui_toggles_reorganize_mode(&key(
             KeyCode::Char('r'),
             KeyModifiers::CONTROL
         )));
@@ -12894,6 +12931,44 @@ mod tests {
         assert_eq!(
             tui_task_reorganize_direction(&key(KeyCode::Char('x'), KeyModifiers::NONE)),
             None
+        );
+
+        assert_eq!(
+            tui_reorganize_input(&key(KeyCode::Char('r'), KeyModifiers::NONE)),
+            TuiReorganizeInput::Exit
+        );
+        assert_eq!(
+            tui_reorganize_input(&key(KeyCode::Esc, KeyModifiers::NONE)),
+            TuiReorganizeInput::Exit
+        );
+        assert_eq!(
+            tui_reorganize_input(&key(KeyCode::Down, KeyModifiers::NONE)),
+            TuiReorganizeInput::Move(TuiTaskReorganizeDirection::Down)
+        );
+        assert_eq!(
+            tui_reorganize_input(&key(KeyCode::Char('x'), KeyModifiers::NONE)),
+            TuiReorganizeInput::Ignore
+        );
+    }
+
+    #[test]
+    fn tui_reorganize_mode_has_a_distinct_title_and_border_color() {
+        assert_eq!(
+            tui_task_column_title("To Do", true, true),
+            " REORGANIZE MODE: To Do [r/Esc exits] "
+        );
+        assert_eq!(
+            tui_task_column_title("To Do", true, false),
+            "To Do   <<<<<< * >>>>>>     "
+        );
+        assert_eq!(tui_task_column_title("Doing", false, true), "Doing");
+        assert_eq!(
+            tui_task_column_border_color(Color::Indexed(110), true),
+            Color::Yellow
+        );
+        assert_eq!(
+            tui_task_column_border_color(Color::Indexed(110), false),
+            Color::Indexed(110)
         );
     }
 
