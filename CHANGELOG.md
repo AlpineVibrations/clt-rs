@@ -10,6 +10,7 @@ Use this section while developing the next release.
 
 ### Added
 
+- Added durable per-run agent workers: macOS uses one-shot launchd jobs and Linux uses transient user services, with persisted launch contracts, fenced worker records, heartbeats, crash recovery, and idempotent run finalization.
 - Added `/goal`-prefixed task support for automated Codex runs, including explicit goals feature enablement and prompt guidance that removes the directive from the persistent goal objective.
 - Added confirmed `Delete`-key removal for registered projects in the Agent Projects pane without deleting project files.
 - Added a TUI Models page with provider presets, custom Responses-compatible endpoints, enabled model targets, favorites, a CLT-wide default, and per-project provider/model overrides.
@@ -37,6 +38,7 @@ Use this section while developing the next release.
 
 ### Changed
 
+- `clt agent start` now snapshots the current executable into an immutable generation, while `clt agent stop` stops only the scheduler and leaves already-dispatched workers running on their original binary generation.
 - Codex session IDs are now attached while automated work is active, stored with generation-safe live process and log metadata, and reused by unambiguous stop, interactive handoff, and interrupted/blocked recovery through `codex exec resume`.
 - Automated commit and commit-and-push runs now use the isolated `CLT Agent <clt-agent@localhost>` Git author and committer identity without modifying Git configuration.
 - Made embedded `codex:<session-id>` task markers the sole interactive-resume link, removed mutable task-text associations from the agent database, and made marker persistence failures visible as failed runs.
@@ -55,6 +57,7 @@ Use this section while developing the next release.
 
 ### Fixed
 
+- Prevented scheduler restarts and binary upgrades from duplicating old-worker projects, made worker run recording/project counter updates/lease release one transaction, bounded failed startup and stale-heartbeat recovery behind verified service draining, serialized global worker capacity, treated newer worker protocols as opaque, deferred incompatible migrations without disabling controls, and kept stop and interrupt requests compatible across binary generations through the existing session-control protocol.
 - Exact-session recovery now continues from the next unfinished step and requires requested code, file, configuration, or task-board changes to exist and pass relevant checks before marking the linked task done, while still allowing response-only tasks to finish with a response.
 - Recovered Codex session markers displaced by completion notes so interactive handback can finish cleanly and the scheduler can continue with ready Todo work.
 - Allowed explicitly registered non-Git folders to start and resume automated Codex runs, and allowed projects with run history to be unregistered cleanly.

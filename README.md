@@ -24,7 +24,7 @@ A file-system-backed task manager written in Rust. `clt` stores work in Markdown
 - **Smart Root Detection**: Automatically finds the git repository root to keep tasks centralized, or uses the current directory.
 - **Agent Registry**: Register many projects, toggle them on or off, inspect `todo`/`doing` counts, choose per-project Git automation, and open any registered task board from the TUI.
 - **Model Catalog**: Configure provider presets or custom Responses endpoints, keep a clean enabled/favorite model list, and select CLT-wide or per-project provider/model targets.
-- **Codex Automation**: Run one Codex task at a time per enabled project, either in the foreground or through a background service.
+- **Codex Automation**: Run one Codex task at a time per enabled project, either in the foreground or through independently managed background workers that survive scheduler restarts and upgrades.
 - **Agent Skills**: Includes installable `clt-task-management` and `git-commit` skill folders for task-board and safe commit workflows.
 
 ## Installation
@@ -35,11 +35,13 @@ Ensure you have Rust and Cargo installed.
 cargo install clt-rs
 ```
 
-After upgrading `clt`, restart the background agent so the running service uses the newly installed binary:
+After upgrading `clt`, restart the background scheduler so new work uses the newly installed binary:
 
 ```bash
 clt agent start
 ```
+
+`start` snapshots that binary into the agent state directory before starting the scheduler. Workers already running continue with their earlier snapshot; newly dispatched work uses the new generation.
 
 ### Shell integration
 
@@ -206,7 +208,7 @@ Run one foreground scheduler pass:
 clt agent run --once
 ```
 
-The scheduler scans enabled projects, picks projects with pending unblocked `todo` tasks, takes an agent lease, and starts one Codex run at a time. Each normal Codex run is prompted to inspect the board, move one available task to `doing`, complete it, run relevant checks, update the task through `clt`, and stop after that single task. If a crashed run left a stale lease and a task in `doing`, the scheduler reclaims the lease and prompts the replacement run to resume that task before starting new work. When exactly one interrupted or blocked task carries a session marker, recovery uses `codex exec resume` for that session instead of opening a new one. Explicit stop and interactive-handoff states suppress ordinary scheduling; an interactive `i` handback is prioritized as an exact-session resume before any Todo selection.
+The scheduler scans enabled projects, picks projects with pending unblocked `todo` tasks, takes an agent lease, and starts one Codex run at a time. A foreground `run --once` owns its run directly. On macOS and Linux, the continuous daemon instead hands each run to a unique launchd job or transient systemd user service. That worker owns lease renewal, the Codex process, task/session finalization, and the run record; the scheduler is free to stop immediately after dispatch. Each normal Codex run is prompted to inspect the board, move one available task to `doing`, complete it, run relevant checks, update the task through `clt`, and stop after that single task. If a crashed worker left a task in `doing`, the scheduler uses its durable worker record to resume that task before starting new work. When exactly one interrupted or blocked task carries a session marker, recovery uses `codex exec resume` for that session instead of opening a new one. Explicit stop and interactive-handoff states suppress ordinary scheduling; an interactive `i` handback is prioritized as an exact-session resume before any Todo selection.
 
 Prefix a Todo task with `/goal` when it needs a persistent objective for long-running work. Automated runs enable Codex goals, remove the leading directive from the goal objective, and ask Codex to create the goal before working on the task. The directive must be the task's first non-whitespace token and must be followed by a non-empty objective; `/goal` elsewhere in a task remains ordinary text.
 
@@ -233,6 +235,14 @@ clt agent stop
 
 On macOS, `start` installs a user `launchd` service named `com.alpinevibrations.clt.agent`. On Linux, it installs a user `systemd` service named `clt-agent.service`. Other platforms can still use `clt agent run --once` or `clt agent daemon`, but `start` and `stop` are unsupported.
 
+`clt agent stop` stops only that scheduler. It does not drain, wait for, or terminate independent workers already running. Their leases remain visible to a later scheduler, so `clt agent start` can be run immediately—even after installing a new CLT binary—without duplicating their projects. Task-level stop and interrupt controls continue to reach older workers through the durable session-control records in `agent.db`.
+
+The first upgrade from a CLT release that predates independent workers cannot detach a run that the old scheduler already owns in-process. To prevent accidentally terminating it, `start` and `stop` refuse while a live legacy scheduler lease exists; let that one-time legacy run finish and retry. Runs dispatched after this feature is installed are independent.
+
+Worker startup and heartbeat records are fenced and bounded. If a worker fails before claiming its service or later stops checking in, the scheduler first drains and verifies that worker's exact launchd/systemd service, records one crash outcome, and only then releases its lease for recovery. This prevents a replacement Codex process from overlapping the old process group.
+
+Worker launch contracts are versioned. A newer scheduler can recover older persisted contracts, while an older scheduler leaves an unknown newer worker untouched. If a future database migration cannot safely coexist with pinned workers, it is deferred: status and task controls remain available, and the scheduler continues crash recovery in compatibility mode until those workers finish.
+
 Run `clt agent start` and `clt agent stop` as your normal user, not with `sudo`; these commands manage per-user services.
 
 On Linux, `clt` recovers the standard `/run/user/<uid>` systemd runtime directory when an SSH or non-interactive shell does not export `XDG_RUNTIME_DIR`. If the user bus is not running at all, log in through a systemd/PAM-managed session or ask an administrator to enable the always-on user manager with `sudo loginctl enable-linger "$USER"`, then start the service again.
@@ -247,9 +257,9 @@ clt agent resume .
 clt agent unregister .
 ```
 
-`clt agent clean` resets stored failure and blocked-recovery state, deletes recorded run history, removes agent run logs, and truncates background service logs. It keeps registered projects and task boards intact, and refuses to run while active Codex leases exist.
+`clt agent clean` resets stored failure and blocked-recovery state, deletes recorded run and terminal-worker history, removes agent run logs, and truncates background service logs. It keeps registered projects and task boards intact, and refuses to run while independent workers or other Codex leases are active. Stopping the scheduler does not make an active worker safe to clean.
 
-By default, agent state is stored at `~/Library/Application Support/clt` on macOS, `$XDG_STATE_HOME/clt` on Linux when `XDG_STATE_HOME` is set, or `~/.local/state/clt` otherwise. The state directory contains `agent.db`, scheduler run logs, and background service logs such as `agent-service.out` and `agent-service.err`. Override it with:
+By default, agent state is stored at `~/Library/Application Support/clt` on macOS, `$XDG_STATE_HOME/clt` on Linux when `XDG_STATE_HOME` is set, or `~/.local/state/clt` otherwise. The state directory contains `agent.db`, scheduler run logs, immutable worker binary generations, per-worker launch metadata, and background service logs such as `agent-service.out` and `agent-service.err`. Terminal worker services and directories are cleaned after completion, and each successful `start` removes binary generations no longer referenced by the new scheduler or an active worker. Override the state directory with:
 ```bash
 CLT_AGENT_STATE_DIR=/path/to/state clt agent daemon
 ```

@@ -3,6 +3,7 @@ use chrono::{DateTime, Local, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 use ratatui::layout::{Alignment, Position, Rect};
 use std::cell::Cell;
+use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write, stdout};
@@ -80,6 +81,13 @@ const AGENT_DEFAULT_RUN_TIMEOUT_SECONDS: u64 = 45 * 60;
 const AGENT_DEFAULT_SUCCESS_COOLDOWN_SECONDS: u64 = 5;
 const AGENT_DAEMON_CHECKIN_STALE_SECONDS: u64 = 45;
 const AGENT_LEASE_RENEW_MAX_INTERVAL_MILLIS: u64 = 15_000;
+const AGENT_WORKER_STARTUP_TIMEOUT_SECONDS: u64 = 60;
+const AGENT_WORKER_HEARTBEAT_TIMEOUT_SECONDS: u64 = 60;
+const AGENT_WORKER_PROTOCOL_VERSION: i64 = 1;
+// Any future migration above this version is deferred while a pinned worker is
+// active. Store access remains available for cross-generation control and
+// recovery; the scheduler waits in compatibility mode until it can migrate.
+const AGENT_WORKER_SHARED_SCHEMA_VERSION: i64 = 15;
 const AGENT_NO_TASKS_LEFT_MARKER: &str = "NO_TASKS_LEFT";
 const CODEX_TASK_SESSION_PREFIX: &str = "codex:";
 const CLT_TASK_MANAGEMENT_SKILL_NAME: &str = "clt-task-management";
@@ -108,6 +116,7 @@ const TUI_MODEL_DISCOVERY_TIMEOUT_SECONDS: u64 = 5;
 const TUI_NO_ACTIVE_BOARD_MESSAGE: &str =
     "No active board. Open a project from Agent Projects, or press M for Models.";
 static INTERACTIVE_LEASE_GENERATION: AtomicU64 = AtomicU64::new(1);
+static AGENT_WORKER_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy)]
 struct AgentProviderPreset {
@@ -150,6 +159,11 @@ const AGENT_PROVIDER_PRESETS: [AgentProviderPreset; 4] = [
 ];
 const AGENT_LAUNCHD_LABEL: &str = "com.alpinevibrations.clt.agent";
 const AGENT_SYSTEMD_UNIT: &str = "clt-agent.service";
+const AGENT_WORKER_STATE_DISPATCHING: &str = "dispatching";
+const AGENT_WORKER_STATE_RUNNING: &str = "running";
+const AGENT_WORKER_STATE_FINALIZING: &str = "finalizing";
+const AGENT_WORKER_LAUNCHD_LABEL_PREFIX: &str = "com.alpinevibrations.clt.agent.worker";
+const AGENT_WORKER_SYSTEMD_UNIT_PREFIX: &str = "clt-agent-worker";
 const AGENT_CODEX_PROMPT_BASE: &str = r#"You are working in this repo.
 
 Use the existing task-management CLI tooling: clt.
@@ -452,6 +466,8 @@ struct AgentRunJob {
     state_dir: PathBuf,
     project: agent_store::AgentProject,
     holder: String,
+    worker_token: Option<String>,
+    max_global_jobs: usize,
     task_selection: AgentTaskSelection,
     resume_session_id: Option<String>,
     blocked_task_count_before: usize,
@@ -487,6 +503,24 @@ struct AgentDaemonRun {
     handle: tokio::task::JoinHandle<Result<AgentRunCompletion>>,
 }
 
+enum AgentDaemonExecutor {
+    Inline(Arc<dyn AgentRunner>),
+    Independent { executable: PathBuf },
+}
+
+#[derive(Clone, Debug)]
+struct AgentWorkerLaunchSpec {
+    state_dir: PathBuf,
+    executable: PathBuf,
+    worker_token: String,
+    project_id: i64,
+    task_selection: AgentTaskSelection,
+    resume_session_id: Option<String>,
+    service_label: String,
+    command_arguments: Option<Vec<OsString>>,
+    service_env: AgentServiceEnvironment,
+}
+
 #[derive(Clone)]
 struct AgentDaemonCheckinSource {
     holder: String,
@@ -511,6 +545,16 @@ impl AgentTaskSelection {
             Self::ResumeDoing => "resume_doing",
             Self::RecoverBlocked => "recover_blocked",
             Self::ResumeSession => "resume_session",
+        }
+    }
+
+    fn from_label(value: &str) -> Result<Self> {
+        match value {
+            "next_todo" => Ok(Self::NextTodo),
+            "resume_doing" => Ok(Self::ResumeDoing),
+            "recover_blocked" => Ok(Self::RecoverBlocked),
+            "resume_session" => Ok(Self::ResumeSession),
+            _ => anyhow::bail!("Unknown agent worker task selection: {value}"),
         }
     }
 }
@@ -676,6 +720,7 @@ struct CodexAgentRunner {
     lease_timeout: Duration,
     lease_renew_interval: Duration,
     command: PathBuf,
+    worker_token: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -808,6 +853,20 @@ enum AgentCommands {
         #[arg(long, default_value_t = false)]
         once: bool,
     },
+    /// Internal independent owner for one scheduled Codex run
+    #[command(hide = true)]
+    Worker {
+        #[arg(long)]
+        state_dir: PathBuf,
+        #[arg(long)]
+        project_id: i64,
+        #[arg(long)]
+        worker_token: String,
+        #[arg(long)]
+        task_selection: String,
+        #[arg(long)]
+        resume_session_id: Option<String>,
+    },
     /// Internal exact-session worker used after an interactive handoff
     #[command(hide = true)]
     ResumeSessionWorker {
@@ -909,6 +968,25 @@ fn main() -> Result<()> {
     }) = cli.command.as_ref()
     {
         return run_automated_exec_gate(program, arguments);
+    }
+    if let Some(Commands::Agent {
+        command:
+            AgentCommands::Worker {
+                state_dir,
+                project_id,
+                worker_token,
+                task_selection,
+                resume_session_id,
+            },
+    }) = cli.command.as_ref()
+    {
+        return run_independent_agent_worker(
+            state_dir,
+            *project_id,
+            worker_token,
+            AgentTaskSelection::from_label(task_selection)?,
+            resume_session_id.as_deref(),
+        );
     }
     #[cfg(unix)]
     if let Some(Commands::Agent {
@@ -1058,8 +1136,9 @@ fn handle_agent_command(command: AgentCommands, local: bool, default_root: &Path
             register_agent_project(&store, path.as_deref(), local, default_root)?;
         }
         AgentCommands::Unregister { path } => {
-            let store = open_agent_store()?;
-            unregister_agent_project(&store, path.as_deref(), local, default_root)?;
+            let state_dir = ensure_agent_state_dir()?;
+            let store = open_agent_store_at(&state_dir)?;
+            unregister_agent_project(&store, &state_dir, path.as_deref(), local, default_root)?;
         }
         AgentCommands::Pause { path } => {
             let store = open_agent_store()?;
@@ -1136,7 +1215,8 @@ fn handle_agent_command(command: AgentCommands, local: bool, default_root: &Path
         }
         AgentCommands::AutomatedExecGate { .. }
         | AgentCommands::AutomatedSessionSupervisor { .. }
-        | AgentCommands::InteractiveExecGate { .. } => {
+        | AgentCommands::InteractiveExecGate { .. }
+        | AgentCommands::Worker { .. } => {
             unreachable!("Codex exec gate handled before task-root discovery")
         }
         AgentCommands::Daemon => {
@@ -1192,11 +1272,16 @@ fn register_agent_project(
 
 fn unregister_agent_project(
     store: &agent_store::TursoAgentStore,
+    state_dir: &Path,
     path: Option<&Path>,
     local: bool,
     default_root: &Path,
 ) -> Result<()> {
     let project_root = resolve_agent_project_root(path, local, default_root)?;
+    #[cfg(not(test))]
+    cleanup_terminal_agent_worker_services(state_dir, store, Some(&project_root))?;
+    #[cfg(test)]
+    let _ = state_dir;
     if store.unregister_project_blocking(&project_root)? {
         println!("Unregistered project: {}", project_root.display());
     } else {
@@ -1270,6 +1355,7 @@ fn show_agent_status(store: &agent_store::TursoAgentStore) -> Result<()> {
     let state_dir = agent_state_dir()?;
     let projects = store.list_projects_blocking()?;
     let active_leases = store.list_active_leases_blocking(&agent_timestamp())?;
+    let active_workers = store.list_active_workers_blocking()?;
     let recent_runs = store.list_recent_runs_blocking(5)?;
     let daemon_checkins = store.list_daemon_checkins_blocking()?;
     let service_status = agent_service_status(&state_dir);
@@ -1293,11 +1379,17 @@ fn show_agent_status(store: &agent_store::TursoAgentStore) -> Result<()> {
     println!("database={}", state_dir.join(AGENT_DB_FILE).display());
     println!("service={}", service_status);
     println!("daemon={}", daemon_status);
+    if let Some(version) = store.pending_migration_version() {
+        println!("schema=compatibility-mode pending_migration={version}");
+    } else {
+        println!("schema=current");
+    }
     println!(
-        "registered_projects={} enabled={} pending={} active_leases={}",
+        "registered_projects={} enabled={} pending={} active_workers={} active_leases={}",
         projects.len(),
         enabled_count,
         pending_count,
+        active_workers.len(),
         active_leases.len()
     );
 
@@ -1316,6 +1408,28 @@ fn show_agent_status(store: &agent_store::TursoAgentStore) -> Result<()> {
             println!(
                 "{}",
                 format_agent_project_summary(project, scan, project.last_scan_at.as_deref())
+            );
+        }
+    }
+
+    if !active_workers.is_empty() {
+        println!();
+        println!("Independent workers:");
+        for worker in &active_workers {
+            println!(
+                "project={} {} state={} protocol={} token={} pid={} service={} binary={} path={}",
+                worker.project_id,
+                worker.project_name,
+                worker.state,
+                worker.protocol_version,
+                worker.worker_token,
+                worker
+                    .worker_pid
+                    .map(|pid| pid.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                worker.service_label,
+                worker.binary_path.display(),
+                worker.project_path.display()
             );
         }
     }
@@ -1441,13 +1555,23 @@ fn show_agent_logs(store: &agent_store::TursoAgentStore) -> Result<()> {
 }
 
 fn clean_agent_state(store: &agent_store::TursoAgentStore, state_dir: &Path) -> Result<()> {
+    let active_workers = store.list_active_workers_blocking()?;
+    if !active_workers.is_empty() {
+        anyhow::bail!(
+            "Refusing to clean agent state while {} independent worker(s) are active. Wait for those Codex runs to finish; stopping the scheduler does not stop them.",
+            active_workers.len()
+        );
+    }
     let active_leases = store.list_active_leases_blocking(&agent_timestamp())?;
     if !active_leases.is_empty() {
         anyhow::bail!(
-            "Refusing to clean agent state while {} active lease(s) exist. Wait for active Codex runs to finish or stop the service first.",
+            "Refusing to clean agent state while {} active lease(s) exist. Wait for active Codex runs to finish.",
             active_leases.len()
         );
     }
+
+    #[cfg(not(test))]
+    cleanup_terminal_agent_worker_services(state_dir, store, None)?;
 
     let mut summary = store.clean_agent_history_blocking(&agent_timestamp())?;
     summary.run_log_dirs_removed = remove_agent_run_logs(state_dir)?;
@@ -1508,7 +1632,17 @@ fn truncate_agent_service_logs(state_dir: &Path) -> Result<u64> {
 
 fn manage_agent_service(action: AgentServiceAction) -> Result<()> {
     let state_dir = ensure_agent_state_dir()?;
-    let executable = std::env::current_exe().context("Failed to resolve current clt executable")?;
+    let store = open_agent_store_at(&state_dir)?;
+    if agent_scheduler_service_is_loaded()? {
+        ensure_no_live_legacy_agent_runs(&store)?;
+    }
+    let current_executable =
+        std::env::current_exe().context("Failed to resolve current clt executable")?;
+    let executable = if action == AgentServiceAction::Start {
+        snapshot_agent_service_binary(&state_dir, &current_executable)?
+    } else {
+        current_executable
+    };
 
     match current_agent_platform() {
         AgentPlatform::Macos => manage_launchd_agent(action, &state_dir, &executable),
@@ -1516,7 +1650,135 @@ fn manage_agent_service(action: AgentServiceAction) -> Result<()> {
         AgentPlatform::Other => anyhow::bail!(
             "clt agent start/stop is only supported on macOS launchd and Linux user systemd."
         ),
+    }?;
+
+    if action == AgentServiceAction::Start {
+        #[cfg(not(test))]
+        cleanup_terminal_agent_worker_services(&state_dir, &store, None)?;
+        garbage_collect_agent_binary_generations(&state_dir, &store, &executable)?;
     }
+    Ok(())
+}
+
+fn agent_scheduler_service_is_loaded() -> Result<bool> {
+    match current_agent_platform() {
+        AgentPlatform::Macos => {
+            let target = format!("{}/{}", launchd_user_domain()?, AGENT_LAUNCHD_LABEL);
+            run_service_command_optional("launchctl", &["print", &target])
+        }
+        AgentPlatform::Linux => run_service_command_optional(
+            "systemctl",
+            &["--user", "is-active", "--quiet", AGENT_SYSTEMD_UNIT],
+        ),
+        AgentPlatform::Other => Ok(false),
+    }
+}
+
+fn ensure_no_live_legacy_agent_runs(store: &agent_store::TursoAgentStore) -> Result<()> {
+    let now = agent_timestamp_seconds();
+    let live_legacy = store
+        .list_active_leases_blocking(&agent_timestamp())?
+        .into_iter()
+        .filter(|lease| lease.holder.starts_with("clt-agent-"))
+        .filter(|lease| !agent_lease_is_reclaimable(lease, false, now))
+        .collect::<Vec<_>>();
+    if !live_legacy.is_empty() {
+        let projects = live_legacy
+            .iter()
+            .map(|lease| lease.project_name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::bail!(
+            "Refusing to restart or stop the scheduler while {} legacy in-process run(s) are active ({projects}). Let this one-time pre-independent-worker generation finish, then retry.",
+            live_legacy.len()
+        );
+    }
+    Ok(())
+}
+
+fn garbage_collect_agent_binary_generations(
+    state_dir: &Path,
+    store: &agent_store::TursoAgentStore,
+    scheduler_executable: &Path,
+) -> Result<()> {
+    let generation_root = state_dir.join("worker-generations");
+    if !generation_root.exists() {
+        return Ok(());
+    }
+    let mut preserved = HashSet::new();
+    if let Some(parent) = scheduler_executable.parent() {
+        preserved.insert(parent.to_path_buf());
+    }
+    for worker in store.list_active_workers_blocking()? {
+        if let Some(parent) = worker.binary_path.parent() {
+            preserved.insert(parent.to_path_buf());
+        }
+    }
+    for entry in fs::read_dir(&generation_root).with_context(|| {
+        format!("Failed to read agent binary generations at {generation_root:?}")
+    })? {
+        let entry = entry.context("Failed to read an agent binary generation entry")?;
+        let path = entry.path();
+        if entry
+            .file_type()
+            .context("Failed to inspect an agent binary generation entry")?
+            .is_dir()
+            && !preserved.contains(&path)
+        {
+            fs::remove_dir_all(&path).with_context(|| {
+                format!("Failed to remove unreferenced agent binary generation {path:?}")
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn snapshot_agent_service_binary(state_dir: &Path, source: &Path) -> Result<PathBuf> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let sequence = AGENT_WORKER_GENERATION.fetch_add(1, Ordering::Relaxed);
+    let generation = format!(
+        "{}-{:09}-p{}-{sequence}",
+        elapsed.as_secs(),
+        elapsed.subsec_nanos(),
+        std::process::id()
+    );
+    let generation_dir = state_dir.join("worker-generations").join(generation);
+    fs::create_dir_all(&generation_dir).with_context(|| {
+        format!(
+            "Failed to create agent binary generation directory {:?}",
+            generation_dir
+        )
+    })?;
+    let destination = generation_dir.join("clt");
+    let temporary = generation_dir.join("clt.partial");
+    fs::copy(source, &temporary).with_context(|| {
+        format!(
+            "Failed to snapshot CLT executable {} to {}",
+            source.display(),
+            temporary.display()
+        )
+    })?;
+    fs::File::open(&temporary)
+        .and_then(|file| file.sync_all())
+        .with_context(|| format!("Failed to sync agent binary snapshot {:?}", temporary))?;
+    fs::rename(&temporary, &destination).with_context(|| {
+        format!(
+            "Failed to publish agent binary generation {}",
+            destination.display()
+        )
+    })?;
+    fs::File::open(&generation_dir)
+        .and_then(|directory| directory.sync_all())
+        .with_context(|| {
+            format!(
+                "Failed to sync agent binary generation directory {:?}",
+                generation_dir
+            )
+        })?;
+
+    Ok(destination)
 }
 
 fn manage_launchd_agent(
@@ -1542,10 +1804,7 @@ fn manage_launchd_agent(
             .with_context(|| format!("Failed to write launchd plist {:?}", plist_path))?;
 
             if run_service_command_optional("launchctl", &["print", &service_target])? {
-                run_service_command(
-                    "launchctl",
-                    &["bootout", &domain, plist_path.to_string_lossy().as_ref()],
-                )?;
+                run_service_command("launchctl", &["bootout", &service_target])?;
             }
             run_service_command(
                 "launchctl",
@@ -1559,24 +1818,21 @@ fn manage_launchd_agent(
             );
         }
         AgentServiceAction::Stop => {
-            if !plist_path.exists() {
-                println!(
-                    "No clt agent launchd service is installed at {}",
-                    plist_path.display()
-                );
-                return Ok(());
-            }
-
             if run_service_command_optional("launchctl", &["print", &service_target])? {
-                run_service_command(
-                    "launchctl",
-                    &["bootout", &domain, plist_path.to_string_lossy().as_ref()],
-                )?;
-                println!("Stopped clt agent launchd service {}", AGENT_LAUNCHD_LABEL);
-            } else {
+                run_service_command("launchctl", &["bootout", &service_target])?;
+                println!(
+                    "Stopped clt agent scheduler {}. Active workers continue independently.",
+                    AGENT_LAUNCHD_LABEL
+                );
+            } else if plist_path.exists() {
                 println!(
                     "clt agent launchd service {} was not running",
                     AGENT_LAUNCHD_LABEL
+                );
+            } else {
+                println!(
+                    "No clt agent launchd service is installed at {}",
+                    plist_path.display()
                 );
             }
         }
@@ -1619,19 +1875,25 @@ fn manage_systemd_agent(
             );
         }
         AgentServiceAction::Stop => {
-            if !unit_path.exists() {
+            let was_active = run_service_command_optional(
+                "systemctl",
+                &["--user", "is-active", "--quiet", AGENT_SYSTEMD_UNIT],
+            )?;
+            let _ =
+                run_service_command_optional("systemctl", &["--user", "stop", AGENT_SYSTEMD_UNIT])?;
+            if was_active {
+                println!(
+                    "Stopped clt agent scheduler {}. Active workers continue independently.",
+                    AGENT_SYSTEMD_UNIT
+                );
+            } else if unit_path.exists() {
+                println!("clt agent systemd user service {AGENT_SYSTEMD_UNIT} was not running");
+            } else {
                 println!(
                     "No clt agent systemd user service is installed at {}",
                     unit_path.display()
                 );
-                return Ok(());
             }
-
-            run_service_command("systemctl", &["--user", "stop", AGENT_SYSTEMD_UNIT])?;
-            println!(
-                "Stopped clt agent systemd user service {}",
-                AGENT_SYSTEMD_UNIT
-            );
         }
     }
 
@@ -1649,15 +1911,13 @@ fn agent_service_status(state_dir: &Path) -> String {
 
 fn launchd_service_status() -> Result<String> {
     let plist_path = launchd_plist_path(&home_dir()?);
-    if !plist_path.exists() {
-        return Ok("not-installed".to_string());
-    }
-
     let target = format!("{}/{}", launchd_user_domain()?, AGENT_LAUNCHD_LABEL);
     if run_service_command_optional("launchctl", &["print", &target])? {
         Ok("running".to_string())
-    } else {
+    } else if plist_path.exists() {
         Ok("installed".to_string())
+    } else {
+        Ok("not-installed".to_string())
     }
 }
 
@@ -1666,17 +1926,15 @@ fn systemd_service_status() -> Result<String> {
         std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
         std::env::var_os("HOME").map(PathBuf::from),
     )?;
-    if !unit_path.exists() {
-        return Ok("not-installed".to_string());
-    }
-
     if run_service_command_optional(
         "systemctl",
         &["--user", "is-active", "--quiet", AGENT_SYSTEMD_UNIT],
     )? {
         Ok("running".to_string())
-    } else {
+    } else if unit_path.exists() {
         Ok("installed".to_string())
+    } else {
+        Ok("not-installed".to_string())
     }
 }
 
@@ -1816,6 +2074,251 @@ WantedBy=default.target\n",
         systemd_env_assignment(AGENT_DAEMON_MODE_ENV, "service"),
         systemd_env_assignment("PATH", service_env.path.to_string_lossy().as_ref())
     )
+}
+
+fn next_agent_worker_token(project_id: i64) -> String {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let sequence = AGENT_WORKER_GENERATION.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "{}-{:09}-p{project_id}-s{sequence}",
+        elapsed.as_secs(),
+        elapsed.subsec_nanos()
+    )
+}
+
+fn agent_worker_lease_holder(worker_token: &str) -> String {
+    format!("clt-worker-{worker_token}")
+}
+
+fn agent_worker_service_label(platform: AgentPlatform, worker_token: &str) -> Result<String> {
+    match platform {
+        AgentPlatform::Macos => Ok(format!(
+            "{AGENT_WORKER_LAUNCHD_LABEL_PREFIX}.{worker_token}"
+        )),
+        AgentPlatform::Linux => Ok(format!(
+            "{AGENT_WORKER_SYSTEMD_UNIT_PREFIX}-{worker_token}.service"
+        )),
+        AgentPlatform::Other => {
+            anyhow::bail!("Independent agent workers require macOS launchd or Linux systemd")
+        }
+    }
+}
+
+fn agent_worker_dir(state_dir: &Path, worker_token: &str) -> PathBuf {
+    state_dir.join("workers").join(worker_token)
+}
+
+fn agent_worker_launchd_plist_path(state_dir: &Path, worker_token: &str) -> PathBuf {
+    agent_worker_dir(state_dir, worker_token).join("worker.plist")
+}
+
+fn agent_worker_command_arguments(spec: &AgentWorkerLaunchSpec) -> Vec<OsString> {
+    if let Some(arguments) = spec.command_arguments.as_ref() {
+        return arguments.clone();
+    }
+    let mut arguments = vec![
+        OsString::from("--local"),
+        OsString::from("agent"),
+        OsString::from("worker"),
+        OsString::from("--state-dir"),
+        spec.state_dir.as_os_str().to_os_string(),
+        OsString::from("--project-id"),
+        OsString::from(spec.project_id.to_string()),
+        OsString::from("--worker-token"),
+        OsString::from(&spec.worker_token),
+        OsString::from("--task-selection"),
+        OsString::from(spec.task_selection.label()),
+    ];
+    if let Some(session_id) = spec.resume_session_id.as_deref() {
+        arguments.push(OsString::from("--resume-session-id"));
+        arguments.push(OsString::from(session_id));
+    }
+    arguments
+}
+
+fn launchd_worker_plist_content(
+    spec: &AgentWorkerLaunchSpec,
+    service_env: &AgentServiceEnvironment,
+) -> String {
+    let executable = xml_escape(&spec.executable.display().to_string());
+    let label = xml_escape(&spec.service_label);
+    let worker_dir = agent_worker_dir(&spec.state_dir, &spec.worker_token);
+    let stdout_path = xml_escape(&worker_dir.join("worker.out").display().to_string());
+    let stderr_path = xml_escape(&worker_dir.join("worker.err").display().to_string());
+    let state_dir = xml_escape(&spec.state_dir.display().to_string());
+    let path = xml_escape(service_env.path.to_string_lossy().as_ref());
+    let codex_path_environment = service_env
+        .codex_path_override
+        .as_ref()
+        .map(|codex_path| {
+            format!(
+                "    <key>{AGENT_CODEX_PATH_ENV}</key>\n    <string>{}</string>\n",
+                xml_escape(&codex_path.display().to_string())
+            )
+        })
+        .unwrap_or_default();
+    let arguments = agent_worker_command_arguments(spec)
+        .into_iter()
+        .map(|argument| {
+            format!(
+                "    <string>{}</string>\n",
+                xml_escape(argument.to_string_lossy().as_ref())
+            )
+        })
+        .collect::<String>();
+
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{label}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{executable}</string>
+{arguments}  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>{AGENT_STATE_DIR_ENV}</key>
+    <string>{state_dir}</string>
+{codex_path_environment}    <key>PATH</key>
+    <string>{path}</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <false/>
+  <key>ProcessType</key>
+  <string>Standard</string>
+  <key>StandardOutPath</key>
+  <string>{stdout_path}</string>
+  <key>StandardErrorPath</key>
+  <string>{stderr_path}</string>
+</dict>
+</plist>
+"#
+    )
+}
+
+fn systemd_worker_run_args(
+    spec: &AgentWorkerLaunchSpec,
+    service_env: &AgentServiceEnvironment,
+) -> Vec<OsString> {
+    let mut arguments = vec![
+        OsString::from("--user"),
+        OsString::from(format!("--unit={}", spec.service_label)),
+        OsString::from("--collect"),
+        OsString::from("--service-type=exec"),
+        OsString::from("--property=Restart=no"),
+        OsString::from("--property=KillMode=control-group"),
+        OsString::from(format!(
+            "--setenv={AGENT_STATE_DIR_ENV}={}",
+            spec.state_dir.display()
+        )),
+        OsString::from(format!(
+            "--setenv=PATH={}",
+            service_env.path.to_string_lossy()
+        )),
+    ];
+    if let Some(codex_path) = service_env.codex_path_override.as_deref() {
+        arguments.push(OsString::from(format!(
+            "--setenv={AGENT_CODEX_PATH_ENV}={}",
+            codex_path.display()
+        )));
+    }
+    arguments.push(OsString::from("--"));
+    arguments.push(spec.executable.as_os_str().to_os_string());
+    arguments.extend(agent_worker_command_arguments(spec));
+    arguments
+}
+
+fn prepare_agent_worker_service(spec: &AgentWorkerLaunchSpec) -> Result<()> {
+    let worker_dir = agent_worker_dir(&spec.state_dir, &spec.worker_token);
+    fs::create_dir_all(&worker_dir)
+        .with_context(|| format!("Failed to create agent worker directory {:?}", worker_dir))?;
+    if current_agent_platform() == AgentPlatform::Macos {
+        let plist_path = agent_worker_launchd_plist_path(&spec.state_dir, &spec.worker_token);
+        if !plist_path.exists() {
+            let temporary = plist_path.with_extension("plist.partial");
+            fs::write(
+                &temporary,
+                launchd_worker_plist_content(spec, &spec.service_env),
+            )
+            .with_context(|| format!("Failed to write agent worker plist {:?}", temporary))?;
+            fs::rename(&temporary, &plist_path).with_context(|| {
+                format!("Failed to publish agent worker plist {:?}", plist_path)
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn launch_agent_worker_service(spec: &AgentWorkerLaunchSpec) -> Result<()> {
+    match current_agent_platform() {
+        AgentPlatform::Macos => {
+            let domain = launchd_user_domain()?;
+            let target = format!("{domain}/{}", spec.service_label);
+            if run_service_command_optional("launchctl", &["print", &target])? {
+                return Ok(());
+            }
+            let plist_path = agent_worker_launchd_plist_path(&spec.state_dir, &spec.worker_token);
+            let plist = plist_path.to_string_lossy();
+            let status = service_command("launchctl", &["bootstrap", &domain, plist.as_ref()])?
+                .status()
+                .with_context(|| {
+                    format!("Failed to bootstrap agent worker {}", spec.service_label)
+                })?;
+            if status.success() || run_service_command_optional("launchctl", &["print", &target])? {
+                Ok(())
+            } else {
+                anyhow::bail!(
+                    "launchctl bootstrap failed for agent worker {} with status {}",
+                    spec.service_label,
+                    status
+                )
+            }
+        }
+        AgentPlatform::Linux => {
+            if run_service_command_optional(
+                "systemctl",
+                &["--user", "is-active", "--quiet", &spec.service_label],
+            )? {
+                return Ok(());
+            }
+            let arguments = systemd_worker_run_args(spec, &spec.service_env);
+            let refs = arguments
+                .iter()
+                .map(|argument| argument.to_string_lossy())
+                .collect::<Vec<_>>();
+            let refs = refs
+                .iter()
+                .map(|argument| argument.as_ref())
+                .collect::<Vec<_>>();
+            let status = service_command("systemd-run", &refs)?
+                .status()
+                .with_context(|| format!("Failed to launch agent worker {}", spec.service_label))?;
+            if status.success()
+                || run_service_command_optional(
+                    "systemctl",
+                    &["--user", "is-active", "--quiet", &spec.service_label],
+                )?
+            {
+                Ok(())
+            } else {
+                anyhow::bail!(
+                    "systemd-run failed for agent worker {} with status {}",
+                    spec.service_label,
+                    status
+                )
+            }
+        }
+        AgentPlatform::Other => {
+            anyhow::bail!("Independent agent workers require macOS launchd or Linux systemd")
+        }
+    }
 }
 
 fn resolve_agent_service_environment() -> Result<AgentServiceEnvironment> {
@@ -2351,7 +2854,6 @@ fn run_automated_session_supervisor(
             return report_automated_supervisor_reaped(status);
         }
     };
-    let mut requested_action = None;
     let mut last_poll_warning: Option<Instant> = None;
     let status = loop {
         match interactive_child_exited_without_reaping(&child) {
@@ -2373,8 +2875,7 @@ fn run_automated_session_supervisor(
 
         match supervised_session_control(&store, spec.project_id, child_pid, spec.run_token) {
             Ok(Some(control)) => {
-                if let Some(action) = control.state.requested_action() {
-                    requested_action = Some(action);
+                if control.state.requested_action().is_some() {
                     break stop_supervised_automated_child_until_reaped(
                         &mut child,
                         "a task-session control was requested",
@@ -2405,7 +2906,12 @@ fn run_automated_session_supervisor(
 
     let parent_disconnected =
         parent_state.load(Ordering::SeqCst) == AUTOMATED_SUPERVISOR_PARENT_DISCONNECTED;
-    if parent_disconnected || requested_action.is_some() {
+    // A connected runner owns durable worker finalization. It already has the
+    // reaping proof and will transition the exact session generation before it
+    // records the run. Releasing or transferring its lease here would fence
+    // that outer worker between `run_project` and transactional finalization.
+    // The supervisor takes over only when that owner actually disconnects.
+    if parent_disconnected {
         finalize_disconnected_automated_supervisor(
             spec.state_dir,
             spec.project_id,
@@ -3328,11 +3834,19 @@ fn run_service_command_quiet(program: &str, args: &[&str]) -> Result<()> {
 }
 
 fn service_command(program: &str, args: &[&str]) -> Result<Command> {
+    service_command_with_systemd_user_configurer(program, args, configure_systemd_user_command)
+}
+
+fn service_command_with_systemd_user_configurer(
+    program: &str,
+    args: &[&str],
+    configure_systemd_user: impl FnOnce(&mut Command) -> Result<()>,
+) -> Result<Command> {
     let mut command = Command::new(program);
     command.args(args);
 
-    if program == "systemctl" && args.contains(&"--user") {
-        configure_systemd_user_command(&mut command)?;
+    if matches!(program, "systemctl" | "systemd-run") && args.contains(&"--user") {
+        configure_systemd_user(&mut command)?;
     }
 
     Ok(command)
@@ -3478,10 +3992,64 @@ fn tail_lines(content: &str, limit: usize) -> Vec<&str> {
 
 fn run_agent_daemon() -> Result<()> {
     let state_dir = ensure_agent_state_dir()?;
-    let runner: Arc<dyn AgentRunner> = Arc::new(CodexAgentRunner::new(state_dir.clone())?);
-    run_agent_daemon_loop(&state_dir, runner, agent_poll_interval()?, None)
+    let poll_interval = agent_poll_interval()?;
+    wait_for_deferred_agent_migrations(&state_dir, poll_interval)?;
+    if current_agent_platform() == AgentPlatform::Other {
+        let runner: Arc<dyn AgentRunner> = Arc::new(CodexAgentRunner::new(state_dir.clone())?);
+        return run_agent_daemon_loop_with_executor(
+            &state_dir,
+            AgentDaemonExecutor::Inline(runner),
+            poll_interval,
+            None,
+            new_agent_shutdown_signal(),
+        );
+    }
+    let current_executable =
+        std::env::current_exe().context("Failed to resolve the agent scheduler executable")?;
+    let generation_root = state_dir.join("worker-generations");
+    let executable = if current_executable.starts_with(&generation_root) {
+        current_executable
+    } else {
+        snapshot_agent_service_binary(&state_dir, &current_executable)?
+    };
+    run_agent_daemon_loop_with_executor(
+        &state_dir,
+        AgentDaemonExecutor::Independent { executable },
+        poll_interval,
+        None,
+        new_agent_shutdown_signal(),
+    )
 }
 
+fn wait_for_deferred_agent_migrations(state_dir: &Path, poll_interval: Duration) -> Result<()> {
+    let retry_interval = std::cmp::min(poll_interval, Duration::from_secs(5));
+    let mut announced_version = None;
+    loop {
+        let store = open_agent_store_at(state_dir)?;
+        let Some(version) = store.pending_migration_version() else {
+            return Ok(());
+        };
+        drop(store);
+
+        // Compatibility-mode reconciliation intentionally uses only the shared
+        // worker/control schema. It must stay usable by a scheduler generation
+        // that has deferred a migration newer than the pinned workers.
+        let workers = reconcile_independent_agent_workers(state_dir)?;
+        if workers.is_empty() {
+            continue;
+        }
+        if announced_version != Some(version) {
+            println!(
+                "Agent schema migration {version} is deferred while {} pinned worker(s) finish; controls and crash recovery remain active.",
+                workers.len()
+            );
+            announced_version = Some(version);
+        }
+        thread::sleep(retry_interval);
+    }
+}
+
+#[cfg(test)]
 fn run_agent_daemon_loop(
     state_dir: &Path,
     runner: Arc<dyn AgentRunner>,
@@ -3497,9 +4065,26 @@ fn run_agent_daemon_loop(
     )
 }
 
+#[cfg(test)]
 fn run_agent_daemon_loop_with_shutdown(
     state_dir: &Path,
     runner: Arc<dyn AgentRunner>,
+    poll_interval: Duration,
+    max_passes: Option<usize>,
+    shutdown: AgentShutdownSignal,
+) -> Result<()> {
+    run_agent_daemon_loop_with_executor(
+        state_dir,
+        AgentDaemonExecutor::Inline(runner),
+        poll_interval,
+        max_passes,
+        shutdown,
+    )
+}
+
+fn run_agent_daemon_loop_with_executor(
+    state_dir: &Path,
+    executor: AgentDaemonExecutor,
     poll_interval: Duration,
     max_passes: Option<usize>,
     shutdown: AgentShutdownSignal,
@@ -3522,7 +4107,7 @@ fn run_agent_daemon_loop_with_shutdown(
         .context("Failed to create async runtime for agent daemon")?;
     runtime.block_on(run_agent_daemon_loop_async(
         state_dir.to_path_buf(),
-        runner,
+        executor,
         poll_interval,
         max_passes,
         shutdown,
@@ -3531,7 +4116,7 @@ fn run_agent_daemon_loop_with_shutdown(
 
 async fn run_agent_daemon_loop_async(
     state_dir: PathBuf,
-    runner: Arc<dyn AgentRunner>,
+    executor: AgentDaemonExecutor,
     poll_interval: Duration,
     max_passes: Option<usize>,
     shutdown: AgentShutdownSignal,
@@ -3580,11 +4165,22 @@ async fn run_agent_daemon_loop_async(
                 if shutdown.load(Ordering::SeqCst) {
                     release_agent_job_lease_for_shutdown(&job)?;
                 } else {
-                    active_runs.push(spawn_agent_daemon_run(
-                        Arc::clone(&runner),
-                        job,
-                        Arc::clone(&shutdown),
-                    ));
+                    match &executor {
+                        AgentDaemonExecutor::Inline(runner) => {
+                            active_runs.push(spawn_agent_daemon_run(
+                                Arc::clone(runner),
+                                job,
+                                Arc::clone(&shutdown),
+                            ));
+                        }
+                        AgentDaemonExecutor::Independent { executable } => {
+                            if let Err(error) =
+                                dispatch_independent_agent_worker(&state_dir, executable, job)
+                            {
+                                eprintln!("Agent worker dispatch failed: {error:#}");
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -3628,7 +4224,7 @@ async fn wait_for_agent_daemon_sleep_or_shutdown(
         _ = tokio::time::sleep(sleep_duration) => Ok(()),
         signal = tokio::signal::ctrl_c() => {
             signal.context("Failed to listen for Ctrl-C shutdown signal")?;
-            println!("Received Ctrl-C; stopping new agent work and waiting for active runs to clean up.");
+            println!("Received Ctrl-C; stopping the scheduler. Independent workers continue.");
             shutdown.store(true, Ordering::SeqCst);
             Ok(())
         }
@@ -3648,6 +4244,13 @@ fn agent_daemon_sleep_interval(pass: &AgentSchedulerPass, poll_interval: Duratio
 
 fn run_agent_once() -> Result<AgentSchedulerPass> {
     let state_dir = ensure_agent_state_dir()?;
+    let store = open_agent_store_at(&state_dir)?;
+    if let Some(version) = store.pending_migration_version() {
+        anyhow::bail!(
+            "Agent schema migration {version} is deferred while pinned workers are active; this foreground scheduler will not start new work until they finish"
+        );
+    }
+    drop(store);
     let runner = CodexAgentRunner::new(state_dir.clone())?;
     run_agent_once_with_runner(&state_dir, &runner)
 }
@@ -3730,6 +4333,8 @@ fn run_agent_session_resume_worker(project_id: i64, session_id: &str) -> Result<
                 state_dir: state_dir.clone(),
                 project: project.clone(),
                 holder: holder.clone(),
+                worker_token: None,
+                max_global_jobs: agent_max_global_jobs()?,
                 task_selection: AgentTaskSelection::ResumeSession,
                 resume_session_id: Some(session_id.to_string()),
                 blocked_task_count_before,
@@ -4714,6 +5319,23 @@ fn run_agent_scheduler_pass_with_max_global_jobs(
         anyhow::bail!("{AGENT_MAX_GLOBAL_JOBS_ENV} must be greater than zero");
     }
 
+    let durable_workers = reconcile_independent_agent_workers(state_dir)?;
+    let abandoned_project_ids = with_agent_store_at(state_dir, |store| {
+        Ok(store
+            .list_terminal_workers_blocking()?
+            .into_iter()
+            .filter(|worker| worker.state == "abandoned")
+            .map(|worker| worker.project_id)
+            .collect::<Vec<_>>())
+    })?;
+    let mut durable_project_ids = durable_workers
+        .iter()
+        .map(|worker| worker.project_id)
+        .collect::<Vec<_>>();
+    durable_project_ids.extend_from_slice(active_project_ids);
+    durable_project_ids.sort_unstable();
+    durable_project_ids.dedup();
+
     let holder = agent_lease_holder();
     let lease_timeout = agent_lease_timeout()?;
     let success_cooldown = agent_success_cooldown()?;
@@ -4722,7 +5344,7 @@ fn run_agent_scheduler_pass_with_max_global_jobs(
     let mut pass = AgentSchedulerPass {
         scanned_projects: 0,
         pending_projects: 0,
-        active_agent_jobs: active_project_ids.len(),
+        active_agent_jobs: durable_project_ids.len(),
         skipped_active_lease: 0,
         deferred_projects: 0,
         runs_started: 0,
@@ -4738,6 +5360,12 @@ fn run_agent_scheduler_pass_with_max_global_jobs(
     })?;
 
     for project in projects {
+        if durable_project_ids.contains(&project.id) {
+            if project.enabled {
+                pass.scanned_projects += 1;
+            }
+            continue;
+        }
         if !project.enabled {
             let existing_lease = agent_lease_for_project(state_dir, project.id)?;
             reconcile_stale_agent_session_controls(
@@ -4751,9 +5379,6 @@ fn run_agent_scheduler_pass_with_max_global_jobs(
         }
 
         pass.scanned_projects += 1;
-        if active_project_ids.contains(&project.id) {
-            continue;
-        }
 
         let scan = scan_agent_project(&project.path);
         with_agent_store_at(state_dir, |store| {
@@ -4791,10 +5416,13 @@ fn run_agent_scheduler_pass_with_max_global_jobs(
             );
             continue;
         }
+        let resume_abandoned_worker =
+            scan.doing_count > 0 && abandoned_project_ids.contains(&project.id);
         let resume_interrupted_task = scan.doing_count > 0
-            && existing_lease.as_ref().is_some_and(|lease| {
-                agent_lease_is_reclaimable(lease, reclaim_current_process_leases, now)
-            });
+            && (resume_abandoned_worker
+                || existing_lease.as_ref().is_some_and(|lease| {
+                    agent_lease_is_reclaimable(lease, reclaim_current_process_leases, now)
+                }));
         let task_selection = if resume_session_id.is_some() {
             Some(AgentTaskSelection::ResumeSession)
         } else if resume_interrupted_task {
@@ -4916,7 +5544,6 @@ fn run_agent_scheduler_pass_with_max_global_jobs(
                 continue;
             }
         }
-
         println!(
             "Project {}: action=running work={} todo={} ready_todo={} blocked_todo={} doing={} blocked_doing={} scan_status={} lease_holder={} lease_acquired_at={} lease_expires_at={} path={}",
             project.name,
@@ -4941,6 +5568,8 @@ fn run_agent_scheduler_pass_with_max_global_jobs(
             state_dir: state_dir.to_path_buf(),
             project,
             holder: holder.clone(),
+            worker_token: None,
+            max_global_jobs,
             task_selection,
             resume_session_id,
             blocked_task_count_before: scan.blocked_task_count(),
@@ -4950,6 +5579,266 @@ fn run_agent_scheduler_pass_with_max_global_jobs(
     }
 
     Ok(AgentSchedulerStart { pass, jobs })
+}
+
+fn reconcile_independent_agent_workers(
+    state_dir: &Path,
+) -> Result<Vec<agent_store::AgentWorkerRecord>> {
+    let store = open_agent_store_at(state_dir)?;
+    #[cfg(not(test))]
+    cleanup_terminal_agent_worker_services(state_dir, &store, None)?;
+    #[cfg(not(test))]
+    return reconcile_independent_agent_workers_with(
+        state_dir,
+        &store,
+        agent_timestamp_seconds(),
+        |spec| prepare_agent_worker_service(spec).and_then(|_| launch_agent_worker_service(spec)),
+        drain_agent_worker_service,
+    );
+    #[cfg(test)]
+    reconcile_independent_agent_workers_with(
+        state_dir,
+        &store,
+        agent_timestamp_seconds(),
+        |_| Ok(()),
+        |_| Ok(true),
+    )
+}
+
+fn agent_worker_observation_is_stale(raw: Option<&str>, now: u64, timeout_seconds: u64) -> bool {
+    raw.and_then(|value| value.parse::<u64>().ok())
+        .is_none_or(|observed| now.saturating_sub(observed) >= timeout_seconds)
+}
+
+fn reconcile_independent_agent_workers_with(
+    state_dir: &Path,
+    store: &agent_store::TursoAgentStore,
+    now: u64,
+    mut launch_dispatching: impl FnMut(&AgentWorkerLaunchSpec) -> Result<()>,
+    mut drain_worker: impl FnMut(&agent_store::AgentWorkerRecord) -> Result<bool>,
+) -> Result<Vec<agent_store::AgentWorkerRecord>> {
+    let workers = store.list_active_workers_blocking()?;
+    for worker in workers {
+        if worker.protocol_version > AGENT_WORKER_PROTOCOL_VERSION {
+            println!(
+                "Project {}: action=worker_protocol_wait worker_token={} worker_protocol={} scheduler_protocol={} path={}",
+                worker.project_name,
+                worker.worker_token,
+                worker.protocol_version,
+                AGENT_WORKER_PROTOCOL_VERSION,
+                worker.project_path.display()
+            );
+            continue;
+        }
+        let lease = store.lease_for_project_blocking(worker.project_id)?;
+        let owns_lease = lease
+            .as_ref()
+            .is_some_and(|lease| lease.holder == worker.lease_holder);
+        let process_state = worker.worker_pid.and_then(local_process_is_running);
+        let startup_stale = worker.state == AGENT_WORKER_STATE_DISPATCHING
+            && agent_worker_observation_is_stale(
+                Some(&worker.created_at),
+                now,
+                AGENT_WORKER_STARTUP_TIMEOUT_SECONDS,
+            );
+        let heartbeat_stale = matches!(
+            worker.state.as_str(),
+            AGENT_WORKER_STATE_RUNNING | AGENT_WORKER_STATE_FINALIZING
+        ) && agent_worker_observation_is_stale(
+            worker.heartbeat_at.as_deref(),
+            now,
+            AGENT_WORKER_HEARTBEAT_TIMEOUT_SECONDS,
+        );
+
+        let abandonment_reason = if !owns_lease {
+            if process_state == Some(true) && !heartbeat_stale {
+                println!(
+                    "Project {}: action=worker_fenced_wait worker_token={} worker_pid={} path={}",
+                    worker.project_name,
+                    worker.worker_token,
+                    worker.worker_pid.unwrap_or_default(),
+                    worker.project_path.display()
+                );
+                None
+            } else {
+                Some("Worker no longer owns its project lease".to_string())
+            }
+        } else if startup_stale {
+            Some(format!(
+                "Worker did not claim its durable reservation within {} seconds",
+                AGENT_WORKER_STARTUP_TIMEOUT_SECONDS
+            ))
+        } else if matches!(
+            worker.state.as_str(),
+            AGENT_WORKER_STATE_RUNNING | AGENT_WORKER_STATE_FINALIZING
+        ) && process_state == Some(false)
+        {
+            Some("Worker process exited before durable finalization".to_string())
+        } else if heartbeat_stale {
+            Some(format!(
+                "Worker heartbeat was stale for at least {} seconds",
+                AGENT_WORKER_HEARTBEAT_TIMEOUT_SECONDS
+            ))
+        } else if worker.state == AGENT_WORKER_STATE_RUNNING && worker.worker_pid.is_none() {
+            Some("Running worker is missing its process ID".to_string())
+        } else {
+            None
+        };
+
+        if let Some(reason) = abandonment_reason {
+            let drained = match drain_worker(&worker) {
+                Ok(drained) => drained,
+                Err(error) => {
+                    eprintln!(
+                        "Project {}: action=worker_drain_retry worker_token={} reason=\"{error:#}\" path={}",
+                        worker.project_name,
+                        worker.worker_token,
+                        worker.project_path.display()
+                    );
+                    false
+                }
+            };
+            if !drained {
+                continue;
+            }
+            let permitted_successor_holder = lease
+                .as_ref()
+                .filter(|lease| lease.holder != worker.lease_holder)
+                .map(|lease| lease.holder.as_str());
+            let abandoned = store.abandon_worker_blocking(agent_store::AgentWorkerAbandonment {
+                worker_token: &worker.worker_token,
+                expected_state: &worker.state,
+                expected_worker_pid: worker.worker_pid,
+                expected_heartbeat_at: worker.heartbeat_at.as_deref(),
+                finished_at: &agent_timestamp(),
+                error: &reason,
+                permitted_successor_holder,
+            })?;
+            if abandoned {
+                println!(
+                    "Project {}: action=worker_abandoned worker_token={} reason=\"{}\" path={}",
+                    worker.project_name,
+                    worker.worker_token,
+                    reason,
+                    worker.project_path.display()
+                );
+            }
+            continue;
+        }
+
+        if worker.state == AGENT_WORKER_STATE_DISPATCHING {
+            let task_selection = match AgentTaskSelection::from_label(&worker.task_selection) {
+                Ok(selection) => selection,
+                Err(error) => {
+                    let reason = format!("Invalid durable worker task selection: {error:#}");
+                    if drain_worker(&worker)? {
+                        let _ =
+                            store.abandon_worker_blocking(agent_store::AgentWorkerAbandonment {
+                                worker_token: &worker.worker_token,
+                                expected_state: &worker.state,
+                                expected_worker_pid: worker.worker_pid,
+                                expected_heartbeat_at: worker.heartbeat_at.as_deref(),
+                                finished_at: &agent_timestamp(),
+                                error: &reason,
+                                permitted_successor_holder: None,
+                            })?;
+                    }
+                    continue;
+                }
+            };
+            let spec = AgentWorkerLaunchSpec {
+                state_dir: state_dir.to_path_buf(),
+                executable: worker.binary_path.clone(),
+                worker_token: worker.worker_token.clone(),
+                project_id: worker.project_id,
+                task_selection,
+                resume_session_id: worker.resume_session_id.clone(),
+                service_label: worker.service_label.clone(),
+                command_arguments: Some(
+                    serde_json::from_str::<Vec<String>>(&worker.command_arguments)
+                        .with_context(|| {
+                            format!(
+                                "Failed to read persisted launch arguments for worker {}",
+                                worker.worker_token
+                            )
+                        })?
+                        .into_iter()
+                        .map(OsString::from)
+                        .collect(),
+                ),
+                service_env: AgentServiceEnvironment {
+                    codex_path_override: worker.codex_path.clone(),
+                    path: worker.path_env.clone(),
+                },
+            };
+            if let Err(error) = launch_dispatching(&spec) {
+                eprintln!(
+                    "Project {}: action=worker_dispatch_retry worker_token={} reason=\"{error:#}\" path={}",
+                    worker.project_name,
+                    worker.worker_token,
+                    worker.project_path.display()
+                );
+            }
+        }
+    }
+
+    store.list_active_workers_blocking()
+}
+
+#[cfg(not(test))]
+fn cleanup_terminal_agent_worker_services(
+    state_dir: &Path,
+    store: &agent_store::TursoAgentStore,
+    project_path: Option<&Path>,
+) -> Result<()> {
+    for worker in store.list_terminal_workers_blocking()? {
+        if worker.service_cleaned_at.is_some()
+            || project_path.is_some_and(|path| worker.project_path != path)
+        {
+            continue;
+        }
+        if !drain_agent_worker_service(&worker)? {
+            anyhow::bail!(
+                "Agent worker service {} is still active after its drain request",
+                worker.service_label
+            );
+        }
+        let worker_dir = agent_worker_dir(state_dir, &worker.worker_token);
+        if worker_dir.exists() {
+            fs::remove_dir_all(&worker_dir).with_context(|| {
+                format!("Failed to remove terminal agent worker directory {worker_dir:?}")
+            })?;
+        }
+        store.mark_worker_service_cleaned_blocking(&worker.worker_token, &agent_timestamp())?;
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn drain_agent_worker_service(worker: &agent_store::AgentWorkerRecord) -> Result<bool> {
+    match current_agent_platform() {
+        AgentPlatform::Macos => {
+            let target = format!("{}/{}", launchd_user_domain()?, worker.service_label);
+            if run_service_command_optional("launchctl", &["print", &target])? {
+                let _ = run_service_command_optional("launchctl", &["bootout", &target])?;
+            }
+            Ok(!run_service_command_optional(
+                "launchctl",
+                &["print", &target],
+            )?)
+        }
+        AgentPlatform::Linux => {
+            let _ = run_service_command_optional(
+                "systemctl",
+                &["--user", "stop", &worker.service_label],
+            )?;
+            Ok(!run_service_command_optional(
+                "systemctl",
+                &["--user", "is-active", "--quiet", &worker.service_label],
+            )?)
+        }
+        AgentPlatform::Other => Ok(true),
+    }
 }
 
 fn spawn_agent_daemon_run(
@@ -4971,11 +5860,259 @@ fn spawn_agent_daemon_run(
     }
 }
 
+fn dispatch_independent_agent_worker(
+    state_dir: &Path,
+    executable: &Path,
+    job: AgentRunJob,
+) -> Result<()> {
+    dispatch_independent_agent_worker_with(
+        state_dir,
+        executable,
+        job,
+        resolve_agent_service_environment()?,
+        prepare_agent_worker_service,
+        launch_agent_worker_service,
+    )
+}
+
+fn dispatch_independent_agent_worker_with(
+    state_dir: &Path,
+    executable: &Path,
+    job: AgentRunJob,
+    service_env: AgentServiceEnvironment,
+    prepare_worker: impl FnOnce(&AgentWorkerLaunchSpec) -> Result<()>,
+    launch_worker: impl FnOnce(&AgentWorkerLaunchSpec) -> Result<()>,
+) -> Result<()> {
+    let platform = current_agent_platform();
+    let worker_token = next_agent_worker_token(job.project.id);
+    let service_label = agent_worker_service_label(platform, &worker_token)?;
+    let spec = AgentWorkerLaunchSpec {
+        state_dir: state_dir.to_path_buf(),
+        executable: executable.to_path_buf(),
+        worker_token: worker_token.clone(),
+        project_id: job.project.id,
+        task_selection: job.task_selection,
+        resume_session_id: job.resume_session_id.clone(),
+        service_label,
+        command_arguments: None,
+        service_env,
+    };
+
+    if let Err(error) = prepare_worker(&spec) {
+        release_agent_job_lease_for_shutdown(&job)?;
+        let worker_dir = agent_worker_dir(state_dir, &spec.worker_token);
+        if worker_dir.exists() {
+            let _ = fs::remove_dir_all(worker_dir);
+        }
+        return Err(error).context("Failed to prepare independent agent worker service");
+    }
+
+    let command_arguments = agent_worker_command_arguments(&spec)
+        .into_iter()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let command_arguments = serde_json::to_string(&command_arguments)
+        .context("Failed to serialize independent worker launch arguments")?;
+    let created_at = agent_timestamp();
+    let reservation_result = with_agent_store_at(state_dir, |store| {
+        store.reserve_worker_blocking(agent_store::AgentWorkerReservation {
+            project_id: job.project.id,
+            worker_token: &spec.worker_token,
+            expected_lease_holder: &job.holder,
+            max_active_workers: job.max_global_jobs,
+            protocol_version: AGENT_WORKER_PROTOCOL_VERSION,
+            service_label: &spec.service_label,
+            binary_path: &spec.executable,
+            command_arguments: &command_arguments,
+            path_env: &spec.service_env.path,
+            codex_path: spec.service_env.codex_path_override.as_deref(),
+            task_selection: spec.task_selection.label(),
+            resume_session_id: spec.resume_session_id.as_deref(),
+            created_at: &created_at,
+        })
+    });
+    let reserved = match reservation_result {
+        Ok(reserved) => reserved,
+        Err(error) => {
+            let release_result = release_agent_job_lease_for_shutdown(&job);
+            return match release_result {
+                Ok(()) => Err(error).context("Failed to reserve independent agent worker"),
+                Err(release_error) => Err(error).context(format!(
+                    "Failed to reserve independent agent worker; releasing its scheduler lease also failed: {release_error:#}"
+                )),
+            };
+        }
+    };
+    if !reserved {
+        release_agent_job_lease_for_shutdown(&job)?;
+        anyhow::bail!(
+            "Project {} lost its lease before worker {} could be reserved",
+            job.project.id,
+            spec.worker_token
+        );
+    }
+
+    if let Err(launch_error) = launch_worker(&spec) {
+        let abandoned = with_agent_store_at(state_dir, |store| {
+            store.abandon_worker_blocking(agent_store::AgentWorkerAbandonment {
+                worker_token: &spec.worker_token,
+                expected_state: AGENT_WORKER_STATE_DISPATCHING,
+                expected_worker_pid: None,
+                expected_heartbeat_at: Some(&created_at),
+                finished_at: &agent_timestamp(),
+                error: &format!("Worker service launch failed: {launch_error:#}"),
+                permitted_successor_holder: None,
+            })
+        })?;
+        if abandoned {
+            return Err(launch_error).context("Failed to launch independent agent worker");
+        }
+        println!(
+            "Project {}: action=worker_launch_ambiguous worker_token={} service={} path={}",
+            job.project.name,
+            spec.worker_token,
+            spec.service_label,
+            job.project.path.display()
+        );
+        return Ok(());
+    }
+
+    println!(
+        "Project {}: action=worker_dispatched worker_token={} service={} binary={} path={}",
+        job.project.name,
+        spec.worker_token,
+        spec.service_label,
+        spec.executable.display(),
+        job.project.path.display()
+    );
+    Ok(())
+}
+
+fn validate_agent_worker_token(worker_token: &str) -> Result<()> {
+    if worker_token.is_empty()
+        || !worker_token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        anyhow::bail!("Invalid independent agent worker token");
+    }
+    Ok(())
+}
+
+fn run_independent_agent_worker(
+    state_dir: &Path,
+    project_id: i64,
+    worker_token: &str,
+    task_selection: AgentTaskSelection,
+    resume_session_id: Option<&str>,
+) -> Result<()> {
+    validate_agent_worker_token(worker_token)?;
+    let store = open_agent_store_at(state_dir)?;
+    let reserved = store
+        .list_active_workers_blocking()?
+        .into_iter()
+        .find(|worker| worker.worker_token == worker_token)
+        .with_context(|| format!("Agent worker reservation {worker_token} is no longer active"))?;
+    if reserved.project_id != project_id
+        || reserved.protocol_version != AGENT_WORKER_PROTOCOL_VERSION
+        || reserved.task_selection != task_selection.label()
+        || reserved.resume_session_id.as_deref() != resume_session_id
+        || reserved.lease_holder != agent_worker_lease_holder(worker_token)
+    {
+        anyhow::bail!("Agent worker {worker_token} arguments do not match its durable reservation");
+    }
+
+    let started_at = agent_timestamp();
+    if !store.claim_worker_blocking(worker_token, std::process::id(), &started_at)? {
+        anyhow::bail!("Agent worker {worker_token} lost its startup fence");
+    }
+    let result = (|| -> Result<()> {
+        let project = store
+            .list_projects_blocking()?
+            .into_iter()
+            .find(|project| project.id == project_id)
+            .with_context(|| format!("Registered project {project_id} no longer exists"))?;
+        let scan = scan_agent_project(&project.path);
+        let done_task_contents_before = completed_task_contents(&project.path).unwrap_or_default();
+        let blocked_task_snapshots_before =
+            blocked_task_snapshots(&project.path).unwrap_or_default();
+        let holder = agent_worker_lease_holder(worker_token);
+        let runner = CodexAgentRunner::new_with_worker_token(
+            state_dir.to_path_buf(),
+            Some(worker_token.to_string()),
+        )?;
+        let completion = run_agent_job(
+            AgentRunJob {
+                state_dir: state_dir.to_path_buf(),
+                project,
+                holder,
+                worker_token: Some(worker_token.to_string()),
+                max_global_jobs: agent_max_global_jobs()?,
+                task_selection,
+                resume_session_id: resume_session_id.map(str::to_string),
+                blocked_task_count_before: scan.blocked_task_count(),
+                done_task_contents_before,
+                blocked_task_snapshots_before,
+            },
+            &runner,
+            &new_agent_shutdown_signal(),
+        )?;
+        print_agent_run_completion(&completion)
+    })();
+
+    if let Err(error) = &result {
+        abandon_agent_worker_after_error(state_dir, worker_token, error)?;
+    }
+    result
+}
+
+fn abandon_agent_worker_after_error(
+    state_dir: &Path,
+    worker_token: &str,
+    error: &anyhow::Error,
+) -> Result<()> {
+    let store = open_agent_store_at(state_dir)?;
+    let Some(worker) = store
+        .list_active_workers_blocking()?
+        .into_iter()
+        .find(|worker| worker.worker_token == worker_token)
+    else {
+        return Ok(());
+    };
+    let lease = store.lease_for_project_blocking(worker.project_id)?;
+    let permitted_successor_holder = lease
+        .as_ref()
+        .filter(|lease| lease.holder != worker.lease_holder)
+        .map(|lease| lease.holder.as_str());
+    let abandoned = store.abandon_worker_blocking(agent_store::AgentWorkerAbandonment {
+        worker_token,
+        expected_state: &worker.state,
+        expected_worker_pid: worker.worker_pid,
+        expected_heartbeat_at: worker.heartbeat_at.as_deref(),
+        finished_at: &agent_timestamp(),
+        error: &format!("Independent worker failed: {error:#}"),
+        permitted_successor_holder,
+    })?;
+    if !abandoned {
+        eprintln!(
+            "Agent worker {worker_token} changed ownership before its failure could be recorded"
+        );
+    }
+    Ok(())
+}
+
 fn run_agent_job(
     job: AgentRunJob,
     runner: &dyn AgentRunner,
     shutdown: &AgentShutdownSignal,
 ) -> Result<AgentRunCompletion> {
+    if job.worker_token.is_none() && job.task_selection == AgentTaskSelection::ResumeDoing {
+        with_agent_store_at(&job.state_dir, |store| {
+            store
+                .supersede_abandoned_workers_for_lease_blocking(job.project.id, &job.holder)
+                .map(|_| ())
+        })?;
+    }
     let started_at = agent_timestamp();
     let run_result = runner.run_project(
         &job.project,
@@ -4984,6 +6121,7 @@ fn run_agent_job(
         &job.holder,
         shutdown,
     );
+    renew_agent_job_worker_fence(&job)?;
     let finished_at = agent_timestamp();
 
     let (
@@ -5103,7 +6241,10 @@ fn run_agent_job(
         }
     }
 
+    renew_agent_job_worker_fence(&job)?;
+
     let mut lease_transferred = false;
+    let mut finalization_lease_holder = job.holder.clone();
     let session_lifecycle_result: Result<()> = (|| match control_action {
         Some(AgentSessionControlAction::Stop) => {
             let session_id = codex_session_id
@@ -5149,28 +6290,29 @@ fn run_agent_job(
                     lease_timeout_seconds,
                 )
             })?;
-            let already_ready = if holder.is_none() {
+            let successor_holder = if let Some(holder) = holder {
+                Some(holder)
+            } else {
                 with_agent_store_at(&job.state_dir, |store| {
                     let control = store.session_control_blocking(job.project.id, session_id)?;
                     let lease = store.lease_for_project_blocking(job.project.id)?;
-                    Ok(control.is_some_and(|control| {
-                        control.state == AgentSessionControlState::ReadyInteractive
+                    Ok(control.and_then(|control| {
+                        let holder = control.interactive_holder?;
+                        (control.state == AgentSessionControlState::ReadyInteractive
                             && control.run_token.as_deref() == Some(run_token)
                             && control.child_pid.is_none()
-                            && control.interactive_holder.as_deref().is_some_and(|holder| {
-                                lease.as_ref().is_some_and(|lease| lease.holder == holder)
-                            })
+                            && lease.as_ref().is_some_and(|lease| lease.holder == holder))
+                        .then_some(holder)
                     }))
                 })?
-            } else {
-                false
             };
-            if holder.is_none() && !already_ready {
-                anyhow::bail!(
+            let successor_holder = successor_holder.with_context(|| {
+                format!(
                     "Codex session {session_id} changed before its interactive handoff completed"
-                );
-            }
+                )
+            })?;
             lease_transferred = true;
+            finalization_lease_holder = successor_holder;
             Ok(())
         }
         None => {
@@ -5201,21 +6343,46 @@ fn run_agent_job(
         summary = format!("{summary} Failed to finalize Codex session control: {error:#}");
     }
 
-    let run_record_result = with_agent_store_at(&job.state_dir, |store| {
-        store.record_run_outcome_blocking(agent_store::AgentRunOutcome {
-            project_id: job.project.id,
-            status,
-            started_at: &started_at,
-            finished_at: Some(&finished_at),
-            exit_code,
-            log_dir: log_dir.as_deref(),
-            stdout_path: stdout_path.as_deref(),
-            stderr_path: stderr_path.as_deref(),
-            summary: Some(&summary),
-            codex_session_id: codex_session_id.as_deref(),
+    let run_record_result = if let Some(worker_token) = job.worker_token.as_deref() {
+        with_agent_store_at(&job.state_dir, |store| {
+            store
+                .finalize_worker_blocking(agent_store::AgentWorkerFinalization {
+                    worker_token,
+                    expected_worker_pid: Some(std::process::id()),
+                    expected_lease_holder: &finalization_lease_holder,
+                    status,
+                    finished_at: &finished_at,
+                    exit_code,
+                    log_dir: log_dir.as_deref(),
+                    stdout_path: stdout_path.as_deref(),
+                    stderr_path: stderr_path.as_deref(),
+                    summary: Some(&summary),
+                    codex_session_id: codex_session_id.as_deref(),
+                    error: None,
+                })
+                .and_then(|run_id| {
+                    run_id.with_context(|| {
+                        format!("Agent worker {worker_token} lost its finalization fence")
+                    })
+                })
         })
-    });
-    let release_result = if lease_transferred {
+    } else {
+        with_agent_store_at(&job.state_dir, |store| {
+            store.record_run_outcome_blocking(agent_store::AgentRunOutcome {
+                project_id: job.project.id,
+                status,
+                started_at: &started_at,
+                finished_at: Some(&finished_at),
+                exit_code,
+                log_dir: log_dir.as_deref(),
+                stdout_path: stdout_path.as_deref(),
+                stderr_path: stderr_path.as_deref(),
+                summary: Some(&summary),
+                codex_session_id: codex_session_id.as_deref(),
+            })
+        })
+    };
+    let release_result = if job.worker_token.is_some() || lease_transferred {
         Ok(())
     } else {
         with_agent_store_at(&job.state_dir, |store| {
@@ -5237,6 +6404,25 @@ fn run_agent_job(
         stdout_path,
         stderr_path,
     })
+}
+
+fn renew_agent_job_worker_fence(job: &AgentRunJob) -> Result<()> {
+    let Some(worker_token) = job.worker_token.as_deref() else {
+        return Ok(());
+    };
+    let expires_at = agent_timestamp_after(agent_lease_timeout()?.as_secs());
+    let renewed = with_agent_store_at(&job.state_dir, |store| {
+        store.renew_worker_blocking(
+            worker_token,
+            std::process::id(),
+            &agent_timestamp(),
+            &expires_at,
+        )
+    })?;
+    if !renewed {
+        anyhow::bail!("Agent worker {worker_token} lost its durable ownership fence");
+    }
+    Ok(())
 }
 
 fn attach_codex_session_after_run(
@@ -6088,6 +7274,10 @@ fn automated_agent_process_group_is_running(pid: u32) -> Option<bool> {
 
 impl CodexAgentRunner {
     fn new(state_dir: PathBuf) -> Result<Self> {
+        Self::new_with_worker_token(state_dir, None)
+    }
+
+    fn new_with_worker_token(state_dir: PathBuf, worker_token: Option<String>) -> Result<Self> {
         let lease_timeout = agent_lease_timeout()?;
         Ok(Self {
             state_dir,
@@ -6096,6 +7286,7 @@ impl CodexAgentRunner {
             lease_timeout,
             lease_renew_interval: agent_lease_renew_interval(lease_timeout),
             command: agent_codex_command(),
+            worker_token,
         })
     }
 
@@ -6109,6 +7300,7 @@ impl CodexAgentRunner {
             lease_timeout,
             lease_renew_interval: agent_lease_renew_interval(lease_timeout),
             command,
+            worker_token: None,
         }
     }
 }
@@ -6271,7 +7463,10 @@ impl AgentRunner for CodexAgentRunner {
         fs::create_dir_all(&log_dir)
             .with_context(|| format!("Failed to create agent run log directory {:?}", log_dir))?;
 
-        let run_file_stem = agent_log_file_stem(project.id);
+        let run_file_stem = self
+            .worker_token
+            .clone()
+            .unwrap_or_else(|| agent_log_file_stem(project.id));
         let stdout_path = log_dir.join(format!("{run_file_stem}.out"));
         let stderr_path = log_dir.join(format!("{run_file_stem}.err"));
         let stdout_file = fs::File::create(&stdout_path)
@@ -6529,8 +7724,16 @@ impl AgentRunner for CodexAgentRunner {
             || {
                 if last_lease_renewal.elapsed() >= self.lease_renew_interval {
                     let expires_at = agent_timestamp_after(self.lease_timeout.as_secs());
-                    let renewed =
-                        store.renew_lease_blocking(project.id, lease_holder, &expires_at)?;
+                    let renewed = if let Some(worker_token) = self.worker_token.as_deref() {
+                        store.renew_worker_blocking(
+                            worker_token,
+                            std::process::id(),
+                            &agent_timestamp(),
+                            &expires_at,
+                        )?
+                    } else {
+                        store.renew_lease_blocking(project.id, lease_holder, &expires_at)?
+                    };
                     if !renewed {
                         anyhow::bail!(
                             "Automated Codex lease is no longer held for project {}",
@@ -7973,12 +9176,12 @@ mod agent_store {
     // sleeps and retries while a statement reports that the database is busy.
     const AGENT_DB_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
-    struct AgentMigration {
+    struct AgentMigration<'a> {
         version: i64,
-        statements: &'static [&'static str],
+        statements: &'a [&'static str],
     }
 
-    const AGENT_MIGRATIONS: &[AgentMigration] = &[
+    const AGENT_MIGRATIONS: &[AgentMigration<'static>] = &[
         AgentMigration {
             version: 1,
             statements: &[
@@ -8186,12 +9389,47 @@ mod agent_store {
             version: 14,
             statements: &["ALTER TABLE session_controls ADD COLUMN interactive_launch_token TEXT"],
         },
+        AgentMigration {
+            version: 15,
+            statements: &[
+                "ALTER TABLE runs ADD COLUMN worker_token TEXT",
+                "CREATE UNIQUE INDEX IF NOT EXISTS runs_worker_token_unique
+                    ON runs(worker_token)
+                    WHERE worker_token IS NOT NULL",
+                "CREATE TABLE IF NOT EXISTS agent_workers (
+                    worker_token TEXT PRIMARY KEY,
+                    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    state TEXT NOT NULL,
+                    protocol_version INTEGER NOT NULL,
+                    lease_holder TEXT NOT NULL UNIQUE,
+                    service_label TEXT NOT NULL UNIQUE,
+                    binary_path TEXT NOT NULL,
+                    command_arguments TEXT NOT NULL,
+                    path_env TEXT NOT NULL,
+                    codex_path TEXT,
+                    task_selection TEXT NOT NULL,
+                    resume_session_id TEXT,
+                    worker_pid INTEGER,
+                    created_at TEXT NOT NULL,
+                    started_at TEXT,
+                    heartbeat_at TEXT,
+                    finished_at TEXT,
+                    run_id INTEGER,
+                    error TEXT,
+                    service_cleaned_at TEXT
+                )",
+                "CREATE UNIQUE INDEX IF NOT EXISTS agent_workers_active_project_unique
+                    ON agent_workers(project_id)
+                    WHERE state IN ('dispatching', 'running', 'finalizing')",
+            ],
+        },
     ];
 
     pub(crate) struct TursoAgentStore {
         #[cfg_attr(not(test), allow(dead_code))]
         db_path: PathBuf,
         db: Database,
+        pending_migration_version: Option<i64>,
     }
 
     #[derive(Clone, Debug)]
@@ -8250,6 +9488,77 @@ mod agent_store {
         pub(crate) stderr_path: Option<&'a str>,
         pub(crate) summary: Option<&'a str>,
         pub(crate) codex_session_id: Option<&'a str>,
+    }
+
+    pub(crate) struct AgentWorkerReservation<'a> {
+        pub(crate) project_id: i64,
+        pub(crate) worker_token: &'a str,
+        pub(crate) expected_lease_holder: &'a str,
+        pub(crate) max_active_workers: usize,
+        pub(crate) protocol_version: i64,
+        pub(crate) service_label: &'a str,
+        pub(crate) binary_path: &'a Path,
+        pub(crate) command_arguments: &'a str,
+        pub(crate) path_env: &'a OsStr,
+        pub(crate) codex_path: Option<&'a Path>,
+        pub(crate) task_selection: &'a str,
+        pub(crate) resume_session_id: Option<&'a str>,
+        pub(crate) created_at: &'a str,
+    }
+
+    pub(crate) struct AgentWorkerAbandonment<'a> {
+        pub(crate) worker_token: &'a str,
+        pub(crate) expected_state: &'a str,
+        pub(crate) expected_worker_pid: Option<u32>,
+        pub(crate) expected_heartbeat_at: Option<&'a str>,
+        pub(crate) finished_at: &'a str,
+        pub(crate) error: &'a str,
+        pub(crate) permitted_successor_holder: Option<&'a str>,
+    }
+
+    pub(crate) struct AgentWorkerFinalization<'a> {
+        pub(crate) worker_token: &'a str,
+        pub(crate) expected_worker_pid: Option<u32>,
+        pub(crate) expected_lease_holder: &'a str,
+        pub(crate) status: &'a str,
+        pub(crate) finished_at: &'a str,
+        pub(crate) exit_code: Option<i64>,
+        pub(crate) log_dir: Option<&'a str>,
+        pub(crate) stdout_path: Option<&'a str>,
+        pub(crate) stderr_path: Option<&'a str>,
+        pub(crate) summary: Option<&'a str>,
+        pub(crate) codex_session_id: Option<&'a str>,
+        pub(crate) error: Option<&'a str>,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(crate) struct AgentWorkerRecord {
+        pub(crate) worker_token: String,
+        pub(crate) project_id: i64,
+        pub(crate) project_name: String,
+        pub(crate) project_path: PathBuf,
+        pub(crate) state: String,
+        pub(crate) protocol_version: i64,
+        pub(crate) lease_holder: String,
+        pub(crate) service_label: String,
+        pub(crate) binary_path: PathBuf,
+        pub(crate) command_arguments: String,
+        pub(crate) path_env: OsString,
+        pub(crate) codex_path: Option<PathBuf>,
+        pub(crate) task_selection: String,
+        pub(crate) resume_session_id: Option<String>,
+        pub(crate) worker_pid: Option<u32>,
+        pub(crate) created_at: String,
+        pub(crate) started_at: Option<String>,
+        pub(crate) heartbeat_at: Option<String>,
+        pub(crate) finished_at: Option<String>,
+        pub(crate) run_id: Option<i64>,
+        pub(crate) error: Option<String>,
+        pub(crate) service_cleaned_at: Option<String>,
+    }
+
+    pub(crate) fn worker_lease_holder(worker_token: &str) -> String {
+        format!("clt-worker-{worker_token}")
     }
 
     pub(crate) struct AgentKnownSessionRegistration<'a> {
@@ -8355,9 +9664,39 @@ mod agent_store {
                 .with_context(|| format!("Failed to connect to agent database {:?}", db_path))?;
             configure_agent_connection(&conn).await?;
 
-            apply_migrations(&mut conn).await?;
+            let pending_migration_version = apply_migrations(&mut conn, AGENT_MIGRATIONS).await?;
 
-            Ok(Self { db_path, db })
+            Ok(Self {
+                db_path,
+                db,
+                pending_migration_version,
+            })
+        }
+
+        pub(crate) fn pending_migration_version(&self) -> Option<i64> {
+            self.pending_migration_version
+        }
+
+        #[cfg(test)]
+        pub(crate) fn open_blocking_with_test_migration(
+            state_dir: &Path,
+            version: i64,
+            statement: &'static str,
+        ) -> Result<Self> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(async {
+                    let mut store = Self::open(state_dir).await?;
+                    let mut conn = store.connect().await?;
+                    let statements = [statement];
+                    let migration = AgentMigration {
+                        version,
+                        statements: &statements,
+                    };
+                    store.pending_migration_version =
+                        apply_migrations(&mut conn, std::slice::from_ref(&migration)).await?;
+                    Ok(store)
+                })
         }
 
         async fn connect(&self) -> Result<Connection> {
@@ -8422,9 +9761,42 @@ mod agent_store {
             let mut conn = self.connect().await?;
             let path = project_root.display().to_string();
             let transaction = conn
-                .transaction()
+                .transaction_with_behavior(TransactionBehavior::Immediate)
                 .await
                 .with_context(|| format!("Failed to begin unregistering project {}", path))?;
+            let active_workers = query_count(
+                &transaction,
+                "SELECT COUNT(*)
+                   FROM agent_workers
+                  WHERE project_id = (SELECT id FROM projects WHERE path = ?1)
+                    AND state IN ('dispatching', 'running', 'finalizing')",
+                [path.as_str()],
+            )
+            .await?;
+            if active_workers > 0 {
+                anyhow::bail!(
+                    "Cannot unregister project {path} while {active_workers} independent worker(s) are active"
+                );
+            }
+            let active_leases = query_count(
+                &transaction,
+                "SELECT COUNT(*)
+                   FROM leases
+                  WHERE project_id = (SELECT id FROM projects WHERE path = ?1)",
+                [path.as_str()],
+            )
+            .await?;
+            if active_leases > 0 {
+                anyhow::bail!("Cannot unregister project {path} while its agent lease is active");
+            }
+            transaction
+                .execute(
+                    "DELETE FROM agent_workers
+                     WHERE project_id = (SELECT id FROM projects WHERE path = ?1)",
+                    [path.as_str()],
+                )
+                .await
+                .with_context(|| format!("Failed to remove worker history for project {path}"))?;
             transaction
                 .execute(
                     "DELETE FROM runs
@@ -8555,7 +9927,14 @@ mod agent_store {
             let conn = self.connect().await?;
 
             conn.execute(
-                "DELETE FROM leases WHERE project_id = ?1 AND expires_at <= ?2",
+                "DELETE FROM leases
+                  WHERE project_id = ?1 AND expires_at <= ?2
+                    AND NOT EXISTS (
+                        SELECT 1 FROM agent_workers w
+                         WHERE w.project_id = leases.project_id
+                           AND w.lease_holder = leases.holder
+                           AND w.state IN ('dispatching', 'running', 'finalizing')
+                    )",
                 params![project_id, acquired_at],
             )
             .await
@@ -8631,6 +10010,763 @@ mod agent_store {
             Ok(removed > 0)
         }
 
+        pub(crate) fn reserve_worker_blocking(
+            &self,
+            reservation: AgentWorkerReservation<'_>,
+        ) -> Result<bool> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(self.reserve_worker(reservation))
+        }
+
+        async fn reserve_worker(&self, reservation: AgentWorkerReservation<'_>) -> Result<bool> {
+            let AgentWorkerReservation {
+                project_id,
+                worker_token,
+                expected_lease_holder,
+                max_active_workers,
+                protocol_version,
+                service_label,
+                binary_path,
+                command_arguments,
+                path_env,
+                codex_path,
+                task_selection,
+                resume_session_id,
+                created_at,
+            } = reservation;
+            let lease_holder = worker_lease_holder(worker_token);
+            let codex_path = codex_path.map(|path| path.to_string_lossy().into_owned());
+            let mut conn = self.connect().await?;
+            let transaction = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .await
+                .with_context(|| {
+                    format!("Failed to begin worker reservation for project {project_id}")
+                })?;
+
+            let max_active_workers = i64::try_from(max_active_workers)
+                .context("Maximum active worker count is outside the supported range")?;
+            if max_active_workers <= 0
+                || query_count(
+                    &transaction,
+                    "SELECT COUNT(*) FROM agent_workers
+                      WHERE state IN ('dispatching', 'running', 'finalizing')",
+                    (),
+                )
+                .await?
+                    >= max_active_workers
+            {
+                return Ok(false);
+            }
+
+            let inserted = transaction
+                .execute(
+                    "INSERT OR IGNORE INTO agent_workers (
+                        worker_token, project_id, state, protocol_version, lease_holder, service_label,
+                        binary_path, command_arguments, path_env, codex_path,
+                        task_selection, resume_session_id, worker_pid,
+                        created_at, started_at, heartbeat_at, finished_at, run_id, error,
+                        service_cleaned_at
+                     ) VALUES (?1, ?2, 'dispatching', ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+                               ?10, ?11, NULL, ?12, NULL, ?12, NULL, NULL, NULL, NULL)",
+                    params![
+                        worker_token,
+                        project_id,
+                        protocol_version,
+                        lease_holder.as_str(),
+                        service_label,
+                        binary_path.to_string_lossy().as_ref(),
+                        command_arguments,
+                        path_env.to_string_lossy().as_ref(),
+                        codex_path.as_deref(),
+                        task_selection,
+                        resume_session_id,
+                        created_at,
+                    ],
+                )
+                .await
+                .with_context(|| {
+                    format!("Failed to reserve worker {worker_token} for project {project_id}")
+                })?;
+            if inserted != 1 {
+                return Ok(false);
+            }
+
+            let transferred = transaction
+                .execute(
+                    "UPDATE leases
+                        SET holder = ?1
+                      WHERE project_id = ?2 AND holder = ?3",
+                    params![lease_holder.as_str(), project_id, expected_lease_holder],
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to transfer project {project_id} lease to worker {worker_token}"
+                    )
+                })?;
+            if transferred != 1 {
+                return Ok(false);
+            }
+
+            transaction
+                .execute(
+                    "UPDATE agent_workers
+                        SET state = 'superseded'
+                      WHERE project_id = ?1 AND state = 'abandoned'
+                        AND worker_token <> ?2",
+                    params![project_id, worker_token],
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to supersede earlier abandoned workers for project {project_id}"
+                    )
+                })?;
+
+            transaction
+                .commit()
+                .await
+                .with_context(|| format!("Failed to commit worker {worker_token} reservation"))?;
+            Ok(true)
+        }
+
+        pub(crate) fn claim_worker_blocking(
+            &self,
+            worker_token: &str,
+            worker_pid: u32,
+            started_at: &str,
+        ) -> Result<bool> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(self.claim_worker(worker_token, worker_pid, started_at))
+        }
+
+        async fn claim_worker(
+            &self,
+            worker_token: &str,
+            worker_pid: u32,
+            started_at: &str,
+        ) -> Result<bool> {
+            let mut conn = self.connect().await?;
+            let transaction = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .await
+                .with_context(|| format!("Failed to begin worker {worker_token} claim"))?;
+            let changed = transaction
+                .execute(
+                    "UPDATE agent_workers
+                        SET state = 'running', worker_pid = ?1, started_at = ?2,
+                            heartbeat_at = ?2, error = NULL
+                      WHERE worker_token = ?3 AND state = 'dispatching'
+                        AND EXISTS (
+                            SELECT 1 FROM leases
+                             WHERE leases.project_id = agent_workers.project_id
+                               AND leases.holder = agent_workers.lease_holder
+                        )",
+                    params![i64::from(worker_pid), started_at, worker_token],
+                )
+                .await
+                .with_context(|| format!("Failed to claim worker {worker_token}"))?;
+            if changed == 1 {
+                transaction
+                    .commit()
+                    .await
+                    .with_context(|| format!("Failed to commit worker {worker_token} claim"))?;
+                return Ok(true);
+            }
+
+            let already_claimed = query_count(
+                &transaction,
+                "SELECT COUNT(*)
+                   FROM agent_workers w
+                   JOIN leases l
+                     ON l.project_id = w.project_id AND l.holder = w.lease_holder
+                  WHERE w.worker_token = ?1 AND w.state = 'running' AND w.worker_pid = ?2",
+                params![worker_token, i64::from(worker_pid)],
+            )
+            .await?
+                == 1;
+            transaction.commit().await.with_context(|| {
+                format!("Failed to finish idempotent worker {worker_token} claim")
+            })?;
+            Ok(already_claimed)
+        }
+
+        pub(crate) fn renew_worker_blocking(
+            &self,
+            worker_token: &str,
+            worker_pid: u32,
+            heartbeat_at: &str,
+            lease_expires_at: &str,
+        ) -> Result<bool> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(self.renew_worker(
+                    worker_token,
+                    worker_pid,
+                    heartbeat_at,
+                    lease_expires_at,
+                ))
+        }
+
+        async fn renew_worker(
+            &self,
+            worker_token: &str,
+            worker_pid: u32,
+            heartbeat_at: &str,
+            lease_expires_at: &str,
+        ) -> Result<bool> {
+            let mut conn = self.connect().await?;
+            let transaction = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .await
+                .with_context(|| format!("Failed to begin worker {worker_token} heartbeat"))?;
+            let worker_changed = transaction
+                .execute(
+                    "UPDATE agent_workers
+                        SET heartbeat_at = ?1
+                      WHERE worker_token = ?2 AND state = 'running' AND worker_pid = ?3
+                        AND EXISTS (
+                            SELECT 1 FROM leases
+                             WHERE leases.project_id = agent_workers.project_id
+                               AND leases.holder = agent_workers.lease_holder
+                        )",
+                    params![heartbeat_at, worker_token, i64::from(worker_pid)],
+                )
+                .await
+                .with_context(|| format!("Failed to update worker {worker_token} heartbeat"))?;
+            if worker_changed != 1 {
+                return Ok(false);
+            }
+
+            let lease_changed = transaction
+                .execute(
+                    "UPDATE leases
+                        SET expires_at = ?1
+                      WHERE project_id = (
+                                SELECT project_id FROM agent_workers WHERE worker_token = ?2
+                            )
+                        AND holder = (
+                                SELECT lease_holder FROM agent_workers WHERE worker_token = ?2
+                            )",
+                    params![lease_expires_at, worker_token],
+                )
+                .await
+                .with_context(|| format!("Failed to renew worker {worker_token} lease"))?;
+            if lease_changed != 1 {
+                return Ok(false);
+            }
+
+            transaction
+                .commit()
+                .await
+                .with_context(|| format!("Failed to commit worker {worker_token} heartbeat"))?;
+            Ok(true)
+        }
+
+        pub(crate) fn list_active_workers_blocking(&self) -> Result<Vec<AgentWorkerRecord>> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(self.list_active_workers())
+        }
+
+        async fn list_active_workers(&self) -> Result<Vec<AgentWorkerRecord>> {
+            self.list_workers_by_terminal_state(false).await
+        }
+
+        pub(crate) fn list_terminal_workers_blocking(&self) -> Result<Vec<AgentWorkerRecord>> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(self.list_terminal_workers())
+        }
+
+        pub(crate) fn supersede_abandoned_workers_for_lease_blocking(
+            &self,
+            project_id: i64,
+            expected_lease_holder: &str,
+        ) -> Result<u64> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(async {
+                    let conn = self.connect().await?;
+                    conn.execute(
+                        "UPDATE agent_workers
+                            SET state = 'superseded'
+                          WHERE project_id = ?1 AND state = 'abandoned'
+                            AND EXISTS (
+                                SELECT 1 FROM leases
+                                 WHERE leases.project_id = agent_workers.project_id
+                                   AND leases.holder = ?2
+                            )",
+                        params![project_id, expected_lease_holder],
+                    )
+                    .await
+                    .with_context(|| {
+                        format!("Failed to supersede abandoned workers for project {project_id}")
+                    })
+                })
+        }
+
+        async fn list_terminal_workers(&self) -> Result<Vec<AgentWorkerRecord>> {
+            self.list_workers_by_terminal_state(true).await
+        }
+
+        #[cfg_attr(test, allow(dead_code))]
+        pub(crate) fn mark_worker_service_cleaned_blocking(
+            &self,
+            worker_token: &str,
+            cleaned_at: &str,
+        ) -> Result<bool> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(async {
+                    let conn = self.connect().await?;
+                    let changed = conn
+                        .execute(
+                            "UPDATE agent_workers
+                                SET service_cleaned_at = ?1
+                              WHERE worker_token = ?2
+                                AND state NOT IN ('dispatching', 'running', 'finalizing')",
+                            params![cleaned_at, worker_token],
+                        )
+                        .await
+                        .with_context(|| {
+                            format!("Failed to mark worker {worker_token} service metadata cleaned")
+                        })?;
+                    Ok(changed == 1)
+                })
+        }
+
+        async fn list_workers_by_terminal_state(
+            &self,
+            terminal: bool,
+        ) -> Result<Vec<AgentWorkerRecord>> {
+            let conn = self.connect().await?;
+            let states = if terminal {
+                "NOT IN ('dispatching', 'running', 'finalizing')"
+            } else {
+                "IN ('dispatching', 'running', 'finalizing')"
+            };
+            let sql = format!(
+                "SELECT w.worker_token, w.project_id, p.name, p.path, w.state,
+                        w.protocol_version, w.lease_holder, w.service_label, w.binary_path,
+                        w.command_arguments, w.path_env, w.codex_path, w.task_selection,
+                        w.resume_session_id, w.worker_pid, w.created_at, w.started_at,
+                        w.heartbeat_at, w.finished_at, w.run_id, w.error, w.service_cleaned_at
+                   FROM agent_workers w
+                   JOIN projects p ON p.id = w.project_id
+                  WHERE w.state {states}
+                  ORDER BY CAST(w.created_at AS INTEGER), w.worker_token"
+            );
+            let mut rows = conn.query(&sql, ()).await.with_context(|| {
+                if terminal {
+                    "Failed to list terminal agent workers"
+                } else {
+                    "Failed to list active agent workers"
+                }
+            })?;
+            let mut workers = Vec::new();
+            while let Some(row) = rows
+                .next()
+                .await
+                .context("Failed to read agent worker row")?
+            {
+                let worker_pid = row_optional_integer(&row, 14, "worker_pid")?
+                    .map(u32::try_from)
+                    .transpose()
+                    .context("Agent worker PID is outside the supported range")?;
+                workers.push(AgentWorkerRecord {
+                    worker_token: row_text(&row, 0, "worker_token")?,
+                    project_id: row_integer(&row, 1, "project_id")?,
+                    project_name: row_text(&row, 2, "name")?,
+                    project_path: PathBuf::from(row_text(&row, 3, "path")?),
+                    state: row_text(&row, 4, "state")?,
+                    protocol_version: row_integer(&row, 5, "protocol_version")?,
+                    lease_holder: row_text(&row, 6, "lease_holder")?,
+                    service_label: row_text(&row, 7, "service_label")?,
+                    binary_path: PathBuf::from(row_text(&row, 8, "binary_path")?),
+                    command_arguments: row_text(&row, 9, "command_arguments")?,
+                    path_env: OsString::from(row_text(&row, 10, "path_env")?),
+                    codex_path: row_optional_text(&row, 11, "codex_path")?.map(PathBuf::from),
+                    task_selection: row_text(&row, 12, "task_selection")?,
+                    resume_session_id: row_optional_text(&row, 13, "resume_session_id")?,
+                    worker_pid,
+                    created_at: row_text(&row, 15, "created_at")?,
+                    started_at: row_optional_text(&row, 16, "started_at")?,
+                    heartbeat_at: row_optional_text(&row, 17, "heartbeat_at")?,
+                    finished_at: row_optional_text(&row, 18, "finished_at")?,
+                    run_id: row_optional_integer(&row, 19, "run_id")?,
+                    error: row_optional_text(&row, 20, "error")?,
+                    service_cleaned_at: row_optional_text(&row, 21, "service_cleaned_at")?,
+                });
+            }
+            Ok(workers)
+        }
+
+        pub(crate) fn abandon_worker_blocking(
+            &self,
+            abandonment: AgentWorkerAbandonment<'_>,
+        ) -> Result<bool> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(self.abandon_worker(abandonment))
+        }
+
+        async fn abandon_worker(&self, abandonment: AgentWorkerAbandonment<'_>) -> Result<bool> {
+            let AgentWorkerAbandonment {
+                worker_token,
+                expected_state,
+                expected_worker_pid,
+                expected_heartbeat_at,
+                finished_at,
+                error,
+                permitted_successor_holder,
+            } = abandonment;
+            let mut conn = self.connect().await?;
+            let transaction = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .await
+                .with_context(|| format!("Failed to begin abandoning worker {worker_token}"))?;
+
+            let (project_id, created_at, started_at, worker_lease_holder) = {
+                let mut rows = transaction
+                    .query(
+                        "SELECT project_id, created_at, started_at, lease_holder
+                           FROM agent_workers
+                          WHERE worker_token = ?1 AND state = ?2
+                            AND (worker_pid = ?3 OR (worker_pid IS NULL AND ?3 IS NULL))
+                            AND (heartbeat_at = ?4 OR (heartbeat_at IS NULL AND ?4 IS NULL))",
+                        params![
+                            worker_token,
+                            expected_state,
+                            expected_worker_pid.map(i64::from),
+                            expected_heartbeat_at,
+                        ],
+                    )
+                    .await
+                    .with_context(|| format!("Failed to inspect worker {worker_token}"))?;
+                let Some(row) = rows
+                    .next()
+                    .await
+                    .context("Failed to read worker abandonment row")?
+                else {
+                    return Ok(false);
+                };
+                (
+                    row_integer(&row, 0, "project_id")?,
+                    row_text(&row, 1, "created_at")?,
+                    row_optional_text(&row, 2, "started_at")?,
+                    row_text(&row, 3, "lease_holder")?,
+                )
+            };
+            let observed_lease_holder = {
+                let mut rows = transaction
+                    .query(
+                        "SELECT holder FROM leases WHERE project_id = ?1",
+                        [project_id],
+                    )
+                    .await
+                    .with_context(|| {
+                        format!("Failed to inspect worker {worker_token} project lease")
+                    })?;
+                rows.next()
+                    .await
+                    .context("Failed to read worker project lease")?
+                    .map(|row| row_text(&row, 0, "holder"))
+                    .transpose()?
+            };
+            let preserve_successor_lease = match observed_lease_holder.as_deref() {
+                None => false,
+                Some(holder) if holder == worker_lease_holder => false,
+                Some(holder) if permitted_successor_holder == Some(holder) => true,
+                Some(_) => return Ok(false),
+            };
+            if observed_lease_holder.is_some()
+                && observed_lease_holder.as_deref() != Some(worker_lease_holder.as_str())
+                && !preserve_successor_lease
+            {
+                return Ok(false);
+            }
+
+            let run_started_at = started_at.as_deref().unwrap_or(created_at.as_str());
+            let outcome = AgentRunOutcome {
+                project_id,
+                status: "failure",
+                started_at: run_started_at,
+                finished_at: Some(finished_at),
+                exit_code: None,
+                log_dir: None,
+                stdout_path: None,
+                stderr_path: None,
+                summary: Some(error),
+                codex_session_id: None,
+            };
+            let inserted = transaction
+                .execute(
+                    "INSERT OR IGNORE INTO runs (
+                        project_id, status, started_at, finished_at, exit_code,
+                        log_dir, stdout_path, stderr_path, summary, codex_session_id,
+                        worker_token
+                     ) VALUES (?1, ?2, ?3, ?4, NULL, NULL, NULL, NULL, ?5, NULL, ?6)",
+                    params![
+                        project_id,
+                        outcome.status,
+                        outcome.started_at,
+                        outcome.finished_at,
+                        error,
+                        worker_token,
+                    ],
+                )
+                .await
+                .with_context(|| format!("Failed to record abandoned worker {worker_token}"))?;
+            let run_id = if inserted == 1 {
+                let run_id = query_count(&transaction, "SELECT last_insert_rowid()", ()).await?;
+                update_project_after_run(&transaction, &outcome).await?;
+                run_id
+            } else {
+                query_count(
+                    &transaction,
+                    "SELECT id FROM runs WHERE worker_token = ?1 AND project_id = ?2",
+                    params![worker_token, project_id],
+                )
+                .await?
+            };
+            let changed = transaction
+                .execute(
+                    "UPDATE agent_workers
+                        SET state = 'abandoned', finished_at = ?1, error = ?2, run_id = ?3
+                      WHERE worker_token = ?4 AND state = ?5
+                        AND (worker_pid = ?6 OR (worker_pid IS NULL AND ?6 IS NULL))
+                        AND (
+                            heartbeat_at = ?7
+                            OR (heartbeat_at IS NULL AND ?7 IS NULL)
+                        )",
+                    params![
+                        finished_at,
+                        error,
+                        run_id,
+                        worker_token,
+                        expected_state,
+                        expected_worker_pid.map(i64::from),
+                        expected_heartbeat_at,
+                    ],
+                )
+                .await
+                .with_context(|| format!("Failed to abandon worker {worker_token}"))?;
+            if changed != 1 {
+                return Ok(false);
+            }
+
+            if observed_lease_holder.as_deref() == Some(worker_lease_holder.as_str()) {
+                let released = transaction
+                    .execute(
+                        "DELETE FROM leases WHERE project_id = ?1 AND holder = ?2",
+                        params![project_id, worker_lease_holder.as_str()],
+                    )
+                    .await
+                    .with_context(|| {
+                        format!("Failed to release abandoned worker {worker_token} lease")
+                    })?;
+                if released != 1 {
+                    return Ok(false);
+                }
+            }
+
+            transaction
+                .commit()
+                .await
+                .with_context(|| format!("Failed to commit abandoned worker {worker_token}"))?;
+            Ok(true)
+        }
+
+        pub(crate) fn finalize_worker_blocking(
+            &self,
+            finalization: AgentWorkerFinalization<'_>,
+        ) -> Result<Option<i64>> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(self.finalize_worker(finalization))
+        }
+
+        async fn finalize_worker(
+            &self,
+            finalization: AgentWorkerFinalization<'_>,
+        ) -> Result<Option<i64>> {
+            let AgentWorkerFinalization {
+                worker_token,
+                expected_worker_pid,
+                expected_lease_holder,
+                status,
+                finished_at,
+                exit_code,
+                log_dir,
+                stdout_path,
+                stderr_path,
+                summary,
+                codex_session_id,
+                error,
+            } = finalization;
+            let mut conn = self.connect().await?;
+            let transaction = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .await
+                .with_context(|| format!("Failed to begin finalizing worker {worker_token}"))?;
+            let (project_id, state, observed_worker_pid, created_at, started_at, existing_run_id) = {
+                let mut rows = transaction
+                    .query(
+                        "SELECT project_id, state, worker_pid, created_at, started_at, run_id
+                           FROM agent_workers
+                          WHERE worker_token = ?1",
+                        [worker_token],
+                    )
+                    .await
+                    .with_context(|| {
+                        format!("Failed to read worker {worker_token} for finalization")
+                    })?;
+                let Some(row) = rows
+                    .next()
+                    .await
+                    .context("Failed to read worker finalization row")?
+                else {
+                    return Ok(None);
+                };
+                (
+                    row_integer(&row, 0, "project_id")?,
+                    row_text(&row, 1, "state")?,
+                    row_optional_integer(&row, 2, "worker_pid")?,
+                    row_text(&row, 3, "created_at")?,
+                    row_optional_text(&row, 4, "started_at")?,
+                    row_optional_integer(&row, 5, "run_id")?,
+                )
+            };
+            if state == "completed" {
+                transaction.commit().await.with_context(|| {
+                    format!("Failed to finish idempotent worker {worker_token} finalization")
+                })?;
+                return existing_run_id
+                    .map(Some)
+                    .context("Completed agent worker is missing its run ID");
+            }
+            if !matches!(state.as_str(), "dispatching" | "running" | "finalizing")
+                || observed_worker_pid != expected_worker_pid.map(i64::from)
+            {
+                return Ok(None);
+            }
+            if query_count(
+                &transaction,
+                "SELECT COUNT(*) FROM leases WHERE project_id = ?1 AND holder = ?2",
+                params![project_id, expected_lease_holder],
+            )
+            .await?
+                != 1
+            {
+                return Ok(None);
+            }
+
+            let claimed = transaction
+                .execute(
+                    "UPDATE agent_workers
+                        SET state = 'finalizing'
+                      WHERE worker_token = ?1 AND state = ?2
+                        AND (worker_pid = ?3 OR (worker_pid IS NULL AND ?3 IS NULL))",
+                    params![
+                        worker_token,
+                        state.as_str(),
+                        expected_worker_pid.map(i64::from)
+                    ],
+                )
+                .await
+                .with_context(|| format!("Failed to claim worker {worker_token} finalization"))?;
+            if claimed != 1 {
+                return Ok(None);
+            }
+
+            let run_started_at = started_at.as_deref().unwrap_or(created_at.as_str());
+            let outcome = AgentRunOutcome {
+                project_id,
+                status,
+                started_at: run_started_at,
+                finished_at: Some(finished_at),
+                exit_code,
+                log_dir,
+                stdout_path,
+                stderr_path,
+                summary,
+                codex_session_id,
+            };
+            let inserted = transaction
+                .execute(
+                    "INSERT OR IGNORE INTO runs (
+                        project_id, status, started_at, finished_at, exit_code,
+                        log_dir, stdout_path, stderr_path, summary, codex_session_id,
+                        worker_token
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    params![
+                        outcome.project_id,
+                        outcome.status,
+                        outcome.started_at,
+                        outcome.finished_at,
+                        outcome.exit_code,
+                        outcome.log_dir,
+                        outcome.stdout_path,
+                        outcome.stderr_path,
+                        outcome.summary,
+                        outcome.codex_session_id,
+                        worker_token,
+                    ],
+                )
+                .await
+                .with_context(|| format!("Failed to record run for worker {worker_token}"))?;
+            let run_id = if inserted == 1 {
+                let run_id = query_count(&transaction, "SELECT last_insert_rowid()", ()).await?;
+                update_project_after_run(&transaction, &outcome).await?;
+                run_id
+            } else {
+                query_count(
+                    &transaction,
+                    "SELECT id FROM runs WHERE worker_token = ?1 AND project_id = ?2",
+                    params![worker_token, project_id],
+                )
+                .await
+                .with_context(|| {
+                    format!("Failed to reuse the existing run for worker {worker_token}")
+                })?
+            };
+
+            let completed = transaction
+                .execute(
+                    "UPDATE agent_workers
+                        SET state = 'completed', finished_at = ?1, run_id = ?2, error = ?3
+                      WHERE worker_token = ?4 AND state = 'finalizing'",
+                    params![finished_at, run_id, error, worker_token],
+                )
+                .await
+                .with_context(|| format!("Failed to complete worker {worker_token}"))?;
+            if completed != 1 {
+                return Ok(None);
+            }
+            transaction
+                .execute(
+                    "DELETE FROM leases
+                      WHERE project_id = ?1
+                        AND holder = (
+                                SELECT lease_holder FROM agent_workers WHERE worker_token = ?2
+                            )",
+                    params![project_id, worker_token],
+                )
+                .await
+                .with_context(|| {
+                    format!("Failed to release completed worker {worker_token} lease")
+                })?;
+            transaction
+                .commit()
+                .await
+                .with_context(|| format!("Failed to commit worker {worker_token} finalization"))?;
+            Ok(Some(run_id))
+        }
+
         pub(crate) fn mark_session_running_blocking(
             &self,
             project_id: i64,
@@ -8661,8 +10797,55 @@ mod agent_store {
             stdout_path: &Path,
             stderr_path: &Path,
         ) -> Result<()> {
-            let conn = self.connect().await?;
-            conn.execute(
+            let mut conn = self.connect().await?;
+            let transaction = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to begin registering Codex session {codex_session_id} for project {project_id}"
+                    )
+                })?;
+            let known_worker = query_count(
+                &transaction,
+                "SELECT COUNT(*) FROM agent_workers WHERE worker_token = ?1",
+                [run_token],
+            )
+            .await?
+                == 1;
+            let fenced_worker = query_count(
+                &transaction,
+                "SELECT COUNT(*)
+                   FROM agent_workers w
+                   JOIN leases l
+                     ON l.project_id = w.project_id AND l.holder = w.lease_holder
+                  WHERE w.worker_token = ?1 AND w.project_id = ?2
+                    AND w.state IN ('dispatching', 'running', 'finalizing')",
+                params![run_token, project_id],
+            )
+            .await?
+                == 1;
+            if known_worker && !fenced_worker {
+                anyhow::bail!(
+                    "Codex session {codex_session_id} worker generation no longer owns its lease"
+                );
+            }
+            if fenced_worker
+                && query_count(
+                    &transaction,
+                    "SELECT COUNT(*) FROM session_controls
+                      WHERE project_id = ?1 AND codex_session_id = ?2
+                        AND run_token IS NOT NULL AND run_token <> ?3",
+                    params![project_id, codex_session_id, run_token],
+                )
+                .await?
+                    > 0
+            {
+                anyhow::bail!(
+                    "Codex session {codex_session_id} belongs to a different active run generation"
+                );
+            }
+            let changed = transaction.execute(
                 "INSERT INTO session_controls (
                     project_id, codex_session_id, state, child_pid, run_token,
                     interactive_holder, stdout_path, stderr_path, updated_at
@@ -8699,6 +10882,16 @@ mod agent_store {
             .with_context(|| {
                 format!(
                     "Failed to mark Codex session {codex_session_id} running for project {project_id}"
+                )
+            })?;
+            if changed != 1 {
+                anyhow::bail!(
+                    "Codex session {codex_session_id} belongs to a different active run generation"
+                );
+            }
+            transaction.commit().await.with_context(|| {
+                format!(
+                    "Failed to commit Codex session {codex_session_id} registration for project {project_id}"
                 )
             })?;
             Ok(())
@@ -9753,7 +11946,19 @@ mod agent_store {
                                     interactive_holder = NULL,
                                     interactive_launch_token = NULL, updated_at = ?1
                               WHERE project_id = ?2 AND codex_session_id = ?3
-                                AND state = 'stop_requested' AND run_token = ?4",
+                                AND state = 'stop_requested' AND run_token = ?4
+                                AND (
+                                    NOT EXISTS (
+                                        SELECT 1 FROM agent_workers WHERE worker_token = ?4
+                                    )
+                                    OR EXISTS (
+                                        SELECT 1 FROM agent_workers w
+                                        JOIN leases l ON l.project_id = w.project_id
+                                                     AND l.holder = w.lease_holder
+                                        WHERE w.worker_token = ?4 AND w.project_id = ?2
+                                          AND w.state IN ('dispatching', 'running', 'finalizing')
+                                    )
+                                )",
                             params![agent_timestamp(), project_id, codex_session_id, run_token],
                         )
                         .await
@@ -10121,8 +12326,52 @@ mod agent_store {
             tokio::runtime::Runtime::new()
                 .context("Failed to create async runtime for agent store")?
                 .block_on(async {
-            let conn = self.connect().await?;
-                    let removed = conn
+                    let mut conn = self.connect().await?;
+                    let transaction = conn
+                        .transaction_with_behavior(TransactionBehavior::Immediate)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "Failed to begin clearing Codex session {codex_session_id} for project {project_id}"
+                            )
+                        })?;
+                    if run_token.is_none()
+                        && query_count(
+                            &transaction,
+                            "SELECT COUNT(*) FROM agent_workers
+                              WHERE project_id = ?1
+                                AND state IN ('dispatching', 'running', 'finalizing')",
+                            [project_id],
+                        )
+                        .await?
+                            > 0
+                    {
+                        return Ok(false);
+                    }
+                    if let Some(run_token) = run_token {
+                        let known_worker = query_count(
+                            &transaction,
+                            "SELECT COUNT(*) FROM agent_workers WHERE worker_token = ?1",
+                            [run_token],
+                        )
+                        .await?
+                            == 1;
+                        let fenced_worker = query_count(
+                            &transaction,
+                            "SELECT COUNT(*) FROM agent_workers w
+                              JOIN leases l ON l.project_id = w.project_id
+                                           AND l.holder = w.lease_holder
+                             WHERE w.worker_token = ?1 AND w.project_id = ?2
+                               AND w.state IN ('dispatching', 'running', 'finalizing')",
+                            params![run_token, project_id],
+                        )
+                        .await?
+                            == 1;
+                        if known_worker && !fenced_worker {
+                            return Ok(false);
+                        }
+                    }
+                    let removed = transaction
                         .execute(
                             "DELETE FROM session_controls
                               WHERE project_id = ?1 AND codex_session_id = ?2 AND state = 'running'
@@ -10135,6 +12384,11 @@ mod agent_store {
                                 "Failed to clear running Codex session {codex_session_id} for project {project_id}"
                             )
                         })?;
+                    transaction.commit().await.with_context(|| {
+                        format!(
+                            "Failed to commit clearing Codex session {codex_session_id} for project {project_id}"
+                        )
+                    })?;
                     Ok(removed > 0)
                 })
         }
@@ -10510,9 +12764,35 @@ mod agent_store {
         }
 
         async fn clean_agent_history(&self, cleaned_at: &str) -> Result<AgentCleanSummary> {
-            let conn = self.connect().await?;
+            let mut conn = self.connect().await?;
+            let transaction = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .await
+                .context("Failed to begin cleaning agent history")?;
+            if query_count(
+                &transaction,
+                "SELECT COUNT(*) FROM agent_workers
+                  WHERE state IN ('dispatching', 'running', 'finalizing')",
+                (),
+            )
+            .await?
+                > 0
+            {
+                anyhow::bail!("Cannot clean agent history while independent workers are active");
+            }
+            if query_count(
+                &transaction,
+                "SELECT COUNT(*) FROM leases
+                  WHERE CAST(expires_at AS INTEGER) > CAST(?1 AS INTEGER)",
+                [cleaned_at],
+            )
+            .await?
+                > 0
+            {
+                anyhow::bail!("Cannot clean agent history while project leases are active");
+            }
 
-            let projects_reset = conn
+            let projects_reset = transaction
                 .execute(
                     "UPDATE projects
                      SET failure_count = 0,
@@ -10526,18 +12806,26 @@ mod agent_store {
                 )
                 .await
                 .context("Failed to reset agent project failure state")?;
-            let runs_deleted = conn
+            transaction
+                .execute("DELETE FROM agent_workers", ())
+                .await
+                .context("Failed to delete terminal agent worker records")?;
+            let runs_deleted = transaction
                 .execute("DELETE FROM runs", ())
                 .await
                 .context("Failed to delete agent run records")?;
-            let leases_deleted = conn
+            let leases_deleted = transaction
                 .execute("DELETE FROM leases", ())
                 .await
                 .context("Failed to delete agent leases")?;
-            let daemon_checkins_deleted = conn
+            let daemon_checkins_deleted = transaction
                 .execute("DELETE FROM daemon_checkins", ())
                 .await
                 .context("Failed to delete agent daemon check-ins")?;
+            transaction
+                .commit()
+                .await
+                .context("Failed to commit cleaned agent history")?;
 
             Ok(AgentCleanSummary {
                 projects_reset,
@@ -10552,6 +12840,19 @@ mod agent_store {
         #[cfg(test)]
         pub(crate) fn db_path(&self) -> &Path {
             &self.db_path
+        }
+
+        #[cfg(test)]
+        pub(crate) fn worker_schema_migration_deferred_blocking(
+            &self,
+            migration_version: i64,
+        ) -> Result<bool> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(async {
+                    let conn = self.connect().await?;
+                    worker_schema_migration_is_deferred(&conn, migration_version).await
+                })
         }
 
         #[cfg(test)]
@@ -11281,7 +13582,10 @@ mod agent_store {
         Ok(())
     }
 
-    async fn apply_migrations(conn: &mut Connection) -> Result<()> {
+    async fn apply_migrations(
+        conn: &mut Connection,
+        migrations: &[AgentMigration<'_>],
+    ) -> Result<Option<i64>> {
         conn.execute("PRAGMA foreign_keys = ON", ())
             .await
             .context("Failed to enable agent database foreign keys")?;
@@ -11295,7 +13599,7 @@ mod agent_store {
         .await
         .context("Failed to initialize agent schema migrations table")?;
 
-        for migration in AGENT_MIGRATIONS {
+        for migration in migrations {
             let transaction = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .await
@@ -11313,6 +13617,16 @@ mod agent_store {
                     )
                 })?;
                 continue;
+            }
+
+            if worker_schema_migration_is_deferred(&transaction, migration.version).await? {
+                transaction.commit().await.with_context(|| {
+                    format!(
+                        "Failed to defer agent migration {} while workers are active",
+                        migration.version
+                    )
+                })?;
+                return Ok(Some(migration.version));
             }
 
             for statement in migration.statements {
@@ -11338,7 +13652,33 @@ mod agent_store {
             })?;
         }
 
-        Ok(())
+        Ok(None)
+    }
+
+    async fn worker_schema_migration_is_deferred(
+        conn: &Connection,
+        migration_version: i64,
+    ) -> Result<bool> {
+        if migration_version <= AGENT_WORKER_SHARED_SCHEMA_VERSION {
+            return Ok(false);
+        }
+        let worker_table_exists = query_count(
+            conn,
+            "SELECT COUNT(*) FROM sqlite_schema
+              WHERE type = 'table' AND name = 'agent_workers'",
+            (),
+        )
+        .await?
+            > 0;
+        Ok(worker_table_exists
+            && query_count(
+                conn,
+                "SELECT COUNT(*) FROM agent_workers
+                  WHERE state IN ('dispatching', 'running', 'finalizing')",
+                (),
+            )
+            .await?
+                > 0)
     }
 
     async fn migration_applied(conn: &Connection, version: i64) -> Result<bool> {
@@ -15175,7 +17515,10 @@ fn remove_tui_agent_project(
     active_root: &Path,
     removal: &TuiAgentProjectRemoval,
 ) -> Result<String> {
-    let store = open_agent_store()?;
+    let state_dir = ensure_agent_state_dir()?;
+    let store = open_agent_store_at(&state_dir)?;
+    #[cfg(not(test))]
+    cleanup_terminal_agent_worker_services(&state_dir, &store, Some(&removal.path))?;
     remove_tui_agent_project_with_store(panel, active_root, removal, &store)
 }
 
@@ -19934,7 +22277,7 @@ fn init_tasks(root: &Path, folders: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, mpsc};
+    use std::sync::{Barrier, Mutex, mpsc};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[cfg(unix)]
@@ -20251,6 +22594,206 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("clt-{}-{}", name, nonce))
+    }
+
+    fn reserve_test_worker(
+        store: &agent_store::TursoAgentStore,
+        project_id: i64,
+        worker_token: &str,
+        expected_lease_holder: &str,
+        created_at: &str,
+        max_active_workers: usize,
+    ) -> bool {
+        let service_label = format!("clt-agent-worker-{worker_token}.service");
+        let command_arguments = serde_json::to_string(&vec![
+            "--local",
+            "agent",
+            "worker",
+            "--worker-token",
+            worker_token,
+        ])
+        .unwrap();
+        store
+            .reserve_worker_blocking(agent_store::AgentWorkerReservation {
+                project_id,
+                worker_token,
+                expected_lease_holder,
+                max_active_workers,
+                protocol_version: AGENT_WORKER_PROTOCOL_VERSION,
+                service_label: &service_label,
+                binary_path: Path::new("/tmp/test-worker-clt"),
+                command_arguments: &command_arguments,
+                path_env: OsStr::new("/usr/bin:/bin"),
+                codex_path: None,
+                task_selection: "next_todo",
+                resume_session_id: None,
+                created_at,
+            })
+            .unwrap()
+    }
+
+    fn assert_independent_worker_control_finalizes(action: AgentSessionControlAction) {
+        let (suffix, expected_status, expected_control_state) = match action {
+            AgentSessionControlAction::Stop => {
+                ("stop", "stopped", AgentSessionControlState::Stopped)
+            }
+            AgentSessionControlAction::Interrupt => (
+                "interrupt",
+                "handoff",
+                AgentSessionControlState::ReadyInteractive,
+            ),
+        };
+        let root = temp_root(&format!("independent-worker-{suffix}"));
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        let session_id = format!("session-{suffix}");
+        fs::write(
+            project_root.join("tasks/done.md"),
+            format!("# Done Tasks\n- controlled task codex:{session_id}\n"),
+        )
+        .unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        let worker_token = format!("control-{suffix}-token");
+        assert!(
+            store
+                .try_acquire_lease_blocking(project.id, "scheduler", "100", "9999999999")
+                .unwrap()
+        );
+        assert!(reserve_test_worker(
+            &store,
+            project.id,
+            &worker_token,
+            "scheduler",
+            "101",
+            12,
+        ));
+        assert!(
+            store
+                .claim_worker_blocking(&worker_token, std::process::id(), "102")
+                .unwrap()
+        );
+        store
+            .mark_session_running_blocking(
+                project.id,
+                &session_id,
+                4242,
+                &worker_token,
+                &root.join(format!("{suffix}.out")),
+                &root.join(format!("{suffix}.err")),
+            )
+            .unwrap();
+        let interactive_holder = format!("clt-interactive-{suffix}");
+        match action {
+            AgentSessionControlAction::Stop => assert!(
+                store
+                    .request_session_stop_blocking(project.id, &session_id, 4242, &worker_token,)
+                    .unwrap()
+            ),
+            AgentSessionControlAction::Interrupt => assert!(
+                store
+                    .request_session_interrupt_blocking(
+                        project.id,
+                        &session_id,
+                        4242,
+                        &worker_token,
+                        &interactive_holder,
+                    )
+                    .unwrap()
+            ),
+        }
+
+        let runner = FakeAgentRunner {
+            result: AgentRunResult {
+                status: expected_status,
+                exit_code: Some(0),
+                log_dir: root.join("runs/project"),
+                stdout_path: root.join(format!("{suffix}.out")),
+                stderr_path: root.join(format!("{suffix}.err")),
+                summary: format!("controlled {suffix}"),
+                codex_session_id: Some(session_id.clone()),
+                session_run_token: Some(worker_token.clone()),
+                control_action: Some(action),
+            },
+            ran_projects: Mutex::new(Vec::new()),
+            delay: Duration::ZERO,
+        };
+        let worker_holder = agent_store::worker_lease_holder(&worker_token);
+        let completion = run_agent_job(
+            AgentRunJob {
+                state_dir: state_dir.clone(),
+                project: project.clone(),
+                holder: worker_holder,
+                worker_token: Some(worker_token.clone()),
+                max_global_jobs: 12,
+                task_selection: AgentTaskSelection::NextTodo,
+                resume_session_id: None,
+                blocked_task_count_before: 0,
+                done_task_contents_before: completed_task_contents(&project_root).unwrap(),
+                blocked_task_snapshots_before: Vec::new(),
+            },
+            &runner,
+            &new_agent_shutdown_signal(),
+        )
+        .unwrap();
+
+        assert_eq!(completion.status, expected_status);
+        assert_eq!(
+            store
+                .session_control_blocking(project.id, &session_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            expected_control_state
+        );
+        assert_eq!(
+            store
+                .latest_run_for_project_blocking(project.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            expected_status
+        );
+        let terminal = store.list_terminal_workers_blocking().unwrap();
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(terminal[0].state, "completed");
+        match action {
+            AgentSessionControlAction::Stop => {
+                assert!(
+                    store
+                        .lease_for_project_blocking(project.id)
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            AgentSessionControlAction::Interrupt => {
+                assert_eq!(
+                    store
+                        .lease_for_project_blocking(project.id)
+                        .unwrap()
+                        .unwrap()
+                        .holder,
+                    interactive_holder
+                );
+            }
+        }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn independent_worker_stop_finalizes_after_supervisor_reap() {
+        assert_independent_worker_control_finalizes(AgentSessionControlAction::Stop);
+    }
+
+    #[test]
+    fn independent_worker_handoff_finalizes_after_supervisor_reap() {
+        assert_independent_worker_control_finalizes(AgentSessionControlAction::Interrupt);
     }
 
     #[test]
@@ -21143,6 +23686,8 @@ mod tests {
             state_dir: root.join("state/clt"),
             project,
             holder: "holder".to_string(),
+            worker_token: None,
+            max_global_jobs: 12,
             task_selection: AgentTaskSelection::NextTodo,
             resume_session_id: None,
             blocked_task_count_before: 0,
@@ -21175,6 +23720,8 @@ mod tests {
             state_dir: root.join("state/clt"),
             project,
             holder: "holder".to_string(),
+            worker_token: None,
+            max_global_jobs: 12,
             task_selection: AgentTaskSelection::NextTodo,
             resume_session_id: None,
             blocked_task_count_before: 0,
@@ -21218,6 +23765,8 @@ mod tests {
             state_dir: root.join("state/clt"),
             project,
             holder: "holder".to_string(),
+            worker_token: None,
+            max_global_jobs: 12,
             task_selection: AgentTaskSelection::NextTodo,
             resume_session_id: None,
             blocked_task_count_before: 0,
@@ -21569,6 +24118,92 @@ mod tests {
                     "clt-interactive-current",
                     Some("run-three"),
                 )
+                .unwrap()
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn newer_scheduler_controls_old_worker_without_overwriting_its_generation() {
+        let root = temp_root("cross-generation-worker-control");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project_id = store.list_projects_blocking().unwrap().remove(0).id;
+        let stdout_path = root.join("session.out");
+        let stderr_path = root.join("session.err");
+        store
+            .mark_session_running_blocking(
+                project_id,
+                "session-old",
+                101,
+                "old-generation",
+                &stdout_path,
+                &stderr_path,
+            )
+            .unwrap();
+        assert!(
+            store
+                .try_acquire_lease_blocking(project_id, "scheduler", "100", "9999999999")
+                .unwrap()
+        );
+        assert!(
+            store
+                .reserve_worker_blocking(agent_store::AgentWorkerReservation {
+                    project_id,
+                    worker_token: "new-generation",
+                    expected_lease_holder: "scheduler",
+                    max_active_workers: 12,
+                    protocol_version: AGENT_WORKER_PROTOCOL_VERSION,
+                    command_arguments: "[]",
+                    path_env: OsStr::new("/usr/bin:/bin"),
+                    codex_path: None,
+                    service_label: "clt-worker-new-generation",
+                    binary_path: Path::new("/tmp/new-clt-generation"),
+                    task_selection: "resume_session",
+                    resume_session_id: Some("session-old"),
+                    created_at: "101",
+                })
+                .unwrap()
+        );
+        assert!(
+            store
+                .claim_worker_blocking("new-generation", std::process::id(), "102")
+                .unwrap()
+        );
+
+        assert!(
+            store
+                .mark_session_running_blocking(
+                    project_id,
+                    "session-old",
+                    202,
+                    "new-generation",
+                    &stdout_path,
+                    &stderr_path,
+                )
+                .is_err()
+        );
+        assert!(
+            !store
+                .clear_running_session_control_blocking(project_id, "session-old", None)
+                .unwrap()
+        );
+        let old_control = store
+            .session_control_blocking(project_id, "session-old")
+            .unwrap()
+            .unwrap();
+        assert_eq!(old_control.child_pid, Some(101));
+        assert_eq!(old_control.run_token.as_deref(), Some("old-generation"));
+        assert!(
+            store
+                .request_session_stop_blocking(project_id, "session-old", 101, "old-generation")
                 .unwrap()
         );
 
@@ -23283,6 +25918,8 @@ mod tests {
             state_dir: root.join("state/clt"),
             project,
             holder: "holder".to_string(),
+            worker_token: None,
+            max_global_jobs: 12,
             task_selection: AgentTaskSelection::ResumeSession,
             resume_session_id: Some(session_id.to_string()),
             blocked_task_count_before: 0,
@@ -23335,6 +25972,8 @@ mod tests {
             state_dir: root.join("state/clt"),
             project,
             holder: "holder".to_string(),
+            worker_token: None,
+            max_global_jobs: 12,
             task_selection: AgentTaskSelection::ResumeSession,
             resume_session_id: Some("session-live".to_string()),
             blocked_task_count_before: 0,
@@ -25082,6 +27721,141 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn agent_service_binary_snapshot_is_executable_and_immutable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_root("agent-service-binary-snapshot");
+        let state_dir = root.join("state/clt");
+        let source = root.join("installed clt");
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::write(&source, b"generation one").unwrap();
+        let mut permissions = fs::metadata(&source).unwrap().permissions();
+        permissions.set_mode(0o751);
+        fs::set_permissions(&source, permissions).unwrap();
+
+        let snapshot = snapshot_agent_service_binary(&state_dir, &source).unwrap();
+
+        assert!(snapshot.starts_with(state_dir.join("worker-generations")));
+        assert_eq!(snapshot.file_name(), Some(OsStr::new("clt")));
+        assert_eq!(fs::read(&snapshot).unwrap(), b"generation one");
+        assert_eq!(
+            fs::metadata(&snapshot).unwrap().permissions().mode() & 0o777,
+            0o751
+        );
+        assert!(!snapshot.with_file_name("clt.partial").exists());
+
+        fs::write(&source, b"generation two").unwrap();
+        assert_eq!(fs::read(&snapshot).unwrap(), b"generation one");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scheduler_service_restart_refuses_a_live_legacy_owned_run() {
+        let root = temp_root("agent-legacy-restart-fence");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        let holder = format!("clt-agent-{}", std::process::id());
+        assert!(
+            store
+                .try_acquire_lease_blocking(
+                    project.id,
+                    &holder,
+                    &agent_timestamp(),
+                    &agent_timestamp_after(60),
+                )
+                .unwrap()
+        );
+
+        let error = ensure_no_live_legacy_agent_runs(&store).unwrap_err();
+        assert!(error.to_string().contains("legacy in-process run"));
+        assert!(store.release_lease_blocking(project.id, &holder).unwrap());
+        ensure_no_live_legacy_agent_runs(&store).unwrap();
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_binary_generation_gc_preserves_scheduler_and_active_worker_snapshots() {
+        let root = temp_root("agent-generation-gc");
+        let state_dir = root.join("state/clt");
+        let generation_root = state_dir.join("worker-generations");
+        let scheduler_dir = generation_root.join("scheduler");
+        let worker_dir = generation_root.join("active-worker");
+        let stale_dir = generation_root.join("stale");
+        for directory in [&scheduler_dir, &worker_dir, &stale_dir] {
+            fs::create_dir_all(directory).unwrap();
+            fs::write(directory.join("clt"), b"snapshot").unwrap();
+        }
+        let project_root = root.join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert!(
+            store
+                .try_acquire_lease_blocking(project.id, "scheduler", "100", "999")
+                .unwrap()
+        );
+        assert!(
+            store
+                .reserve_worker_blocking(agent_store::AgentWorkerReservation {
+                    project_id: project.id,
+                    worker_token: "generation-token",
+                    expected_lease_holder: "scheduler",
+                    max_active_workers: 12,
+                    protocol_version: AGENT_WORKER_PROTOCOL_VERSION,
+                    service_label: "clt-worker-generation-token",
+                    binary_path: &worker_dir.join("clt"),
+                    command_arguments: "[]",
+                    path_env: OsStr::new("/usr/bin:/bin"),
+                    codex_path: None,
+                    task_selection: "next_todo",
+                    resume_session_id: None,
+                    created_at: "101",
+                })
+                .unwrap()
+        );
+
+        garbage_collect_agent_binary_generations(&state_dir, &store, &scheduler_dir.join("clt"))
+            .unwrap();
+        assert!(scheduler_dir.exists());
+        assert!(worker_dir.exists());
+        assert!(!stale_dir.exists());
+
+        assert!(
+            store
+                .abandon_worker_blocking(agent_store::AgentWorkerAbandonment {
+                    worker_token: "generation-token",
+                    expected_state: AGENT_WORKER_STATE_DISPATCHING,
+                    expected_worker_pid: None,
+                    expected_heartbeat_at: Some("101"),
+                    finished_at: "102",
+                    error: "test cleanup",
+                    permitted_successor_holder: None,
+                })
+                .unwrap()
+        );
+        garbage_collect_agent_binary_generations(&state_dir, &store, &scheduler_dir.join("clt"))
+            .unwrap();
+        assert!(scheduler_dir.exists());
+        assert!(!worker_dir.exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn launchd_plist_runs_agent_daemon_with_state_dir() {
         let service_env = AgentServiceEnvironment {
@@ -25111,6 +27885,65 @@ mod tests {
         ));
         assert!(plist.contains(
             "<string>/Users/alex/Library/Application Support/clt/agent-service.err</string>"
+        ));
+    }
+
+    #[test]
+    fn launchd_worker_plist_runs_one_pinned_worker_generation() {
+        let service_env = AgentServiceEnvironment {
+            codex_path_override: Some(PathBuf::from("/Users/alex/Codex & Tools/codex")),
+            path: OsString::from("/Users/alex/bin & tools:/usr/bin:/bin"),
+        };
+        let spec = AgentWorkerLaunchSpec {
+            state_dir: PathBuf::from("/Users/alex/Library/Application Support/clt & worker state"),
+            executable: PathBuf::from("/Users/alex/CLT & Tools/generations/one/clt"),
+            worker_token: "1234567890-000000001-p42-s7".to_string(),
+            project_id: 42,
+            task_selection: AgentTaskSelection::ResumeSession,
+            resume_session_id: Some("01234567-89ab-cdef-0123-456789abcdef".to_string()),
+            service_label: "com.alpinevibrations.clt.agent.worker.1234567890-000000001-p42-s7"
+                .to_string(),
+            command_arguments: None,
+            service_env: service_env.clone(),
+        };
+
+        let plist = launchd_worker_plist_content(&spec, &service_env);
+
+        assert!(plist.contains(&format!("<string>{}</string>", spec.service_label)));
+        assert!(plist.contains("<string>/Users/alex/CLT &amp; Tools/generations/one/clt</string>"));
+        for argument in [
+            "--local",
+            "agent",
+            "worker",
+            "--state-dir",
+            "--project-id",
+            "42",
+            "--worker-token",
+            "1234567890-000000001-p42-s7",
+            "--task-selection",
+            "resume_session",
+            "--resume-session-id",
+            "01234567-89ab-cdef-0123-456789abcdef",
+        ] {
+            assert!(
+                plist.contains(&format!("<string>{argument}</string>")),
+                "missing worker argument {argument}"
+            );
+        }
+        assert!(plist.contains(
+            "<string>/Users/alex/Library/Application Support/clt &amp; worker state</string>"
+        ));
+        assert!(plist.contains("<key>CLT_AGENT_CODEX_PATH</key>"));
+        assert!(plist.contains("<string>/Users/alex/Codex &amp; Tools/codex</string>"));
+        assert!(plist.contains("<string>/Users/alex/bin &amp; tools:/usr/bin:/bin</string>"));
+        assert!(plist.contains("<key>RunAtLoad</key>\n  <true/>"));
+        assert!(plist.contains("<key>KeepAlive</key>\n  <false/>"));
+        assert!(plist.contains("<key>ProcessType</key>\n  <string>Standard</string>"));
+        assert!(plist.contains(
+            "<string>/Users/alex/Library/Application Support/clt &amp; worker state/workers/1234567890-000000001-p42-s7/worker.out</string>"
+        ));
+        assert!(plist.contains(
+            "<string>/Users/alex/Library/Application Support/clt &amp; worker state/workers/1234567890-000000001-p42-s7/worker.err</string>"
         ));
     }
 
@@ -25156,6 +27989,60 @@ mod tests {
         assert!(unit.contains("Environment=\"PATH=/home/alex/bin:/usr/bin:/bin\""));
         assert!(unit.contains("Restart=always"));
         assert!(unit.contains("WantedBy=default.target"));
+    }
+
+    #[test]
+    fn systemd_worker_run_uses_a_separate_one_shot_user_service() {
+        let service_env = AgentServiceEnvironment {
+            codex_path_override: Some(PathBuf::from("/home/alex/Codex Tools/codex")),
+            path: OsString::from("/home/alex/bin with spaces:/usr/bin:/bin"),
+        };
+        let spec = AgentWorkerLaunchSpec {
+            state_dir: PathBuf::from("/home/alex/.local/state/clt worker"),
+            executable: PathBuf::from("/home/alex/.local/state/clt generations/one/clt"),
+            worker_token: "1234567890-000000001-p42-s7".to_string(),
+            project_id: 42,
+            task_selection: AgentTaskSelection::ResumeSession,
+            resume_session_id: Some("01234567-89ab-cdef-0123-456789abcdef".to_string()),
+            service_label: "clt-agent-worker-1234567890-000000001-p42-s7.service".to_string(),
+            command_arguments: None,
+            service_env: service_env.clone(),
+        };
+
+        let arguments = systemd_worker_run_args(&spec, &service_env)
+            .into_iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            arguments,
+            vec![
+                "--user",
+                "--unit=clt-agent-worker-1234567890-000000001-p42-s7.service",
+                "--collect",
+                "--service-type=exec",
+                "--property=Restart=no",
+                "--property=KillMode=control-group",
+                "--setenv=CLT_AGENT_STATE_DIR=/home/alex/.local/state/clt worker",
+                "--setenv=PATH=/home/alex/bin with spaces:/usr/bin:/bin",
+                "--setenv=CLT_AGENT_CODEX_PATH=/home/alex/Codex Tools/codex",
+                "--",
+                "/home/alex/.local/state/clt generations/one/clt",
+                "--local",
+                "agent",
+                "worker",
+                "--state-dir",
+                "/home/alex/.local/state/clt worker",
+                "--project-id",
+                "42",
+                "--worker-token",
+                "1234567890-000000001-p42-s7",
+                "--task-selection",
+                "resume_session",
+                "--resume-session-id",
+                "01234567-89ab-cdef-0123-456789abcdef",
+            ]
+        );
     }
 
     #[test]
@@ -25244,6 +28131,37 @@ mod tests {
                 .get_envs()
                 .all(|(key, _)| key != OsStr::new(XDG_RUNTIME_DIR_ENV))
         );
+    }
+
+    #[test]
+    fn systemd_run_user_service_command_receives_runtime_dir() {
+        let command = service_command_with_systemd_user_configurer(
+            "systemd-run",
+            &[
+                "--user",
+                "--unit=clt-agent-worker-test.service",
+                "--",
+                "/bin/true",
+            ],
+            |command| configure_systemd_user_command_with_runtime_dir(command, None, "1000"),
+        )
+        .unwrap();
+
+        assert_eq!(command.get_program(), OsStr::new("systemd-run"));
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            vec![
+                OsStr::new("--user"),
+                OsStr::new("--unit=clt-agent-worker-test.service"),
+                OsStr::new("--"),
+                OsStr::new("/bin/true"),
+            ]
+        );
+        let configured_runtime_dir = command
+            .get_envs()
+            .find(|(key, _)| *key == OsStr::new(XDG_RUNTIME_DIR_ENV))
+            .and_then(|(_, value)| value);
+        assert_eq!(configured_runtime_dir, Some(OsStr::new("/run/user/1000")));
     }
 
     #[cfg(unix)]
@@ -25343,6 +28261,7 @@ mod tests {
             "model_providers",
             "model_targets",
             "agent_settings",
+            "agent_workers",
         ] {
             assert!(
                 store.table_exists_blocking(table).unwrap(),
@@ -25485,7 +28404,7 @@ mod tests {
                 .copied()
                 .unwrap()
         });
-        assert_eq!(migration_count, 14);
+        assert_eq!(migration_count, 15);
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -27770,6 +30689,1330 @@ mod tests {
     }
 
     #[test]
+    fn independent_worker_dispatch_survives_scheduler_state_and_consumes_capacity() {
+        let root = temp_root("independent-worker-dispatch");
+        let state_dir = root.join("state/clt");
+        let first_root = root.join("a-project");
+        let second_root = root.join("b-project");
+        add_task(&first_root, "first task", None).unwrap();
+        add_task(&second_root, "second task", None).unwrap();
+        let first_root = fs::canonicalize(first_root).unwrap();
+        let second_root = fs::canonicalize(second_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&first_root, "a-project")
+            .unwrap();
+        store
+            .register_project_blocking(&second_root, "b-project")
+            .unwrap();
+        drop(store);
+
+        let mut first =
+            run_agent_scheduler_pass_with_max_global_jobs(&state_dir, false, &[], 1, None).unwrap();
+        assert_eq!(first.jobs.len(), 1);
+        assert_eq!(first.pass.deferred_projects, 1);
+        let launched = Cell::new(false);
+        let mut observed = None;
+        dispatch_independent_agent_worker_with(
+            &state_dir,
+            Path::new("/tmp/pinned-clt-generation"),
+            first.jobs.pop().unwrap(),
+            AgentServiceEnvironment {
+                codex_path_override: None,
+                path: OsString::from("/usr/bin:/bin"),
+            },
+            |spec| {
+                observed = Some(spec.clone());
+                Ok(())
+            },
+            |_| {
+                launched.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(launched.get());
+        let observed = observed.unwrap();
+
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        let workers = store.list_active_workers_blocking().unwrap();
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].worker_token, observed.worker_token);
+        assert_eq!(workers[0].state, AGENT_WORKER_STATE_DISPATCHING);
+        assert_eq!(
+            workers[0].binary_path,
+            PathBuf::from("/tmp/pinned-clt-generation")
+        );
+        assert_eq!(
+            store
+                .lease_for_project_blocking(workers[0].project_id)
+                .unwrap()
+                .unwrap()
+                .holder,
+            agent_worker_lease_holder(&observed.worker_token)
+        );
+        drop(store);
+
+        let restarted =
+            run_agent_scheduler_pass_with_max_global_jobs(&state_dir, false, &[], 1, None).unwrap();
+        assert_eq!(restarted.pass.active_agent_jobs, 1);
+        assert_eq!(restarted.pass.runs_started, 0);
+        assert_eq!(restarted.pass.deferred_projects, 1);
+        assert!(restarted.jobs.is_empty());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_independent_worker_launch_releases_only_its_fenced_lease() {
+        let root = temp_root("independent-worker-launch-failure");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        add_task(&project_root, "task", None).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        drop(store);
+        let mut start = run_agent_scheduler_pass(&state_dir, false, &[]).unwrap();
+
+        let error = dispatch_independent_agent_worker_with(
+            &state_dir,
+            Path::new("/tmp/pinned-clt-generation"),
+            start.jobs.pop().unwrap(),
+            AgentServiceEnvironment {
+                codex_path_override: None,
+                path: OsString::from("/usr/bin:/bin"),
+            },
+            |_| Ok(()),
+            |_| anyhow::bail!("synthetic launch failure"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("independent agent worker"));
+
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        assert!(store.list_active_workers_blocking().unwrap().is_empty());
+        let terminal = store.list_terminal_workers_blocking().unwrap();
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(terminal[0].state, "abandoned");
+        assert!(
+            store
+                .lease_for_project_blocking(terminal[0].project_id)
+                .unwrap()
+                .is_none()
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scheduler_resumes_doing_task_after_independent_worker_dies() {
+        let root = temp_root("independent-worker-crash-recovery");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        add_task(&project_root, "interrupted task", None).unwrap();
+        move_task(&project_root, "todo", "doing", "1").unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert!(
+            store
+                .try_acquire_lease_blocking(project.id, "scheduler", "100", "9999999999")
+                .unwrap()
+        );
+        assert!(
+            store
+                .reserve_worker_blocking(agent_store::AgentWorkerReservation {
+                    project_id: project.id,
+                    worker_token: "crashed-worker",
+                    expected_lease_holder: "scheduler",
+                    max_active_workers: 12,
+                    protocol_version: AGENT_WORKER_PROTOCOL_VERSION,
+                    command_arguments: "[]",
+                    path_env: OsStr::new("/usr/bin:/bin"),
+                    codex_path: None,
+                    service_label: "clt-worker-crashed-worker",
+                    binary_path: Path::new("/tmp/old-clt-generation"),
+                    task_selection: "next_todo",
+                    resume_session_id: None,
+                    created_at: "101",
+                })
+                .unwrap()
+        );
+        assert!(
+            store
+                .claim_worker_blocking("crashed-worker", u32::MAX, "102")
+                .unwrap()
+        );
+        drop(store);
+
+        let start = run_agent_scheduler_pass(&state_dir, false, &[]).unwrap();
+        assert_eq!(start.jobs.len(), 1);
+        assert_eq!(
+            start.jobs[0].task_selection,
+            AgentTaskSelection::ResumeDoing
+        );
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        assert!(store.list_active_workers_blocking().unwrap().is_empty());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_store_worker_reservation_claim_and_heartbeat_are_fenced() {
+        let root = temp_root("agent-worker-lifecycle");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert!(
+            store
+                .try_acquire_lease_blocking(project.id, "scheduler", "100", "200")
+                .unwrap()
+        );
+
+        assert!(
+            store
+                .reserve_worker_blocking(agent_store::AgentWorkerReservation {
+                    project_id: project.id,
+                    worker_token: "token-one",
+                    expected_lease_holder: "scheduler",
+                    max_active_workers: 12,
+                    protocol_version: AGENT_WORKER_PROTOCOL_VERSION,
+                    command_arguments: "[]",
+                    path_env: OsStr::new("/usr/bin:/bin"),
+                    codex_path: None,
+                    service_label: "clt-worker-token-one",
+                    binary_path: Path::new("/tmp/clt-generation-one"),
+                    task_selection: "next_todo",
+                    resume_session_id: None,
+                    created_at: "101",
+                })
+                .unwrap()
+        );
+        let lease = store
+            .lease_for_project_blocking(project.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(lease.holder, agent_store::worker_lease_holder("token-one"));
+        let workers = store.list_active_workers_blocking().unwrap();
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].state, "dispatching");
+        assert_eq!(workers[0].heartbeat_at.as_deref(), Some("101"));
+        assert_eq!(workers[0].worker_pid, None);
+        assert!(
+            !store
+                .try_acquire_lease_blocking(project.id, "new-scheduler", "201", "400")
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .lease_for_project_blocking(project.id)
+                .unwrap()
+                .unwrap()
+                .holder,
+            agent_store::worker_lease_holder("token-one")
+        );
+
+        assert!(
+            store
+                .claim_worker_blocking("token-one", 123, "102")
+                .unwrap()
+        );
+        assert!(
+            !store
+                .claim_worker_blocking("token-one", 456, "102")
+                .unwrap()
+        );
+        assert!(
+            store
+                .claim_worker_blocking("token-one", 123, "102")
+                .unwrap()
+        );
+        assert!(
+            !store
+                .renew_worker_blocking("token-one", 456, "103", "300")
+                .unwrap()
+        );
+        let unchanged = store.list_active_workers_blocking().unwrap().remove(0);
+        assert_eq!(unchanged.heartbeat_at.as_deref(), Some("102"));
+        assert_eq!(
+            store
+                .lease_for_project_blocking(project.id)
+                .unwrap()
+                .unwrap()
+                .expires_at,
+            "200"
+        );
+        assert!(
+            store
+                .renew_worker_blocking("token-one", 123, "104", "300")
+                .unwrap()
+        );
+        let renewed = store.list_active_workers_blocking().unwrap().remove(0);
+        assert_eq!(renewed.state, "running");
+        assert_eq!(renewed.worker_pid, Some(123));
+        assert_eq!(renewed.started_at.as_deref(), Some("102"));
+        assert_eq!(renewed.heartbeat_at.as_deref(), Some("104"));
+        assert_eq!(
+            store
+                .lease_for_project_blocking(project.id)
+                .unwrap()
+                .unwrap()
+                .expires_at,
+            "300"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_store_worker_reservation_rolls_back_failed_lease_transfer() {
+        let root = temp_root("agent-worker-reservation-rollback");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert!(
+            store
+                .try_acquire_lease_blocking(project.id, "scheduler", "100", "200")
+                .unwrap()
+        );
+
+        let reserve = |expected_lease_holder| agent_store::AgentWorkerReservation {
+            project_id: project.id,
+            worker_token: "token-one",
+            expected_lease_holder,
+            max_active_workers: 12,
+            protocol_version: AGENT_WORKER_PROTOCOL_VERSION,
+            command_arguments: "[]",
+            path_env: OsStr::new("/usr/bin:/bin"),
+            codex_path: None,
+            service_label: "clt-worker-token-one",
+            binary_path: Path::new("/tmp/clt-generation-one"),
+            task_selection: "next_todo",
+            resume_session_id: None,
+            created_at: "101",
+        };
+        assert!(
+            !store
+                .reserve_worker_blocking(reserve("wrong-holder"))
+                .unwrap()
+        );
+        assert!(store.list_active_workers_blocking().unwrap().is_empty());
+        assert_eq!(
+            store
+                .lease_for_project_blocking(project.id)
+                .unwrap()
+                .unwrap()
+                .holder,
+            "scheduler"
+        );
+        assert!(store.reserve_worker_blocking(reserve("scheduler")).unwrap());
+
+        assert!(
+            !store
+                .reserve_worker_blocking(agent_store::AgentWorkerReservation {
+                    project_id: project.id,
+                    worker_token: "token-two",
+                    expected_lease_holder: &agent_store::worker_lease_holder("token-one"),
+                    max_active_workers: 12,
+                    protocol_version: AGENT_WORKER_PROTOCOL_VERSION,
+                    command_arguments: "[]",
+                    path_env: OsStr::new("/usr/bin:/bin"),
+                    codex_path: None,
+                    service_label: "clt-worker-token-two",
+                    binary_path: Path::new("/tmp/clt-generation-two"),
+                    task_selection: "next_todo",
+                    resume_session_id: None,
+                    created_at: "102",
+                })
+                .unwrap()
+        );
+        assert_eq!(store.list_active_workers_blocking().unwrap().len(), 1);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_store_worker_abandonment_is_observation_and_lease_fenced() {
+        let root = temp_root("agent-worker-abandonment");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert!(
+            store
+                .try_acquire_lease_blocking(project.id, "scheduler", "100", "200")
+                .unwrap()
+        );
+        assert!(
+            store
+                .reserve_worker_blocking(agent_store::AgentWorkerReservation {
+                    project_id: project.id,
+                    worker_token: "token-one",
+                    expected_lease_holder: "scheduler",
+                    max_active_workers: 12,
+                    protocol_version: AGENT_WORKER_PROTOCOL_VERSION,
+                    command_arguments: "[]",
+                    path_env: OsStr::new("/usr/bin:/bin"),
+                    codex_path: None,
+                    service_label: "clt-worker-token-one",
+                    binary_path: Path::new("/tmp/clt-generation-one"),
+                    task_selection: "next_todo",
+                    resume_session_id: None,
+                    created_at: "101",
+                })
+                .unwrap()
+        );
+        assert!(
+            store
+                .claim_worker_blocking("token-one", 123, "102")
+                .unwrap()
+        );
+        assert!(
+            !store
+                .abandon_worker_blocking(agent_store::AgentWorkerAbandonment {
+                    worker_token: "token-one",
+                    expected_state: "running",
+                    expected_worker_pid: Some(123),
+                    expected_heartbeat_at: Some("stale-observation"),
+                    finished_at: "103",
+                    error: "worker disappeared",
+                    permitted_successor_holder: None,
+                })
+                .unwrap()
+        );
+        assert_eq!(store.list_active_workers_blocking().unwrap().len(), 1);
+        assert!(
+            store
+                .lease_for_project_blocking(project.id)
+                .unwrap()
+                .is_some()
+        );
+
+        let worker_holder = agent_store::worker_lease_holder("token-one");
+        assert!(
+            store
+                .release_lease_blocking(project.id, &worker_holder)
+                .unwrap()
+        );
+        assert!(
+            store
+                .try_acquire_lease_blocking(project.id, "successor-holder", "103", "300")
+                .unwrap()
+        );
+        assert!(
+            !store
+                .abandon_worker_blocking(agent_store::AgentWorkerAbandonment {
+                    worker_token: "token-one",
+                    expected_state: "running",
+                    expected_worker_pid: Some(123),
+                    expected_heartbeat_at: Some("102"),
+                    finished_at: "104",
+                    error: "worker disappeared",
+                    permitted_successor_holder: Some("different-successor"),
+                })
+                .unwrap()
+        );
+        assert_eq!(store.list_active_workers_blocking().unwrap().len(), 1);
+        assert!(
+            store
+                .abandon_worker_blocking(agent_store::AgentWorkerAbandonment {
+                    worker_token: "token-one",
+                    expected_state: "running",
+                    expected_worker_pid: Some(123),
+                    expected_heartbeat_at: Some("102"),
+                    finished_at: "104",
+                    error: "worker disappeared",
+                    permitted_successor_holder: Some("successor-holder"),
+                })
+                .unwrap()
+        );
+        assert!(store.list_active_workers_blocking().unwrap().is_empty());
+        assert_eq!(
+            store
+                .lease_for_project_blocking(project.id)
+                .unwrap()
+                .unwrap()
+                .holder,
+            "successor-holder"
+        );
+        let terminal = store.list_terminal_workers_blocking().unwrap();
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(terminal[0].state, "abandoned");
+        assert_eq!(terminal[0].finished_at.as_deref(), Some("104"));
+        assert_eq!(terminal[0].error.as_deref(), Some("worker disappeared"));
+        assert!(terminal[0].run_id.is_some());
+        assert_eq!(store.run_count_blocking().unwrap(), 1);
+        assert_eq!(
+            store
+                .list_projects_blocking()
+                .unwrap()
+                .remove(0)
+                .failure_count,
+            1
+        );
+        assert!(
+            !store
+                .abandon_worker_blocking(agent_store::AgentWorkerAbandonment {
+                    worker_token: "token-one",
+                    expected_state: "running",
+                    expected_worker_pid: Some(123),
+                    expected_heartbeat_at: Some("102"),
+                    finished_at: "106",
+                    error: "duplicate observation",
+                    permitted_successor_holder: None,
+                })
+                .unwrap()
+        );
+        assert_eq!(store.run_count_blocking().unwrap(), 1);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_store_worker_finalization_is_idempotent_and_transactional() {
+        let root = temp_root("agent-worker-finalization");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert!(
+            store
+                .try_acquire_lease_blocking(project.id, "scheduler", "100", "200")
+                .unwrap()
+        );
+        assert!(
+            store
+                .reserve_worker_blocking(agent_store::AgentWorkerReservation {
+                    project_id: project.id,
+                    worker_token: "token-one",
+                    expected_lease_holder: "scheduler",
+                    max_active_workers: 12,
+                    protocol_version: AGENT_WORKER_PROTOCOL_VERSION,
+                    command_arguments: "[]",
+                    path_env: OsStr::new("/usr/bin:/bin"),
+                    codex_path: None,
+                    service_label: "clt-worker-token-one",
+                    binary_path: Path::new("/tmp/clt-generation-one"),
+                    task_selection: "next_todo",
+                    resume_session_id: None,
+                    created_at: "101",
+                })
+                .unwrap()
+        );
+        assert!(
+            store
+                .claim_worker_blocking("token-one", 123, "102")
+                .unwrap()
+        );
+        let worker_holder = agent_store::worker_lease_holder("token-one");
+        let finalize = |expected_worker_pid| agent_store::AgentWorkerFinalization {
+            worker_token: "token-one",
+            expected_worker_pid,
+            expected_lease_holder: &worker_holder,
+            status: "failure",
+            finished_at: "110",
+            exit_code: Some(1),
+            log_dir: Some("/tmp/logs"),
+            stdout_path: Some("/tmp/logs/run.out"),
+            stderr_path: Some("/tmp/logs/run.err"),
+            summary: Some("failed once"),
+            codex_session_id: Some("session-one"),
+            error: Some("worker reported failure"),
+        };
+        assert_eq!(
+            store.finalize_worker_blocking(finalize(Some(456))).unwrap(),
+            None
+        );
+        assert_eq!(store.run_count_blocking().unwrap(), 0);
+        assert!(
+            store
+                .lease_for_project_blocking(project.id)
+                .unwrap()
+                .is_some()
+        );
+
+        let run_id = store
+            .finalize_worker_blocking(finalize(Some(123)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.finalize_worker_blocking(finalize(Some(123))).unwrap(),
+            Some(run_id)
+        );
+        assert_eq!(store.run_count_blocking().unwrap(), 1);
+        assert_eq!(store.lease_count_blocking().unwrap(), 0);
+        assert!(store.list_active_workers_blocking().unwrap().is_empty());
+        let terminal = store.list_terminal_workers_blocking().unwrap();
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(terminal[0].state, "completed");
+        assert_eq!(terminal[0].run_id, Some(run_id));
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert_eq!(project.failure_count, 1);
+        assert_eq!(project.last_failure_at.as_deref(), Some("110"));
+        let run = store
+            .latest_run_for_project_blocking(project.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.id, run_id);
+        assert_eq!(run.status, "failure");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn dispatching_worker_requires_a_verified_drain_after_its_startup_deadline() {
+        let root = temp_root("agent-worker-dispatch-timeout");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert!(
+            store
+                .try_acquire_lease_blocking(project.id, "scheduler", "99", "999")
+                .unwrap()
+        );
+        assert!(reserve_test_worker(
+            &store,
+            project.id,
+            "dispatch-token",
+            "scheduler",
+            "100",
+            12,
+        ));
+
+        let launch_count = Cell::new(0);
+        let workers = reconcile_independent_agent_workers_with(
+            &state_dir,
+            &store,
+            159,
+            |spec| {
+                launch_count.set(launch_count.get() + 1);
+                assert_eq!(
+                    spec.command_arguments.as_ref().unwrap(),
+                    &vec![
+                        OsString::from("--local"),
+                        OsString::from("agent"),
+                        OsString::from("worker"),
+                        OsString::from("--worker-token"),
+                        OsString::from("dispatch-token"),
+                    ]
+                );
+                assert_eq!(spec.service_env.path, OsString::from("/usr/bin:/bin"));
+                Ok(())
+            },
+            |_| panic!("a fresh dispatch must not be drained"),
+        )
+        .unwrap();
+        assert_eq!(workers.len(), 1);
+        assert_eq!(launch_count.get(), 1);
+
+        let workers = reconcile_independent_agent_workers_with(
+            &state_dir,
+            &store,
+            160,
+            |_| panic!("a timed-out dispatch must not be relaunched before draining"),
+            |_| Ok(false),
+        )
+        .unwrap();
+        assert_eq!(workers.len(), 1);
+        assert_eq!(store.run_count_blocking().unwrap(), 0);
+        assert!(
+            store
+                .lease_for_project_blocking(project.id)
+                .unwrap()
+                .is_some()
+        );
+
+        let workers = reconcile_independent_agent_workers_with(
+            &state_dir,
+            &store,
+            161,
+            |_| panic!("a timed-out dispatch must not be relaunched"),
+            |_| Ok(true),
+        )
+        .unwrap();
+        assert!(workers.is_empty());
+        assert!(
+            store
+                .lease_for_project_blocking(project.id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(store.run_count_blocking().unwrap(), 1);
+        let terminal = store.list_terminal_workers_blocking().unwrap();
+        assert_eq!(terminal[0].state, "abandoned");
+        assert!(terminal[0].run_id.is_some());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn newer_worker_protocol_is_opaque_to_an_older_scheduler() {
+        let root = temp_root("agent-worker-newer-protocol");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert!(
+            store
+                .try_acquire_lease_blocking(project.id, "scheduler", "1", "999")
+                .unwrap()
+        );
+        assert!(
+            store
+                .reserve_worker_blocking(agent_store::AgentWorkerReservation {
+                    project_id: project.id,
+                    worker_token: "future-token",
+                    expected_lease_holder: "scheduler",
+                    max_active_workers: 12,
+                    protocol_version: AGENT_WORKER_PROTOCOL_VERSION + 1,
+                    service_label: "future-service",
+                    binary_path: Path::new("/tmp/future-clt"),
+                    command_arguments: "[]",
+                    path_env: OsStr::new("/usr/bin:/bin"),
+                    codex_path: None,
+                    task_selection: "next_todo",
+                    resume_session_id: None,
+                    created_at: "2",
+                })
+                .unwrap()
+        );
+
+        let workers = reconcile_independent_agent_workers_with(
+            &state_dir,
+            &store,
+            10_000,
+            |_| panic!("an older scheduler must not launch a newer worker protocol"),
+            |_| panic!("an older scheduler must not drain a newer worker protocol"),
+        )
+        .unwrap();
+
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].worker_token, "future-token");
+        assert_eq!(store.run_count_blocking().unwrap(), 0);
+        assert_eq!(
+            store
+                .lease_for_project_blocking(project.id)
+                .unwrap()
+                .unwrap()
+                .holder,
+            agent_store::worker_lease_holder("future-token")
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn dead_outer_worker_keeps_its_fence_until_the_service_is_drained() {
+        let root = temp_root("agent-worker-drain-fence");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert!(
+            store
+                .try_acquire_lease_blocking(project.id, "scheduler", "100", "999")
+                .unwrap()
+        );
+        assert!(reserve_test_worker(
+            &store,
+            project.id,
+            "dead-token",
+            "scheduler",
+            "101",
+            12,
+        ));
+        assert!(
+            store
+                .claim_worker_blocking("dead-token", u32::MAX, "102")
+                .unwrap()
+        );
+
+        let still_fenced = reconcile_independent_agent_workers_with(
+            &state_dir,
+            &store,
+            103,
+            |_| Ok(()),
+            |_| Ok(false),
+        )
+        .unwrap();
+        assert_eq!(still_fenced.len(), 1);
+        assert!(
+            store
+                .lease_for_project_blocking(project.id)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(store.run_count_blocking().unwrap(), 0);
+
+        let recovered = reconcile_independent_agent_workers_with(
+            &state_dir,
+            &store,
+            104,
+            |_| Ok(()),
+            |_| Ok(true),
+        )
+        .unwrap();
+        assert!(recovered.is_empty());
+        assert!(
+            store
+                .lease_for_project_blocking(project.id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(store.run_count_blocking().unwrap(), 1);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stale_heartbeat_is_recovered_even_when_the_pid_was_reused() {
+        let root = temp_root("agent-worker-stale-heartbeat");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert!(
+            store
+                .try_acquire_lease_blocking(project.id, "scheduler", "99", "999")
+                .unwrap()
+        );
+        assert!(reserve_test_worker(
+            &store,
+            project.id,
+            "stale-token",
+            "scheduler",
+            "100",
+            12,
+        ));
+        assert!(
+            store
+                .claim_worker_blocking("stale-token", std::process::id(), "100")
+                .unwrap()
+        );
+
+        let drain_count = Cell::new(0);
+        let workers = reconcile_independent_agent_workers_with(
+            &state_dir,
+            &store,
+            160,
+            |_| Ok(()),
+            |_| {
+                drain_count.set(drain_count.get() + 1);
+                Ok(true)
+            },
+        )
+        .unwrap();
+        assert!(workers.is_empty());
+        assert_eq!(drain_count.get(), 1);
+        assert_eq!(store.run_count_blocking().unwrap(), 1);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn worker_finalization_requires_the_exact_current_lease_holder() {
+        let root = temp_root("agent-worker-finalization-fence");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert!(
+            store
+                .try_acquire_lease_blocking(project.id, "scheduler", "100", "999")
+                .unwrap()
+        );
+        assert!(reserve_test_worker(
+            &store,
+            project.id,
+            "fenced-token",
+            "scheduler",
+            "101",
+            12,
+        ));
+        assert!(
+            store
+                .claim_worker_blocking("fenced-token", 123, "102")
+                .unwrap()
+        );
+        store
+            .mark_session_running_blocking(
+                project.id,
+                "session-fenced",
+                456,
+                "fenced-token",
+                &root.join("session.out"),
+                &root.join("session.err"),
+            )
+            .unwrap();
+        let worker_holder = agent_store::worker_lease_holder("fenced-token");
+        assert!(
+            store
+                .release_lease_blocking(project.id, &worker_holder)
+                .unwrap()
+        );
+        assert!(
+            store
+                .try_acquire_lease_blocking(project.id, "unrelated-successor", "103", "999")
+                .unwrap()
+        );
+        assert!(
+            store
+                .mark_session_running_blocking(
+                    project.id,
+                    "session-fenced",
+                    789,
+                    "fenced-token",
+                    &root.join("new-session.out"),
+                    &root.join("new-session.err"),
+                )
+                .is_err()
+        );
+        assert!(
+            !store
+                .clear_running_session_control_blocking(
+                    project.id,
+                    "session-fenced",
+                    Some("fenced-token"),
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .session_control_blocking(project.id, "session-fenced")
+                .unwrap()
+                .unwrap()
+                .child_pid,
+            Some(456)
+        );
+
+        assert_eq!(
+            store
+                .finalize_worker_blocking(agent_store::AgentWorkerFinalization {
+                    worker_token: "fenced-token",
+                    expected_worker_pid: Some(123),
+                    expected_lease_holder: &worker_holder,
+                    status: "success",
+                    finished_at: "104",
+                    exit_code: Some(0),
+                    log_dir: None,
+                    stdout_path: None,
+                    stderr_path: None,
+                    summary: Some("must not commit"),
+                    codex_session_id: None,
+                    error: None,
+                })
+                .unwrap(),
+            None
+        );
+        assert_eq!(store.run_count_blocking().unwrap(), 0);
+        assert_eq!(store.list_active_workers_blocking().unwrap().len(), 1);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn abandoned_worker_preserves_a_generation_verified_interactive_successor() {
+        let root = temp_root("agent-worker-interactive-successor");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert!(
+            store
+                .try_acquire_lease_blocking(project.id, "scheduler", "100", "9999999999")
+                .unwrap()
+        );
+        assert!(reserve_test_worker(
+            &store,
+            project.id,
+            "handoff-token",
+            "scheduler",
+            "101",
+            12,
+        ));
+        assert!(
+            store
+                .claim_worker_blocking("handoff-token", 123, "102")
+                .unwrap()
+        );
+        store
+            .mark_session_running_blocking(
+                project.id,
+                "session-handoff",
+                456,
+                "handoff-token",
+                &root.join("session.out"),
+                &root.join("session.err"),
+            )
+            .unwrap();
+        let interactive_holder = "clt-interactive-999";
+        assert!(
+            store
+                .request_session_interrupt_blocking(
+                    project.id,
+                    "session-handoff",
+                    456,
+                    "handoff-token",
+                    interactive_holder,
+                )
+                .unwrap()
+        );
+        let worker_holder = agent_store::worker_lease_holder("handoff-token");
+        assert_eq!(
+            store
+                .complete_session_interrupt_handoff_blocking(
+                    project.id,
+                    "session-handoff",
+                    "handoff-token",
+                    &worker_holder,
+                    60,
+                )
+                .unwrap()
+                .as_deref(),
+            Some(interactive_holder)
+        );
+        assert!(
+            store
+                .transition_session_control_state_blocking(
+                    project.id,
+                    "session-handoff",
+                    AgentSessionControlState::ReadyInteractive,
+                    AgentSessionControlState::Interactive,
+                )
+                .unwrap()
+        );
+
+        assert!(
+            store
+                .abandon_worker_blocking(agent_store::AgentWorkerAbandonment {
+                    worker_token: "handoff-token",
+                    expected_state: "running",
+                    expected_worker_pid: Some(123),
+                    expected_heartbeat_at: Some("102"),
+                    finished_at: "104",
+                    error: "outer worker exited after handoff",
+                    permitted_successor_holder: Some(interactive_holder),
+                })
+                .unwrap()
+        );
+        assert!(store.list_active_workers_blocking().unwrap().is_empty());
+        assert_eq!(
+            store
+                .lease_for_project_blocking(project.id)
+                .unwrap()
+                .unwrap()
+                .holder,
+            interactive_holder
+        );
+        assert_eq!(store.run_count_blocking().unwrap(), 1);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn worker_reservation_serializes_the_global_capacity_limit() {
+        let root = temp_root("agent-worker-global-capacity");
+        let state_dir = root.join("state/clt");
+        let first_root = root.join("first");
+        let second_root = root.join("second");
+        fs::create_dir_all(&first_root).unwrap();
+        fs::create_dir_all(&second_root).unwrap();
+        let first_root = fs::canonicalize(first_root).unwrap();
+        let second_root = fs::canonicalize(second_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&first_root, "first")
+            .unwrap();
+        store
+            .register_project_blocking(&second_root, "second")
+            .unwrap();
+        let projects = store.list_projects_blocking().unwrap();
+        let first_id = projects
+            .iter()
+            .find(|project| project.name == "first")
+            .unwrap()
+            .id;
+        let second_id = projects
+            .iter()
+            .find(|project| project.name == "second")
+            .unwrap()
+            .id;
+        assert!(
+            store
+                .try_acquire_lease_blocking(first_id, "scheduler-one", "100", "999")
+                .unwrap()
+        );
+        assert!(
+            store
+                .try_acquire_lease_blocking(second_id, "scheduler-two", "100", "999")
+                .unwrap()
+        );
+        drop(store);
+
+        let barrier = Arc::new(Barrier::new(3));
+        let handles = [
+            (first_id, "capacity-one", "scheduler-one"),
+            (second_id, "capacity-two", "scheduler-two"),
+        ]
+        .into_iter()
+        .map(|(project_id, token, holder)| {
+            let state_dir = state_dir.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+                barrier.wait();
+                reserve_test_worker(&store, project_id, token, holder, "101", 1)
+            })
+        })
+        .collect::<Vec<_>>();
+        barrier.wait();
+        let reserved = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .filter(|reserved| *reserved)
+            .count();
+        assert_eq!(reserved, 1);
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        assert_eq!(store.list_active_workers_blocking().unwrap().len(), 1);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn successful_worker_reservation_atomically_supersedes_old_abandonment() {
+        let root = temp_root("agent-worker-supersede-atomic");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert!(
+            store
+                .try_acquire_lease_blocking(project.id, "scheduler-old", "100", "999")
+                .unwrap()
+        );
+        assert!(reserve_test_worker(
+            &store,
+            project.id,
+            "old-token",
+            "scheduler-old",
+            "101",
+            12,
+        ));
+        assert!(
+            store
+                .claim_worker_blocking("old-token", 123, "102")
+                .unwrap()
+        );
+        assert!(
+            store
+                .abandon_worker_blocking(agent_store::AgentWorkerAbandonment {
+                    worker_token: "old-token",
+                    expected_state: "running",
+                    expected_worker_pid: Some(123),
+                    expected_heartbeat_at: Some("102"),
+                    finished_at: "103",
+                    error: "old worker exited",
+                    permitted_successor_holder: None,
+                })
+                .unwrap()
+        );
+        assert_eq!(
+            store.list_terminal_workers_blocking().unwrap()[0].state,
+            "abandoned"
+        );
+        assert!(
+            store
+                .try_acquire_lease_blocking(project.id, "scheduler-new", "104", "999")
+                .unwrap()
+        );
+        assert!(reserve_test_worker(
+            &store,
+            project.id,
+            "new-token",
+            "scheduler-new",
+            "105",
+            12,
+        ));
+        let terminal = store.list_terminal_workers_blocking().unwrap();
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(terminal[0].worker_token, "old-token");
+        assert_eq!(terminal[0].state, "superseded");
+        assert_eq!(
+            store.list_active_workers_blocking().unwrap()[0].worker_token,
+            "new-token"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn incompatible_schema_migration_is_deferred_for_pinned_workers() {
+        let root = temp_root("agent-worker-migration-barrier");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert!(
+            store
+                .try_acquire_lease_blocking(project.id, "scheduler", "100", "999")
+                .unwrap()
+        );
+        assert!(reserve_test_worker(
+            &store,
+            project.id,
+            "migration-token",
+            "scheduler",
+            "101",
+            12,
+        ));
+        assert!(
+            !store
+                .worker_schema_migration_deferred_blocking(AGENT_WORKER_SHARED_SCHEMA_VERSION)
+                .unwrap()
+        );
+        assert!(
+            store
+                .worker_schema_migration_deferred_blocking(AGENT_WORKER_SHARED_SCHEMA_VERSION + 1)
+                .unwrap()
+        );
+        store
+            .mark_session_running_blocking(
+                project.id,
+                "migration-session",
+                123,
+                "migration-token",
+                &root.join("migration.out"),
+                &root.join("migration.err"),
+            )
+            .unwrap();
+        let compatibility_store = agent_store::TursoAgentStore::open_blocking_with_test_migration(
+            &state_dir,
+            AGENT_WORKER_SHARED_SCHEMA_VERSION + 1,
+            "CREATE TABLE deferred_worker_migration_probe (id INTEGER PRIMARY KEY)",
+        )
+        .unwrap();
+        assert_eq!(
+            compatibility_store.pending_migration_version(),
+            Some(AGENT_WORKER_SHARED_SCHEMA_VERSION + 1)
+        );
+        assert!(
+            !compatibility_store
+                .table_exists_blocking("deferred_worker_migration_probe")
+                .unwrap()
+        );
+        assert!(
+            compatibility_store
+                .request_session_stop_blocking(
+                    project.id,
+                    "migration-session",
+                    123,
+                    "migration-token",
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .abandon_worker_blocking(agent_store::AgentWorkerAbandonment {
+                    worker_token: "migration-token",
+                    expected_state: AGENT_WORKER_STATE_DISPATCHING,
+                    expected_worker_pid: None,
+                    expected_heartbeat_at: Some("101"),
+                    finished_at: "102",
+                    error: "test completion",
+                    permitted_successor_holder: None,
+                })
+                .unwrap()
+        );
+        assert!(
+            !store
+                .worker_schema_migration_deferred_blocking(AGENT_WORKER_SHARED_SCHEMA_VERSION + 1)
+                .unwrap()
+        );
+        let migrated_store = agent_store::TursoAgentStore::open_blocking_with_test_migration(
+            &state_dir,
+            AGENT_WORKER_SHARED_SCHEMA_VERSION + 1,
+            "CREATE TABLE deferred_worker_migration_probe (id INTEGER PRIMARY KEY)",
+        )
+        .unwrap();
+        assert_eq!(migrated_store.pending_migration_version(), None);
+        assert!(
+            migrated_store
+                .table_exists_blocking("deferred_worker_migration_probe")
+                .unwrap()
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn agent_store_recovers_stale_leases() {
         let root = temp_root("agent-run-stale-lease");
         let state_dir = root.join("state/clt");
@@ -28053,6 +32296,25 @@ mod tests {
         fs::write(state_dir.join("agent-service.out"), "service out").unwrap();
         fs::write(state_dir.join("agent-service.err"), "service err").unwrap();
 
+        assert!(
+            store
+                .try_acquire_lease_blocking(project.id, "concurrent-scheduler", "104", "999")
+                .unwrap()
+        );
+        let error = store.clean_agent_history_blocking("105").unwrap_err();
+        assert!(error.to_string().contains("project leases are active"));
+        assert_eq!(store.run_count_blocking().unwrap(), 2);
+        assert!(
+            store
+                .release_lease_blocking(project.id, "concurrent-scheduler")
+                .unwrap()
+        );
+        assert!(
+            store
+                .try_acquire_lease_blocking(project.id, "stale-scheduler", "90", "100")
+                .unwrap()
+        );
+
         clean_agent_state(&store, &state_dir).unwrap();
 
         let project = store.list_projects_blocking().unwrap().remove(0);
@@ -28060,6 +32322,7 @@ mod tests {
         assert_eq!(project.last_failure_at, None);
         assert_eq!(project.last_blocked_recovery_at, None);
         assert_eq!(store.run_count_blocking().unwrap(), 0);
+        assert_eq!(store.lease_count_blocking().unwrap(), 0);
         assert!(store.list_daemon_checkins_blocking().unwrap().is_empty());
         assert_eq!(fs::read_dir(state_dir.join("runs")).unwrap().count(), 0);
         assert_eq!(
