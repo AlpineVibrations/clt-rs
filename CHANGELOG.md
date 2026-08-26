@@ -57,6 +57,7 @@ Use this section while developing the next release.
 
 ### Fixed
 
+- Distinguished independent scheduler dispatch leases from legacy in-process runs so `clt agent stop` no longer reports a false legacy-run fence during post-reboot worker handoff.
 - Moved independent-worker dispatch off the daemon's async runtime so blocking agent-store operations cannot panic and restart the scheduler before the worker service is launched.
 - Reclaimed dead or expired agent leases for disabled projects and during unregister, while continuing to protect live, unknown, and independent-worker leases from deletion.
 - Prevented scheduler restarts and binary upgrades from duplicating old-worker projects, made worker run recording/project counter updates/lease release one transaction, bounded failed startup and stale-heartbeat recovery behind verified service draining, serialized global worker capacity, treated newer worker protocols as opaque, deferred incompatible migrations without disabling controls, and kept stop and interrupt requests compatible across binary generations through the existing session-control protocol.
