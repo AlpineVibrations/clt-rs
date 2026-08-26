@@ -38,7 +38,9 @@ use toml_edit::{DocumentMut, Item, Table, value};
 use tui_input::{Input, InputRequest};
 
 #[cfg(unix)]
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
@@ -220,8 +222,11 @@ const AGENT_RESUME_SESSION_PROMPT_APPENDIX: &str = r#"
 
 Interactive handoff recovery:
 - Resume the exact task and Codex session that CLT handed back from interactive mode.
-- Inspect the current task state and continue its automated work from the conversation context.
-- If the task is already complete, verify its recorded completion and exit without selecting another task.
+- Inspect the linked task, current project state, and any interactive instructions, then continue from the next unfinished substantive step in the conversation context.
+- A prior assistant plan, progress message, draft, summary, or claimed completion is not proof that requested work finished.
+- If the linked task or interactive instructions request project, file, code, configuration, or task-board changes, do not mark the task done until those durable changes actually exist and the relevant checks pass.
+- For a response-only task that does not request durable changes, a completed response may be the deliverable.
+- If the task is already complete, verify its recorded completion and any requested durable output, then exit without selecting another task.
 - Otherwise finish or update that same task using the normal task workflow and relevant checks.
 - Do not select another Todo or Backlog task. Stop after handling this one session.
 - These recovery instructions replace steps 2-4 above.
@@ -583,6 +588,21 @@ impl InteractiveGuardianDisposition {
         .into_iter()
         .find(|disposition| holder.starts_with(disposition.guardian_holder_prefix()))
     }
+
+    fn guardian_process_is_proven_dead(holder: &str) -> bool {
+        let Some(disposition) = Self::from_guardian_holder(holder) else {
+            return false;
+        };
+        let Some(pid) = holder
+            .strip_prefix(disposition.guardian_holder_prefix())
+            .and_then(|suffix| suffix.strip_prefix('-'))
+            .and_then(|suffix| suffix.split('-').next())
+            .and_then(|pid| pid.parse::<u32>().ok())
+        else {
+            return false;
+        };
+        local_process_is_running(pid) == Some(false)
+    }
 }
 
 impl AgentSessionControlState {
@@ -807,6 +827,8 @@ enum AgentCommands {
         from_holder: String,
         #[arg(long, default_value_t = false)]
         resume_exec: bool,
+        #[arg(long)]
+        control_fd: Option<i32>,
     },
     /// Internal launch gate used to register a known Codex session before exec
     #[command(hide = true)]
@@ -837,6 +859,8 @@ enum AgentCommands {
     /// Internal launch gate used to register interactive Codex before exec
     #[command(hide = true)]
     InteractiveExecGate {
+        #[arg(long)]
+        control_fd: Option<i32>,
         program: PathBuf,
         #[arg(num_args = 0.., trailing_var_arg = true, allow_hyphen_values = true)]
         arguments: Vec<OsString>,
@@ -902,22 +926,29 @@ fn main() -> Result<()> {
     }) = cli.command.as_ref()
     {
         let exit_code = run_automated_session_supervisor(
-            state_dir,
-            *project_id,
-            run_token,
-            lease_holder,
-            stdout_path,
-            stderr_path,
+            AutomatedSupervisorSpec {
+                state_dir,
+                project_id: *project_id,
+                run_token,
+                lease_holder,
+                stdout_path,
+                stderr_path,
+            },
             program,
             arguments,
         )?;
         std::process::exit(exit_code);
     }
     if let Some(Commands::Agent {
-        command: AgentCommands::InteractiveExecGate { program, arguments },
+        command:
+            AgentCommands::InteractiveExecGate {
+                control_fd,
+                program,
+                arguments,
+            },
     }) = cli.command.as_ref()
     {
-        return run_interactive_exec_gate(program, arguments);
+        return run_interactive_exec_gate(*control_fd, program, arguments);
     }
 
     let root = get_task_root(cli.local)?;
@@ -1093,12 +1124,14 @@ fn handle_agent_command(command: AgentCommands, local: bool, default_root: &Path
             session_id,
             from_holder,
             resume_exec,
+            control_fd,
         } => {
             run_agent_interactive_session_worker(
                 project_id,
                 &session_id,
                 &from_holder,
                 resume_exec,
+                control_fd,
             )?;
         }
         AgentCommands::AutomatedExecGate { .. }
@@ -1866,9 +1899,15 @@ fn configure_automated_codex_subcommand(
     };
     command.arg("exec");
     if let Some(session_id) = session_id.as_deref() {
-        command.arg("resume").arg(session_id);
+        command
+            .arg("resume")
+            .arg("--skip-git-repo-check")
+            .arg(session_id);
     } else {
-        command.arg("-C").arg(&project.path);
+        command
+            .arg("--skip-git-repo-check")
+            .arg("-C")
+            .arg(&project.path);
     }
     command.arg(agent_codex_prompt(project, task_selection));
     Ok(session_id)
@@ -1975,15 +2014,28 @@ struct AutomatedSupervisorChild {
     proof: BufReader<std::process::ChildStdout>,
 }
 
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+struct AutomatedSupervisorSpec<'a> {
+    state_dir: &'a Path,
+    project_id: i64,
+    run_token: &'a str,
+    lease_holder: &'a str,
+    stdout_path: &'a Path,
+    stderr_path: &'a Path,
+}
+
+#[cfg(unix)]
+struct AutomatedSupervisorWaitHandles<'a> {
+    process: &'a mut Child,
+    control: &'a mut Option<std::process::ChildStdin>,
+    proof: &'a mut BufReader<std::process::ChildStdout>,
+}
+
 #[cfg(all(unix, not(test)))]
 fn automated_session_supervisor_command(
     target: &Command,
-    state_dir: &Path,
-    project_id: i64,
-    run_token: &str,
-    lease_holder: &str,
-    stdout_path: &Path,
-    stderr_path: &Path,
+    spec: AutomatedSupervisorSpec<'_>,
 ) -> Result<Command> {
     let executable = std::env::current_exe()
         .context("Failed to resolve the CLT automated-session supervisor executable")?;
@@ -1993,17 +2045,17 @@ fn automated_session_supervisor_command(
         .arg("agent")
         .arg("automated-session-supervisor")
         .arg("--state-dir")
-        .arg(state_dir)
+        .arg(spec.state_dir)
         .arg("--project-id")
-        .arg(project_id.to_string())
+        .arg(spec.project_id.to_string())
         .arg("--run-token")
-        .arg(run_token)
+        .arg(spec.run_token)
         .arg("--lease-holder")
-        .arg(lease_holder)
+        .arg(spec.lease_holder)
         .arg("--stdout-path")
-        .arg(stdout_path)
+        .arg(spec.stdout_path)
         .arg("--stderr-path")
-        .arg(stderr_path)
+        .arg(spec.stderr_path)
         .arg("--")
         .arg(target.get_program())
         .args(target.get_args());
@@ -2014,12 +2066,7 @@ fn automated_session_supervisor_command(
 #[cfg(all(unix, test))]
 fn automated_session_supervisor_command(
     target: &Command,
-    state_dir: &Path,
-    project_id: i64,
-    run_token: &str,
-    lease_holder: &str,
-    stdout_path: &Path,
-    stderr_path: &Path,
+    spec: AutomatedSupervisorSpec<'_>,
 ) -> Result<Command> {
     // A test binary is driven by libtest rather than the Clap entry point. Run
     // one exact helper test and pass the real supervisor arguments through its
@@ -2032,12 +2079,15 @@ fn automated_session_supervisor_command(
         .arg("tests::automated_session_supervisor_process_entry")
         .arg("--nocapture")
         .env(TEST_AUTOMATED_SUPERVISOR_ENV, "1")
-        .env("CLT_TEST_SUPERVISOR_STATE_DIR", state_dir)
-        .env("CLT_TEST_SUPERVISOR_PROJECT_ID", project_id.to_string())
-        .env("CLT_TEST_SUPERVISOR_RUN_TOKEN", run_token)
-        .env("CLT_TEST_SUPERVISOR_LEASE_HOLDER", lease_holder)
-        .env("CLT_TEST_SUPERVISOR_STDOUT_PATH", stdout_path)
-        .env("CLT_TEST_SUPERVISOR_STDERR_PATH", stderr_path)
+        .env("CLT_TEST_SUPERVISOR_STATE_DIR", spec.state_dir)
+        .env(
+            "CLT_TEST_SUPERVISOR_PROJECT_ID",
+            spec.project_id.to_string(),
+        )
+        .env("CLT_TEST_SUPERVISOR_RUN_TOKEN", spec.run_token)
+        .env("CLT_TEST_SUPERVISOR_LEASE_HOLDER", spec.lease_holder)
+        .env("CLT_TEST_SUPERVISOR_STDOUT_PATH", spec.stdout_path)
+        .env("CLT_TEST_SUPERVISOR_STDERR_PATH", spec.stderr_path)
         .env("CLT_TEST_SUPERVISOR_PROGRAM", target.get_program())
         .env(
             "CLT_TEST_SUPERVISOR_ARGUMENT_COUNT",
@@ -2053,23 +2103,10 @@ fn automated_session_supervisor_command(
 #[cfg(unix)]
 fn spawn_automated_session_supervisor(
     target: &Command,
-    state_dir: &Path,
-    project_id: i64,
-    run_token: &str,
-    lease_holder: &str,
-    stdout_path: &Path,
-    stderr_path: &Path,
+    spec: AutomatedSupervisorSpec<'_>,
     supervisor_stderr: fs::File,
 ) -> Result<AutomatedSupervisorChild> {
-    let mut command = automated_session_supervisor_command(
-        target,
-        state_dir,
-        project_id,
-        run_token,
-        lease_holder,
-        stdout_path,
-        stderr_path,
-    )?;
+    let mut command = automated_session_supervisor_command(target, spec)?;
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -2087,7 +2124,10 @@ fn spawn_automated_session_supervisor(
         .context("Automated Codex supervisor did not open its readiness pipe")?;
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     thread::Builder::new()
-        .name(format!("clt-automated-supervisor-ready-{project_id}"))
+        .name(format!(
+            "clt-automated-supervisor-ready-{}",
+            spec.project_id
+        ))
         .spawn(move || {
             let mut reader = BufReader::new(readiness);
             let result = loop {
@@ -2142,25 +2182,30 @@ fn spawn_automated_session_supervisor(
 
 #[cfg(unix)]
 fn run_automated_session_supervisor(
-    state_dir: &Path,
-    project_id: i64,
-    run_token: &str,
-    lease_holder: &str,
-    stdout_path: &Path,
-    stderr_path: &Path,
+    spec: AutomatedSupervisorSpec<'_>,
     program: &Path,
     arguments: &[OsString],
 ) -> Result<i32> {
     let stdout_file = fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(stdout_path)
-        .with_context(|| format!("Failed to open supervised Codex stdout {stdout_path:?}"))?;
+        .open(spec.stdout_path)
+        .with_context(|| {
+            format!(
+                "Failed to open supervised Codex stdout {:?}",
+                spec.stdout_path
+            )
+        })?;
     let stderr_file = fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(stderr_path)
-        .with_context(|| format!("Failed to open supervised Codex stderr {stderr_path:?}"))?;
+        .open(spec.stderr_path)
+        .with_context(|| {
+            format!(
+                "Failed to open supervised Codex stderr {:?}",
+                spec.stderr_path
+            )
+        })?;
     let mut target = Command::new(program);
     target.args(arguments);
     let mut command = automated_exec_gate_command(&target)?;
@@ -2196,19 +2241,37 @@ fn run_automated_session_supervisor(
             "its parent disconnected before readiness",
         );
         finalize_disconnected_automated_supervisor(
-            state_dir,
-            project_id,
+            spec.state_dir,
+            spec.project_id,
             child_pid,
-            run_token,
-            lease_holder,
+            spec.run_token,
+            spec.lease_holder,
         );
         return Err(error).context("Failed to report the supervised Codex child PID");
     }
 
     let mut parent_input = io::stdin().lock();
-    if !automated_exec_gate_is_released(&mut parent_input)
-        .context("Failed to read automated supervisor launch release")?
-    {
+    let parent_released = match automated_exec_gate_is_released(&mut parent_input) {
+        Ok(released) => released,
+        Err(error) => {
+            drop(parent_input);
+            drop(launch_gate);
+            let status = stop_supervised_automated_child_until_reaped(
+                &mut child,
+                "its launch-release pipe failed",
+            );
+            finalize_disconnected_automated_supervisor(
+                spec.state_dir,
+                spec.project_id,
+                child_pid,
+                spec.run_token,
+                spec.lease_holder,
+            );
+            eprintln!("Failed to read automated supervisor launch release: {error}");
+            return report_automated_supervisor_reaped(status);
+        }
+    };
+    if !parent_released {
         drop(parent_input);
         drop(launch_gate);
         let status = stop_supervised_automated_child_until_reaped(
@@ -2216,11 +2279,11 @@ fn run_automated_session_supervisor(
             "its parent disconnected before launch",
         );
         finalize_disconnected_automated_supervisor(
-            state_dir,
-            project_id,
+            spec.state_dir,
+            spec.project_id,
             child_pid,
-            run_token,
-            lease_holder,
+            spec.run_token,
+            spec.lease_holder,
         );
         return report_automated_supervisor_reaped(status);
     }
@@ -2241,8 +2304,11 @@ fn run_automated_session_supervisor(
 
     let parent_state = Arc::new(AtomicU64::new(AUTOMATED_SUPERVISOR_CONNECTED));
     let lifeline_state = Arc::clone(&parent_state);
-    thread::Builder::new()
-        .name(format!("clt-automated-supervisor-lifeline-{project_id}"))
+    let lifeline_result = thread::Builder::new()
+        .name(format!(
+            "clt-automated-supervisor-lifeline-{}",
+            spec.project_id
+        ))
         .spawn(move || {
             let mut input = io::stdin();
             let mut buffer = [0_u8; 1];
@@ -2264,17 +2330,25 @@ fn run_automated_session_supervisor(
                     Ok(_) => {}
                 }
             }
-        })
-        .context("Failed to start automated supervisor parent lifeline")?;
+        });
+    if let Err(error) = lifeline_result {
+        let status = stop_supervised_automated_child_until_reaped(
+            &mut child,
+            "its parent lifeline could not start",
+        );
+        eprintln!("Failed to start automated supervisor parent lifeline: {error}");
+        return report_automated_supervisor_reaped(status);
+    }
 
-    let store = match open_agent_store_at(state_dir) {
+    let store = match open_agent_store_at(spec.state_dir) {
         Ok(store) => store,
         Err(error) => {
-            let _ = stop_supervised_automated_child_until_reaped(
+            let status = stop_supervised_automated_child_until_reaped(
                 &mut child,
                 "its session-control store could not be opened",
             );
-            return Err(error).context("Failed to open automated supervisor session control");
+            eprintln!("Failed to open automated supervisor session control: {error:#}");
+            return report_automated_supervisor_reaped(status);
         }
     };
     let mut requested_action = None;
@@ -2297,7 +2371,7 @@ fn run_automated_session_supervisor(
             }
         }
 
-        match supervised_session_control(&store, project_id, child_pid, run_token) {
+        match supervised_session_control(&store, spec.project_id, child_pid, spec.run_token) {
             Ok(Some(control)) => {
                 if let Some(action) = control.state.requested_action() {
                     requested_action = Some(action);
@@ -2333,11 +2407,11 @@ fn run_automated_session_supervisor(
         parent_state.load(Ordering::SeqCst) == AUTOMATED_SUPERVISOR_PARENT_DISCONNECTED;
     if parent_disconnected || requested_action.is_some() {
         finalize_disconnected_automated_supervisor(
-            state_dir,
-            project_id,
+            spec.state_dir,
+            spec.project_id,
             child_pid,
-            run_token,
-            lease_holder,
+            spec.run_token,
+            spec.lease_holder,
         );
     }
     report_automated_supervisor_reaped(status)
@@ -2397,9 +2471,10 @@ fn stop_supervised_automated_child_until_reaped(
         if let Some(status) = leader_status {
             match agent_process_group_exists(process_group) {
                 Ok(false) => return Some(status),
-                Ok(true) => {
-                    let _ = signal_agent_process_group(process_group, libc::SIGKILL);
-                }
+                // Once the leader is reaped, its numeric PGID is no longer
+                // anchored against reuse. Keep the generation fenced and only
+                // observe from here; signaling again could target a new group.
+                Ok(true) => {}
                 Err(error) => {
                     let should_warn = last_warning
                         .is_none_or(|warning| warning.elapsed() >= Duration::from_secs(5));
@@ -2495,18 +2570,87 @@ fn finalize_disconnected_automated_supervisor(
 }
 
 #[cfg(unix)]
-fn run_interactive_exec_gate(program: &Path, arguments: &[OsString]) -> Result<()> {
-    let stdin = io::stdin();
-    let mut reader = stdin.lock();
+fn set_descriptor_close_on_exec(fd: libc::c_int, close_on_exec: bool) -> io::Result<()> {
+    // SAFETY: fcntl only inspects or updates descriptor flags for the supplied
+    // live descriptor.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let updated = if close_on_exec {
+        flags | libc::FD_CLOEXEC
+    } else {
+        flags & !libc::FD_CLOEXEC
+    };
+    // SAFETY: `updated` is derived from the descriptor's current flag set.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, updated) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn configure_inherited_child_control(command: &mut Command) -> Result<(i32, UnixStream)> {
+    let (child_control, parent_control) =
+        UnixStream::pair().context("Failed to create the interactive guardian control channel")?;
+    set_descriptor_close_on_exec(child_control.as_raw_fd(), true)
+        .context("Failed to protect the child end of the interactive control channel")?;
+    set_descriptor_close_on_exec(parent_control.as_raw_fd(), true)
+        .context("Failed to protect the parent end of the interactive control channel")?;
+    let control_fd = child_control.as_raw_fd();
+
+    // SAFETY: the closure only performs async-signal-safe fcntl calls. It owns
+    // `child_control`, keeping that exact descriptor allocated through fork,
+    // and clears CLOEXEC only in the child that was explicitly given its
+    // numeric descriptor on the command line.
+    unsafe {
+        command.pre_exec(move || {
+            let child_fd = child_control.as_raw_fd();
+            let flags = libc::fcntl(child_fd, libc::F_GETFD);
+            if flags < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::fcntl(child_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    Ok((control_fd, parent_control))
+}
+
+#[cfg(unix)]
+fn inherited_child_control_reader(control_fd: Option<i32>) -> Result<fs::File> {
+    let control_fd = control_fd.context("Interactive helper did not receive its control FD")?;
+    if control_fd <= libc::STDERR_FILENO {
+        anyhow::bail!("Interactive helper received an invalid control FD {control_fd}");
+    }
+    // SAFETY: the hidden helper receives this descriptor from the parent that
+    // kept it allocated across exec. Taking ownership here ensures it closes
+    // when the helper finishes reading the channel.
+    let control = unsafe { fs::File::from_raw_fd(control_fd) };
+    set_descriptor_close_on_exec(control.as_raw_fd(), true)
+        .context("Failed to contain the inherited interactive control FD")?;
+    Ok(control)
+}
+
+#[cfg(unix)]
+fn run_interactive_exec_gate(
+    control_fd: Option<i32>,
+    program: &Path,
+    arguments: &[OsString],
+) -> Result<()> {
+    let mut reader = inherited_child_control_reader(control_fd)?;
     if !automated_exec_gate_is_released(&mut reader)
         .context("Failed to read interactive Codex launch gate")?
     {
         return Ok(());
     }
+    drop(reader);
 
-    let terminal_input = interactive_terminal_input()?;
     let mut command = Command::new(program);
-    command.args(arguments).stdin(Stdio::from(terminal_input));
+    command.args(arguments);
     let error = command.exec();
     Err(error).with_context(|| {
         format!(
@@ -2517,7 +2661,11 @@ fn run_interactive_exec_gate(program: &Path, arguments: &[OsString]) -> Result<(
 }
 
 #[cfg(not(unix))]
-fn run_interactive_exec_gate(program: &Path, arguments: &[OsString]) -> Result<()> {
+fn run_interactive_exec_gate(
+    _control_fd: Option<i32>,
+    program: &Path,
+    arguments: &[OsString],
+) -> Result<()> {
     let stdin = io::stdin();
     let mut reader = stdin.lock();
     if !automated_exec_gate_is_released(&mut reader)
@@ -2544,37 +2692,78 @@ fn run_interactive_exec_gate(program: &Path, arguments: &[OsString]) -> Result<(
     }
 }
 
+struct InteractiveExecGateCommand {
+    command: Command,
+    launch_gate: Option<Box<dyn Write>>,
+}
+
+impl InteractiveExecGateCommand {
+    fn command_mut(&mut self) -> &mut Command {
+        &mut self.command
+    }
+
+    fn spawn(mut self) -> Result<(Child, Box<dyn Write>)> {
+        let mut child = self.command.spawn()?;
+        let launch_gate = match self.launch_gate.take() {
+            Some(launch_gate) => launch_gate,
+            None => match child.stdin.take() {
+                Some(launch_gate) => Box::new(launch_gate),
+                None => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    anyhow::bail!("Interactive Codex launch gate did not open its release pipe");
+                }
+            },
+        };
+        Ok((child, launch_gate))
+    }
+}
+
 #[cfg(all(unix, not(test)))]
-fn interactive_exec_gate_command(target: &Command) -> Result<Command> {
+fn interactive_exec_gate_command(target: &Command) -> Result<InteractiveExecGateCommand> {
     let executable = std::env::current_exe()
         .context("Failed to resolve the CLT executable for the interactive Codex launch gate")?;
     let mut gate = Command::new(executable);
+    configure_automated_exec_gate_inheritance(&mut gate, target);
+    gate.stdin(Stdio::inherit());
+    let (control_fd, launch_gate) = configure_inherited_child_control(&mut gate)?;
     gate.arg("--local")
         .arg("agent")
         .arg("interactive-exec-gate")
+        .arg("--control-fd")
+        .arg(control_fd.to_string())
         .arg("--")
         .arg(target.get_program())
         .args(target.get_args());
-    configure_automated_exec_gate_inheritance(&mut gate, target);
-    Ok(gate)
+    Ok(InteractiveExecGateCommand {
+        command: gate,
+        launch_gate: Some(Box::new(launch_gate)),
+    })
 }
 
 #[cfg(all(unix, test))]
-fn interactive_exec_gate_command(target: &Command) -> Result<Command> {
+fn interactive_exec_gate_command(target: &Command) -> Result<InteractiveExecGateCommand> {
     // Unit tests cannot re-enter this binary's Clap entry point. The shell gate
     // provides the same EOF-before-release guarantee for launch-phase tests.
     let mut gate = Command::new("/bin/sh");
+    configure_automated_exec_gate_inheritance(&mut gate, target);
+    gate.stdin(Stdio::inherit());
+    let (control_fd, launch_gate) = configure_inherited_child_control(&mut gate)?;
     gate.arg("-c")
-        .arg("gate=$(/bin/dd bs=1 count=1 2>/dev/null)\n[ \"$gate\" = x ] || exit 0\nexec \"$@\"")
+        .arg(format!(
+            "gate=$(/bin/dd bs=1 count=1 <&{control_fd} 2>/dev/null)\n[ \"$gate\" = x ] || exit 0\nexec \"$@\""
+        ))
         .arg("clt-interactive-exec-gate")
         .arg(target.get_program())
         .args(target.get_args());
-    configure_automated_exec_gate_inheritance(&mut gate, target);
-    Ok(gate)
+    Ok(InteractiveExecGateCommand {
+        command: gate,
+        launch_gate: Some(Box::new(launch_gate)),
+    })
 }
 
 #[cfg(not(unix))]
-fn interactive_exec_gate_command(target: &Command) -> Result<Command> {
+fn interactive_exec_gate_command(target: &Command) -> Result<InteractiveExecGateCommand> {
     let executable = std::env::current_exe()
         .context("Failed to resolve the CLT executable for the interactive Codex launch gate")?;
     let mut gate = Command::new(executable);
@@ -2598,7 +2787,10 @@ fn interactive_exec_gate_command(target: &Command) -> Result<Command> {
         }
     }
     gate.stdin(Stdio::piped());
-    Ok(gate)
+    Ok(InteractiveExecGateCommand {
+        command: gate,
+        launch_gate: None,
+    })
 }
 
 struct InteractiveAgentLease {
@@ -2793,11 +2985,16 @@ fn resume_codex_session_interactively(
         .arg(session_id)
         .arg("--from-holder")
         .arg(from_holder)
-        .current_dir(project_root)
-        .stdin(Stdio::piped());
+        .current_dir(project_root);
     if resume_exec {
         command.arg("--resume-exec");
     }
+    #[cfg(unix)]
+    let (control_fd, guardian_lifeline) = configure_inherited_child_control(&mut command)?;
+    #[cfg(unix)]
+    command.arg("--control-fd").arg(control_fd.to_string());
+    #[cfg(not(unix))]
+    command.stdin(Stdio::piped());
     let mut guardian = command.spawn().with_context(|| {
         format!(
             "Failed to start the interactive Codex guardian with {} in {}",
@@ -2805,6 +3002,10 @@ fn resume_codex_session_interactively(
             project_root.display()
         )
     })?;
+    drop(command);
+    #[cfg(unix)]
+    let mut lifeline: Box<dyn Write> = Box::new(guardian_lifeline);
+    #[cfg(not(unix))]
     let Some(mut lifeline) = guardian.stdin.take() else {
         let _ = guardian.kill();
         let _ = guardian.wait();
@@ -2827,13 +3028,39 @@ fn resume_codex_session_interactively(
         .wait()
         .context("Failed to wait for the interactive Codex guardian");
     drop(lifeline);
+    let foreground_result = restore_parent_terminal_after_interactive_guardian();
     match status_result {
-        Ok(status) => Ok(status),
+        Ok(status) => {
+            foreground_result?;
+            Ok(status)
+        }
         Err(error) => {
             let _ = guardian.wait();
-            Err(error)
+            match foreground_result {
+                Ok(()) => Err(error),
+                Err(foreground_error) => Err(error.context(format!(
+                    "restoring the parent terminal foreground also failed: {foreground_error:#}"
+                ))),
+            }
         }
     }
+}
+
+#[cfg(unix)]
+fn restore_parent_terminal_after_interactive_guardian() -> Result<()> {
+    let terminal = interactive_terminal_input()?;
+    // SAFETY: getpgrp has no arguments and returns this CLT process's group.
+    let parent_process_group = unsafe { libc::getpgrp() };
+    set_terminal_foreground_process_group(&terminal, parent_process_group).with_context(|| {
+        format!(
+            "Failed to restore CLT terminal foreground group {parent_process_group} after the interactive guardian exited"
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn restore_parent_terminal_after_interactive_guardian() -> Result<()> {
+    Ok(())
 }
 
 fn agent_codex_path_env() -> Option<PathBuf> {
@@ -3537,6 +3764,7 @@ fn run_agent_interactive_session_worker(
     session_id: &str,
     from_holder: &str,
     resume_exec: bool,
+    control_fd: Option<i32>,
 ) -> Result<()> {
     if session_id.is_empty()
         || !session_id
@@ -3546,8 +3774,13 @@ fn run_agent_interactive_session_worker(
         anyhow::bail!("Invalid Codex session ID for interactive guardian");
     }
 
+    #[cfg(unix)]
+    let mut parent_control: Box<dyn Read + Send> =
+        Box::new(inherited_child_control_reader(control_fd)?);
+    #[cfg(not(unix))]
+    let mut parent_control: Box<dyn Read + Send> = Box::new(io::stdin());
     let mut startup_gate = [0_u8; 1];
-    io::stdin()
+    parent_control
         .read_exact(&mut startup_gate)
         .context("Interactive guardian parent disconnected before startup")?;
     let parent_connected = Arc::new(AtomicBool::new(true));
@@ -3555,10 +3788,9 @@ fn run_agent_interactive_session_worker(
     thread::Builder::new()
         .name(format!("clt-interactive-lifeline-{project_id}"))
         .spawn(move || {
-            let mut input = io::stdin();
             let mut buffer = [0_u8; 1];
             loop {
-                match input.read(&mut buffer) {
+                match parent_control.read(&mut buffer) {
                     Ok(0) | Err(_) => {
                         lifeline.store(false, Ordering::SeqCst);
                         break;
@@ -3711,7 +3943,25 @@ fn interactive_guardian_holder(disposition: InteractiveGuardianDisposition) -> S
 
 #[cfg(unix)]
 fn interactive_terminal_input() -> Result<fs::File> {
-    fs::File::open("/dev/tty").context("Failed to open the terminal for interactive Codex")
+    // The TUI deliberately preserves its inherited terminal as fd 0 through
+    // both guardian execs. On sandboxed macOS, opening a fresh /dev/tty alias
+    // can succeed while kqueue and terminal ioctls on that alias fail with
+    // EINVAL/EPERM, which makes crossterm's EventStream panic during startup.
+    // Duplicating the inherited descriptor preserves the terminal's original
+    // kernel identity and entitlement.
+    // SAFETY: isatty only inspects the process's standard-input descriptor.
+    if unsafe { libc::isatty(libc::STDIN_FILENO) } != 1 {
+        anyhow::bail!("Interactive Codex requires an inherited terminal on standard input");
+    }
+    // SAFETY: F_DUPFD_CLOEXEC atomically duplicates the live terminal fd and
+    // gives this owner an independently closeable descriptor.
+    let terminal_fd = unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_DUPFD_CLOEXEC, 3) };
+    if terminal_fd < 0 {
+        return Err(io::Error::last_os_error())
+            .context("Failed to retain the inherited terminal for interactive Codex");
+    }
+    // SAFETY: fcntl returned a new owned descriptor on success.
+    Ok(unsafe { fs::File::from_raw_fd(terminal_fd) })
 }
 
 #[cfg(windows)]
@@ -3974,8 +4224,8 @@ fn run_guarded_interactive_codex(
     let mut target = Command::new(&codex_command);
     configure_interactive_codex_resume_command(&mut target, &project.path, session_id);
     let mut command = interactive_exec_gate_command(&target)?;
-    configure_interactive_child_command(&mut command);
-    let mut child = match command.spawn() {
+    configure_interactive_child_command(command.command_mut());
+    let (mut child, mut launch_gate) = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
             return Err(error).with_context(|| {
@@ -3986,10 +4236,6 @@ fn run_guarded_interactive_codex(
                 )
             });
         }
-    };
-    let Some(mut launch_gate) = child.stdin.take() else {
-        let _ = stop_interactive_child_process(&mut child);
-        anyhow::bail!("Interactive Codex launch gate did not open its release pipe");
     };
     let child_pid = child.id();
     let registered = store.register_interactive_guardian_child_blocking(
@@ -4869,7 +5115,17 @@ fn run_agent_job(
             let stopped = with_agent_store_at(&job.state_dir, |store| {
                 store.complete_session_stop_blocking(job.project.id, session_id, run_token)
             })?;
-            if !stopped {
+            let already_stopped = !stopped
+                && with_agent_store_at(&job.state_dir, |store| {
+                    Ok(store
+                        .session_control_blocking(job.project.id, session_id)?
+                        .is_some_and(|control| {
+                            control.state == AgentSessionControlState::Stopped
+                                && control.run_token.as_deref() == Some(run_token)
+                                && control.child_pid.is_none()
+                        }))
+                })?;
+            if !stopped && !already_stopped {
                 anyhow::bail!(
                     "Codex session {session_id} changed before its stop could be finalized"
                 );
@@ -4893,7 +5149,23 @@ fn run_agent_job(
                     lease_timeout_seconds,
                 )
             })?;
-            if holder.is_none() {
+            let already_ready = if holder.is_none() {
+                with_agent_store_at(&job.state_dir, |store| {
+                    let control = store.session_control_blocking(job.project.id, session_id)?;
+                    let lease = store.lease_for_project_blocking(job.project.id)?;
+                    Ok(control.is_some_and(|control| {
+                        control.state == AgentSessionControlState::ReadyInteractive
+                            && control.run_token.as_deref() == Some(run_token)
+                            && control.child_pid.is_none()
+                            && control.interactive_holder.as_deref().is_some_and(|holder| {
+                                lease.as_ref().is_some_and(|lease| lease.holder == holder)
+                            })
+                    }))
+                })?
+            } else {
+                false
+            };
+            if holder.is_none() && !already_ready {
                 anyhow::bail!(
                     "Codex session {session_id} changed before its interactive handoff completed"
                 );
@@ -4973,10 +5245,15 @@ fn attach_codex_session_after_run(
     run_status: &str,
 ) -> Result<()> {
     let _mutation_lock = acquire_board_mutation_lock(&get_tasks_dir(&job.project.path))?;
-    if task_status_for_codex_session(&job.project.path, session_id)?.is_some() {
+    if terminal_task_for_codex_session_in_board(&get_tasks_dir(&job.project.path), session_id)?
+        .is_some()
+    {
         return Ok(());
     }
     if job.task_selection == AgentTaskSelection::ResumeSession {
+        if task_status_for_codex_session(&job.project.path, session_id)?.is_some() {
+            return Ok(());
+        }
         anyhow::bail!(
             "The task marker for exact Codex session {session_id} disappeared before handback"
         );
@@ -5339,6 +5616,21 @@ fn agent_lease_for_project(
     })
 }
 
+#[cfg(unix)]
+fn interactive_guardian_child_is_proven_absent(child_pid: Option<u32>) -> bool {
+    child_pid
+        .is_none_or(|child_pid| automated_agent_process_group_is_running(child_pid) == Some(false))
+}
+
+#[cfg(not(unix))]
+fn interactive_guardian_child_is_proven_absent(child_pid: Option<u32>) -> bool {
+    // The non-Unix gate must remain as a parent while Codex runs because this
+    // platform has no exec replacement. Its disappearance cannot prove that a
+    // spawned target also exited, so only the pre-release NULL phase is safe to
+    // recover automatically.
+    child_pid.is_none()
+}
+
 fn reconcile_stale_agent_session_controls(
     state_dir: &Path,
     project_id: i64,
@@ -5399,16 +5691,17 @@ fn reconcile_stale_agent_session_controls(
                 now.saturating_sub(updated_at)
                     <= TUI_SESSION_HANDOFF_TIMEOUT_SECONDS.saturating_add(5)
             });
-            let handoff_is_abandoned =
-                !matching_active_lease && (!requester_alive || !recently_updated);
+            let guardian_is_proven_dead =
+                InteractiveGuardianDisposition::guardian_process_is_proven_dead(holder);
+            let handoff_is_abandoned = guardian_is_proven_dead
+                || (!matching_active_lease && (!requester_alive || !recently_updated));
             if handoff_is_abandoned {
                 // The interactive exec gate makes a NULL PID proof that Codex was
                 // never released. Once a PID is registered, recovery remains
                 // fail-closed until that exact PGID is observed absent; it never
                 // signals a numeric PID that could have been reused.
-                let child_is_proven_absent = control.child_pid.is_none_or(|child_pid| {
-                    automated_agent_process_group_is_running(child_pid) == Some(false)
-                });
+                let child_is_proven_absent =
+                    interactive_guardian_child_is_proven_absent(control.child_pid);
                 if child_is_proven_absent {
                     with_agent_store_at(state_dir, |store| {
                         store
@@ -5496,14 +5789,17 @@ fn reconcile_stale_agent_session_controls(
         if let Some(recovery_state) = recovery_state {
             with_agent_store_at(state_dir, |store| {
                 if control.state == AgentSessionControlState::InterruptRequested {
+                    let Some(run_token) = control.run_token.as_deref() else {
+                        // Legacy/unregistered requested rows have no generation
+                        // proof. Keep them fenced instead of manufacturing an
+                        // interactive lease for an ambiguous session.
+                        return Ok(());
+                    };
                     store
                         .finalize_reaped_automated_session_blocking(
                             project_id,
                             control.child_pid.expect("stale recovery checked child PID"),
-                            control
-                                .run_token
-                                .as_deref()
-                                .expect("registered interrupt has a run token"),
+                            run_token,
                             lease.map_or("", |lease| lease.holder.as_str()),
                             agent_lease_timeout()?.as_secs().max(60),
                         )
@@ -5571,15 +5867,39 @@ fn task_for_codex_session_in_board(
     board_dir: &Path,
     session_id: &str,
 ) -> Result<Option<(&'static str, TaskEntry)>> {
+    task_for_codex_session_in_board_matching(board_dir, session_id, true)
+}
+
+fn terminal_task_for_codex_session_in_board(
+    board_dir: &Path,
+    session_id: &str,
+) -> Result<Option<(&'static str, TaskEntry)>> {
+    task_for_codex_session_in_board_matching(board_dir, session_id, false)
+}
+
+fn task_for_codex_session_in_board_matching(
+    board_dir: &Path,
+    session_id: &str,
+    recover_displaced_marker: bool,
+) -> Result<Option<(&'static str, TaskEntry)>> {
     for status in ["doing", "todo", "backlog", "done"] {
         let tasks = read_task_entries(board_dir, status)?;
         for task in tasks {
-            if codex_session_id_from_task_content(&task.content) == Some(session_id) {
+            let task_session_id = if recover_displaced_marker {
+                recoverable_codex_session_id_from_task_content(&task.content)
+            } else {
+                codex_session_id_from_task_content(&task.content)
+            };
+            if task_session_id == Some(session_id) {
                 return Ok(Some((status, task)));
             }
             if task.has_subtasks
                 && let TaskSource::Path { path, is_dir: true } = &task.source
-                && let Some(nested_task) = task_for_codex_session_in_board(path, session_id)?
+                && let Some(nested_task) = task_for_codex_session_in_board_matching(
+                    path,
+                    session_id,
+                    recover_displaced_marker,
+                )?
             {
                 return Ok(Some(nested_task));
             }
@@ -5956,8 +6276,13 @@ impl AgentRunner for CodexAgentRunner {
         let stderr_path = log_dir.join(format!("{run_file_stem}.err"));
         let stdout_file = fs::File::create(&stdout_path)
             .with_context(|| format!("Failed to create stdout log {:?}", stdout_path))?;
-        let stderr_file = fs::File::create(&stderr_path)
+        fs::File::create(&stderr_path)
             .with_context(|| format!("Failed to create stderr log {:?}", stderr_path))?;
+        let stderr_file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&stderr_path)
+            .with_context(|| format!("Failed to reopen stderr log {:?}", stderr_path))?;
 
         let mut command = Command::new(&self.command);
         command
@@ -6041,12 +6366,14 @@ impl AgentRunner for CodexAgentRunner {
             drop(stdout_file);
             spawn_automated_session_supervisor(
                 &command,
-                &self.state_dir,
-                project.id,
-                &run_file_stem,
-                lease_holder,
-                &stdout_path,
-                &stderr_path,
+                AutomatedSupervisorSpec {
+                    state_dir: &self.state_dir,
+                    project_id: project.id,
+                    run_token: &run_file_stem,
+                    lease_holder,
+                    stdout_path: &stdout_path,
+                    stderr_path: &stderr_path,
+                },
                 stderr_file,
             )
             .map(|supervised| {
@@ -6075,27 +6402,27 @@ impl AgentRunner for CodexAgentRunner {
 
         let (mut child, child_pid, mut supervisor_control, mut supervisor_proof) =
             match spawn_result {
-            Ok(child) => child,
-            Err(err) => {
-                let summary = format!(
-                    "Failed to start Codex command {} in {}: {err}",
-                    self.command.display(),
-                    project.path.display()
-                );
-                append_agent_log_line(&stderr_path, &summary)?;
-                return Ok(AgentRunResult {
-                    status: "failure",
-                    exit_code: None,
-                    log_dir,
-                    stdout_path,
-                    stderr_path,
-                    summary,
-                    codex_session_id: configured_session_id,
-                    session_run_token: None,
-                    control_action: None,
-                });
-            }
-        };
+                Ok(child) => child,
+                Err(err) => {
+                    let summary = format!(
+                        "Failed to start Codex command {} in {}: {err}",
+                        self.command.display(),
+                        project.path.display()
+                    );
+                    append_agent_log_line(&stderr_path, &summary)?;
+                    return Ok(AgentRunResult {
+                        status: "failure",
+                        exit_code: None,
+                        log_dir,
+                        stdout_path,
+                        stderr_path,
+                        summary,
+                        codex_session_id: configured_session_id,
+                        session_run_token: None,
+                        control_action: None,
+                    });
+                }
+            };
         let mut last_heartbeat_stderr_bytes = 0;
         let mut observed_session_id = configured_session_id;
         let mut session_linked = false;
@@ -6180,11 +6507,13 @@ impl AgentRunner for CodexAgentRunner {
         }
         #[cfg(unix)]
         let wait_result = wait_for_automated_supervisor_with_timeout_and_heartbeat(
-            &mut child,
-            &mut supervisor_control,
-            supervisor_proof
-                .as_mut()
-                .expect("Unix automated supervisor has a proof pipe"),
+            AutomatedSupervisorWaitHandles {
+                process: &mut child,
+                control: &mut supervisor_control,
+                proof: supervisor_proof
+                    .as_mut()
+                    .expect("Unix automated supervisor has a proof pipe"),
+            },
             self.timeout,
             self.heartbeat_interval,
             |elapsed| {
@@ -6308,11 +6637,8 @@ impl AgentRunner for CodexAgentRunner {
         if requested_control_cell.get().is_none()
             && let Some(session_id) = codex_session_id.as_deref()
             && let Some(control) = store.session_control_blocking(project.id, session_id)?
-            && let Some(action) = automated_session_control_action_for_generation(
-                &control,
-                child_pid,
-                &run_file_stem,
-            )
+            && let Some(action) =
+                automated_session_control_action_for_generation(&control, child_pid, &run_file_stem)
         {
             requested_control_cell.set(Some(action));
         }
@@ -7016,6 +7342,7 @@ fn agent_log_file_stem(project_id: i64) -> String {
     )
 }
 
+#[cfg(any(not(unix), test))]
 fn wait_for_child_with_timeout_and_heartbeat(
     child: &mut Child,
     timeout: Duration,
@@ -7065,15 +7392,18 @@ fn wait_for_child_with_timeout_and_heartbeat(
 
 #[cfg(unix)]
 fn wait_for_automated_supervisor_with_timeout_and_heartbeat(
-    supervisor: &mut Child,
-    control: &mut Option<std::process::ChildStdin>,
-    proof: &mut BufReader<std::process::ChildStdout>,
+    handles: AutomatedSupervisorWaitHandles<'_>,
     timeout: Duration,
     heartbeat_interval: Duration,
     mut heartbeat: impl FnMut(Duration) -> Result<()>,
     mut observe: impl FnMut() -> Result<()>,
     mut should_shutdown: impl FnMut() -> bool,
 ) -> Result<AgentProcessWait> {
+    let AutomatedSupervisorWaitHandles {
+        process: supervisor,
+        control,
+        proof,
+    } = handles;
     let heartbeat_interval = if heartbeat_interval.is_zero() {
         Duration::from_millis(250)
     } else {
@@ -7115,7 +7445,15 @@ fn wait_for_automated_supervisor_with_timeout_and_heartbeat(
         }
 
         if last_heartbeat.elapsed() >= heartbeat_interval {
-            heartbeat(started.elapsed())?;
+            if let Err(error) = heartbeat(started.elapsed()) {
+                request_automated_supervisor_stop(control);
+                wait_for_automated_supervisor_reaped(supervisor, proof).with_context(|| {
+                    format!(
+                        "Automated Codex heartbeat failed ({error:#}); its supervisor did not prove the process group reaped"
+                    )
+                })?;
+                return Err(error);
+            }
             last_heartbeat = Instant::now();
         }
         thread::sleep(std::cmp::min(
@@ -7198,34 +7536,68 @@ fn configure_agent_git_identity(command: &mut Command, git_mode: AgentGitMode) {
 }
 
 #[cfg(unix)]
+fn recover_rejected_agent_process_group_signal(
+    child: &mut Child,
+    process_group: libc::pid_t,
+    signal_error: anyhow::Error,
+    group_exists: impl FnOnce(libc::pid_t) -> Result<bool>,
+) -> Result<Option<ExitStatus>> {
+    let Some(status) = child
+        .try_wait()
+        .context("Failed to poll Codex leader after process-group signal rejection")?
+    else {
+        return Err(signal_error);
+    };
+
+    match group_exists(process_group) {
+        Ok(false) => Ok(Some(status)),
+        Ok(true) => Err(signal_error),
+        Err(probe_error) => {
+            let context = format!(
+                "Codex leader was reaped, but its process group could not be proven absent: {probe_error:#}"
+            );
+            Err(signal_error.context(context))
+        }
+    }
+}
+
+#[cfg(unix)]
 fn stop_agent_child_process(child: &mut Child) -> Result<Option<ExitStatus>> {
     let process_group = i32::try_from(child.id()).context("Codex process ID exceeded pid_t")?;
-    let term_sent = signal_agent_process_group(process_group, libc::SIGTERM)
-        .context("Failed to request Codex process-group termination")?;
+    let term_sent = match signal_agent_process_group(process_group, libc::SIGTERM)
+        .context("Failed to request Codex process-group termination")
+    {
+        Ok(term_sent) => term_sent,
+        Err(signal_error) => {
+            // Darwin can reject a group signal with EPERM when the group contains
+            // only its unreaped zombie leader. Reap first, then accept the
+            // rejection only when signal zero proves that exact group disappeared.
+            return recover_rejected_agent_process_group_signal(
+                child,
+                process_group,
+                signal_error,
+                agent_process_group_exists,
+            );
+        }
+    };
 
     if term_sent {
         // Keep the leader unreaped during the grace period. Its retained PID anchors
         // the process-group ID, so escalation cannot race with PGID reuse and signal
         // an unrelated group after the leader exits ahead of its descendants.
         thread::sleep(Duration::from_secs(2));
-        if let Err(force_stop_error) = signal_agent_process_group(process_group, libc::SIGKILL)
+        if let Err(signal_error) = signal_agent_process_group(process_group, libc::SIGKILL)
             .context("Failed to force-stop Codex process group")
         {
             // Darwin and restricted sandboxes can reject a group signal after
             // TERM has already left only a zombie leader. Reap that leader and
             // accept the rejection only when signal-zero proves the group gone.
-            return match child
-                .try_wait()
-                .context("Failed to poll Codex leader after force-stop rejection")?
-            {
-                Some(status)
-                    if !agent_process_group_exists(process_group)
-                        .context("Failed to verify rejected Codex force-stop")? =>
-                {
-                    Ok(Some(status))
-                }
-                Some(_) | None => Err(force_stop_error),
-            };
+            return recover_rejected_agent_process_group_signal(
+                child,
+                process_group,
+                signal_error,
+                agent_process_group_exists,
+            );
         }
     }
 
@@ -8047,12 +8419,28 @@ mod agent_store {
         }
 
         async fn unregister_project(&self, project_root: &Path) -> Result<bool> {
-            let conn = self.connect().await?;
+            let mut conn = self.connect().await?;
             let path = project_root.display().to_string();
-            let removed = conn
+            let transaction = conn
+                .transaction()
+                .await
+                .with_context(|| format!("Failed to begin unregistering project {}", path))?;
+            transaction
+                .execute(
+                    "DELETE FROM runs
+                     WHERE project_id = (SELECT id FROM projects WHERE path = ?1)",
+                    [path.as_str()],
+                )
+                .await
+                .with_context(|| format!("Failed to remove run history for project {}", path))?;
+            let removed = transaction
                 .execute("DELETE FROM projects WHERE path = ?1", [path.as_str()])
                 .await
                 .with_context(|| format!("Failed to unregister project {}", path))?;
+            transaction
+                .commit()
+                .await
+                .with_context(|| format!("Failed to commit unregistering project {}", path))?;
 
             Ok(removed > 0)
         }
@@ -11484,6 +11872,64 @@ fn codex_session_id_from_task_content(content: &str) -> Option<&str> {
     .then_some(session_id)
 }
 
+fn codex_session_markers_in_task_content(content: &str) -> Vec<(usize, usize, &str)> {
+    content
+        .match_indices(CODEX_TASK_SESSION_PREFIX)
+        .filter_map(|(start, _)| {
+            if start > 0
+                && !content[..start]
+                    .chars()
+                    .next_back()
+                    .is_some_and(char::is_whitespace)
+            {
+                return None;
+            }
+
+            let marker = &content[start..];
+            let end = marker
+                .char_indices()
+                .find(|(_, ch)| ch.is_whitespace())
+                .map(|(offset, _)| start + offset)
+                .unwrap_or(content.len());
+            let session_id = content[start..end].strip_prefix(CODEX_TASK_SESSION_PREFIX)?;
+            (!session_id.is_empty()
+                && session_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'))
+            .then_some((start, end, session_id))
+        })
+        .collect()
+}
+
+fn recoverable_codex_session_id_from_task_content(content: &str) -> Option<&str> {
+    if let Some(session_id) = codex_session_id_from_task_content(content) {
+        return Some(session_id);
+    }
+
+    let mut markers = codex_session_markers_in_task_content(content)
+        .into_iter()
+        .filter(|(_, end, session_id)| {
+            codex_session_id_is_uuid(session_id)
+                || content[*end..].starts_with('\r')
+                || content[*end..].starts_with('\n')
+        });
+    let (_, _, session_id) = markers.next()?;
+    markers
+        .all(|(_, _, candidate)| candidate == session_id)
+        .then_some(session_id)
+}
+
+fn codex_session_id_is_uuid(session_id: &str) -> bool {
+    session_id.len() == 36
+        && session_id.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
 fn task_content_without_codex_session(content: &str) -> &str {
     let trimmed = content.trim_end();
     let Some(session_id) = codex_session_id_from_task_content(trimmed) else {
@@ -11494,8 +11940,42 @@ fn task_content_without_codex_session(content: &str) -> &str {
     trimmed[..trimmed.len() - marker_len].trim_end()
 }
 
+fn task_content_without_matching_codex_sessions(content: &str, session_id: &str) -> String {
+    let mut result = String::with_capacity(content.len());
+    let mut cursor = 0;
+
+    for (start, end, candidate) in codex_session_markers_in_task_content(content) {
+        if candidate != session_id {
+            continue;
+        }
+
+        let mut removal_start = start;
+        if content[..start]
+            .chars()
+            .next_back()
+            .is_some_and(|ch| matches!(ch, ' ' | '\t'))
+        {
+            removal_start -= 1;
+        }
+        result.push_str(&content[cursor..removal_start]);
+        cursor = end;
+    }
+
+    result.push_str(&content[cursor..]);
+    result.trim_end().to_string()
+}
+
+fn task_content_without_recoverable_codex_session(content: &str) -> String {
+    let trimmed = content.trim_end();
+    match recoverable_codex_session_id_from_task_content(trimmed) {
+        Some(session_id) => task_content_without_matching_codex_sessions(trimmed, session_id),
+        None => trimmed.to_string(),
+    }
+}
+
 fn task_content_with_codex_session(content: &str, session_id: &str) -> String {
     let content = task_content_without_codex_session(content);
+    let content = task_content_without_matching_codex_sessions(content, session_id);
     if content.is_empty() {
         format!("{CODEX_TASK_SESSION_PREFIX}{session_id}")
     } else {
@@ -11504,7 +11984,7 @@ fn task_content_with_codex_session(content: &str, session_id: &str) -> String {
 }
 
 fn normalize_task_text(content: &str) -> String {
-    task_content_without_codex_session(content)
+    task_content_without_recoverable_codex_session(content)
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
@@ -11694,7 +12174,7 @@ fn insert_content_into_directory(path: &Path, index: Option<usize>, content: &st
 
 fn single_line_content(content: &str) -> String {
     let normalized = normalize_task_text(content);
-    match codex_session_id_from_task_content(content) {
+    match recoverable_codex_session_id_from_task_content(content) {
         Some(session_id) => task_content_with_codex_session(&normalized, session_id),
         None => normalized,
     }
@@ -12124,7 +12604,8 @@ fn update_task_in_board_after_lock(
     new_description: &str,
 ) -> Result<()> {
     let entry = task_entry_at(board_dir, status, task_index)?;
-    let updated_content = match codex_session_id_from_task_content(&entry.content) {
+    let session_id = recoverable_codex_session_id_from_task_content(&entry.content);
+    let updated_content = match session_id {
         Some(session_id) => task_content_with_codex_session(new_description, session_id),
         None => new_description.trim_end().to_string(),
     };
@@ -12240,7 +12721,21 @@ fn attach_codex_session_to_task_after_lock(
 ) -> Result<String> {
     let board_dir = get_tasks_dir(project_root);
     if let Some((_, existing)) = task_for_codex_session_in_board(&board_dir, session_id)? {
-        return Ok(existing.content);
+        if existing.source != entry.source
+            || codex_session_id_from_task_content(&existing.content) == Some(session_id)
+        {
+            return Ok(existing.content);
+        }
+
+        let content = task_content_with_codex_session(&existing.content, session_id);
+        write_task_entry_content_with_before_replace(
+            &board_dir,
+            status,
+            &existing,
+            &content,
+            before_replace,
+        )?;
+        return Ok(content);
     }
     let current = read_task_entries(&board_dir, status)?
         .into_iter()
@@ -13265,10 +13760,14 @@ struct TuiModelsPanel {
     focus: TuiModelsFocus,
     provider_state: ListState,
     model_state: ListState,
+    model_search: String,
+    provider_viewport_height: usize,
+    model_viewport_height: usize,
     last_error: Option<String>,
 }
 
 enum TuiModelInputKind {
+    SearchModels,
     AddModel {
         provider_id: String,
     },
@@ -13286,6 +13785,13 @@ struct TuiModelInput {
 }
 
 impl TuiModelInput {
+    fn search_models(query: String) -> Self {
+        Self {
+            kind: TuiModelInputKind::SearchModels,
+            input: Input::new(query),
+        }
+    }
+
     fn add_model(provider_id: String) -> Self {
         Self {
             kind: TuiModelInputKind::AddModel { provider_id },
@@ -13307,6 +13813,7 @@ impl TuiModelInput {
 
     fn label(&self) -> &'static str {
         match &self.kind {
+            TuiModelInputKind::SearchModels => " Search Models: ",
             TuiModelInputKind::AddModel { .. } => " Model ID: ",
             TuiModelInputKind::CustomProvider { step, .. } => match step {
                 0 => " Endpoint Name: ",
@@ -13318,6 +13825,9 @@ impl TuiModelInput {
 
     fn guidance(&self) -> &'static str {
         match &self.kind {
+            TuiModelInputKind::SearchModels => {
+                "Enter filters by model name or ID; submit an empty search to show every model"
+            }
             TuiModelInputKind::AddModel { .. } => "Enter the exact model ID used by the endpoint",
             TuiModelInputKind::CustomProvider { step, .. } => match step {
                 0 => "Enter a friendly name, for example My Local Server",
@@ -13626,6 +14136,9 @@ impl TuiModelsPanel {
             focus: TuiModelsFocus::Providers,
             provider_state: ListState::default(),
             model_state: ListState::default(),
+            model_search: String::new(),
+            provider_viewport_height: 0,
+            model_viewport_height: 0,
             last_error: None,
         };
         panel.refresh();
@@ -13642,6 +14155,37 @@ impl TuiModelsPanel {
         self.model_state
             .selected()
             .and_then(|index| self.models.get(index))
+    }
+
+    fn visible_model_indices(&self) -> Vec<usize> {
+        let query = self.model_search.trim().to_lowercase();
+        self.models
+            .iter()
+            .enumerate()
+            .filter_map(|(index, model)| {
+                (query.is_empty()
+                    || model.model_id.to_lowercase().contains(&query)
+                    || model.label.to_lowercase().contains(&query))
+                .then_some(index)
+            })
+            .collect()
+    }
+
+    fn normalize_model_selection(&mut self) {
+        let visible = self.visible_model_indices();
+        let selected = self.model_state.selected();
+        self.model_state.select(
+            selected
+                .filter(|index| visible.contains(index))
+                .or_else(|| visible.first().copied()),
+        );
+    }
+
+    fn set_model_search(&mut self, query: String) -> usize {
+        self.model_search = query.trim().to_string();
+        self.focus = TuiModelsFocus::Models;
+        self.normalize_model_selection();
+        self.visible_model_indices().len()
     }
 
     fn refresh(&mut self) {
@@ -13714,6 +14258,7 @@ impl TuiModelsPanel {
                         .unwrap_or(0);
                     self.model_state
                         .select((!self.models.is_empty()).then_some(model_index));
+                    self.normalize_model_selection();
                     self.last_error = None;
                 }
                 Err(error) => self.last_error = Some(error.to_string()),
@@ -13748,6 +14293,7 @@ impl TuiModelsPanel {
                     .unwrap_or(0);
                 self.model_state
                     .select((!self.models.is_empty()).then_some(index));
+                self.normalize_model_selection();
                 self.last_error = None;
             }
             Err(error) => self.last_error = Some(error.to_string()),
@@ -13766,11 +14312,19 @@ impl TuiModelsPanel {
                 }
             }
             TuiModelsFocus::Models => {
-                let len = self.models.len();
-                if len > 0 {
-                    let index = self.model_state.selected().unwrap_or(0);
-                    self.model_state
-                        .select(Some(if index == 0 { len - 1 } else { index - 1 }));
+                let visible = self.visible_model_indices();
+                if !visible.is_empty() {
+                    let position = self
+                        .model_state
+                        .selected()
+                        .and_then(|selected| visible.iter().position(|index| *index == selected))
+                        .unwrap_or(0);
+                    let previous = if position == 0 {
+                        visible.len() - 1
+                    } else {
+                        position - 1
+                    };
+                    self.model_state.select(Some(visible[previous]));
                 }
             }
         }
@@ -13787,11 +14341,103 @@ impl TuiModelsPanel {
                 }
             }
             TuiModelsFocus::Models => {
-                let len = self.models.len();
-                if len > 0 {
-                    let index = self.model_state.selected().unwrap_or(0);
-                    self.model_state.select(Some((index + 1) % len));
+                let visible = self.visible_model_indices();
+                if !visible.is_empty() {
+                    let position = self
+                        .model_state
+                        .selected()
+                        .and_then(|selected| visible.iter().position(|index| *index == selected))
+                        .unwrap_or(0);
+                    self.model_state
+                        .select(Some(visible[(position + 1) % visible.len()]));
                 }
+            }
+        }
+    }
+
+    fn select_first(&mut self) {
+        match self.focus {
+            TuiModelsFocus::Providers => {
+                self.provider_state
+                    .select((!self.providers.is_empty()).then_some(0));
+                self.refresh_models();
+            }
+            TuiModelsFocus::Models => {
+                self.model_state
+                    .select(self.visible_model_indices().first().copied());
+            }
+        }
+    }
+
+    fn select_last(&mut self) {
+        match self.focus {
+            TuiModelsFocus::Providers => {
+                self.provider_state
+                    .select(self.providers.len().checked_sub(1));
+                self.refresh_models();
+            }
+            TuiModelsFocus::Models => {
+                self.model_state
+                    .select(self.visible_model_indices().last().copied());
+            }
+        }
+    }
+
+    fn select_page_up(&mut self) {
+        match self.focus {
+            TuiModelsFocus::Providers => {
+                let Some(selected) = self.provider_state.selected() else {
+                    return;
+                };
+                self.provider_state.select(Some(
+                    selected.saturating_sub(self.provider_viewport_height.max(1)),
+                ));
+                self.refresh_models();
+            }
+            TuiModelsFocus::Models => {
+                let visible = self.visible_model_indices();
+                let Some(position) = self
+                    .model_state
+                    .selected()
+                    .and_then(|selected| visible.iter().position(|index| *index == selected))
+                else {
+                    return;
+                };
+                let target = position.saturating_sub(self.model_viewport_height.max(1));
+                self.model_state.select(Some(visible[target]));
+            }
+        }
+    }
+
+    fn select_page_down(&mut self) {
+        match self.focus {
+            TuiModelsFocus::Providers => {
+                let Some(selected) = self.provider_state.selected() else {
+                    return;
+                };
+                let Some(last) = self.providers.len().checked_sub(1) else {
+                    return;
+                };
+                self.provider_state.select(Some(
+                    selected
+                        .saturating_add(self.provider_viewport_height.max(1))
+                        .min(last),
+                ));
+                self.refresh_models();
+            }
+            TuiModelsFocus::Models => {
+                let visible = self.visible_model_indices();
+                let Some(position) = self
+                    .model_state
+                    .selected()
+                    .and_then(|selected| visible.iter().position(|index| *index == selected))
+                else {
+                    return;
+                };
+                let target = position
+                    .saturating_add(self.model_viewport_height.max(1))
+                    .min(visible.len() - 1);
+                self.model_state.select(Some(visible[target]));
             }
         }
     }
@@ -14212,6 +14858,14 @@ fn submit_tui_model_input(
 ) -> Result<Option<String>> {
     let entered = model_input.input.value().trim().to_string();
     match &mut model_input.kind {
+        TuiModelInputKind::SearchModels => {
+            let matches = panel.set_model_search(entered.clone());
+            Ok(Some(if entered.is_empty() {
+                format!("Model search cleared; showing {matches} models")
+            } else {
+                format!("Model search {entered:?}: {matches} matches")
+            }))
+        }
         TuiModelInputKind::AddModel { provider_id } => {
             if entered.is_empty() {
                 anyhow::bail!("Model ID cannot be empty");
@@ -14838,7 +15492,7 @@ fn collect_codex_session_tasks_in_board(
     for status in ["doing", "todo", "backlog", "done"] {
         let tasks = read_task_entries(board_dir, status)?;
         for task in tasks {
-            if codex_session_id_from_task_content(&task.content) == Some(session_id) {
+            if recoverable_codex_session_id_from_task_content(&task.content) == Some(session_id) {
                 matches.push((status, task.clone()));
             }
             if task.has_subtasks
@@ -14852,7 +15506,7 @@ fn collect_codex_session_tasks_in_board(
 }
 
 fn codex_session_for_task(task: &TaskEntry) -> Option<String> {
-    codex_session_id_from_task_content(&task.content).map(str::to_string)
+    recoverable_codex_session_id_from_task_content(&task.content).map(str::to_string)
 }
 
 fn toggle_tui_codex_session_stop(project_id: i64, session_id: &str) -> Result<String> {
@@ -16099,7 +16753,7 @@ fn render_tui_agent_panel(
 }
 
 fn tui_models_instructions() -> &'static str {
-    "n adds a provider. Select a non-built-in provider on the left and press x/Delete to remove it. Local endpoints discover /models automatically; r refreshes. New models start OFF: Right, Up/Down, then Space chooses them. a manually adds an ID. f favorites; t cycles model reasoning; d sets CLT; c sets Codex. M, Tab, or Esc returns to the previous pane. API keys come only from environment variables."
+    "n adds a provider. Select a non-built-in provider on the left and press x/Delete to remove it. Local endpoints discover /models automatically; r refreshes. New models start OFF: Right, Up/Down, PageUp/PageDown, Home/End, then Space chooses them. / searches model names and IDs. a manually adds an ID. f favorites; t cycles model reasoning; d sets CLT; c sets Codex. M, Tab, or Esc returns to the previous pane. API keys come only from environment variables."
 }
 
 fn provider_env_status(provider: &agent_store::AgentModelProvider) -> String {
@@ -16228,7 +16882,7 @@ fn tui_models_model_row(
 fn render_tui_models_panel(
     f: &mut ratatui::Frame<'_>,
     area: Rect,
-    panel: &TuiModelsPanel,
+    panel: &mut TuiModelsPanel,
     text_color: Color,
     c_highlight: Color,
 ) {
@@ -16313,6 +16967,7 @@ fn render_tui_models_panel(
     );
     let provider_selected = panel.provider_state.selected();
     let provider_height = provider_list_inner.height as usize;
+    panel.provider_viewport_height = provider_height;
     let provider_offset = provider_selected
         .unwrap_or(0)
         .saturating_sub(provider_height.saturating_sub(1));
@@ -16352,11 +17007,19 @@ fn render_tui_models_panel(
         .selected_provider()
         .map(|provider| provider.name.as_str())
         .unwrap_or("No provider");
+    let model_title = if panel.model_search.is_empty() {
+        format!(" {selected_provider_name} Models ")
+    } else {
+        format!(
+            " {selected_provider_name} Models  Search: {} ",
+            panel.model_search
+        )
+    };
     let models_block = Block::default()
         .title(if models_focused {
-            format!(" {selected_provider_name} Models  <<<<<< * >>>>>> ")
+            format!("{model_title} <<<<<< * >>>>>>")
         } else {
-            format!(" {selected_provider_name} Models ")
+            model_title
         })
         .title(Line::from(default_label).alignment(Alignment::Right))
         .borders(Borders::ALL)
@@ -16406,26 +17069,43 @@ fn render_tui_models_panel(
         models_inner.height.saturating_sub(2),
     );
 
-    if panel.models.is_empty() && models_list_inner.height > 0 {
-        f.render_widget(
-            Paragraph::new("No models yet. Press r to discover or a to add a model ID.")
-                .style(Style::default().fg(Color::Yellow)),
-            models_list_inner,
-        );
-    }
-
     let model_selected = panel.model_state.selected();
     let models_height = models_list_inner.height as usize;
-    let models_offset = model_selected
-        .unwrap_or(0)
-        .saturating_sub(models_height.saturating_sub(1));
-    for (index, model) in panel
-        .models
+    panel.model_viewport_height = models_height;
+    let visible_model_indices = panel.visible_model_indices();
+    if models_list_inner.height > 0 {
+        let empty_message = if panel.models.is_empty() {
+            Some("No models yet. Press r to discover or a to add a model ID.".to_string())
+        } else if visible_model_indices.is_empty() {
+            Some(format!(
+                "No models match {:?}. Press / to change or clear the search.",
+                panel.model_search
+            ))
+        } else {
+            None
+        };
+        if let Some(message) = empty_message {
+            f.render_widget(
+                Paragraph::new(message).style(Style::default().fg(Color::Yellow)),
+                models_list_inner,
+            );
+        }
+    }
+    let selected_visible_position = model_selected
+        .and_then(|selected| {
+            visible_model_indices
+                .iter()
+                .position(|index| *index == selected)
+        })
+        .unwrap_or(0);
+    let models_offset = selected_visible_position.saturating_sub(models_height.saturating_sub(1));
+    for (visible_position, model_index) in visible_model_indices
         .iter()
         .enumerate()
         .skip(models_offset)
         .take(models_height)
     {
+        let model = &panel.models[*model_index];
         let row = tui_models_model_row(
             model,
             tui_model_matches_clt_default(
@@ -16440,7 +17120,7 @@ fn render_tui_models_panel(
                 model,
             ),
         );
-        let style = if Some(index) == model_selected {
+        let style = if Some(*model_index) == model_selected {
             if models_focused {
                 Style::default().fg(Color::Black).bg(c_highlight)
             } else {
@@ -16455,7 +17135,7 @@ fn render_tui_models_panel(
             Paragraph::new(truncate_to_width(&row, models_list_inner.width as usize)).style(style),
             Rect::new(
                 models_list_inner.x,
-                models_list_inner.y + (index - models_offset) as u16,
+                models_list_inner.y + (visible_position - models_offset) as u16,
                 models_list_inner.width,
                 1,
             ),
@@ -16879,6 +17559,72 @@ fn tui_console_block<'a>(title: &'a str, right_title: Option<&'a str>) -> Block<
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TuiCodexHandoffStage {
+    WaitingForAutomatedExit,
+    PreparingIdleSession,
+    EnteringInteractive,
+    QueueingExecResume,
+    RestoringTaskControls,
+}
+
+impl TuiCodexHandoffStage {
+    fn message(self) -> &'static str {
+        match self {
+            Self::WaitingForAutomatedExit => {
+                "Requesting the automated Codex process to stop...\nWaiting for the current run to exit safely."
+            }
+            Self::PreparingIdleSession => {
+                "Reserving the Codex session for interactive use...\nThe session will open as soon as the handoff is ready."
+            }
+            Self::EnteringInteractive => {
+                "Entering interactive Codex...\nExit Codex when you are ready to return to CLT."
+            }
+            Self::QueueingExecResume => {
+                "Interactive Codex exited.\nReturning the same session to automated exec mode..."
+            }
+            Self::RestoringTaskControls => {
+                "Interactive Codex exited.\nRestoring the task's Codex session controls..."
+            }
+        }
+    }
+}
+
+fn draw_tui_codex_handoff_status<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    stage: TuiCodexHandoffStage,
+) -> std::result::Result<(), B::Error> {
+    terminal.draw(|frame| {
+        let area = frame.area();
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Codex handoff ");
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let status_height = inner.height.min(2);
+        let status_area = Rect::new(
+            inner.x,
+            inner.y + inner.height.saturating_sub(status_height) / 2,
+            inner.width,
+            status_height,
+        );
+        frame.render_widget(
+            Paragraph::new(stage.message()).alignment(Alignment::Center),
+            status_area,
+        );
+    })?;
+    Ok(())
+}
+
+fn write_tui_codex_handoff_status<W: Write>(
+    output: &mut W,
+    stage: TuiCodexHandoffStage,
+) -> io::Result<()> {
+    writeln!(output, "\n{}", stage.message())?;
+    output.flush()
+}
+
 fn tui_view(root: &Path) -> Result<PathBuf> {
     tui_view_with_active_board(root, true)
 }
@@ -17082,7 +17828,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                 render_tui_models_panel(
                     f,
                     content_area,
-                    &models_panel,
+                    &mut models_panel,
                     text_color,
                     c_highlight,
                 );
@@ -17450,9 +18196,11 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                  [Agent m]      - Cycle selected target\n\
                                  [M]            - Open Models from Tasks or Agent Projects\n\
                                  [Models n/r/a] - Add provider / discover models / manually add ID\n\
+                                 [Models /]     - Search model names and IDs\n\
                                  [Models x/Del] - Remove selected non-built-in provider\n\
                                  [Models d/c]   - Set CLT default / explicitly set Codex default\n\
-                                 [Arrows]       - Navigate boards and tasks\n\
+                                 [Arrows]       - Navigate boards, tasks, providers, and models\n\
+                                 [PgUp/Dn Home/End] - Jump through Models lists\n\
                                  [r]            - Toggle sticky Reorganize mode (r/Esc exits)\n\
                                  [Shift+Arrows] - Reorder/Move tasks\n\
                                  [Ctrl-P/N]     - Reorder task Up/Down\n\
@@ -17653,6 +18401,21 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                     }
                                     KeyCode::Up => models_panel.select_previous(),
                                     KeyCode::Down => models_panel.select_next(),
+                                    KeyCode::PageUp => models_panel.select_page_up(),
+                                    KeyCode::PageDown => models_panel.select_page_down(),
+                                    KeyCode::Home => models_panel.select_first(),
+                                    KeyCode::End => models_panel.select_last(),
+                                    KeyCode::Char('/') => {
+                                        models_panel.focus = TuiModelsFocus::Models;
+                                        model_input = Some(TuiModelInput::search_models(
+                                            models_panel.model_search.clone(),
+                                        ));
+                                        feedback_buffer = model_input
+                                            .as_ref()
+                                            .expect("model search input was just created")
+                                            .guidance()
+                                            .to_string();
+                                    }
                                     KeyCode::Char(' ') => {
                                         feedback_buffer =
                                             match toggle_tui_models_enabled(&mut models_panel) {
@@ -18266,6 +19029,10 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                                     .to_string();
                                             continue;
                                         };
+                                        draw_tui_codex_handoff_status(
+                                            &mut terminal,
+                                            TuiCodexHandoffStage::WaitingForAutomatedExit,
+                                        )?;
                                         let interactive_lease =
                                             match prepare_tui_codex_session_interrupt(
                                                 project_id,
@@ -18281,7 +19048,15 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                             };
 
                                         agent_log_view = None;
+                                        let _ = draw_tui_codex_handoff_status(
+                                            &mut terminal,
+                                            TuiCodexHandoffStage::EnteringInteractive,
+                                        );
                                         terminal_session.suspend();
+                                        let _ = write_tui_codex_handoff_status(
+                                            &mut stdout(),
+                                            TuiCodexHandoffStage::EnteringInteractive,
+                                        );
                                         let provisional_holder = interactive_lease.holder.clone();
                                         let resume_result = resume_codex_session_interactively(
                                             &active_root,
@@ -18289,6 +19064,10 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                             &session_id,
                                             &provisional_holder,
                                             true,
+                                        );
+                                        let _ = write_tui_codex_handoff_status(
+                                            &mut stdout(),
+                                            TuiCodexHandoffStage::QueueingExecResume,
                                         );
                                         let guardian_completed = resume_result
                                             .as_ref()
@@ -18437,6 +19216,10 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                                             .to_string();
                                                     continue;
                                                 };
+                                                draw_tui_codex_handoff_status(
+                                                    &mut terminal,
+                                                    TuiCodexHandoffStage::PreparingIdleSession,
+                                                )?;
                                                 let stopped_control =
                                                     match tui_stopped_codex_session_control(
                                                         project_id,
@@ -18541,7 +19324,15 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                                 }
 
                                                 agent_log_view = None;
+                                                let _ = draw_tui_codex_handoff_status(
+                                                    &mut terminal,
+                                                    TuiCodexHandoffStage::EnteringInteractive,
+                                                );
                                                 terminal_session.suspend();
+                                                let _ = write_tui_codex_handoff_status(
+                                                    &mut stdout(),
+                                                    TuiCodexHandoffStage::EnteringInteractive,
+                                                );
                                                 let resume_result =
                                                     resume_codex_session_interactively(
                                                         &active_root,
@@ -18550,6 +19341,10 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                                         &provisional_holder,
                                                         false,
                                                     );
+                                                let _ = write_tui_codex_handoff_status(
+                                                    &mut stdout(),
+                                                    TuiCodexHandoffStage::RestoringTaskControls,
+                                                );
                                                 let guardian_completed = resume_result
                                                     .as_ref()
                                                     .is_ok_and(|status| status.success());
@@ -18745,10 +19540,9 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                                     current_mode = Mode::Edit;
                                                     editing_task_idx = Some(idx + 1);
                                                     task_input = TaskInput::new(
-                                                        task_content_without_codex_session(
+                                                        task_content_without_recoverable_codex_session(
                                                             &entry.content,
-                                                        )
-                                                        .to_string(),
+                                                        ),
                                                     );
                                                 }
                                             }
@@ -18767,8 +19561,9 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                             current_mode = Mode::Edit;
                                             editing_task_idx = Some(idx + 1);
                                             task_input = TaskInput::new(
-                                                task_content_without_codex_session(&entry.content)
-                                                    .to_string(),
+                                                task_content_without_recoverable_codex_session(
+                                                    &entry.content,
+                                                ),
                                             );
                                         } else {
                                             feedback_buffer = "No task selected".to_string();
@@ -19141,6 +19936,265 @@ mod tests {
     use super::*;
     use std::sync::{Mutex, mpsc};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[cfg(unix)]
+    #[test]
+    fn interactive_terminal_event_source_process_entry() {
+        if std::env::var_os("CLT_TEST_INTERACTIVE_TERMINAL_SOURCE").is_none() {
+            return;
+        }
+        // SAFETY: isatty only inspects the inherited standard-input fd.
+        assert_eq!(unsafe { libc::isatty(libc::STDIN_FILENO) }, 1);
+        event::poll(Duration::ZERO)
+            .expect("crossterm must initialize from the inherited terminal descriptor");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automated_session_supervisor_process_entry() {
+        if std::env::var_os(TEST_AUTOMATED_SUPERVISOR_ENV).is_none() {
+            return;
+        }
+        let argument_count = std::env::var("CLT_TEST_SUPERVISOR_ARGUMENT_COUNT")
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
+        let arguments = (0..argument_count)
+            .map(|index| std::env::var_os(format!("CLT_TEST_SUPERVISOR_ARGUMENT_{index}")).unwrap())
+            .collect::<Vec<_>>();
+        let state_dir = PathBuf::from(std::env::var_os("CLT_TEST_SUPERVISOR_STATE_DIR").unwrap());
+        let run_token = std::env::var("CLT_TEST_SUPERVISOR_RUN_TOKEN").unwrap();
+        let lease_holder = std::env::var("CLT_TEST_SUPERVISOR_LEASE_HOLDER").unwrap();
+        let stdout_path =
+            PathBuf::from(std::env::var_os("CLT_TEST_SUPERVISOR_STDOUT_PATH").unwrap());
+        let stderr_path =
+            PathBuf::from(std::env::var_os("CLT_TEST_SUPERVISOR_STDERR_PATH").unwrap());
+        let exit_code = run_automated_session_supervisor(
+            AutomatedSupervisorSpec {
+                state_dir: &state_dir,
+                project_id: std::env::var("CLT_TEST_SUPERVISOR_PROJECT_ID")
+                    .unwrap()
+                    .parse()
+                    .unwrap(),
+                run_token: &run_token,
+                lease_holder: &lease_holder,
+                stdout_path: &stdout_path,
+                stderr_path: &stderr_path,
+            },
+            Path::new(&std::env::var_os("CLT_TEST_SUPERVISOR_PROGRAM").unwrap()),
+            &arguments,
+        )
+        .unwrap();
+        std::process::exit(exit_code);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automated_runner_owner_process_entry() {
+        if std::env::var_os("CLT_TEST_AUTOMATED_RUNNER_OWNER").is_none() {
+            return;
+        }
+        let state_dir = PathBuf::from(std::env::var_os("CLT_TEST_OWNER_STATE_DIR").unwrap());
+        let project_id = std::env::var("CLT_TEST_OWNER_PROJECT_ID")
+            .unwrap()
+            .parse::<i64>()
+            .unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        let project = store
+            .list_projects_blocking()
+            .unwrap()
+            .into_iter()
+            .find(|project| project.id == project_id)
+            .unwrap();
+        let mut runner = CodexAgentRunner::with_command(
+            state_dir,
+            Duration::from_secs(30),
+            PathBuf::from(std::env::var_os("CLT_TEST_OWNER_CODEX").unwrap()),
+        );
+        runner.heartbeat_interval = Duration::from_millis(50);
+        runner
+            .run_project(
+                &project,
+                AgentTaskSelection::ResumeSession,
+                Some(&std::env::var("CLT_TEST_OWNER_SESSION_ID").unwrap()),
+                &std::env::var("CLT_TEST_OWNER_LEASE_HOLDER").unwrap(),
+                &new_agent_shutdown_signal(),
+            )
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    fn assert_crashed_automated_owner_control_is_reaped(action: AgentSessionControlAction) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let suffix = match action {
+            AgentSessionControlAction::Stop => "stop",
+            AgentSessionControlAction::Interrupt => "interrupt",
+        };
+        let root = temp_root(&format!("automated-owner-crash-{suffix}"));
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "crash-owner-project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        let session_id = format!("session-owner-crash-{suffix}");
+        store
+            .set_session_control_state_blocking(
+                project.id,
+                &session_id,
+                AgentSessionControlState::ResumeRequested,
+            )
+            .unwrap();
+        let lease_holder = format!("crash-owner-lease-{suffix}");
+        assert!(
+            store
+                .try_acquire_lease_blocking(
+                    project.id,
+                    &lease_holder,
+                    &agent_timestamp(),
+                    &agent_timestamp_after(60),
+                )
+                .unwrap()
+        );
+
+        let launch_marker = root.join("codex-launches");
+        let fake_codex = root.join("fake-codex");
+        fs::write(
+            &fake_codex,
+            format!(
+                "#!/bin/sh\nprintf 'launched\\n' >> '{}'\ntrap '' TERM HUP\nwhile :; do sleep 1; done\n",
+                launch_marker.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&fake_codex).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_codex, permissions).unwrap();
+
+        let executable = std::env::current_exe().unwrap();
+        let mut owner = Command::new(executable)
+            .arg("--exact")
+            .arg("tests::automated_runner_owner_process_entry")
+            .arg("--nocapture")
+            .env("CLT_TEST_AUTOMATED_RUNNER_OWNER", "1")
+            .env("CLT_TEST_OWNER_STATE_DIR", &state_dir)
+            .env("CLT_TEST_OWNER_PROJECT_ID", project.id.to_string())
+            .env("CLT_TEST_OWNER_CODEX", &fake_codex)
+            .env("CLT_TEST_OWNER_SESSION_ID", &session_id)
+            .env("CLT_TEST_OWNER_LEASE_HOLDER", &lease_holder)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        let started = Instant::now();
+        let running = loop {
+            if let Some(control) = store
+                .session_control_blocking(project.id, &session_id)
+                .unwrap()
+                && control.state == AgentSessionControlState::Running
+                && control.child_pid.is_some()
+                && launch_marker.exists()
+            {
+                break control;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "runner never registered and launched supervised Codex"
+            );
+            thread::sleep(Duration::from_millis(25));
+        };
+        let child_pid = running.child_pid.unwrap();
+        let run_token = running.run_token.clone().unwrap();
+
+        owner.kill().unwrap();
+        owner.wait().unwrap();
+        let interactive_lease = match action {
+            AgentSessionControlAction::Stop => {
+                let message =
+                    toggle_tui_codex_session_stop_at(&state_dir, project.id, &session_id).unwrap();
+                assert!(message.starts_with("Stopping this Codex task session"));
+                None
+            }
+            AgentSessionControlAction::Interrupt => Some(
+                prepare_tui_codex_session_interrupt_at(
+                    &state_dir,
+                    project.id,
+                    &session_id,
+                    60,
+                    Duration::from_secs(10),
+                )
+                .unwrap(),
+            ),
+        };
+
+        let expected_state = match action {
+            AgentSessionControlAction::Stop => AgentSessionControlState::Stopped,
+            AgentSessionControlAction::Interrupt => AgentSessionControlState::ReadyInteractive,
+        };
+        let started = Instant::now();
+        let finalized = loop {
+            let control = store
+                .session_control_blocking(project.id, &session_id)
+                .unwrap()
+                .unwrap();
+            if control.state == expected_state {
+                break control;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "supervisor did not finalize crashed-owner {suffix} request; state={} ",
+                control.state.database_value()
+            );
+            thread::sleep(Duration::from_millis(25));
+        };
+        assert!(finalized.child_pid.is_none());
+        assert_eq!(finalized.run_token.as_deref(), Some(run_token.as_str()));
+        assert_eq!(
+            automated_agent_process_group_is_running(child_pid),
+            Some(false)
+        );
+        assert_eq!(
+            fs::read_to_string(&launch_marker).unwrap().lines().count(),
+            1
+        );
+        let lease = store.lease_for_project_blocking(project.id).unwrap();
+        match action {
+            AgentSessionControlAction::Stop => assert!(lease.is_none()),
+            AgentSessionControlAction::Interrupt => {
+                let interactive_holder = &interactive_lease.as_ref().unwrap().holder;
+                assert_eq!(
+                    finalized.interactive_holder.as_deref(),
+                    Some(interactive_holder.as_str())
+                );
+                assert_eq!(
+                    lease.as_ref().map(|lease| lease.holder.as_str()),
+                    Some(interactive_holder.as_str())
+                );
+            }
+        }
+        if let Some(lease) = interactive_lease {
+            lease.release().unwrap();
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn crashed_automated_owner_stop_is_completed_by_supervisor() {
+        assert_crashed_automated_owner_control_is_reaped(AgentSessionControlAction::Stop);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn crashed_automated_owner_interrupt_is_handed_to_interactive_holder() {
+        assert_crashed_automated_owner_control_is_reaped(AgentSessionControlAction::Interrupt);
+    }
 
     struct FakeAgentRunner {
         result: AgentRunResult,
@@ -19732,7 +20786,41 @@ mod tests {
             codex_session_id_from_task_content("codex:session-123 is mentioned in the task"),
             None
         );
+        assert_eq!(
+            normalize_task_text("codex:session-123 is mentioned in the task"),
+            "codex:session-123 is mentioned in the task"
+        );
         assert_eq!(codex_session_id_from_task_content("task codex:"), None);
+    }
+
+    #[test]
+    fn displaced_codex_session_marker_is_recovered_and_repositioned() {
+        let content = "Fix keyboard navigation. codex:session-123\n\nCompletion note.\n";
+
+        assert_eq!(codex_session_id_from_task_content(content), None);
+        assert_eq!(
+            recoverable_codex_session_id_from_task_content(content),
+            Some("session-123")
+        );
+        assert_eq!(
+            task_content_without_recoverable_codex_session(content),
+            "Fix keyboard navigation.\n\nCompletion note."
+        );
+        assert_eq!(
+            task_content_with_codex_session(content, "session-123"),
+            "Fix keyboard navigation.\n\nCompletion note. codex:session-123"
+        );
+
+        let session_id = "019fe7ab-f267-76e3-b82c-d7c5705be8d1";
+        let inline = format!("Fix keyboard navigation codex:{session_id} — COMPLETED: done");
+        assert_eq!(
+            recoverable_codex_session_id_from_task_content(&inline),
+            Some(session_id)
+        );
+        assert_eq!(
+            task_content_with_codex_session(&inline, session_id),
+            format!("Fix keyboard navigation — COMPLETED: done codex:{session_id}")
+        );
     }
 
     #[test]
@@ -19794,6 +20882,45 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&done_path).unwrap(),
             "Edited task.\n\nNew details. codex:session-456\n"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn task_edits_move_displaced_codex_session_markers_to_the_end() {
+        let root = temp_root("edit-displaced-codex-session-marker");
+        init_tasks(&root, true).unwrap();
+        let done_path = root.join("tasks/done/0001-finished-task.md");
+        fs::write(
+            &done_path,
+            "Finished task. codex:session-456\n\nCompletion note.\n",
+        )
+        .unwrap();
+        let board_dir = root.join("tasks");
+        let entry = read_task_entries(&board_dir, "done").unwrap().remove(0);
+
+        assert_eq!(
+            codex_session_for_task(&entry).as_deref(),
+            Some("session-456")
+        );
+        assert_eq!(task_display_text(&entry), "Finished task.");
+        update_task_in_board(
+            &board_dir,
+            "done",
+            1,
+            "Edited task.\n\nUpdated completion note.",
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&done_path).unwrap(),
+            "Edited task.\n\nUpdated completion note. codex:session-456\n"
+        );
+        let updated = read_task_entries(&board_dir, "done").unwrap().remove(0);
+        assert_eq!(
+            codex_session_id_from_task_content(&updated.content),
+            Some("session-456")
         );
 
         fs::remove_dir_all(root).unwrap();
@@ -20136,6 +21263,43 @@ mod tests {
             ]
         );
         assert_eq!(command.get_current_dir(), Some(project_root.as_path()));
+    }
+
+    #[test]
+    fn automated_codex_commands_allow_registered_non_git_projects() {
+        let project_root = PathBuf::from("/tmp/non-git-project");
+        let mut project = tui_agent_project_for_test(1, "non-git-project").project;
+        project.path = project_root.clone();
+
+        let mut new_command = Command::new("codex");
+        let new_session = configure_automated_codex_subcommand(
+            &mut new_command,
+            &project,
+            AgentTaskSelection::NextTodo,
+            None,
+        )
+        .unwrap();
+        let new_args: Vec<_> = new_command.get_args().collect();
+        assert_eq!(new_session, None);
+        assert_eq!(new_args[0], OsStr::new("exec"));
+        assert_eq!(new_args[1], OsStr::new("--skip-git-repo-check"));
+        assert_eq!(new_args[2], OsStr::new("-C"));
+        assert_eq!(new_args[3], project_root.as_os_str());
+
+        let mut resumed_command = Command::new("codex");
+        let resumed_session = configure_automated_codex_subcommand(
+            &mut resumed_command,
+            &project,
+            AgentTaskSelection::ResumeSession,
+            Some("session-123"),
+        )
+        .unwrap();
+        let resumed_args: Vec<_> = resumed_command.get_args().collect();
+        assert_eq!(resumed_session.as_deref(), Some("session-123"));
+        assert_eq!(resumed_args[0], OsStr::new("exec"));
+        assert_eq!(resumed_args[1], OsStr::new("resume"));
+        assert_eq!(resumed_args[2], OsStr::new("--skip-git-repo-check"));
+        assert_eq!(resumed_args[3], OsStr::new("session-123"));
     }
 
     #[test]
@@ -20634,9 +21798,10 @@ mod tests {
         assert_eq!(configured_session.as_deref(), Some("session-123"));
         assert_eq!(args[0], OsStr::new("exec"));
         assert_eq!(args[1], OsStr::new("resume"));
-        assert_eq!(args[2], OsStr::new("session-123"));
+        assert_eq!(args[2], OsStr::new("--skip-git-repo-check"));
+        assert_eq!(args[3], OsStr::new("session-123"));
         assert!(
-            args[3]
+            args[4]
                 .to_string_lossy()
                 .contains("Interactive handoff recovery:")
         );
@@ -21705,6 +22870,7 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn stale_gated_guardian_recovers_after_dying_before_child_registration() {
         let root = temp_root("stale-interactive-guardian");
@@ -21718,7 +22884,7 @@ mod tests {
             .unwrap();
         let project_id = store.list_projects_blocking().unwrap().remove(0).id;
         let provisional_holder = "clt-interactive-1-2-3";
-        let guardian_holder = "clt-interactive-worker-4-5-6";
+        let guardian_holder = format!("clt-interactive-worker-{}-5-6", u32::MAX);
         assert!(
             store
                 .try_acquire_lease_blocking(
@@ -21752,7 +22918,7 @@ mod tests {
                     project_id,
                     Some("session-123"),
                     provisional_holder,
-                    guardian_holder,
+                    &guardian_holder,
                     60,
                 )
                 .unwrap()
@@ -21763,26 +22929,27 @@ mod tests {
             .unwrap();
         assert_eq!(adopted.state, AgentSessionControlState::Interactive);
         assert_eq!(adopted.child_pid, None);
-        assert_eq!(adopted.interactive_holder.as_deref(), Some(guardian_holder));
+        assert_eq!(
+            adopted.interactive_holder.as_deref(),
+            Some(guardian_holder.as_str())
+        );
         assert_eq!(
             adopted.interactive_launch_token.as_deref(),
-            Some(guardian_holder)
+            Some(guardian_holder.as_str())
         );
-        assert!(
-            store
-                .release_lease_blocking(project_id, guardian_holder)
-                .unwrap()
-        );
+        let orphaned_lease = store
+            .lease_for_project_blocking(project_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(orphaned_lease.holder, guardian_holder);
         drop(store);
 
         reconcile_stale_agent_session_controls(
             &state_dir,
             project_id,
-            None,
+            Some(&orphaned_lease),
             false,
-            agent_timestamp_seconds()
-                .saturating_add(TUI_SESSION_HANDOFF_TIMEOUT_SECONDS)
-                .saturating_add(10),
+            agent_timestamp_seconds(),
         )
         .unwrap();
 
@@ -21795,6 +22962,12 @@ mod tests {
         assert_eq!(recovered.child_pid, None);
         assert!(recovered.interactive_holder.is_none());
         assert!(recovered.interactive_launch_token.is_none());
+        assert!(
+            store
+                .lease_for_project_blocking(project_id)
+                .unwrap()
+                .is_none()
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -22018,8 +23191,9 @@ mod tests {
         assert_eq!(session_id.as_deref(), Some("session-123"));
         assert_eq!(args[0], OsStr::new("exec"));
         assert_eq!(args[1], OsStr::new("resume"));
-        assert_eq!(args[2], OsStr::new("session-123"));
-        assert!(args[3].to_string_lossy().contains("Blocked-task monitor:"));
+        assert_eq!(args[2], OsStr::new("--skip-git-repo-check"));
+        assert_eq!(args[3], OsStr::new("session-123"));
+        assert!(args[4].to_string_lossy().contains("Blocked-task monitor:"));
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -22080,6 +23254,54 @@ mod tests {
         let doing = read_task_entries(&get_tasks_dir(&root), "doing").unwrap();
         assert_eq!(doing.len(), 1);
         assert!(codex_session_for_task(&doing[0]).is_none());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exact_session_completion_accepts_a_displaced_marker_and_leaves_todo_ready() {
+        let root = temp_root("exact-session-displaced-completion-marker");
+        init_tasks(&root, false).unwrap();
+        let session_id = "01a03e61-21a8-7da1-956a-f50e4565123b";
+        fs::write(
+            root.join("tasks/done.md"),
+            format!(
+                "# Done Tasks\n- handed-back task codex:{session_id} \
+— COMPLETED 2026-08-26: done\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            root.join("tasks/todo.md"),
+            "# Todo Tasks\n- next automated task\n",
+        )
+        .unwrap();
+
+        let mut project = tui_agent_project_for_test(1, "project").project;
+        project.path = root.clone();
+        let job = AgentRunJob {
+            state_dir: root.join("state/clt"),
+            project,
+            holder: "holder".to_string(),
+            task_selection: AgentTaskSelection::ResumeSession,
+            resume_session_id: Some(session_id.to_string()),
+            blocked_task_count_before: 0,
+            done_task_contents_before: Vec::new(),
+            blocked_task_snapshots_before: Vec::new(),
+        };
+
+        let done = read_task_entries(&get_tasks_dir(&root), "done")
+            .unwrap()
+            .remove(0);
+        assert_eq!(codex_session_for_task(&done).as_deref(), Some(session_id));
+        attach_codex_session_after_run(&job, session_id, "success").unwrap();
+        assert_eq!(
+            task_status_for_codex_session(&root, session_id).unwrap(),
+            Some("done")
+        );
+        let scan = scan_agent_project(&root);
+        assert_eq!(scan.available_todo_count(), 1);
+        assert!(scan.has_pending_task());
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -23455,12 +24677,14 @@ mod tests {
                         session_id,
                         from_holder,
                         resume_exec,
+                        control_fd,
                     },
             }) => {
                 assert_eq!(project_id, 42);
                 assert_eq!(session_id, "session-123");
                 assert_eq!(from_holder, "clt-interactive-7-generation-2");
                 assert!(resume_exec);
+                assert_eq!(control_fd, None);
             }
             _ => panic!("expected interactive guardian worker command"),
         }
@@ -24517,6 +25741,42 @@ mod tests {
     }
 
     #[test]
+    fn agent_store_unregister_removes_project_run_history() {
+        let root = temp_root("agent-unregister-run-history");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        store
+            .record_run_outcome_blocking(agent_store::AgentRunOutcome {
+                project_id: project.id,
+                status: "failed",
+                started_at: "100",
+                finished_at: Some("101"),
+                exit_code: Some(1),
+                log_dir: None,
+                stdout_path: None,
+                stderr_path: None,
+                summary: Some("Codex rejected an untrusted directory"),
+                codex_session_id: Some("session-123"),
+            })
+            .unwrap();
+        assert_eq!(store.run_count_blocking().unwrap(), 1);
+
+        assert!(store.unregister_project_blocking(&project_root).unwrap());
+        assert!(store.list_projects_blocking().unwrap().is_empty());
+        assert_eq!(store.run_count_blocking().unwrap(), 0);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn agent_store_unregister_cascades_session_controls_on_its_fresh_connection() {
         let root = temp_root("agent-unregister-session-control-cascade");
         let state_dir = root.join("state/clt");
@@ -24898,6 +26158,76 @@ mod tests {
     }
 
     #[test]
+    fn tui_models_navigation_pages_and_searches_visible_models() {
+        let mut panel = TuiModelsPanel {
+            providers: Vec::new(),
+            models: [
+                ("alpha", "Alpha"),
+                ("beta-v1", "Beta"),
+                ("delta-v2", "Delta"),
+                ("g-3", "Gamma Preview"),
+            ]
+            .into_iter()
+            .map(|(model_id, label)| agent_store::AgentModelTarget {
+                provider_id: "test".to_string(),
+                model_id: model_id.to_string(),
+                label: label.to_string(),
+                enabled: true,
+                favorite: false,
+                reasoning_effort: None,
+            })
+            .collect(),
+            defaults: agent_store::AgentModelDefaults::default(),
+            codex_default: "not explicitly set".to_string(),
+            codex_default_provider: None,
+            codex_default_model: None,
+            focus: TuiModelsFocus::Models,
+            provider_state: ListState::default(),
+            model_state: ListState::default().with_selected(Some(0)),
+            model_search: String::new(),
+            provider_viewport_height: 0,
+            model_viewport_height: 2,
+            last_error: None,
+        };
+
+        panel.select_page_down();
+        assert_eq!(panel.model_state.selected(), Some(2));
+        panel.select_page_down();
+        assert_eq!(panel.model_state.selected(), Some(3));
+        panel.select_page_up();
+        assert_eq!(panel.model_state.selected(), Some(1));
+        panel.select_first();
+        assert_eq!(panel.model_state.selected(), Some(0));
+        panel.select_last();
+        assert_eq!(panel.model_state.selected(), Some(3));
+
+        let mut search = TuiModelInput::search_models("TA".to_string());
+        let message = submit_tui_model_input(&mut search, &mut panel)
+            .unwrap()
+            .unwrap();
+        assert!(message.contains("2 matches"));
+        assert_eq!(panel.visible_model_indices(), [1, 2]);
+        assert_eq!(panel.model_state.selected(), Some(1));
+        panel.select_next();
+        assert_eq!(panel.model_state.selected(), Some(2));
+        panel.select_next();
+        assert_eq!(panel.model_state.selected(), Some(1));
+        panel.select_previous();
+        assert_eq!(panel.model_state.selected(), Some(2));
+        panel.select_first();
+        assert_eq!(panel.model_state.selected(), Some(1));
+        panel.select_last();
+        assert_eq!(panel.model_state.selected(), Some(2));
+
+        assert_eq!(panel.set_model_search("PREVIEW".to_string()), 1);
+        assert_eq!(panel.selected_model().unwrap().model_id, "g-3");
+        assert_eq!(panel.set_model_search("missing".to_string()), 0);
+        assert!(panel.selected_model().is_none());
+        assert_eq!(panel.set_model_search(String::new()), 4);
+        assert_eq!(panel.model_state.selected(), Some(0));
+    }
+
+    #[test]
     fn tui_models_rows_have_labeled_columns_and_independent_defaults() {
         let provider = agent_store::AgentModelProvider {
             id: "openai".to_string(),
@@ -25073,6 +26403,8 @@ mod tests {
         assert!(tui_models_provider_choice_prompt().contains("[5] Local/custom"));
         assert!(!tui_models_instructions().contains("1 OpenAI"));
         assert!(tui_models_instructions().contains("r refreshes"));
+        assert!(tui_models_instructions().contains("/ searches"));
+        assert!(tui_models_instructions().contains("PageUp/PageDown"));
         assert!(tui_models_instructions().contains("x/Delete to remove"));
         assert!(tui_models_instructions().contains("t cycles model reasoning"));
         let mut input = TuiModelInput::custom_provider();
@@ -26811,6 +28143,16 @@ mod tests {
         assert!(recovery_prompt.contains("Resume and finish exactly one existing doing task."));
         assert!(recovery_prompt.contains("Do not pick or move a TODO task"));
 
+        let exact_recovery_prompt =
+            build_agent_codex_prompt(&project, AgentTaskSelection::ResumeSession, true, true);
+        assert!(exact_recovery_prompt.contains("Interactive handoff recovery:"));
+        assert!(exact_recovery_prompt.contains("next unfinished substantive step"));
+        assert!(exact_recovery_prompt.contains("claimed completion is not proof"));
+        assert!(exact_recovery_prompt.contains("durable changes actually exist"));
+        assert!(exact_recovery_prompt.contains("response-only task"));
+        assert!(exact_recovery_prompt.contains("any requested durable output"));
+        assert!(exact_recovery_prompt.contains("Do not select another Todo or Backlog task"));
+
         let blocked_prompt =
             build_agent_codex_prompt(&project, AgentTaskSelection::RecoverBlocked, true, true);
         assert!(blocked_prompt.contains("Blocked-task monitor:"));
@@ -27017,6 +28359,120 @@ wait
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stop_agent_child_process_accepts_darwin_zombie_only_group_signal_rejection() {
+        let mut command = Command::new("/usr/bin/true");
+        configure_agent_child_command(&mut command);
+        let mut child = command.spawn().unwrap();
+        let process_group = i32::try_from(child.id()).unwrap();
+
+        let started = Instant::now();
+        while !interactive_child_exited_without_reaping(&child).unwrap() {
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "process-group leader did not exit"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        // Darwin reports EPERM for a group containing only its unreaped zombie
+        // leader. This is the exact rejection that cleanup must disambiguate.
+        // SAFETY: the retained direct child anchors this positive process-group ID.
+        assert_eq!(unsafe { libc::kill(-process_group, libc::SIGTERM) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EPERM));
+
+        let status = stop_agent_child_process(&mut child).unwrap();
+
+        assert!(status.is_some_and(|status| status.success()));
+        assert!(!agent_process_group_exists(process_group).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejected_group_signal_is_accepted_only_after_reap_and_absence_proof() {
+        let mut command = Command::new("/usr/bin/true");
+        configure_agent_child_command(&mut command);
+        let mut child = command.spawn().unwrap();
+        let process_group = i32::try_from(child.id()).unwrap();
+
+        let started = Instant::now();
+        while !interactive_child_exited_without_reaping(&child).unwrap() {
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "process-group leader did not exit"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let status = recover_rejected_agent_process_group_signal(
+            &mut child,
+            process_group,
+            anyhow::anyhow!("synthetic group signal rejection"),
+            |_| Ok(false),
+        )
+        .unwrap();
+
+        assert!(status.is_some_and(|status| status.success()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejected_group_signal_stays_fenced_while_leader_is_live() {
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg("sleep 30");
+        configure_agent_child_command(&mut command);
+        let mut child = command.spawn().unwrap();
+        let process_group = i32::try_from(child.id()).unwrap();
+        let probe_called = std::cell::Cell::new(false);
+
+        let result = recover_rejected_agent_process_group_signal(
+            &mut child,
+            process_group,
+            anyhow::anyhow!("synthetic group signal rejection"),
+            |_| {
+                probe_called.set(true);
+                Ok(false)
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(!probe_called.get());
+        assert!(child.try_wait().unwrap().is_none());
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejected_group_signal_stays_fenced_when_group_is_live_or_unknown() {
+        for group_probe in [Ok(true), Err(anyhow::anyhow!("synthetic probe failure"))] {
+            let mut command = Command::new("/usr/bin/true");
+            configure_agent_child_command(&mut command);
+            let mut child = command.spawn().unwrap();
+            let process_group = i32::try_from(child.id()).unwrap();
+
+            let started = Instant::now();
+            while !interactive_child_exited_without_reaping(&child).unwrap() {
+                assert!(
+                    started.elapsed() < Duration::from_secs(2),
+                    "process-group leader did not exit"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+
+            let result = recover_rejected_agent_process_group_signal(
+                &mut child,
+                process_group,
+                anyhow::anyhow!("synthetic group signal rejection"),
+                |_| group_probe,
+            );
+
+            assert!(result.is_err());
+            assert!(child.try_wait().unwrap().is_some());
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn interactive_exit_observation_keeps_the_group_anchored_until_descendants_stop() {
@@ -27077,6 +28533,59 @@ exit 0
 
     #[cfg(unix)]
     #[test]
+    fn interactive_exec_gate_preserves_inherited_terminal_for_crossterm() {
+        let mut master_fd = -1;
+        let mut slave_fd = -1;
+        // SAFETY: openpty initializes both integer descriptors; null termios,
+        // winsize, and name pointers request platform defaults.
+        let open_result = unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(
+            open_result,
+            0,
+            "openpty failed: {}",
+            io::Error::last_os_error()
+        );
+        // SAFETY: successful openpty returned two newly owned descriptors.
+        let master = unsafe { fs::File::from_raw_fd(master_fd) };
+        // SAFETY: successful openpty returned two newly owned descriptors.
+        let slave = unsafe { fs::File::from_raw_fd(slave_fd) };
+
+        let executable = std::env::current_exe().unwrap();
+        let mut target = Command::new(executable);
+        target
+            .arg("--exact")
+            .arg("tests::interactive_terminal_event_source_process_entry")
+            .arg("--nocapture")
+            .env("CLT_TEST_INTERACTIVE_TERMINAL_SOURCE", "1");
+        let mut gate = interactive_exec_gate_command(&target).unwrap();
+        gate.command_mut()
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave));
+        configure_interactive_child_command(gate.command_mut());
+        let (mut child, mut launch_gate) = gate.spawn().unwrap();
+        launch_gate.write_all(b"x").unwrap();
+        launch_gate.flush().unwrap();
+        drop(launch_gate);
+
+        let status = child.wait().unwrap();
+        drop(master);
+        assert!(
+            status.success(),
+            "terminal source probe exited with {status}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn interactive_exec_gate_parent_drop_prevents_target_exec() {
         let root = temp_root("interactive-exec-gate-parent-drop");
         let launched_marker = root.join("target-launched");
@@ -27089,12 +28598,12 @@ exit 0
             .arg("sh")
             .arg(&launched_marker);
         let mut gate = interactive_exec_gate_command(&target).unwrap();
-        configure_interactive_child_command(&mut gate);
-        let mut child = gate.spawn().unwrap();
+        configure_interactive_child_command(gate.command_mut());
+        let (mut child, launch_gate) = gate.spawn().unwrap();
 
         // A hard guardian death closes its only writer. The gate must exit
         // without ever replacing itself with the interactive Codex target.
-        drop(child.stdin.take().unwrap());
+        drop(launch_gate);
         assert!(child.wait().unwrap().success());
         assert!(!launched_marker.exists());
 
@@ -27116,7 +28625,7 @@ exit 0
             .unwrap();
         let project_id = store.list_projects_blocking().unwrap().remove(0).id;
         let provisional_holder = "clt-interactive-pre-release-requester";
-        let guardian_holder = "clt-interactive-worker-pre-release-guardian";
+        let guardian_holder = format!("clt-interactive-worker-{}-pre-release-guardian", u32::MAX);
         assert!(
             store
                 .try_acquire_lease_blocking(
@@ -27150,7 +28659,7 @@ exit 0
                     project_id,
                     Some("session-123"),
                     provisional_holder,
-                    guardian_holder,
+                    &guardian_holder,
                     60,
                 )
                 .unwrap()
@@ -27163,15 +28672,15 @@ exit 0
             .arg("sh")
             .arg(&launched_marker);
         let mut gate = interactive_exec_gate_command(&target).unwrap();
-        configure_interactive_child_command(&mut gate);
-        let mut child = gate.spawn().unwrap();
+        configure_interactive_child_command(gate.command_mut());
+        let (mut child, launch_gate) = gate.spawn().unwrap();
         let child_pid = child.id();
         assert!(
             store
                 .register_interactive_guardian_child_blocking(
                     project_id,
                     "session-123",
-                    guardian_holder,
+                    &guardian_holder,
                     child_pid,
                     60,
                 )
@@ -27185,17 +28694,17 @@ exit 0
         assert_eq!(registered.child_pid, Some(child_pid));
         assert_eq!(
             registered.interactive_launch_token.as_deref(),
-            Some(guardian_holder)
+            Some(guardian_holder.as_str())
         );
         assert!(!launched_marker.exists());
 
         // Simulate SIGKILL after registration but before the one-byte release.
-        assert!(
-            store
-                .release_lease_blocking(project_id, guardian_holder)
-                .unwrap()
-        );
-        drop(child.stdin.take().unwrap());
+        let orphaned_lease = store
+            .lease_for_project_blocking(project_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(orphaned_lease.holder, guardian_holder);
+        drop(launch_gate);
         assert!(child.wait().unwrap().success());
         assert!(!launched_marker.exists());
         drop(store);
@@ -27203,11 +28712,9 @@ exit 0
         reconcile_stale_agent_session_controls(
             &state_dir,
             project_id,
-            None,
+            Some(&orphaned_lease),
             false,
-            agent_timestamp_seconds()
-                .saturating_add(TUI_SESSION_HANDOFF_TIMEOUT_SECONDS)
-                .saturating_add(10),
+            agent_timestamp_seconds(),
         )
         .unwrap();
         let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
@@ -27219,6 +28726,12 @@ exit 0
         assert_eq!(recovered.child_pid, None);
         assert!(recovered.interactive_holder.is_none());
         assert!(recovered.interactive_launch_token.is_none());
+        assert!(
+            store
+                .lease_for_project_blocking(project_id)
+                .unwrap()
+                .is_none()
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -27238,7 +28751,7 @@ exit 0
             .unwrap();
         let project_id = store.list_projects_blocking().unwrap().remove(0).id;
         let provisional_holder = "clt-interactive-live-requester";
-        let guardian_holder = "clt-interactive-worker-live-guardian";
+        let guardian_holder = format!("clt-interactive-worker-{}-live-guardian", u32::MAX);
         assert!(
             store
                 .try_acquire_lease_blocking(
@@ -27272,7 +28785,7 @@ exit 0
                     project_id,
                     Some("session-123"),
                     provisional_holder,
-                    guardian_holder,
+                    &guardian_holder,
                     60,
                 )
                 .unwrap()
@@ -27285,15 +28798,15 @@ exit 0
             .arg("sh")
             .arg(&launched_marker);
         let mut gate = interactive_exec_gate_command(&target).unwrap();
-        configure_interactive_child_command(&mut gate);
-        let mut child = gate.spawn().unwrap();
+        configure_interactive_child_command(gate.command_mut());
+        let (mut child, mut launch_gate) = gate.spawn().unwrap();
         let child_pid = child.id();
         assert!(
             store
                 .register_interactive_guardian_child_blocking(
                     project_id,
                     "session-123",
-                    guardian_holder,
+                    &guardian_holder,
                     child_pid,
                     60,
                 )
@@ -27304,13 +28817,12 @@ exit 0
                 .recover_stale_interactive_guardian_blocking(
                     project_id,
                     "session-123",
-                    guardian_holder,
+                    &guardian_holder,
                     Some(child_pid.checked_add(1).unwrap()),
                     InteractiveGuardianDisposition::ResumeExec,
                 )
                 .unwrap()
         );
-        let mut launch_gate = child.stdin.take().unwrap();
         launch_gate.write_all(b"x").unwrap();
         launch_gate.flush().unwrap();
         drop(launch_gate);
@@ -27320,18 +28832,22 @@ exit 0
         }
         assert!(launched_marker.exists());
         assert!(child.try_wait().unwrap().is_none());
-        assert!(
-            store
-                .release_lease_blocking(project_id, guardian_holder)
-                .unwrap()
-        );
+        let orphaned_lease = store
+            .lease_for_project_blocking(project_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(orphaned_lease.holder, guardian_holder);
         drop(store);
 
-        let stale_now = agent_timestamp_seconds()
-            .saturating_add(TUI_SESSION_HANDOFF_TIMEOUT_SECONDS)
-            .saturating_add(10);
-        reconcile_stale_agent_session_controls(&state_dir, project_id, None, false, stale_now)
-            .unwrap();
+        let stale_now = agent_timestamp_seconds();
+        reconcile_stale_agent_session_controls(
+            &state_dir,
+            project_id,
+            Some(&orphaned_lease),
+            false,
+            stale_now,
+        )
+        .unwrap();
         let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
         let fenced = store
             .session_control_blocking(project_id, "session-123")
@@ -27347,8 +28863,14 @@ exit 0
                 .unwrap()
                 .is_some()
         );
-        reconcile_stale_agent_session_controls(&state_dir, project_id, None, false, stale_now)
-            .unwrap();
+        reconcile_stale_agent_session_controls(
+            &state_dir,
+            project_id,
+            Some(&orphaned_lease),
+            false,
+            stale_now,
+        )
+        .unwrap();
         let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
         let recovered = store
             .session_control_blocking(project_id, "session-123")
@@ -27358,6 +28880,12 @@ exit 0
         assert_eq!(recovered.child_pid, None);
         assert!(recovered.interactive_holder.is_none());
         assert!(recovered.interactive_launch_token.is_none());
+        assert!(
+            store
+                .lease_for_project_blocking(project_id)
+                .unwrap()
+                .is_none()
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -27557,7 +29085,7 @@ exit 0
         );
         let stderr = fs::read_to_string(&result.stderr_path).unwrap();
         assert!(stderr.contains(
-            "arg=--sandbox\narg=danger-full-access\narg=--ask-for-approval\narg=never\narg=--enable\narg=goals\narg=--config\narg=model_provider=\"openai\"\narg=--model\narg=gpt-5.6-terra\narg=--config\narg=model_reasoning_effort=\"high\"\narg=--enable\narg=fast_mode\narg=--config\narg=service_tier=\"fast\"\narg=exec\narg=-C\n"
+            "arg=--sandbox\narg=danger-full-access\narg=--ask-for-approval\narg=never\narg=--enable\narg=goals\narg=--config\narg=model_provider=\"openai\"\narg=--model\narg=gpt-5.6-terra\narg=--config\narg=model_reasoning_effort=\"high\"\narg=--enable\narg=fast_mode\narg=--config\narg=service_tier=\"fast\"\narg=exec\narg=--skip-git-repo-check\narg=-C\n"
         ));
         assert!(!stderr.contains("arg=model_reasoning_effort=\"low\"\n"));
         assert!(stderr.contains(&format!("arg={}\n", project_root.display())));
@@ -27965,6 +29493,44 @@ exit 0
             .join("");
         assert!(top_border.starts_with("┌clt Console"));
         assert!(top_border.ends_with(" Backlog: 2 [B] ┐"));
+    }
+
+    #[test]
+    fn tui_codex_handoff_status_renders_while_the_event_handler_is_blocked() {
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(100, 9);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        draw_tui_codex_handoff_status(&mut terminal, TuiCodexHandoffStage::WaitingForAutomatedExit)
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Codex handoff"));
+        assert!(rendered.contains("Requesting the automated Codex process to stop..."));
+        assert!(rendered.contains("Waiting for the current run to exit safely."));
+    }
+
+    #[test]
+    fn tui_codex_handoff_status_is_printed_across_terminal_suspension() {
+        let mut output = Vec::new();
+
+        write_tui_codex_handoff_status(&mut output, TuiCodexHandoffStage::QueueingExecResume)
+            .unwrap();
+
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "\nInteractive Codex exited.\nReturning the same session to automated exec mode...\n"
+        );
     }
 
     #[test]

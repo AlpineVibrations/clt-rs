@@ -55,6 +55,10 @@ Use this section while developing the next release.
 
 ### Fixed
 
+- Exact-session recovery now continues from the next unfinished step and requires requested code, file, configuration, or task-board changes to exist and pass relevant checks before marking the linked task done, while still allowing response-only tasks to finish with a response.
+- Recovered Codex session markers displaced by completion notes so interactive handback can finish cleanly and the scheduler can continue with ready Todo work.
+- Allowed explicitly registered non-Git folders to start and resume automated Codex runs, and allowed projects with run history to be unregistered cleanly.
+- Fixed interactive Codex handoff on macOS by preserving the inherited terminal through the guardian and launch gate, handling zombie-only process groups safely, and showing stop, entry, and return-to-exec progress in the TUI.
 - Prevented `c` from opening a Codex session that is still occupied by its automated run, and reserved the project while the interactive handoff is active so the scheduler cannot resume it concurrently.
 - Prevented stop and interactive handoff races by having the owning runner terminate its own Codex process group, fencing the scheduler with persisted session state, and recovering stale TUI handoffs.
 - Made the Kanban agent-output viewer follow the selected task, using live output for the active Doing task and session-linked run history for completed or blocked tasks.

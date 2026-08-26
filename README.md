@@ -137,6 +137,8 @@ clt init --folders
 clt agent register
 ```
 
+Registering a project is the user's explicit opt-in to automated Codex runs in that directory. Registered projects do not have to be Git repositories; CLT passes Codex's non-Git `exec` override for both new and resumed automated sessions.
+
 #### Linux Codex sandbox setup
 
 Codex uses Bubblewrap (`bwrap`) to sandbox commands on Linux. Install the distribution package before starting the agent:
