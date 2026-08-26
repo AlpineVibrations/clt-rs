@@ -505,8 +505,13 @@ struct AgentDaemonRun {
 
 enum AgentDaemonExecutor {
     Inline(Arc<dyn AgentRunner>),
-    Independent { executable: PathBuf },
+    Independent {
+        executable: PathBuf,
+        dispatch: AgentWorkerDispatchFn,
+    },
 }
+
+type AgentWorkerDispatchFn = fn(&Path, &Path, AgentRunJob) -> Result<()>;
 
 #[derive(Clone, Debug)]
 struct AgentWorkerLaunchSpec {
@@ -4014,7 +4019,10 @@ fn run_agent_daemon() -> Result<()> {
     };
     run_agent_daemon_loop_with_executor(
         &state_dir,
-        AgentDaemonExecutor::Independent { executable },
+        AgentDaemonExecutor::Independent {
+            executable,
+            dispatch: dispatch_independent_agent_worker,
+        },
         poll_interval,
         None,
         new_agent_shutdown_signal(),
@@ -4173,11 +4181,35 @@ async fn run_agent_daemon_loop_async(
                                 Arc::clone(&shutdown),
                             ));
                         }
-                        AgentDaemonExecutor::Independent { executable } => {
-                            if let Err(error) =
-                                dispatch_independent_agent_worker(&state_dir, executable, job)
+                        AgentDaemonExecutor::Independent {
+                            executable,
+                            dispatch,
+                        } => {
+                            let dispatch_state_dir = state_dir.clone();
+                            let dispatch_executable = executable.clone();
+                            let dispatch = *dispatch;
+                            let project_id = job.project.id;
+                            let lease_holder = job.holder.clone();
+                            match tokio::task::spawn_blocking(move || {
+                                dispatch(&dispatch_state_dir, &dispatch_executable, job)
+                            })
+                            .await
                             {
-                                eprintln!("Agent worker dispatch failed: {error:#}");
+                                Ok(Ok(())) => {}
+                                Ok(Err(error)) => {
+                                    eprintln!("Agent worker dispatch failed: {error:#}");
+                                }
+                                Err(error) => {
+                                    eprintln!(
+                                        "Independent agent worker dispatch task failed: {error}"
+                                    );
+                                    release_agent_dispatch_lease_best_effort(
+                                        state_dir.clone(),
+                                        project_id,
+                                        lease_holder,
+                                    )
+                                    .await;
+                                }
                             }
                         }
                     }
@@ -5881,6 +5913,25 @@ fn dispatch_independent_agent_worker(
         resolve_agent_service_environment()?,
         prepare_agent_worker_service,
         launch_agent_worker_service,
+    )
+}
+
+#[cfg(test)]
+fn dispatch_independent_agent_worker_without_service(
+    state_dir: &Path,
+    executable: &Path,
+    job: AgentRunJob,
+) -> Result<()> {
+    dispatch_independent_agent_worker_with(
+        state_dir,
+        executable,
+        job,
+        AgentServiceEnvironment {
+            codex_path_override: None,
+            path: OsString::from("/usr/bin:/bin"),
+        },
+        |_| Ok(()),
+        |_| Ok(()),
     )
 }
 
@@ -8363,6 +8414,32 @@ async fn clear_agent_daemon_checkin_best_effort(state_dir: &Path, holder: &str) 
         })
     })
     .await;
+}
+
+async fn release_agent_dispatch_lease_best_effort(
+    state_dir: PathBuf,
+    project_id: i64,
+    holder: String,
+) {
+    let release = tokio::task::spawn_blocking(move || {
+        with_agent_store_at(&state_dir, |store| {
+            store
+                .release_lease_blocking(project_id, &holder)
+                .map(|_| ())
+        })
+    })
+    .await;
+    match release {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            eprintln!(
+                "Failed to release scheduler lease after worker dispatch task failure: {error:#}"
+            );
+        }
+        Err(error) => {
+            eprintln!("Agent worker dispatch lease recovery task failed: {error}");
+        }
+    }
 }
 
 fn agent_max_global_jobs() -> Result<usize> {
@@ -30097,6 +30174,51 @@ mod tests {
         assert_eq!(store.run_count_blocking().unwrap(), 1);
         assert_eq!(store.lease_count_blocking().unwrap(), 0);
         assert_eq!(runner.ran_project_count(), 1);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_daemon_dispatches_independent_worker_outside_async_runtime() {
+        let root = temp_root("agent-daemon-independent-dispatch");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        add_task(&project_root, "independent daemon task", None).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project_id = store.list_projects_blocking().unwrap().remove(0).id;
+        drop(store);
+
+        run_agent_daemon_loop_with_executor(
+            &state_dir,
+            AgentDaemonExecutor::Independent {
+                executable: PathBuf::from("/tmp/pinned-clt-generation"),
+                dispatch: dispatch_independent_agent_worker_without_service,
+            },
+            Duration::ZERO,
+            Some(1),
+            new_agent_shutdown_signal(),
+        )
+        .unwrap();
+
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        let workers = store.list_active_workers_blocking().unwrap();
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].project_id, project_id);
+        assert_eq!(workers[0].state, AGENT_WORKER_STATE_DISPATCHING);
+        assert_eq!(
+            store
+                .lease_for_project_blocking(project_id)
+                .unwrap()
+                .unwrap()
+                .holder,
+            workers[0].lease_holder
+        );
+        assert_eq!(store.run_count_blocking().unwrap(), 0);
 
         fs::remove_dir_all(root).unwrap();
     }

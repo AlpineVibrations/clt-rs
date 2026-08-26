@@ -57,6 +57,7 @@ Use this section while developing the next release.
 
 ### Fixed
 
+- Moved independent-worker dispatch off the daemon's async runtime so blocking agent-store operations cannot panic and restart the scheduler before the worker service is launched.
 - Reclaimed dead or expired agent leases for disabled projects and during unregister, while continuing to protect live, unknown, and independent-worker leases from deletion.
 - Prevented scheduler restarts and binary upgrades from duplicating old-worker projects, made worker run recording/project counter updates/lease release one transaction, bounded failed startup and stale-heartbeat recovery behind verified service draining, serialized global worker capacity, treated newer worker protocols as opaque, deferred incompatible migrations without disabling controls, and kept stop and interrupt requests compatible across binary generations through the existing session-control protocol.
 - Exact-session recovery now continues from the next unfinished step and requires requested code, file, configuration, or task-board changes to exist and pass relevant checks before marking the linked task done, while still allowing response-only tasks to finish with a response.
