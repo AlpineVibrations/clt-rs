@@ -18301,14 +18301,44 @@ fn selected_tui_agent_log_view(panel: &TuiAgentPanel) -> Result<Option<TuiAgentL
     selected_tui_agent_log_view_at(panel, &state_dir)
 }
 
-fn selected_tui_task_log_view_for_path(
+fn selected_tui_task_or_project_log_view_for_path(
     panel: &mut TuiAgentPanel,
     project_path: &Path,
     task_status: &str,
-    task: &TaskEntry,
+    task: Option<&TaskEntry>,
 ) -> Result<Option<TuiAgentLogView>> {
     let state_dir = agent_state_dir()?;
-    selected_tui_task_log_view_for_path_at(panel, project_path, task_status, task, &state_dir)
+    selected_tui_task_or_project_log_view_for_path_at(
+        panel,
+        project_path,
+        task_status,
+        task,
+        &state_dir,
+    )
+}
+
+fn selected_tui_task_or_project_log_view_for_path_at(
+    panel: &mut TuiAgentPanel,
+    project_path: &Path,
+    task_status: &str,
+    task: Option<&TaskEntry>,
+    state_dir: &Path,
+) -> Result<Option<TuiAgentLogView>> {
+    match task {
+        Some(task) => selected_tui_task_log_view_for_path_at(
+            panel,
+            project_path,
+            task_status,
+            task,
+            state_dir,
+        ),
+        None => {
+            if !panel.select_project_for_path(project_path) {
+                return Ok(None);
+            }
+            selected_tui_agent_log_view_at(panel, state_dir)
+        }
+    }
 }
 
 fn selected_tui_task_log_view_for_path_at(
@@ -18502,18 +18532,15 @@ fn sync_open_tui_task_log_view(
         return;
     }
 
-    let selected_view = match task {
-        Some(task) => agent_state_dir().and_then(|state_dir| {
-            selected_tui_task_log_view_for_path_at(
-                panel,
-                project_path,
-                task_status,
-                task,
-                &state_dir,
-            )
-        }),
-        None => Ok(None),
-    };
+    let selected_view = agent_state_dir().and_then(|state_dir| {
+        selected_tui_task_or_project_log_view_for_path_at(
+            panel,
+            project_path,
+            task_status,
+            task,
+            &state_dir,
+        )
+    });
     replace_open_tui_task_log_view(panel, task.is_some(), log_view, selected_view);
 }
 
@@ -18530,16 +18557,13 @@ fn sync_open_tui_task_log_view_at(
         return;
     }
 
-    let selected_view = match task {
-        Some(task) => selected_tui_task_log_view_for_path_at(
-            panel,
-            project_path,
-            task_status,
-            task,
-            state_dir,
-        ),
-        None => Ok(None),
-    };
+    let selected_view = selected_tui_task_or_project_log_view_for_path_at(
+        panel,
+        project_path,
+        task_status,
+        task,
+        state_dir,
+    );
     replace_open_tui_task_log_view(panel, task.is_some(), log_view, selected_view);
 }
 
@@ -18609,12 +18633,14 @@ fn replace_open_tui_task_log_view(
     *log_view = Some(match selected_view {
         Ok(Some(view)) => view,
         Ok(None) => {
-            let content = if !task_selected {
-                "No task selected".to_string()
-            } else if panel.selected_current_project_registration().is_some() {
+            let content = if panel.selected_current_project_registration().is_some() {
                 "Register this project before viewing agent output".to_string()
             } else if panel.selected_project().is_some() {
-                "No agent output recorded for selected task".to_string()
+                if task_selected {
+                    "No agent output recorded for selected task".to_string()
+                } else {
+                    "No agent output recorded for selected project".to_string()
+                }
             } else {
                 "No registered project selected".to_string()
             };
@@ -21905,22 +21931,20 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                         }
 
                                         let selected_status = statuses[selected_board];
-                                        let Some((_, task)) = selected_task_entry_in_board(
+                                        let selected_task = selected_task_entry_in_board(
                                             &board_dir,
                                             selected_status,
                                             &board_states[selected_board],
-                                        ) else {
-                                            feedback_buffer = "No task selected".to_string();
-                                            continue;
-                                        };
+                                        )
+                                        .map(|(_, task)| task);
 
                                         agent_panel.refresh(&active_root);
                                         last_agent_panel_refresh = Instant::now();
-                                        match selected_tui_task_log_view_for_path(
+                                        match selected_tui_task_or_project_log_view_for_path(
                                             &mut agent_panel,
                                             &active_root,
                                             selected_status,
-                                            &task,
+                                            selected_task.as_ref(),
                                         ) {
                                             Ok(Some(log_view)) => {
                                                 let output_kind = if log_view.is_live {
@@ -21950,8 +21974,11 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                                 {
                                                     "Register current project before viewing agent output"
                                                     .to_string()
-                                                } else {
+                                                } else if selected_task.is_some() {
                                                     "No agent output recorded for selected task"
+                                                        .to_string()
+                                                } else {
+                                                    "No agent output recorded for selected project"
                                                         .to_string()
                                                 };
                                             }
@@ -26520,6 +26547,21 @@ mod tests {
         assert_eq!(log_view.project_name, "alpha");
         assert!(log_view.content.contains("alpha is working"));
         assert!(log_view.is_live);
+
+        panel.select_next();
+        let project_log_view = selected_tui_task_or_project_log_view_for_path_at(
+            &mut panel,
+            &active_path,
+            "doing",
+            None,
+            &state_dir,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(panel.selected_project().unwrap().project.name, "alpha");
+        assert!(project_log_view.content.contains("alpha is working"));
+        assert!(project_log_view.is_live);
+
         let completed_view = selected_tui_task_log_view_for_path_at(
             &mut panel,
             &active_path,
@@ -26634,9 +26676,20 @@ mod tests {
             &state_dir,
         );
 
-        let log_view = log_view.unwrap();
-        assert_eq!(log_view.content, "second task output");
-        assert!(!log_view.is_live);
+        assert_eq!(log_view.as_ref().unwrap().content, "second task output");
+
+        sync_open_tui_task_log_view_at(
+            &mut panel,
+            &project_root,
+            "done",
+            None,
+            &mut log_view,
+            &state_dir,
+        );
+
+        let project_log_view = log_view.unwrap();
+        assert_eq!(project_log_view.content, "second task output");
+        assert!(!project_log_view.is_live);
 
         fs::remove_dir_all(root).unwrap();
     }
