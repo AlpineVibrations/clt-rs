@@ -15846,19 +15846,11 @@ fn tui_reorganize_input(key: &crossterm::event::KeyEvent) -> TuiReorganizeInput 
 
 fn tui_task_column_title(title: &str, selected: bool, reorganizing: bool) -> String {
     if selected && reorganizing {
-        format!(" REORGANIZE MODE: {title} ")
+        format!(" REORGANIZE MODE: {title} [r/Esc exits] ")
+    } else if selected {
+        format!("{title}   <<<<<< * >>>>>>     ")
     } else {
         title.to_string()
-    }
-}
-
-fn tui_task_column_controls(selected: bool, reorganizing: bool) -> &'static str {
-    if selected && reorganizing {
-        "[r/Esc exits]"
-    } else if selected {
-        "<<<<<< * >>>>>> [a]"
-    } else {
-        ""
     }
 }
 
@@ -15886,29 +15878,8 @@ fn render_tui_task_column_header(
         .borders(Borders::ALL)
         .border_style(Style::default().fg(header_color));
     let inner_area = block.inner(area);
-    let controls_height = inner_area.height.min(1);
-
-    if controls_height > 0 {
-        f.render_widget(
-            Paragraph::new(tui_task_column_controls(selected, reorganizing))
-                .alignment(Alignment::Center)
-                .style(Style::default().fg(header_color)),
-            Rect::new(
-                inner_area.x,
-                inner_area.y,
-                inner_area.width,
-                controls_height,
-            ),
-        );
-    }
     f.render_widget(block, area);
-
-    Rect::new(
-        inner_area.x,
-        inner_area.y.saturating_add(controls_height),
-        inner_area.width,
-        inner_area.height.saturating_sub(controls_height),
-    )
+    inner_area
 }
 
 fn reorder_selected_tui_task(
@@ -23247,13 +23218,13 @@ mod tests {
     fn tui_reorganize_mode_has_a_distinct_title_and_border_color() {
         assert_eq!(
             tui_task_column_title("To Do", true, true),
-            " REORGANIZE MODE: To Do "
+            " REORGANIZE MODE: To Do [r/Esc exits] "
         );
-        assert_eq!(tui_task_column_title("To Do", true, false), "To Do");
+        assert_eq!(
+            tui_task_column_title("To Do", true, false),
+            "To Do   <<<<<< * >>>>>>     "
+        );
         assert_eq!(tui_task_column_title("Doing", false, true), "Doing");
-        assert_eq!(tui_task_column_controls(true, true), "[r/Esc exits]");
-        assert_eq!(tui_task_column_controls(true, false), "<<<<<< * >>>>>> [a]");
-        assert_eq!(tui_task_column_controls(false, false), "");
         assert_eq!(
             tui_task_column_border_color(Color::Indexed(110), true),
             Color::Yellow
@@ -23265,7 +23236,7 @@ mod tests {
     }
 
     #[test]
-    fn tui_task_column_renders_controls_below_the_title() {
+    fn tui_task_column_keeps_controls_on_title_line_without_reserving_a_row() {
         use ratatui::backend::TestBackend;
 
         let backend = TestBackend::new(36, 5);
@@ -23297,9 +23268,8 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(rows[0].contains("To Do"));
-        assert!(!rows[0].contains("<<<<<< * >>>>>> [a]"));
-        assert!(rows[1].contains("<<<<<< * >>>>>> [a]"));
-        assert!(rows[2].contains("1. task"));
+        assert!(rows[0].contains("<<<<<< * >>>>>>"));
+        assert!(rows[1].contains("1. task"));
     }
 
     #[test]
