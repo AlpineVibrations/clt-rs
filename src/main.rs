@@ -5445,7 +5445,7 @@ fn run_agent_scheduler_pass_with_max_global_jobs(
                 Ok((resume_session_id, controls))
             })?;
         let has_suspended_session = resume_session_id.is_none()
-            && session_controls_suspend_project(&project.path, &controls_after_initial_check)?;
+            && session_controls_suspend_project(&controls_after_initial_check);
         if has_suspended_session {
             println!(
                 "Project {}: action=skip reason=session_suspended todo={} doing={} scan_status={} path={}",
@@ -5571,7 +5571,7 @@ fn run_agent_scheduler_pass_with_max_global_jobs(
             let controls = with_agent_store_at(state_dir, |store| {
                 store.session_controls_for_project_blocking(project.id)
             })?;
-            if session_controls_suspend_project(&project.path, &controls)? {
+            if session_controls_suspend_project(&controls) {
                 with_agent_store_at(state_dir, |store| {
                     store
                         .release_lease_blocking(project.id, &holder)
@@ -7154,18 +7154,13 @@ fn task_for_codex_session_in_board_matching(
     Ok(None)
 }
 
-fn session_controls_suspend_project(
-    project_root: &Path,
-    controls: &[agent_store::AgentSessionControlRecord],
-) -> Result<bool> {
-    for control in controls {
-        if control.state != AgentSessionControlState::Stopped
-            || task_status_for_codex_session(project_root, &control.codex_session_id)?.is_some()
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+fn session_controls_suspend_project(controls: &[agent_store::AgentSessionControlRecord]) -> bool {
+    // A stopped session keeps its task-to-session link for an explicit resume,
+    // but it no longer owns a process or project lease. Other queued work can
+    // therefore run without disturbing the stopped task.
+    controls
+        .iter()
+        .any(|control| control.state != AgentSessionControlState::Stopped)
 }
 
 fn agent_lease_is_reclaimable(
@@ -22831,6 +22826,11 @@ mod tests {
             format!("# Done Tasks\n- controlled task codex:{session_id}\n"),
         )
         .unwrap();
+        fs::write(
+            project_root.join("tasks/todo.md"),
+            "# Todo Tasks\n- next task\n",
+        )
+        .unwrap();
         let project_root = fs::canonicalize(project_root).unwrap();
         let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
         store
@@ -22947,6 +22947,19 @@ mod tests {
                         .lease_for_project_blocking(project.id)
                         .unwrap()
                         .is_none()
+                );
+                drop(store);
+                let scheduled = run_agent_scheduler_pass(&state_dir, false, &[]).unwrap();
+                assert_eq!(scheduled.jobs.len(), 1);
+                assert_eq!(
+                    scheduled.jobs[0].task_selection,
+                    AgentTaskSelection::NextTodo
+                );
+                let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+                assert!(
+                    store
+                        .release_lease_blocking(project.id, &scheduled.jobs[0].holder)
+                        .unwrap()
                 );
             }
             AgentSessionControlAction::Interrupt => {
@@ -24588,7 +24601,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_suppresses_stopped_session_then_schedules_exact_resume_job() {
+    fn scheduler_runs_next_todo_while_stopped_session_waits_for_exact_resume() {
         let root = temp_root("scheduler-session-control");
         let state_dir = root.join("state/clt");
         let project_root = root.join("project");
@@ -24596,6 +24609,11 @@ mod tests {
         fs::write(
             project_root.join("tasks/doing.md"),
             "# Doing Tasks\n- paused task codex:session-123\n",
+        )
+        .unwrap();
+        fs::write(
+            project_root.join("tasks/todo.md"),
+            "# Todo Tasks\n- next task\n",
         )
         .unwrap();
         let project_root = fs::canonicalize(project_root).unwrap();
@@ -24613,11 +24631,28 @@ mod tests {
             .unwrap();
         drop(store);
 
-        let suppressed = run_agent_scheduler_pass(&state_dir, false, &[]).unwrap();
-        assert!(suppressed.jobs.is_empty());
-        assert_eq!(suppressed.pass.runs_started, 0);
+        let scheduled = run_agent_scheduler_pass(&state_dir, false, &[]).unwrap();
+        assert_eq!(scheduled.jobs.len(), 1);
+        assert_eq!(scheduled.pass.runs_started, 1);
+        assert_eq!(
+            scheduled.jobs[0].task_selection,
+            AgentTaskSelection::NextTodo
+        );
 
         let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        assert_eq!(
+            store
+                .session_control_blocking(project_id, "session-123")
+                .unwrap()
+                .unwrap()
+                .state,
+            AgentSessionControlState::Stopped
+        );
+        assert!(
+            store
+                .release_lease_blocking(project_id, &scheduled.jobs[0].holder)
+                .unwrap()
+        );
         assert!(
             store
                 .transition_session_control_state_blocking(
@@ -24707,8 +24742,12 @@ mod tests {
         drop(store);
 
         move_task(&project_root, "doing", "done", "1").unwrap();
-        let suppressed = run_agent_scheduler_pass(&state_dir, false, &[]).unwrap();
-        assert!(suppressed.jobs.is_empty());
+        let scheduled = run_agent_scheduler_pass(&state_dir, false, &[]).unwrap();
+        assert_eq!(scheduled.jobs.len(), 1);
+        assert_eq!(
+            scheduled.jobs[0].task_selection,
+            AgentTaskSelection::NextTodo
+        );
         let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
         assert_eq!(
             store
@@ -24717,6 +24756,11 @@ mod tests {
                 .unwrap()
                 .state,
             AgentSessionControlState::Stopped
+        );
+        assert!(
+            store
+                .release_lease_blocking(project_id, &scheduled.jobs[0].holder)
+                .unwrap()
         );
         drop(store);
         toggle_tui_codex_session_stop_at(&state_dir, project_id, "session-123").unwrap();
@@ -25977,15 +26021,11 @@ mod tests {
                 .state,
             AgentSessionControlState::Running
         );
-        assert!(
-            session_controls_suspend_project(
-                &project_root,
-                &store
-                    .session_controls_for_project_blocking(project_id)
-                    .unwrap(),
-            )
-            .unwrap()
-        );
+        assert!(session_controls_suspend_project(
+            &store
+                .session_controls_for_project_blocking(project_id)
+                .unwrap(),
+        ));
 
         store
             .mark_session_running_blocking(
