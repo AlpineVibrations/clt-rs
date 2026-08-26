@@ -1,6 +1,6 @@
 ---
 name: git-commit
-description: Commit and optionally push Git changes with a safe, direct workflow. Use when the user asks to commit, save changes, create a git commit, push changes, finish Git work, or mentions /commit. Inspect the diff, respect existing staged changes, stage only the intended logical change, generate a clear commit message from the staged diff, and pull with the user's configured integration strategy before pushing when push is requested.
+description: Start repository tasks from the latest safe upstream state, then commit and optionally push Git changes with a safe, direct workflow. Use when beginning a new task in a Git repository or when the user asks to commit, save changes, create a git commit, push changes, finish Git work, or mentions /commit. Pull only when the checkout can be updated cleanly, inspect the diff, respect existing staged changes, stage only the intended logical change, generate a clear commit message from the staged diff, and sync again before pushing when requested.
 ---
 
 # Git Commit Workflow
@@ -8,6 +8,22 @@ description: Commit and optionally push Git changes with a safe, direct workflow
 Use shell/Bash Git commands for inspection, staging, committing, rebasing, and pushing. Prefer non-interactive commands. Do not change Git config.
 
 The caller may request either a commit-only or commit-and-push workflow. An automated agent prompt that explicitly selects commit and push authorizes pushing the completed task for that run.
+
+## Start-of-Task Sync
+
+Before editing files for each new task in an existing Git repository, inspect the checkout:
+
+```bash
+git status --short --branch
+```
+
+If the worktree and index are clean, HEAD is attached to a branch, and that branch has an upstream, update it before starting work:
+
+```bash
+git pull --ff-only
+```
+
+Use fast-forward-only here so the startup sync cannot create a merge commit, rebase local commits, or disturb user work. If the checkout is dirty, detached, has no upstream, or cannot fast-forward, do not stash, discard, commit, switch branches, or integrate changes solely to make the pull succeed. Continue from the current checkout when safe and mention that the startup pull was skipped or could not complete.
 
 ## Default Flow
 

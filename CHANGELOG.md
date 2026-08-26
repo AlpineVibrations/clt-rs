@@ -15,7 +15,9 @@ Use this section while developing the next release.
 - Added a TUI Models page with provider presets, custom Responses-compatible endpoints, enabled model targets, favorites, a CLT-wide default, and per-project provider/model overrides.
 - Added `x`/`Delete` removal for non-built-in providers on the Models page, including dependent model, selection, and Codex configuration cleanup.
 - Added explicit, backup-protected Codex `config.toml` actions for custom provider definitions and the user's top-level default while keeping API keys exclusively in environment variables.
-- Added a Done-or-blocked-task shortcut to resume that task's automated Codex run interactively, returning to the same board after Codex exits.
+- Added an idle Done-or-blocked-task `c` shortcut to resume that task's Codex session interactively, returning to the same board after Codex exits.
+- Added task-level `s` controls to stop a selected task's linked active Codex session and later queue that exact session ID for automated `codex exec resume`, without stopping the agent service.
+- Added task-level `i` interruption to stop a selected task's linked active Codex process, open the same ID in interactive Codex, and automatically restart that session in `codex exec resume` mode after exit.
 - Added blocked-task monitoring: blocked Todo entries are skipped during normal selection, and when every task across Todo and Doing is blocked, the agent revisits one existing blocker at a time and backs off unchanged recovery attempts.
 - Added the current local time to the agent projects pane's top border before the daemon status.
 - Added `clt shell-init bash|zsh` integration so quitting after opening a registered project can change the calling shell to that project's directory.
@@ -35,6 +37,7 @@ Use this section while developing the next release.
 
 ### Changed
 
+- Codex session IDs are now attached while automated work is active, stored with generation-safe live process and log metadata, and reused by unambiguous stop, interactive handoff, and interrupted/blocked recovery through `codex exec resume`.
 - Automated commit and commit-and-push runs now use the isolated `CLT Agent <clt-agent@localhost>` Git author and committer identity without modifying Git configuration.
 - Made embedded `codex:<session-id>` task markers the sole interactive-resume link, removed mutable task-text associations from the agent database, and made marker persistence failures visible as failed runs.
 - Made the TUI task-board console help show task controls instead of Agent Projects controls.
@@ -52,6 +55,9 @@ Use this section while developing the next release.
 
 ### Fixed
 
+- Prevented `c` from opening a Codex session that is still occupied by its automated run, and reserved the project while the interactive handoff is active so the scheduler cannot resume it concurrently.
+- Prevented stop and interactive handoff races by having the owning runner terminate its own Codex process group, fencing the scheduler with persisted session state, and recovering stale TUI handoffs.
+- Made the Kanban agent-output viewer follow the selected task, using live output for the active Doing task and session-linked run history for completed or blocked tasks.
 - Fixed prompt construction in the bundled task-runner script under the macOS-provided Bash 3.2.
 - Registering the current project from the Agent Projects pane now keeps the cursor on that project after it moves into the alphabetically sorted project list.
 - Added portable task-reorganization shortcuts for terminals that do not distinguish Shift+Arrow: `Ctrl-P`/`Ctrl-N` reorder vertically, and `r` toggles a keyboard-driven reorganization mode.

@@ -1,6 +1,6 @@
 [package]
 name = "clt-rs"
-version = "0.3.14"
+version = "0.3.15"
 edition = "2024"
 description = "File-backed task manager with a TUI Kanban board and multi-project Codex agent registry"
 license = "MIT"
@@ -19,6 +19,7 @@ ratatui = "0.30"
 crossterm = "0.29"
 anyhow = "1.0"
 chrono = "0.4"
+libc = "0.2"
 tui-input = "0.15.3"
 tokio = { version = "1.52", features = ["macros", "rt-multi-thread", "signal", "time"] }
 turso = { version = "0.7", default-features = false }

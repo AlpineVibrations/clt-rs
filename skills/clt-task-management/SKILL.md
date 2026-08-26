@@ -1,6 +1,6 @@
 ---
 name: clt-task-management
-description: Manage project tasks with the clt file-system-backed Kanban CLI, including backlog triage, initialization, task creation and listing, status transitions, outcome notes, deletion, folder-backed tasks, and nested boards. Use when Codex needs to inspect, create, track, update, complete, or organize tasks in a project that uses clt or tasks/backlog.md, tasks/todo.md, tasks/doing.md, and tasks/done.md.
+description: Manage project tasks with the clt file-system-backed Kanban CLI, including safe pre-task Git synchronization, backlog triage, initialization, task creation and listing, status transitions, outcome notes, deletion, folder-backed tasks, and nested boards. Use when Codex needs to inspect, create, track, update, complete, or organize tasks in a project that uses clt or tasks/backlog.md, tasks/todo.md, tasks/doing.md, and tasks/done.md.
 ---
 
 # Skills: Project Task Management with `clt`
@@ -21,6 +21,22 @@ Statuses can also be folders instead of Markdown files:
 - `tasks/done/`: Each direct file or subfolder is one completed task.
 
 For folder-backed statuses, `clt` displays the first sentence of each task file while preserving the full file content for longer notes. A task subfolder with its own `backlog`, `todo`, `doing`, and `done` stores is a nested subtask board in the TUI.
+
+## Start-of-Task Git Sync
+
+Before moving a task to `doing` or editing files for a new task in an existing Git repository, inspect the checkout:
+
+```bash
+git status --short --branch
+```
+
+If the worktree and index are clean, HEAD is attached to a branch, and that branch has an upstream, update it before starting the task:
+
+```bash
+git pull --ff-only
+```
+
+Do this before the CLT status transition because moving a task to `doing` changes the task board and makes the checkout dirty. Use fast-forward-only so the startup sync cannot create a merge commit, rebase local commits, or disturb user work. If the checkout is dirty, detached, has no upstream, or cannot fast-forward, do not stash, discard, commit, switch branches, or integrate changes solely to make the pull succeed. Continue from the current checkout when safe and mention that the startup pull was skipped or could not complete.
 
 ## Core Workflow
 The agent must adhere to the following state transition pipeline:
