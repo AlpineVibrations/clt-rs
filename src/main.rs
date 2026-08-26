@@ -6256,9 +6256,11 @@ impl AgentRunner for CodexAgentRunner {
                     if let Some(session_id) = observed_session_id.as_deref()
                         && let Some(control) =
                             store.session_control_blocking(project.id, session_id)?
-                        && control.child_pid == Some(child_pid)
-                        && control.run_token.as_deref() == Some(run_file_stem.as_str())
-                        && let Some(action) = control.state.requested_action()
+                        && let Some(action) = automated_session_control_action_for_generation(
+                            &control,
+                            child_pid,
+                            &run_file_stem,
+                        )
                     {
                         requested_control_cell.set(Some(action));
                     }
@@ -6306,10 +6308,13 @@ impl AgentRunner for CodexAgentRunner {
         if requested_control_cell.get().is_none()
             && let Some(session_id) = codex_session_id.as_deref()
             && let Some(control) = store.session_control_blocking(project.id, session_id)?
-            && control.child_pid == Some(child_pid)
-            && control.run_token.as_deref() == Some(run_file_stem.as_str())
+            && let Some(action) = automated_session_control_action_for_generation(
+                &control,
+                child_pid,
+                &run_file_stem,
+            )
         {
-            requested_control_cell.set(control.state.requested_action());
+            requested_control_cell.set(Some(action));
         }
         let requested_control = requested_control_cell.get();
         let (status, exit_code, summary) = if let Some(action) = requested_control {
