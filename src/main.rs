@@ -4129,7 +4129,10 @@ async fn run_agent_daemon_loop_async(
     max_passes: Option<usize>,
     shutdown: AgentShutdownSignal,
 ) -> Result<()> {
-    let daemon_checkin = AgentDaemonCheckinSource::current();
+    let daemon_checkin = AgentDaemonCheckinSource::current_with_holder(match &executor {
+        AgentDaemonExecutor::Inline(_) => agent_lease_holder(),
+        AgentDaemonExecutor::Independent { .. } => agent_scheduler_lease_holder(),
+    });
     let mut scheduled_passes = 0;
     let mut active_passes: Vec<tokio::task::JoinHandle<Result<AgentSchedulerStart>>> = Vec::new();
     let mut active_runs: Vec<AgentDaemonRun> = Vec::new();
@@ -5368,7 +5371,9 @@ fn run_agent_scheduler_pass_with_max_global_jobs(
     durable_project_ids.sort_unstable();
     durable_project_ids.dedup();
 
-    let holder = agent_lease_holder();
+    let holder = daemon_checkin
+        .map(|checkin| checkin.holder.clone())
+        .unwrap_or_else(agent_lease_holder);
     let lease_timeout = agent_lease_timeout()?;
     let success_cooldown = agent_success_cooldown()?;
     let failure_backoff = agent_failure_backoff()?;
@@ -7294,6 +7299,7 @@ fn agent_pid_liveness(pid: u32) -> AgentLeaseHolderLiveness {
 fn agent_lease_holder_pid(holder: &str) -> Option<u32> {
     holder
         .strip_prefix("clt-agent-")
+        .or_else(|| holder.strip_prefix("clt-scheduler-"))
         .or_else(|| holder.strip_prefix("clt-interactive-"))?
         .parse()
         .ok()
@@ -8366,10 +8372,18 @@ fn agent_lease_holder() -> String {
     format!("clt-agent-{}", std::process::id())
 }
 
+fn agent_scheduler_lease_holder() -> String {
+    format!("clt-scheduler-{}", std::process::id())
+}
+
 impl AgentDaemonCheckinSource {
     fn current() -> Self {
+        Self::current_with_holder(agent_lease_holder())
+    }
+
+    fn current_with_holder(holder: String) -> Self {
         Self {
-            holder: agent_lease_holder(),
+            holder,
             mode: agent_daemon_mode(),
             started_at: agent_timestamp(),
         }
@@ -28003,6 +28017,10 @@ mod tests {
             agent_lease_holder_pid(&interactive_holder),
             Some(std::process::id())
         );
+        assert_eq!(
+            agent_lease_holder_liveness(&agent_scheduler_lease_holder()),
+            AgentLeaseHolderLiveness::CurrentProcess
+        );
         assert_eq!(agent_lease_holder_pid("external-agent"), None);
     }
 
@@ -28218,6 +28236,19 @@ mod tests {
         let error = ensure_no_live_legacy_agent_runs(&store).unwrap_err();
         assert!(error.to_string().contains("legacy in-process run"));
         assert!(store.release_lease_blocking(project.id, &holder).unwrap());
+        ensure_no_live_legacy_agent_runs(&store).unwrap();
+
+        let scheduler_holder = agent_scheduler_lease_holder();
+        assert!(
+            store
+                .try_acquire_lease_blocking(
+                    project.id,
+                    &scheduler_holder,
+                    &agent_timestamp(),
+                    &agent_timestamp_after(60),
+                )
+                .unwrap()
+        );
         ensure_no_live_legacy_agent_runs(&store).unwrap();
 
         fs::remove_dir_all(root).unwrap();
@@ -30619,6 +30650,7 @@ mod tests {
         let state_dir = root.join("state/clt");
         let project_root = root.join("project");
         init_tasks(&project_root, false).unwrap();
+        add_task(&project_root, "scheduled task", None).unwrap();
         let project_root = fs::canonicalize(project_root).unwrap();
         let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
         store
@@ -30627,7 +30659,7 @@ mod tests {
         drop(store);
 
         let checkin = AgentDaemonCheckinSource {
-            holder: "clt-agent-test".to_string(),
+            holder: "clt-scheduler-test".to_string(),
             mode: "cli".to_string(),
             started_at: "100".to_string(),
         };
@@ -30641,6 +30673,8 @@ mod tests {
         let checkins = store.list_daemon_checkins_blocking().unwrap();
 
         assert_eq!(start.pass.scanned_projects, 1);
+        assert_eq!(start.jobs.len(), 1);
+        assert_eq!(start.jobs[0].holder, checkin.holder);
         assert_eq!(checkins.len(), 1);
         assert_eq!(checkins[0].mode, "cli");
         assert!(daemon_checkin_is_fresh(
