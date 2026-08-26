@@ -620,6 +620,24 @@ impl AgentSessionControlState {
     }
 }
 
+fn automated_session_control_action_for_generation(
+    control: &agent_store::AgentSessionControlRecord,
+    child_pid: u32,
+    run_token: &str,
+) -> Option<AgentSessionControlAction> {
+    if control.run_token.as_deref() != Some(run_token) {
+        return None;
+    }
+    if control.child_pid == Some(child_pid) {
+        return control.state.requested_action();
+    }
+    match control.state {
+        AgentSessionControlState::Stopped => Some(AgentSessionControlAction::Stop),
+        AgentSessionControlState::ReadyInteractive => Some(AgentSessionControlAction::Interrupt),
+        _ => None,
+    }
+}
+
 trait AgentRunner: Send + Sync {
     fn run_project(
         &self,
@@ -6109,35 +6127,64 @@ impl AgentRunner for CodexAgentRunner {
                 Err(error) => Some(error),
             };
             if let Some(error) = registration_error {
-                drop(launch_gate.take());
-                if let Err(stop_error) = stop_agent_child_process(&mut child) {
-                    return Err(unproven_agent_child_termination(
-                        stop_error,
-                        &format!(
-                            "Known-session registration failed ({error:#}), and CLT could not prove its spawned Codex process group stopped"
-                        ),
-                    ));
+                #[cfg(unix)]
+                {
+                    supervisor_control.take();
+                    wait_for_automated_supervisor_reaped(
+                        &mut child,
+                        supervisor_proof
+                            .as_mut()
+                            .expect("Unix automated supervisor has a proof pipe"),
+                    )
+                    .with_context(|| {
+                        format!(
+                            "Known-session registration failed ({error:#}), and its supervisor could not prove Codex stopped"
+                        )
+                    })?;
                 }
+                #[cfg(not(unix))]
+                stop_agent_child_process(&mut child).with_context(|| {
+                    format!(
+                        "Known-session registration failed ({error:#}), and CLT could not prove its spawned Codex process stopped"
+                    )
+                })?;
                 return Err(error).context("Failed to register known Codex child before launch");
             }
             session_registered = true;
         }
-        if let Some(mut gate) = launch_gate.take()
-            && let Err(error) = gate.write_all(b"x")
+        #[cfg(unix)]
+        if let Err(error) = supervisor_control
+            .as_mut()
+            .expect("Unix automated supervisor has a control pipe")
+            .write_all(b"x")
+            .and_then(|_| {
+                supervisor_control
+                    .as_mut()
+                    .expect("Unix automated supervisor has a control pipe")
+                    .flush()
+            })
         {
-            drop(gate);
-            if let Err(stop_error) = stop_agent_child_process(&mut child) {
-                return Err(unproven_agent_child_termination(
-                    stop_error,
-                    &format!(
-                        "Registered automated Codex launch gate failed ({error:#}), and CLT could not prove its process group stopped"
-                    ),
-                ));
-            }
-            return Err(error).context("Failed to release registered automated Codex launch gate");
+            supervisor_control.take();
+            wait_for_automated_supervisor_reaped(
+                &mut child,
+                supervisor_proof
+                    .as_mut()
+                    .expect("Unix automated supervisor has a proof pipe"),
+            )
+            .with_context(|| {
+                format!(
+                    "Automated supervisor launch release failed ({error}), and it could not prove Codex stopped"
+                )
+            })?;
+            return Err(error).context("Failed to release supervised automated Codex launch gate");
         }
-        let wait_result = wait_for_child_with_timeout_and_heartbeat(
+        #[cfg(unix)]
+        let wait_result = wait_for_automated_supervisor_with_timeout_and_heartbeat(
             &mut child,
+            &mut supervisor_control,
+            supervisor_proof
+                .as_mut()
+                .expect("Unix automated supervisor has a proof pipe"),
             self.timeout,
             self.heartbeat_interval,
             |elapsed| {
@@ -6221,17 +6268,33 @@ impl AgentRunner for CodexAgentRunner {
             },
             || shutdown.load(Ordering::SeqCst) || requested_control_cell.get().is_some(),
         );
+        #[cfg(not(unix))]
+        let wait_result = wait_for_child_with_timeout_and_heartbeat(
+            &mut child,
+            self.timeout,
+            self.heartbeat_interval,
+            |elapsed| {
+                print_agent_run_heartbeat(
+                    project,
+                    elapsed,
+                    self.timeout,
+                    &stdout_path,
+                    &stderr_path,
+                    &mut last_heartbeat_stderr_bytes,
+                )
+            },
+            || Ok(()),
+            || shutdown.load(Ordering::SeqCst),
+        );
         let wait_result = match wait_result {
             Ok(wait_result) => wait_result,
             Err(error) => {
-                if let Err(stop_error) = stop_agent_child_process(&mut child) {
-                    return Err(unproven_agent_child_termination(
-                        stop_error,
-                        &format!(
-                            "Codex run observation failed ({error:#}), and CLT could not prove its process group stopped"
-                        ),
-                    ));
-                }
+                #[cfg(not(unix))]
+                stop_agent_child_process(&mut child).with_context(|| {
+                    format!(
+                        "Codex run observation failed ({error:#}), and CLT could not prove its process stopped"
+                    )
+                })?;
                 return Err(error).context("Failed while observing the Codex run");
             }
         };
