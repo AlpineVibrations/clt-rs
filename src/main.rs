@@ -8377,6 +8377,7 @@ fn agent_scheduler_lease_holder() -> String {
 }
 
 impl AgentDaemonCheckinSource {
+    #[cfg(test)]
     fn current() -> Self {
         Self::current_with_holder(agent_lease_holder())
     }
