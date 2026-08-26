@@ -15737,11 +15737,19 @@ fn tui_reorganize_input(key: &crossterm::event::KeyEvent) -> TuiReorganizeInput 
 
 fn tui_task_column_title(title: &str, selected: bool, reorganizing: bool) -> String {
     if selected && reorganizing {
-        format!(" REORGANIZE MODE: {title} [r/Esc exits] ")
-    } else if selected {
-        format!("{title}   <<<<<< * >>>>>>     ")
+        format!(" REORGANIZE MODE: {title} ")
     } else {
         title.to_string()
+    }
+}
+
+fn tui_task_column_controls(selected: bool, reorganizing: bool) -> &'static str {
+    if selected && reorganizing {
+        "[r/Esc exits]"
+    } else if selected {
+        "<<<<<< * >>>>>>"
+    } else {
+        ""
     }
 }
 
@@ -15751,6 +15759,47 @@ fn tui_task_column_border_color(default_color: Color, reorganizing: bool) -> Col
     } else {
         default_color
     }
+}
+
+fn render_tui_task_column_header(
+    f: &mut ratatui::Frame<'_>,
+    area: Rect,
+    title: &str,
+    task_count: usize,
+    selected: bool,
+    reorganizing: bool,
+    border_color: Color,
+) -> Rect {
+    let header_color = tui_task_column_border_color(border_color, reorganizing);
+    let block = Block::default()
+        .title(tui_task_column_title(title, selected, reorganizing))
+        .title(Line::from(vec![Span::raw(format!(" {task_count} "))]).alignment(Alignment::Right))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(header_color));
+    let inner_area = block.inner(area);
+    let controls_height = inner_area.height.min(1);
+
+    if controls_height > 0 {
+        f.render_widget(
+            Paragraph::new(tui_task_column_controls(selected, reorganizing))
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(header_color)),
+            Rect::new(
+                inner_area.x,
+                inner_area.y,
+                inner_area.width,
+                controls_height,
+            ),
+        );
+    }
+    f.render_widget(block, area);
+
+    Rect::new(
+        inner_area.x,
+        inner_area.y.saturating_add(controls_height),
+        inner_area.width,
+        inner_area.height.saturating_sub(controls_height),
+    )
 }
 
 fn reorder_selected_tui_task(
@@ -20494,28 +20543,20 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                     };
 
                     let reorganizing = matches!(current_mode, Mode::Reorganize);
-                    let block = Block::default()
-                        .title(tui_task_column_title(
-                            titles[board_index],
-                            selected_board == board_index,
-                            reorganizing,
-                        ))
-                        .title(
-                            Line::from(vec![Span::raw(format!(" {} ", tasks.len()))])
-                                .alignment(Alignment::Right),
-                        )
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(tui_task_column_border_color(
-                            colors[board_index],
-                            reorganizing,
-                        )));
-
-                    let inner_area = block.inner(chunks[column_index]);
+                    let task_list_inner = render_tui_task_column_header(
+                        f,
+                        chunks[column_index],
+                        titles[board_index],
+                        tasks.len(),
+                        selected_board == board_index,
+                        reorganizing,
+                        colors[board_index],
+                    );
                     keep_selected_task_visible(
                         &display_tasks,
                         selected_idx,
                         &mut board_scroll_offsets[board_index],
-                        inner_area.height as usize,
+                        task_list_inner.height as usize,
                         col_width,
                     );
 
@@ -20529,31 +20570,11 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                         let cleaned = t.strip_prefix("- ").unwrap_or(t);
                         let is_selected = Some(idx) == selected_idx;
 
-                        let text = if is_selected {
-                            wrap_text(cleaned, col_width.saturating_sub(5))
-                        } else {
-                            cleaned.to_string()
-                        };
-
                         let style = if is_selected {
                             highlight_style
                         } else {
                             Style::default().fg(text_color)
                         };
-
-                        let content = format!("{}. {}", idx + 1, text);
-                        let _paragraph = Paragraph::new(content).style(style);
-
-                        let _area = ratatui::layout::Rect {
-                            x: inner_area.x,
-                            y: inner_area.y + current_y as u16,
-                            width: inner_area.width,
-                            height: 1, // This is a simplification; we should calculate height based on wrap_text
-                        };
-
-                        // To actually support multi-line expansion in a manual loop,
-                        // we need to render the wrapped text as a Paragraph and increment current_y
-                        // by the number of lines it actually takes.
 
                         let mut wrapped_content = if is_selected {
                             wrap_text(cleaned, col_width.saturating_sub(5))
@@ -20565,16 +20586,16 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                         }
 
                         let line_count = wrapped_content.lines().count().max(1);
-                        if current_y >= inner_area.height as usize {
+                        if current_y >= task_list_inner.height as usize {
                             break;
                         }
 
                         let visible_height = (line_count as u16)
-                            .min(inner_area.height.saturating_sub(current_y as u16));
+                            .min(task_list_inner.height.saturating_sub(current_y as u16));
                         let item_area = ratatui::layout::Rect {
-                            x: inner_area.x,
-                            y: inner_area.y + current_y as u16,
-                            width: inner_area.width,
+                            x: task_list_inner.x,
+                            y: task_list_inner.y + current_y as u16,
+                            width: task_list_inner.width,
                             height: visible_height,
                         };
 
@@ -20582,11 +20603,10 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                         f.render_widget(Paragraph::new(item_text).style(style), item_area);
 
                         current_y += line_count;
-                        if inner_area.y + current_y as u16 >= chunks[column_index].height {
+                        if current_y >= task_list_inner.height as usize {
                             break;
                         }
                     }
-                    f.render_widget(block, chunks[column_index]);
                 }
             }
 
@@ -23082,13 +23102,13 @@ mod tests {
     fn tui_reorganize_mode_has_a_distinct_title_and_border_color() {
         assert_eq!(
             tui_task_column_title("To Do", true, true),
-            " REORGANIZE MODE: To Do [r/Esc exits] "
+            " REORGANIZE MODE: To Do "
         );
-        assert_eq!(
-            tui_task_column_title("To Do", true, false),
-            "To Do   <<<<<< * >>>>>>     "
-        );
+        assert_eq!(tui_task_column_title("To Do", true, false), "To Do");
         assert_eq!(tui_task_column_title("Doing", false, true), "Doing");
+        assert_eq!(tui_task_column_controls(true, true), "[r/Esc exits]");
+        assert_eq!(tui_task_column_controls(true, false), "<<<<<< * >>>>>>");
+        assert_eq!(tui_task_column_controls(false, false), "");
         assert_eq!(
             tui_task_column_border_color(Color::Indexed(110), true),
             Color::Yellow
@@ -23097,6 +23117,44 @@ mod tests {
             tui_task_column_border_color(Color::Indexed(110), false),
             Color::Indexed(110)
         );
+    }
+
+    #[test]
+    fn tui_task_column_renders_controls_below_the_title() {
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(36, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| {
+                let task_area = render_tui_task_column_header(
+                    frame,
+                    frame.area(),
+                    "To Do",
+                    1,
+                    true,
+                    false,
+                    Color::Indexed(110),
+                );
+                frame.render_widget(Paragraph::new("1. task"), task_area);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rows = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .collect::<Vec<_>>();
+
+        assert!(rows[0].contains("To Do"));
+        assert!(!rows[0].contains("<<<<<< * >>>>>>"));
+        assert!(rows[1].contains("<<<<<< * >>>>>>"));
+        assert!(rows[2].contains("1. task"));
     }
 
     #[test]
