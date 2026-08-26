@@ -5375,6 +5375,15 @@ fn run_agent_scheduler_pass_with_max_global_jobs(
                 reclaim_current_process_leases,
                 now,
             )?;
+            if let Some(lease) = existing_lease.as_ref() {
+                try_reclaim_inactive_agent_lease(
+                    state_dir,
+                    &project,
+                    None,
+                    lease,
+                    reclaim_current_process_leases,
+                )?;
+            }
             continue;
         }
 
@@ -5504,7 +5513,7 @@ fn run_agent_scheduler_pass_with_max_global_jobs(
                 && try_reclaim_inactive_agent_lease(
                     state_dir,
                     &project,
-                    &scan,
+                    Some(&scan),
                     lease,
                     reclaim_current_process_leases,
                 )?
@@ -7131,7 +7140,7 @@ fn agent_lease_is_reclaimable(
 fn try_reclaim_inactive_agent_lease(
     state_dir: &Path,
     project: &agent_store::AgentProject,
-    scan: &AgentProjectScan,
+    scan: Option<&AgentProjectScan>,
     lease: &agent_store::AgentLeaseRecord,
     reclaim_current_process_leases: bool,
 ) -> Result<bool> {
@@ -7148,17 +7157,29 @@ fn try_reclaim_inactive_agent_lease(
         store.release_lease_blocking(project.id, &lease.holder)
     })?;
     if released {
-        println!(
-            "Project {}: action=reclaim reason=inactive_lease todo={} scan_status={} lease_holder={} lease_process={} lease_acquired_at={} lease_expires_at={} path={}",
-            project.name,
-            scan.todo_count,
-            scan.status_label(),
-            lease.holder,
-            liveness.label(),
-            format_agent_timestamp(&lease.acquired_at),
-            format_agent_timestamp(&lease.expires_at),
-            project.path.display()
-        );
+        if let Some(scan) = scan {
+            println!(
+                "Project {}: action=reclaim reason=inactive_lease todo={} scan_status={} lease_holder={} lease_process={} lease_acquired_at={} lease_expires_at={} path={}",
+                project.name,
+                scan.todo_count,
+                scan.status_label(),
+                lease.holder,
+                liveness.label(),
+                format_agent_timestamp(&lease.acquired_at),
+                format_agent_timestamp(&lease.expires_at),
+                project.path.display()
+            );
+        } else {
+            println!(
+                "Project {}: action=reclaim reason=inactive_lease project_state=disabled lease_holder={} lease_process={} lease_acquired_at={} lease_expires_at={} path={}",
+                project.name,
+                lease.holder,
+                liveness.label(),
+                format_agent_timestamp(&lease.acquired_at),
+                format_agent_timestamp(&lease.expires_at),
+                project.path.display()
+            );
+        }
     }
 
     Ok(released)
@@ -9778,16 +9799,49 @@ mod agent_store {
                     "Cannot unregister project {path} while {active_workers} independent worker(s) are active"
                 );
             }
-            let active_leases = query_count(
-                &transaction,
-                "SELECT COUNT(*)
-                   FROM leases
-                  WHERE project_id = (SELECT id FROM projects WHERE path = ?1)",
-                [path.as_str()],
-            )
-            .await?;
-            if active_leases > 0 {
-                anyhow::bail!("Cannot unregister project {path} while its agent lease is active");
+            let lease = {
+                let mut rows = transaction
+                    .query(
+                        "SELECT holder, expires_at
+                           FROM leases
+                          WHERE project_id = (SELECT id FROM projects WHERE path = ?1)",
+                        [path.as_str()],
+                    )
+                    .await
+                    .with_context(|| format!("Failed to read agent lease for project {path}"))?;
+                match rows
+                    .next()
+                    .await
+                    .context("Failed to read agent lease row while unregistering project")?
+                {
+                    Some(row) => Some((
+                        row_text(&row, 0, "holder")?,
+                        row_text(&row, 1, "expires_at")?,
+                    )),
+                    None => None,
+                }
+            };
+            if let Some((holder, expires_at)) = lease {
+                let reclaimable = expires_at
+                    .parse::<u64>()
+                    .is_ok_and(|expires_at| expires_at <= agent_timestamp_seconds())
+                    || agent_lease_holder_liveness(&holder) == AgentLeaseHolderLiveness::Dead;
+                if !reclaimable {
+                    anyhow::bail!(
+                        "Cannot unregister project {path} while its agent lease is active"
+                    );
+                }
+                transaction
+                    .execute(
+                        "DELETE FROM leases
+                          WHERE project_id = (SELECT id FROM projects WHERE path = ?1)
+                            AND holder = ?2",
+                        params![path.as_str(), holder],
+                    )
+                    .await
+                    .with_context(|| {
+                        format!("Failed to reclaim stale agent lease for project {path}")
+                    })?;
             }
             transaction
                 .execute(
@@ -28659,6 +28713,93 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn agent_store_unregister_reclaims_dead_process_lease() {
+        let root = temp_root("agent-unregister-dead-lease");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert!(
+            store
+                .try_acquire_lease_blocking(
+                    project.id,
+                    "clt-agent-4294967295",
+                    "100",
+                    "9999999999",
+                )
+                .unwrap()
+        );
+
+        assert!(store.unregister_project_blocking(&project_root).unwrap());
+        assert!(store.list_projects_blocking().unwrap().is_empty());
+        assert_eq!(store.lease_count_blocking().unwrap(), 0);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_store_unregister_reclaims_expired_lease() {
+        let root = temp_root("agent-unregister-expired-lease");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert!(
+            store
+                .try_acquire_lease_blocking(project.id, "unknown-holder", "100", "101")
+                .unwrap()
+        );
+
+        assert!(store.unregister_project_blocking(&project_root).unwrap());
+        assert!(store.list_projects_blocking().unwrap().is_empty());
+        assert_eq!(store.lease_count_blocking().unwrap(), 0);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_store_unregister_rejects_live_or_unknown_lease() {
+        let root = temp_root("agent-unregister-active-lease");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert!(
+            store
+                .try_acquire_lease_blocking(project.id, "unknown-holder", "100", "9999999999",)
+                .unwrap()
+        );
+
+        let error = store
+            .unregister_project_blocking(&project_root)
+            .unwrap_err();
+        assert!(error.to_string().contains("agent lease is active"));
+        assert_eq!(store.list_projects_blocking().unwrap().len(), 1);
+        assert_eq!(store.lease_count_blocking().unwrap(), 1);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn agent_store_unregister_removes_project_run_history() {
         let root = temp_root("agent-unregister-run-history");
@@ -30207,6 +30348,48 @@ mod tests {
                 .state,
             AgentSessionControlState::ResumeRequested
         );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_run_once_reclaims_dead_lease_for_disabled_project() {
+        let root = temp_root("agent-run-disabled-dead-lease");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        add_task(&project_root, "disabled task", None).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert!(
+            store
+                .try_acquire_lease_blocking(
+                    project.id,
+                    "clt-agent-4294967295",
+                    "100",
+                    "9999999999",
+                )
+                .unwrap()
+        );
+        store
+            .set_project_enabled_blocking(project.id, false)
+            .unwrap();
+        let runner = FakeAgentRunner::new(&state_dir, "success");
+        drop(store);
+
+        let pass = run_agent_once_with_runner(&state_dir, &runner).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+
+        assert_eq!(pass.scanned_projects, 0);
+        assert_eq!(pass.runs_started, 0);
+        assert_eq!(store.lease_count_blocking().unwrap(), 0);
+        assert_eq!(store.run_count_blocking().unwrap(), 0);
+        assert_eq!(runner.ran_project_count(), 0);
 
         fs::remove_dir_all(root).unwrap();
     }
