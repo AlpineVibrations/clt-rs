@@ -3,7 +3,7 @@ use chrono::{DateTime, Local, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 use ratatui::layout::{Alignment, Position, Rect};
 use std::cell::Cell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write, stdout};
@@ -14504,6 +14504,105 @@ fn task_tui_display_text(entry: &TaskEntry, is_selected: bool) -> String {
     }
 }
 
+type TaskAgentSessionStates = HashMap<String, AgentSessionControlState>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TaskAgentFlag {
+    Clt,
+    Stopped,
+}
+
+impl TaskAgentFlag {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Clt => "CLT",
+            Self::Stopped => "STOPPED",
+        }
+    }
+}
+
+fn task_agent_flag(
+    status: &str,
+    entry: &TaskEntry,
+    session_states: &TaskAgentSessionStates,
+) -> Option<TaskAgentFlag> {
+    if status == "done" {
+        return None;
+    }
+
+    let session_id = recoverable_codex_session_id_from_task_content(&entry.content)?;
+    match session_states.get(session_id)? {
+        AgentSessionControlState::Stopped => Some(TaskAgentFlag::Stopped),
+        AgentSessionControlState::Running
+        | AgentSessionControlState::StopRequested
+        | AgentSessionControlState::InterruptRequested
+        | AgentSessionControlState::ReadyInteractive
+        | AgentSessionControlState::Interactive
+        | AgentSessionControlState::ResumeRequested => Some(TaskAgentFlag::Clt),
+    }
+}
+
+fn prefix_task_agent_flag(
+    text: String,
+    status: &str,
+    entry: &TaskEntry,
+    session_states: &TaskAgentSessionStates,
+) -> String {
+    match task_agent_flag(status, entry, session_states) {
+        Some(flag) => format!("[{}] {text}", flag.label()),
+        None => text,
+    }
+}
+
+fn task_display_text_with_agent_flag(
+    entry: &TaskEntry,
+    status: &str,
+    session_states: &TaskAgentSessionStates,
+) -> String {
+    prefix_task_agent_flag(task_display_text(entry), status, entry, session_states)
+}
+
+fn task_tui_display_text_with_agent_flag(
+    entry: &TaskEntry,
+    status: &str,
+    is_selected: bool,
+    session_states: &TaskAgentSessionStates,
+) -> String {
+    prefix_task_agent_flag(
+        task_tui_display_text(entry, is_selected),
+        status,
+        entry,
+        session_states,
+    )
+}
+
+fn load_task_agent_session_states(root: &Path) -> TaskAgentSessionStates {
+    try_load_task_agent_session_states(root).unwrap_or_default()
+}
+
+fn try_load_task_agent_session_states(root: &Path) -> Result<TaskAgentSessionStates> {
+    let state_dir = agent_state_dir()?;
+    if !state_dir.join(AGENT_DB_FILE).is_file() {
+        return Ok(TaskAgentSessionStates::default());
+    }
+
+    let project_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let store = open_agent_store_at(&state_dir)?;
+    let Some(project) = store
+        .list_projects_blocking()?
+        .into_iter()
+        .find(|project| project.path == project_root)
+    else {
+        return Ok(TaskAgentSessionStates::default());
+    };
+
+    Ok(store
+        .session_controls_for_project_blocking(project.id)?
+        .into_iter()
+        .map(|control| (control.codex_session_id, control.state))
+        .collect())
+}
+
 fn parse_one_based_task_index(task_index_str: &str) -> Result<usize> {
     let task_index = task_index_str
         .parse::<usize>()
@@ -15292,6 +15391,7 @@ fn reorder_directory_task(path: &Path, from_idx: usize, to_idx: usize) -> Result
 
 fn list_tasks(root: &Path, filter_status: Option<String>) -> Result<()> {
     let board_dir = get_tasks_dir(root);
+    let session_states = load_task_agent_session_states(root);
 
     if let Some(ref s) = filter_status {
         let status = match s.as_str() {
@@ -15307,7 +15407,7 @@ fn list_tasks(root: &Path, filter_status: Option<String>) -> Result<()> {
             println!(
                 "{}. {}{}",
                 index + 1,
-                task_display_text(entry),
+                task_display_text_with_agent_flag(entry, status, &session_states),
                 if entry.has_subtasks {
                     " [subtasks]"
                 } else {
@@ -15322,7 +15422,7 @@ fn list_tasks(root: &Path, filter_status: Option<String>) -> Result<()> {
                 println!(
                     "{}. {}{}",
                     index + 1,
-                    task_display_text(entry),
+                    task_display_text_with_agent_flag(entry, status, &session_states),
                     if entry.has_subtasks {
                         " [subtasks]"
                     } else {
@@ -20199,6 +20299,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
     let mut current_pane = start_state.current_pane;
     let mut models_return_pane = tui_models_return_pane(current_pane);
     let mut agent_panel = TuiAgentPanel::new(&active_root);
+    let mut task_agent_session_states = load_task_agent_session_states(&active_root);
     let mut models_panel = TuiModelsPanel::new();
     let mut model_input: Option<TuiModelInput> = None;
     let mut awaiting_model_provider_choice = false;
@@ -20252,6 +20353,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
 
         if last_agent_panel_refresh.elapsed() >= tui_agent_panel_refresh_interval() {
             agent_panel.refresh(&active_root);
+            task_agent_session_states = load_task_agent_session_states(&active_root);
             if current_pane == TuiPane::AgentProjects {
                 sync_open_tui_agent_log_view(&agent_panel, &mut agent_log_view);
             } else if current_pane == TuiPane::Tasks && active_board && !archive_view {
@@ -20474,7 +20576,16 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                     let entries = read_task_entries(&board_dir, status).unwrap_or_default();
                     let tasks: Vec<String> = entries
                         .iter()
-                        .map(|entry| format!("- {}", task_display_text(entry)))
+                        .map(|entry| {
+                            format!(
+                                "- {}",
+                                task_display_text_with_agent_flag(
+                                    entry,
+                                    status,
+                                    &task_agent_session_states,
+                                )
+                            )
+                        })
                         .collect();
                     let display_tasks: Vec<String> = entries
                         .iter()
@@ -20482,7 +20593,12 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                         .map(|(idx, entry)| {
                             format!(
                                 "- {}",
-                                task_tui_display_text(entry, Some(idx) == selected_idx)
+                                task_tui_display_text_with_agent_flag(
+                                    entry,
+                                    status,
+                                    Some(idx) == selected_idx,
+                                    &task_agent_session_states,
+                                )
                             )
                         })
                         .collect();
@@ -21085,6 +21201,8 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                         match std::env::set_current_dir(&project.path) {
                                             Ok(_) => {
                                                 active_root = project.path.clone();
+                                                task_agent_session_states =
+                                                    load_task_agent_session_states(&active_root);
                                                 active_board = true;
                                                 board_stack.clear();
                                                 board_stack.push(get_tasks_dir(&active_root));
@@ -23563,6 +23681,45 @@ mod tests {
             "codex:session-123 is mentioned in the task"
         );
         assert_eq!(codex_session_id_from_task_content("task codex:"), None);
+    }
+
+    #[test]
+    fn linked_unfinished_tasks_display_clt_and_stopped_flags() {
+        let running = task_entry_from_text(
+            TaskSource::MarkdownLine { line_index: 0 },
+            "running task codex:session-running",
+            "running task codex:session-running",
+            false,
+        );
+        let stopped = task_entry_from_text(
+            TaskSource::MarkdownLine { line_index: 1 },
+            "stopped task codex:session-stopped",
+            "stopped task codex:session-stopped",
+            false,
+        );
+        let session_states = TaskAgentSessionStates::from([
+            (
+                "session-running".to_string(),
+                AgentSessionControlState::Interactive,
+            ),
+            (
+                "session-stopped".to_string(),
+                AgentSessionControlState::Stopped,
+            ),
+        ]);
+
+        assert_eq!(
+            task_display_text_with_agent_flag(&running, "doing", &session_states),
+            "[CLT] running task"
+        );
+        assert_eq!(
+            task_tui_display_text_with_agent_flag(&stopped, "doing", true, &session_states),
+            "[STOPPED] stopped task"
+        );
+        assert_eq!(
+            task_display_text_with_agent_flag(&stopped, "done", &session_states),
+            "stopped task"
+        );
     }
 
     #[test]
