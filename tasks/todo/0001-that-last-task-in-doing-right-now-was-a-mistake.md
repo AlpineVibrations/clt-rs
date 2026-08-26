@@ -1,0 +1,1 @@
+that last task in doing right now was a mistake any code that was changed should be removed. also this brings up a apoint that we should be able to press c to jump into codex resume on a task that is stopped in addition to blocked or done.

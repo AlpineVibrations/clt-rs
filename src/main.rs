@@ -15742,7 +15742,7 @@ fn tui_task_column_controls(selected: bool, reorganizing: bool) -> &'static str 
     if selected && reorganizing {
         "[r/Esc exits]"
     } else if selected {
-        "<<<<<< * >>>>>>"
+        "<<<<<< * >>>>>> [a]"
     } else {
         ""
     }
@@ -23120,7 +23120,7 @@ mod tests {
         assert_eq!(tui_task_column_title("To Do", true, false), "To Do");
         assert_eq!(tui_task_column_title("Doing", false, true), "Doing");
         assert_eq!(tui_task_column_controls(true, true), "[r/Esc exits]");
-        assert_eq!(tui_task_column_controls(true, false), "<<<<<< * >>>>>>");
+        assert_eq!(tui_task_column_controls(true, false), "<<<<<< * >>>>>> [a]");
         assert_eq!(tui_task_column_controls(false, false), "");
         assert_eq!(
             tui_task_column_border_color(Color::Indexed(110), true),
@@ -23165,8 +23165,8 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(rows[0].contains("To Do"));
-        assert!(!rows[0].contains("<<<<<< * >>>>>>"));
-        assert!(rows[1].contains("<<<<<< * >>>>>>"));
+        assert!(!rows[0].contains("<<<<<< * >>>>>> [a]"));
+        assert!(rows[1].contains("<<<<<< * >>>>>> [a]"));
         assert!(rows[2].contains("1. task"));
     }
 
