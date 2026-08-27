@@ -16481,7 +16481,7 @@ struct TuiStartState {
 }
 
 fn tui_task_board_instructions() -> &'static str {
-    "Arrows navigate boards and tasks, Enter opens subtasks or edits the selected task, Space creates a task, e edits, s stops/resumes the selected linked Codex session, i interrupts an active linked session into interactive Codex and restarts exec on exit, c opens a selected Done or blocked session (read-only if the project is busy), Backspace returns to the parent board, a archives, A opens Archive, b moves to Backlog, B shows/hides Backlog, r enters Reorganize mode, Shift+Arrows move/reorder, Ctrl-P/N reorder, d/Delete deletes, l shows agent output, Tab opens Agent Projects, M opens Models, h/? opens Help, q quits."
+    "Arrows navigate boards and tasks, Enter opens subtasks, e edits, and Space creates a task. Press r to reorganize; use Shift+Arrows to move tasks. Tab opens Agent Projects, M opens Models, and h/? opens Help. Codex: s stops/resumes, i interrupts for interaction, c opens completed or blocked sessions, and l shows logs."
 }
 
 fn tui_start_state(active_board: bool) -> TuiStartState {
@@ -28042,14 +28042,11 @@ mod tests {
 
         assert!(instructions.contains("Space creates a task"));
         assert!(instructions.contains("e edits"));
-        assert!(instructions.contains("s stops/resumes the selected linked Codex session"));
-        assert!(instructions.contains(
-            "i interrupts an active linked session into interactive Codex and restarts exec on exit"
-        ));
-        assert!(instructions.contains(
-            "c opens a selected Done or blocked session (read-only if the project is busy)"
-        ));
-        assert!(instructions.contains("r enters Reorganize mode"));
+        assert!(instructions.contains("Codex: s stops/resumes"));
+        assert!(instructions.contains("i interrupts for interaction"));
+        assert!(instructions.contains("c opens completed or blocked sessions"));
+        assert!(instructions.contains("l shows logs"));
+        assert!(instructions.contains("Press r to reorganize"));
         assert!(instructions.contains("Tab opens Agent Projects"));
         assert!(!instructions.contains("toggles ON/OFF"));
         assert!(!instructions.contains("cycles Git"));
