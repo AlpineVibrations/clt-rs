@@ -10,6 +10,7 @@ Use this section while developing the next release.
 
 ### Added
 
+- Added persisted daemon project-scan errors to the Agent Projects pane, with red `ERROR` rows and actionable macOS Full Disk Access guidance for inaccessible external drives.
 - Added `n` and `+` TUI shortcuts that create a Todo subtask under the selected task, automatically expand Markdown-backed parent storage, and open the resulting nested board.
 - Added durable per-run agent workers: macOS uses one-shot launchd jobs and Linux uses transient user services, with persisted launch contracts, fenced worker records, heartbeats, crash recovery, and idempotent run finalization.
 - Added `/goal`-prefixed task support for automated Codex runs, including explicit goals feature enablement and prompt guidance that removes the directive from the persistent goal objective.

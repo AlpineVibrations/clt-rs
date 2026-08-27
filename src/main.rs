@@ -87,7 +87,7 @@ const AGENT_WORKER_PROTOCOL_VERSION: i64 = 1;
 // Any future migration above this version is deferred while a pinned worker is
 // active. Store access remains available for cross-generation control and
 // recovery; the scheduler waits in compatibility mode until it can migrate.
-const AGENT_WORKER_SHARED_SCHEMA_VERSION: i64 = 15;
+const AGENT_WORKER_SHARED_SCHEMA_VERSION: i64 = 16;
 const AGENT_NO_TASKS_LEFT_MARKER: &str = "NO_TASKS_LEFT";
 const CODEX_TASK_SESSION_PREFIX: &str = "codex:";
 const CLT_TASK_MANAGEMENT_SKILL_NAME: &str = "clt-task-management";
@@ -5529,7 +5529,11 @@ fn run_agent_scheduler_pass_with_max_global_jobs(
 
         let scan = scan_agent_project(&project.path);
         with_agent_store_at(state_dir, |store| {
-            store.record_project_scan_blocking(project.id)
+            store.record_project_daemon_scan_blocking(
+                project.id,
+                scan.status_label(),
+                scan.error_message(),
+            )
         })?;
 
         let existing_lease = agent_lease_for_project(state_dir, project.id)?;
@@ -8340,6 +8344,13 @@ impl AgentProjectScan {
             AgentProjectScanStatus::Unavailable(_) => "unavailable",
         }
     }
+
+    fn error_message(&self) -> Option<&str> {
+        match &self.status {
+            AgentProjectScanStatus::Unavailable(error) => Some(error),
+            _ => None,
+        }
+    }
 }
 
 fn resolve_agent_project_root(
@@ -9646,6 +9657,13 @@ mod agent_store {
                     WHERE state IN ('dispatching', 'running', 'finalizing')",
             ],
         },
+        AgentMigration {
+            version: 16,
+            statements: &[
+                "ALTER TABLE projects ADD COLUMN last_daemon_scan_status TEXT",
+                "ALTER TABLE projects ADD COLUMN last_daemon_scan_error TEXT",
+            ],
+        },
     ];
 
     pub(crate) struct TursoAgentStore {
@@ -9667,6 +9685,8 @@ mod agent_store {
         pub(crate) codex_reasoning_effort: Option<String>,
         pub(crate) codex_fast_enabled: bool,
         pub(crate) last_scan_at: Option<String>,
+        pub(crate) last_daemon_scan_status: Option<String>,
+        pub(crate) last_daemon_scan_error: Option<String>,
         pub(crate) last_run_at: Option<String>,
         pub(crate) last_success_at: Option<String>,
         pub(crate) last_failure_at: Option<String>,
@@ -10084,9 +10104,9 @@ mod agent_store {
             let mut rows = conn
                 .query(
                     "SELECT id, path, name, enabled, git_mode, codex_provider, codex_model,
-                            codex_reasoning_effort, codex_fast_enabled, last_scan_at, last_run_at,
-                            last_success_at, last_failure_at, last_blocked_recovery_at,
-                            failure_count
+                            codex_reasoning_effort, codex_fast_enabled, last_scan_at,
+                            last_daemon_scan_status, last_daemon_scan_error, last_run_at,
+                            last_success_at, last_failure_at, last_blocked_recovery_at, failure_count
                      FROM projects
                      ORDER BY name COLLATE NOCASE, path COLLATE NOCASE",
                     (),
@@ -10110,12 +10130,15 @@ mod agent_store {
                 let codex_reasoning_effort = row_optional_text(&row, 7, "codex_reasoning_effort")?;
                 let codex_fast_enabled = row_integer(&row, 8, "codex_fast_enabled")? != 0;
                 let last_scan_at = row_optional_text(&row, 9, "last_scan_at")?;
-                let last_run_at = row_optional_text(&row, 10, "last_run_at")?;
-                let last_success_at = row_optional_text(&row, 11, "last_success_at")?;
-                let last_failure_at = row_optional_text(&row, 12, "last_failure_at")?;
+                let last_daemon_scan_status =
+                    row_optional_text(&row, 10, "last_daemon_scan_status")?;
+                let last_daemon_scan_error = row_optional_text(&row, 11, "last_daemon_scan_error")?;
+                let last_run_at = row_optional_text(&row, 12, "last_run_at")?;
+                let last_success_at = row_optional_text(&row, 13, "last_success_at")?;
+                let last_failure_at = row_optional_text(&row, 14, "last_failure_at")?;
                 let last_blocked_recovery_at =
-                    row_optional_text(&row, 13, "last_blocked_recovery_at")?;
-                let failure_count = row_integer(&row, 14, "failure_count")?;
+                    row_optional_text(&row, 15, "last_blocked_recovery_at")?;
+                let failure_count = row_integer(&row, 16, "failure_count")?;
 
                 projects.push(AgentProject {
                     id,
@@ -10128,6 +10151,8 @@ mod agent_store {
                     codex_reasoning_effort,
                     codex_fast_enabled,
                     last_scan_at,
+                    last_daemon_scan_status,
+                    last_daemon_scan_error,
                     last_run_at,
                     last_success_at,
                     last_failure_at,
@@ -10157,6 +10182,41 @@ mod agent_store {
             )
             .await
             .with_context(|| format!("Failed to record agent project scan {}", project_id))?;
+
+            Ok(scanned_at)
+        }
+
+        pub(crate) fn record_project_daemon_scan_blocking(
+            &self,
+            project_id: i64,
+            status: &str,
+            error: Option<&str>,
+        ) -> Result<String> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(self.record_project_daemon_scan(project_id, status, error))
+        }
+
+        async fn record_project_daemon_scan(
+            &self,
+            project_id: i64,
+            status: &str,
+            error: Option<&str>,
+        ) -> Result<String> {
+            let conn = self.connect().await?;
+            let scanned_at = agent_timestamp();
+
+            conn.execute(
+                "UPDATE projects
+                 SET last_scan_at = ?1,
+                     last_daemon_scan_status = ?2,
+                     last_daemon_scan_error = ?3,
+                     updated_at = ?1
+                 WHERE id = ?4",
+                params![scanned_at.as_str(), status, error, project_id],
+            )
+            .await
+            .with_context(|| format!("Failed to record daemon project scan {project_id}"))?;
 
             Ok(scanned_at)
         }
@@ -16583,6 +16643,7 @@ struct TuiAgentProject {
     project: agent_store::AgentProject,
     scan: AgentProjectScan,
     runtime_state: TuiAgentRuntimeState,
+    daemon_scan_problem: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -16590,6 +16651,7 @@ enum TuiAgentRuntimeState {
     Idle,
     Running,
     Stale,
+    Error,
 }
 
 impl TuiAgentRuntimeState {
@@ -16598,6 +16660,7 @@ impl TuiAgentRuntimeState {
             Self::Idle => "IDLE",
             Self::Running => "RUNNING",
             Self::Stale => "STALE",
+            Self::Error => "ERROR",
         }
     }
 
@@ -17876,11 +17939,16 @@ fn load_tui_agent_panel_snapshot(_active_root: &Path) -> Result<TuiAgentPanelSna
         .into_iter()
         .map(|project| {
             let scan = scan_agent_project(&project.path);
-            let runtime_state = tui_agent_runtime_state(project.id, &active_leases);
+            let daemon_scan_problem = tui_agent_daemon_scan_problem(&project);
+            let mut runtime_state = tui_agent_runtime_state(project.id, &active_leases);
+            if runtime_state == TuiAgentRuntimeState::Idle && daemon_scan_problem.is_some() {
+                runtime_state = TuiAgentRuntimeState::Error;
+            }
             TuiAgentProject {
                 project,
                 scan,
                 runtime_state,
+                daemon_scan_problem,
             }
         })
         .collect();
@@ -17889,6 +17957,44 @@ fn load_tui_agent_panel_snapshot(_active_root: &Path) -> Result<TuiAgentPanelSna
         projects,
         daemon_status,
     })
+}
+
+fn tui_agent_daemon_scan_problem(project: &agent_store::AgentProject) -> Option<String> {
+    if !project.enabled {
+        return None;
+    }
+
+    let status = project.last_daemon_scan_status.as_deref()?;
+    let external_project = project.path.starts_with("/Volumes");
+    match status {
+        "unavailable" if external_project => Some(format!(
+            "External project scan failed: {}. In macOS System Settings > Privacy & Security > Full Disk Access, allow CLT and restart the agent.",
+            project
+                .last_daemon_scan_error
+                .as_deref()
+                .unwrap_or("the daemon cannot access the project")
+        )),
+        "missing" if external_project => Some(format!(
+            "External project is unavailable. Make sure the drive is mounted and accessible: {}",
+            project.path.display()
+        )),
+        "unavailable" => Some(format!(
+            "Daemon project scan failed: {}",
+            project
+                .last_daemon_scan_error
+                .as_deref()
+                .unwrap_or("the project cannot be read")
+        )),
+        "missing" => Some(format!(
+            "Project folder is unavailable: {}",
+            project.path.display()
+        )),
+        "uninitialized" => Some(format!(
+            "No CLT task board found. Open {} and run `clt init`.",
+            project.path.display()
+        )),
+        _ => None,
+    }
 }
 
 fn agent_service_needs_restart(
@@ -19326,6 +19432,10 @@ fn format_agent_project_table_row(
     let todo = item.scan.todo_count.to_string();
     let doing = item.scan.doing_count.to_string();
     let last_run = format_agent_table_last_run(&item.project);
+    let path_or_error = item
+        .daemon_scan_problem
+        .as_deref()
+        .unwrap_or_else(|| item.project.path.to_str().unwrap_or("<non-UTF-8 path>"));
 
     if width < 120 {
         let path_width = width.saturating_sub(52 + project_width + codex_width);
@@ -19343,7 +19453,7 @@ fn format_agent_project_table_row(
                 fit_cell(&codex, codex_width),
                 TUI_AGENT_TABLE_CODEX_LAST_RUN_GAP,
                 fit_cell(&last_run, 11),
-                fit_cell(&item.project.path.display().to_string(), path_width)
+                fit_cell(path_or_error, path_width)
             ),
             width,
         );
@@ -19384,7 +19494,7 @@ fn format_agent_project_table_row(
             fit_cell(&codex, codex_width),
             TUI_AGENT_TABLE_CODEX_LAST_RUN_GAP,
             fit_cell(&last_run, last_run_width),
-            fit_cell(&item.project.path.display().to_string(), path_width)
+            fit_cell(path_or_error, path_width)
         ),
         width,
     )
@@ -19480,7 +19590,7 @@ fn format_agent_project_table_header(
                 fit_cell("CODEX", codex_width),
                 TUI_AGENT_TABLE_CODEX_LAST_RUN_GAP,
                 fit_cell("LAST RUN", 11),
-                fit_cell("PATH", path_width)
+                fit_cell("PATH / ERROR", path_width)
             ),
             width,
         );
@@ -19521,7 +19631,7 @@ fn format_agent_project_table_header(
             fit_cell("CODEX", codex_width),
             TUI_AGENT_TABLE_CODEX_LAST_RUN_GAP,
             fit_cell("LAST RUN", last_run_width),
-            fit_cell("PATH", path_width)
+            fit_cell("PATH / ERROR", path_width)
         ),
         width,
     )
@@ -19666,7 +19776,9 @@ fn render_tui_agent_panel(
                         codex_width,
                         item.project.path == active_root,
                     ),
-                    if item.project.enabled {
+                    if item.daemon_scan_problem.is_some() {
+                        Style::default().fg(Color::LightRed)
+                    } else if item.project.enabled {
                         Style::default().fg(text_color)
                     } else {
                         Style::default().fg(Color::Indexed(244))
@@ -19685,7 +19797,9 @@ fn render_tui_agent_panel(
                     codex_width,
                     item.project.path == active_root,
                 ),
-                if item.project.enabled {
+                if item.daemon_scan_problem.is_some() {
+                    Style::default().fg(Color::LightRed)
+                } else if item.project.enabled {
                     Style::default().fg(text_color)
                 } else {
                     Style::default().fg(Color::Indexed(244))
@@ -20109,6 +20223,13 @@ fn tui_console_content<'a>(
     }
     if let Some(log_view) = log_view {
         return (&log_view.content, Color::Gray);
+    }
+    if agent_pane
+        && let Some(problem) = panel
+            .selected_project()
+            .and_then(|project| project.daemon_scan_problem.as_deref())
+    {
+        return (problem, Color::LightRed);
     }
 
     (feedback, Color::Gray)
@@ -23860,6 +23981,8 @@ mod tests {
                 codex_reasoning_effort: None,
                 codex_fast_enabled: false,
                 last_scan_at: None,
+                last_daemon_scan_status: None,
+                last_daemon_scan_error: None,
                 last_run_at: None,
                 last_success_at: None,
                 last_failure_at: None,
@@ -23868,6 +23991,7 @@ mod tests {
             },
             scan: AgentProjectScan::empty(),
             runtime_state: TuiAgentRuntimeState::Idle,
+            daemon_scan_problem: None,
         }
     }
 
@@ -24096,6 +24220,7 @@ mod tests {
                 project,
                 scan: AgentProjectScan::empty(),
                 runtime_state: TuiAgentRuntimeState::Idle,
+                daemon_scan_problem: None,
             }],
             current_project_registration: None,
             daemon_status: "not-installed".to_string(),
@@ -27075,6 +27200,7 @@ mod tests {
                 project,
                 scan: AgentProjectScan::empty(),
                 runtime_state: TuiAgentRuntimeState::Idle,
+                daemon_scan_problem: None,
             }],
             current_project_registration: None,
             daemon_status: "running".to_string(),
@@ -27571,6 +27697,7 @@ mod tests {
                 project,
                 scan: AgentProjectScan::empty(),
                 runtime_state: TuiAgentRuntimeState::Idle,
+                daemon_scan_problem: None,
             }],
             current_project_registration: None,
             daemon_status: "not-installed".to_string(),
@@ -27672,6 +27799,7 @@ mod tests {
                     project,
                     scan: AgentProjectScan::empty(),
                     runtime_state: TuiAgentRuntimeState::Idle,
+                    daemon_scan_problem: None,
                 })
                 .collect(),
             current_project_registration: None,
@@ -27725,6 +27853,38 @@ mod tests {
             tui_agent_runtime_state(1, &[active_lease]),
             TuiAgentRuntimeState::Running
         );
+    }
+
+    #[test]
+    fn agent_project_table_surfaces_external_daemon_scan_errors() {
+        let mut item = tui_agent_project_for_test(1, "fishdome");
+        item.project.path = PathBuf::from("/Volumes/External/FISHDOME");
+        item.project.last_daemon_scan_status = Some("unavailable".to_string());
+        item.project.last_daemon_scan_error =
+            Some("Operation not permitted (os error 1)".to_string());
+        item.daemon_scan_problem = tui_agent_daemon_scan_problem(&item.project);
+        item.runtime_state = TuiAgentRuntimeState::Error;
+
+        let codex_width = agent_codex_column_width(std::slice::from_ref(&item), false);
+        let project_width =
+            agent_project_column_width(std::slice::from_ref(&item), None, 160, codex_width);
+        let row = format_agent_project_table_row(0, &item, 160, project_width, codex_width, false);
+        let mut panel = TuiAgentPanel {
+            projects: vec![item],
+            current_project_registration: None,
+            daemon_status: "service active".to_string(),
+            state: ListState::default(),
+            scroll_offset: 0,
+            last_error: None,
+        };
+        panel.state.select(Some(0));
+        let (console, color) = tui_console_content(true, &panel, None, "instructions");
+
+        assert!(row.contains("ERROR"));
+        assert!(row.contains("External project scan failed"));
+        assert!(console.contains("Full Disk Access"));
+        assert!(console.contains("restart the agent"));
+        assert_eq!(color, Color::LightRed);
     }
 
     #[test]
@@ -28682,6 +28842,8 @@ mod tests {
             codex_reasoning_effort: None,
             codex_fast_enabled: false,
             last_scan_at: None,
+            last_daemon_scan_status: None,
+            last_daemon_scan_error: None,
             last_run_at: Some("last-run".to_string()),
             last_success_at: Some("last-success".to_string()),
             last_failure_at: None,
@@ -28865,6 +29027,8 @@ mod tests {
             codex_reasoning_effort: None,
             codex_fast_enabled: false,
             last_scan_at: None,
+            last_daemon_scan_status: None,
+            last_daemon_scan_error: None,
             last_run_at: None,
             last_success_at: Some("100".to_string()),
             last_failure_at: None,
@@ -28909,6 +29073,8 @@ mod tests {
             codex_reasoning_effort: None,
             codex_fast_enabled: false,
             last_scan_at: None,
+            last_daemon_scan_status: None,
+            last_daemon_scan_error: None,
             last_run_at: Some("100".to_string()),
             last_success_at: None,
             last_failure_at: None,
@@ -29656,7 +29822,7 @@ mod tests {
                 .copied()
                 .unwrap()
         });
-        assert_eq!(migration_count, 15);
+        assert_eq!(migration_count, 16);
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -31112,6 +31278,80 @@ mod tests {
         let project = store.list_projects_blocking().unwrap().remove(0);
 
         assert_eq!(project.last_scan_at, Some(scanned_at));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_store_records_and_clears_daemon_scan_errors() {
+        let root = temp_root("agent-daemon-scan-store");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project_id = store.list_projects_blocking().unwrap()[0].id;
+
+        store
+            .record_project_daemon_scan_blocking(
+                project_id,
+                "unavailable",
+                Some("Operation not permitted (os error 1)"),
+            )
+            .unwrap();
+        let failed = store.list_projects_blocking().unwrap().remove(0);
+
+        assert_eq!(
+            failed.last_daemon_scan_status.as_deref(),
+            Some("unavailable")
+        );
+        assert_eq!(
+            failed.last_daemon_scan_error.as_deref(),
+            Some("Operation not permitted (os error 1)")
+        );
+
+        store
+            .record_project_daemon_scan_blocking(project_id, "pending", None)
+            .unwrap();
+        let recovered = store.list_projects_blocking().unwrap().remove(0);
+
+        assert_eq!(
+            recovered.last_daemon_scan_status.as_deref(),
+            Some("pending")
+        );
+        assert_eq!(recovered.last_daemon_scan_error, None);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_scheduler_persists_unavailable_scan_for_the_ui() {
+        let root = temp_root("agent-scheduler-scan-error");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        let tasks_dir = project_root.join("tasks");
+        fs::create_dir_all(&tasks_dir).unwrap();
+        fs::write(tasks_dir.join("todo.md"), [0xff, 0xfe]).unwrap();
+        fs::write(tasks_dir.join("doing.md"), "# Doing Tasks\n").unwrap();
+        fs::write(tasks_dir.join("done.md"), "# Done Tasks\n").unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+
+        let start = run_agent_scheduler_pass(&state_dir, false, &[]).unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+
+        assert_eq!(start.pass.pending_projects, 0);
+        assert_eq!(
+            project.last_daemon_scan_status.as_deref(),
+            Some("unavailable")
+        );
+        assert!(project.last_daemon_scan_error.is_some());
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -33811,6 +34051,8 @@ mod tests {
             codex_reasoning_effort: None,
             codex_fast_enabled: false,
             last_scan_at: None,
+            last_daemon_scan_status: None,
+            last_daemon_scan_error: None,
             last_run_at: None,
             last_success_at: None,
             last_failure_at: None,
@@ -33926,6 +34168,8 @@ mod tests {
             codex_reasoning_effort: None,
             codex_fast_enabled: false,
             last_scan_at: None,
+            last_daemon_scan_status: None,
+            last_daemon_scan_error: None,
             last_run_at: None,
             last_success_at: None,
             last_failure_at: None,
@@ -34776,6 +35020,8 @@ exit 0
             codex_reasoning_effort: Some("high".to_string()),
             codex_fast_enabled: true,
             last_scan_at: None,
+            last_daemon_scan_status: None,
+            last_daemon_scan_error: None,
             last_run_at: None,
             last_success_at: None,
             last_failure_at: None,
@@ -35084,6 +35330,8 @@ exit 0
             codex_reasoning_effort: None,
             codex_fast_enabled: false,
             last_scan_at: None,
+            last_daemon_scan_status: None,
+            last_daemon_scan_error: None,
             last_run_at: None,
             last_success_at: None,
             last_failure_at: None,
@@ -35145,6 +35393,8 @@ exit 0
             codex_reasoning_effort: None,
             codex_fast_enabled: false,
             last_scan_at: None,
+            last_daemon_scan_status: None,
+            last_daemon_scan_error: None,
             last_run_at: None,
             last_success_at: None,
             last_failure_at: None,
