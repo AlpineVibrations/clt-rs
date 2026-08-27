@@ -38,6 +38,8 @@ git pull --ff-only
 
 Do this before the CLT status transition because moving a task to `doing` changes the task board and makes the checkout dirty. Use fast-forward-only so the startup sync cannot create a merge commit, rebase local commits, or disturb user work. If the checkout is dirty, detached, has no upstream, or cannot fast-forward, do not stash, discard, commit, switch branches, or integrate changes solely to make the pull succeed. Continue from the current checkout when safe and mention that the startup pull was skipped or could not complete.
 
+A dirty worktree is expected in shared repositories where a person, an interactive session, or an independent worker may have changes in progress. It is not a blocker by itself. Treat the initial status and diff as the baseline, preserve pre-existing changes, and continue with non-conflicting work. Another change in the same file is also not automatically a blocker: re-read the affected area and keep both changes when the intended combined result is clear. Mark the task blocked only when the required edits genuinely conflict and the correct result cannot be determined safely.
+
 ## Core Workflow
 The agent must adhere to the following state transition pipeline:
 `Backlog` → `Todo` → `Doing` → `Done`

@@ -25,6 +25,16 @@ git pull --ff-only
 
 Use fast-forward-only here so the startup sync cannot create a merge commit, rebase local commits, or disturb user work. If the checkout is dirty, detached, has no upstream, or cannot fast-forward, do not stash, discard, commit, switch branches, or integrate changes solely to make the pull succeed. Continue from the current checkout when safe and mention that the startup pull was skipped or could not complete.
 
+## Shared Dirty Worktrees
+
+A dirty worktree is expected when a person, an interactive session, or an independent worker has changes in progress. Dirtiness alone is never a reason to block or abandon the current task.
+
+- Treat the status and diff observed before editing as the baseline, and preserve those pre-existing changes.
+- Continue with non-conflicting work even when unrelated files are modified.
+- A pre-existing change in the same file is not automatically a conflict. Re-read the affected area, apply the task's change against the current contents, and preserve both changes when the combined result is clear.
+- Stop only for a real conflict: the same behavior or lines require incompatible outcomes and the correct combined result cannot be determined safely.
+- At commit time, stage only the current task's paths or hunks. Leave unrelated unstaged changes in place. When a file contains mixed changes, use patch staging and verify the cached diff before committing.
+
 ## Default Flow
 
 ```bash
@@ -116,6 +126,8 @@ git diff --staged
 ```
 
 If unrelated changes are present, commit only the requested or coherent set and leave the rest untouched.
+
+Pre-existing unstaged changes do not prevent a commit. Use path-specific or patch staging to isolate the completed task. Do not require the whole worktree to become clean before committing.
 
 ## CLT Task Updates
 

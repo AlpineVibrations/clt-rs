@@ -191,6 +191,10 @@ Your job for this run:
 Safety rules:
 - Do not overwrite unrelated user changes.
 - Before making edits, inspect the current repo state.
+- A dirty worktree is expected when people, interactive sessions, or independent workers share a repository; it is not a blocker by itself.
+- Treat the initial status and diff as the baseline, preserve pre-existing changes, and continue with non-conflicting work.
+- Another change in the same file is not automatically a blocker. Re-read the affected area and keep both changes when the intended combined result is clear.
+- Stop for Git overlap only when the required edits genuinely conflict and the correct combined result cannot be determined safely.
 - During normal TODO selection, skip tasks whose latest dated state note is `BLOCKED YYYY-MM-DD:`.
 - Inspect task details when needed; a folder-backed task's list summary may not show its blocker notes.
 - If the task is blocked or cannot be completed safely, update it with a concise `BLOCKED YYYY-MM-DD:` note instead of forcing it.
@@ -200,6 +204,8 @@ const AGENT_GIT_COMMIT_PROMPT_APPENDIX: &str = r#"
 Git commit:
 - After completing and verifying the task, use the $git-commit skill to create one git commit for the completed work.
 - Include the code changes and related task-board updates in the commit when they are part of the same logical change.
+- Pre-existing unstaged changes do not prevent a commit. Stage only this task's paths or hunks, verify the staged diff, and leave unrelated changes untouched.
+- Do not require the worktree to be clean before committing.
 - The scheduler supplies the isolated Git identity `CLT Agent <clt-agent@localhost>` for clear automated-commit attribution; do not change Git configuration.
 - Do not commit when there are no tasks left, the task is blocked, checks fail, or the work cannot be completed safely.
 "#;
@@ -32988,6 +32994,9 @@ mod tests {
         assert!(base_prompt.contains("Use the existing task-management CLI tooling: clt."));
         assert!(base_prompt.contains("Use the $clt-task-management skill"));
         assert!(base_prompt.contains("Pick the next available unblocked TODO"));
+        assert!(base_prompt.contains("A dirty worktree is expected"));
+        assert!(base_prompt.contains("it is not a blocker by itself"));
+        assert!(base_prompt.contains("same file is not automatically a blocker"));
         assert!(base_prompt.contains("the first non-whitespace token is exactly `/goal`"));
         assert!(base_prompt.contains("without including `/goal` in the goal objective"));
         assert!(base_prompt.contains("do not create a goal when `/goal` appears anywhere except"));
@@ -33004,6 +33013,8 @@ mod tests {
         assert!(commit_prompt.contains("$git-commit"));
         assert!(commit_prompt.contains("CLT Agent <clt-agent@localhost>"));
         assert!(commit_prompt.contains("do not change Git configuration"));
+        assert!(commit_prompt.contains("Pre-existing unstaged changes do not prevent a commit"));
+        assert!(commit_prompt.contains("Do not require the worktree to be clean"));
         assert!(commit_prompt.contains("Do not commit when there are no tasks left"));
         assert!(!commit_prompt.contains("Git push:"));
 
