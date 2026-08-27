@@ -227,8 +227,9 @@ Interrupted task recovery:
 const AGENT_RECOVER_BLOCKED_PROMPT_APPENDIX: &str = r#"
 
 Blocked-task monitor:
-- The scheduler found that every task across todo and doing is currently blocked; Todo does not have to be empty.
-- Review the existing blocker notes and choose exactly one blocked task from todo or doing that can be advanced.
+- The scheduler found at least one blocked task in todo or doing and is reconsidering blockers before starting fresh Todo work.
+- Review the existing blocker notes and choose exactly one blocked task from todo or doing.
+- Re-evaluate whether the recorded blocking conditions still exist instead of assuming the task remains blocked.
 - If the selected task is in todo, move it to doing before working on it.
 - Try to resolve that task's blocker and finish the task, including the relevant checks.
 - Update the existing task; do not create a replacement task.
@@ -605,16 +606,41 @@ enum AgentSessionControlState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InteractiveCodexResumeMode {
+    ResumeExec,
+    WritableIdle,
+    ReadOnly,
+}
+
+impl InteractiveCodexResumeMode {
+    fn resumes_exec(self) -> bool {
+        self == Self::ResumeExec
+    }
+
+    fn is_read_only(self) -> bool {
+        self == Self::ReadOnly
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InteractiveGuardianDisposition {
     ResumeExec,
     DeleteIdleReservation,
     RestoreStopped,
+    DeleteReadOnlyReservation,
+    RestoreStoppedReadOnly,
 }
 
 impl InteractiveGuardianDisposition {
-    fn from_handoff(resume_exec: bool, from_holder: &str) -> Self {
-        if resume_exec {
+    fn from_handoff(mode: InteractiveCodexResumeMode, from_holder: &str) -> Self {
+        if mode.resumes_exec() {
             Self::ResumeExec
+        } else if mode.is_read_only() {
+            if from_holder.starts_with("clt-stopped-readonly-interactive-") {
+                Self::RestoreStoppedReadOnly
+            } else {
+                Self::DeleteReadOnlyReservation
+            }
         } else if from_holder.starts_with("clt-stopped-interactive-") {
             Self::RestoreStopped
         } else {
@@ -626,11 +652,24 @@ impl InteractiveGuardianDisposition {
         self == Self::ResumeExec
     }
 
+    fn holds_project_lease(self) -> bool {
+        !matches!(
+            self,
+            Self::DeleteReadOnlyReservation | Self::RestoreStoppedReadOnly
+        )
+    }
+
+    fn is_read_only(self) -> bool {
+        !self.holds_project_lease()
+    }
+
     fn guardian_holder_prefix(self) -> &'static str {
         match self {
             Self::ResumeExec => "clt-interactive-worker",
             Self::DeleteIdleReservation => "clt-idle-interactive-worker",
             Self::RestoreStopped => "clt-stopped-interactive-worker",
+            Self::DeleteReadOnlyReservation => "clt-readonly-interactive-worker",
+            Self::RestoreStoppedReadOnly => "clt-stopped-readonly-interactive-worker",
         }
     }
 
@@ -639,6 +678,8 @@ impl InteractiveGuardianDisposition {
             Self::ResumeExec,
             Self::DeleteIdleReservation,
             Self::RestoreStopped,
+            Self::DeleteReadOnlyReservation,
+            Self::RestoreStoppedReadOnly,
         ]
         .into_iter()
         .find(|disposition| holder.starts_with(disposition.guardian_holder_prefix()))
@@ -897,6 +938,8 @@ enum AgentCommands {
         from_holder: String,
         #[arg(long, default_value_t = false)]
         resume_exec: bool,
+        #[arg(long, default_value_t = false)]
+        read_only: bool,
         #[arg(long)]
         control_fd: Option<i32>,
     },
@@ -1214,13 +1257,21 @@ fn handle_agent_command(command: AgentCommands, local: bool, default_root: &Path
             session_id,
             from_holder,
             resume_exec,
+            read_only,
             control_fd,
         } => {
+            let mode = if resume_exec {
+                InteractiveCodexResumeMode::ResumeExec
+            } else if read_only {
+                InteractiveCodexResumeMode::ReadOnly
+            } else {
+                InteractiveCodexResumeMode::WritableIdle
+            };
             run_agent_interactive_session_worker(
                 project_id,
                 &session_id,
                 &from_holder,
-                resume_exec,
+                mode,
                 control_fd,
             )?;
         }
@@ -2387,14 +2438,23 @@ fn configure_interactive_codex_resume_command(
     command: &mut Command,
     project_root: &Path,
     session_id: &str,
+    mode: InteractiveCodexResumeMode,
 ) {
     command
         .arg("resume")
         .arg("--include-non-interactive")
         .arg("--sandbox")
-        .arg("workspace-write")
+        .arg(if mode.is_read_only() {
+            "read-only"
+        } else {
+            "workspace-write"
+        })
         .arg("--ask-for-approval")
-        .arg("on-request")
+        .arg(if mode.is_read_only() {
+            "never"
+        } else {
+            "on-request"
+        })
         .arg("-C")
         .arg(project_root)
         .arg(session_id)
@@ -3381,6 +3441,15 @@ impl InteractiveAgentLease {
         Self::holder_for_current_process_with_prefix("clt-stopped-interactive")
     }
 
+    fn holder_for_read_only_session(restore_stopped: bool) -> String {
+        let prefix = if restore_stopped {
+            "clt-stopped-readonly-interactive"
+        } else {
+            "clt-readonly-interactive"
+        };
+        Self::holder_for_current_process_with_prefix(prefix)
+    }
+
     fn try_acquire_idle(project_id: i64, restore_stopped: bool) -> Result<Option<Self>> {
         let state_dir = ensure_agent_state_dir()?;
         let timeout_seconds = TUI_SESSION_HANDOFF_TIMEOUT_SECONDS.max(60);
@@ -3488,7 +3557,7 @@ fn resume_codex_session_interactively(
     project_id: i64,
     session_id: &str,
     from_holder: &str,
-    resume_exec: bool,
+    mode: InteractiveCodexResumeMode,
 ) -> Result<ExitStatus> {
     let executable = std::env::current_exe().context("Failed to resolve the CLT executable")?;
     let mut command = Command::new(&executable);
@@ -3503,8 +3572,11 @@ fn resume_codex_session_interactively(
         .arg("--from-holder")
         .arg(from_holder)
         .current_dir(project_root);
-    if resume_exec {
+    if mode.resumes_exec() {
         command.arg("--resume-exec");
+    }
+    if mode.is_read_only() {
+        command.arg("--read-only");
     }
     #[cfg(unix)]
     let (control_fd, guardian_lifeline) = configure_inherited_child_control(&mut command)?;
@@ -4409,7 +4481,7 @@ fn run_agent_interactive_session_worker(
     project_id: i64,
     session_id: &str,
     from_holder: &str,
-    resume_exec: bool,
+    mode: InteractiveCodexResumeMode,
     control_fd: Option<i32>,
 ) -> Result<()> {
     if session_id.is_empty()
@@ -4456,7 +4528,7 @@ fn run_agent_interactive_session_worker(
         .with_context(|| format!("Registered project {project_id} no longer exists"))?;
     let terminal_input = interactive_terminal_input()?;
     let lease_timeout = agent_lease_timeout()?;
-    let disposition = InteractiveGuardianDisposition::from_handoff(resume_exec, from_holder);
+    let disposition = InteractiveGuardianDisposition::from_handoff(mode, from_holder);
     let guardian_holder = interactive_guardian_holder(disposition);
     if !store.adopt_interactive_guardian_blocking(
         project_id,
@@ -4530,13 +4602,16 @@ fn finish_interactive_guardian_after_reap(
                                 ) && control.interactive_holder.as_deref() != Some(guardian_holder)
                             })
                         }
-                        InteractiveGuardianDisposition::DeleteIdleReservation => control.is_none(),
-                        InteractiveGuardianDisposition::RestoreStopped => {
-                            control.is_some_and(|control| {
+                        InteractiveGuardianDisposition::DeleteIdleReservation
+                        | InteractiveGuardianDisposition::DeleteReadOnlyReservation => {
+                            control.is_none()
+                        }
+                        InteractiveGuardianDisposition::RestoreStopped
+                        | InteractiveGuardianDisposition::RestoreStoppedReadOnly => control
+                            .is_some_and(|control| {
                                 control.state == AgentSessionControlState::Stopped
                                     && control.interactive_holder.is_none()
-                            })
-                        }
+                            }),
                     };
                     if already_finalized {
                         return Ok(());
@@ -4791,6 +4866,8 @@ fn restore_interactive_terminal_before_handoff(
     lease_timeout: Duration,
     parent_connected: &AtomicBool,
 ) {
+    let holds_project_lease = InteractiveGuardianDisposition::from_guardian_holder(guardian_holder)
+        .is_none_or(InteractiveGuardianDisposition::holds_project_lease);
     let renewal_interval = agent_lease_renew_interval(lease_timeout);
     let mut last_renewal = Instant::now();
     let mut last_warning: Option<Instant> = None;
@@ -4815,7 +4892,7 @@ fn restore_interactive_terminal_before_handoff(
             }
         }
 
-        if last_renewal.elapsed() >= renewal_interval {
+        if holds_project_lease && last_renewal.elapsed() >= renewal_interval {
             let expires_at = agent_timestamp_after(lease_timeout.as_secs().max(60));
             let _ = store.renew_lease_blocking(project_id, guardian_holder, &expires_at);
             last_renewal = Instant::now();
@@ -4865,10 +4942,21 @@ fn run_guarded_interactive_codex(
         return Ok(None);
     }
 
+    let disposition = InteractiveGuardianDisposition::from_guardian_holder(guardian_holder)
+        .context("Interactive Codex guardian has an unrecognized holder")?;
     let mut terminal_foreground = InteractiveTerminalForeground::capture(&terminal_input)?;
     let codex_command = agent_codex_command();
     let mut target = Command::new(&codex_command);
-    configure_interactive_codex_resume_command(&mut target, &project.path, session_id);
+    configure_interactive_codex_resume_command(
+        &mut target,
+        &project.path,
+        session_id,
+        if disposition.is_read_only() {
+            InteractiveCodexResumeMode::ReadOnly
+        } else {
+            InteractiveCodexResumeMode::WritableIdle
+        },
+    );
     let mut command = interactive_exec_gate_command(&target)?;
     configure_interactive_child_command(command.command_mut());
     let (mut child, mut launch_gate) = match command.spawn() {
@@ -5021,7 +5109,7 @@ fn run_guarded_interactive_codex(
             );
             break Ok(status);
         }
-        if last_renewal.elapsed() >= renew_interval {
+        if disposition.holds_project_lease() && last_renewal.elapsed() >= renew_interval {
             let expires_at = agent_timestamp_after(lease_timeout.as_secs().max(60));
             match store.renew_lease_blocking(project.id, guardian_holder, &expires_at) {
                 Ok(true) => last_renewal = Instant::now(),
@@ -5175,6 +5263,11 @@ fn renew_interactive_guardian_cleanup_lease(
     last_renewal: &mut Instant,
     renewal_interval: Duration,
 ) {
+    if InteractiveGuardianDisposition::from_guardian_holder(guardian_holder)
+        .is_some_and(|disposition| !disposition.holds_project_lease())
+    {
+        return;
+    }
     if last_renewal.elapsed() < renewal_interval {
         return;
     }
@@ -5200,6 +5293,8 @@ fn stop_interactive_child_until_reaped(
     lease_timeout: Duration,
     reason: &str,
 ) -> Option<ExitStatus> {
+    let holds_project_lease = InteractiveGuardianDisposition::from_guardian_holder(guardian_holder)
+        .is_none_or(InteractiveGuardianDisposition::holds_project_lease);
     let renewal_interval = agent_lease_renew_interval(lease_timeout);
     let mut last_renewal = Instant::now();
     let mut last_warning: Option<Instant> = None;
@@ -5220,7 +5315,7 @@ fn stop_interactive_child_until_reaped(
             }
         }
 
-        if last_renewal.elapsed() >= renewal_interval {
+        if holds_project_lease && last_renewal.elapsed() >= renewal_interval {
             let expires_at = agent_timestamp_after(lease_timeout.as_secs().max(60));
             match store.renew_lease_blocking(project_id, guardian_holder, &expires_at) {
                 Ok(true) => {}
@@ -5475,13 +5570,17 @@ fn run_agent_scheduler_pass_with_max_global_jobs(
                 || existing_lease.as_ref().is_some_and(|lease| {
                     agent_lease_is_reclaimable(lease, reclaim_current_process_leases, now)
                 }));
+        let blocked_recovery_backoff_active = scan.has_blocked_task()
+            && blocked_recovery_backoff_reason(&project, now, failure_backoff).is_some();
         let task_selection = if resume_session_id.is_some() {
             Some(AgentTaskSelection::ResumeSession)
         } else if resume_interrupted_task {
             Some(AgentTaskSelection::ResumeDoing)
+        } else if scan.has_blocked_task() && !blocked_recovery_backoff_active {
+            Some(AgentTaskSelection::RecoverBlocked)
         } else if scan.has_pending_task() {
             Some(AgentTaskSelection::NextTodo)
-        } else if scan.all_actionable_tasks_blocked() {
+        } else if scan.has_blocked_task() {
             Some(AgentTaskSelection::RecoverBlocked)
         } else {
             None
@@ -6212,7 +6311,7 @@ fn run_agent_job(
             {
                 result.status = "blocked";
                 result.summary = format!(
-                    "Blocked-task recovery left all {} task(s) blocked across todo and doing; retry after the recovery backoff. Runner result: {}",
+                    "Blocked-task recovery left {} blocked task(s) unresolved across todo and doing; retry after the recovery backoff. Runner result: {}",
                     job.blocked_task_count_before, result.summary
                 );
             }
@@ -6745,8 +6844,7 @@ fn blocked_recovery_made_no_progress(job: &AgentRunJob) -> bool {
     }
 
     let scan = scan_agent_project(&job.project.path);
-    scan.all_actionable_tasks_blocked()
-        && scan.blocked_task_count() >= job.blocked_task_count_before
+    scan.blocked_task_count() >= job.blocked_task_count_before
 }
 
 fn release_agent_job_lease_for_shutdown(job: &AgentRunJob) -> Result<()> {
@@ -8202,8 +8300,13 @@ impl AgentProjectScan {
         self.status == AgentProjectScanStatus::Pending
     }
 
+    #[cfg(test)]
     fn all_actionable_tasks_blocked(&self) -> bool {
         self.status == AgentProjectScanStatus::Blocked
+    }
+
+    fn has_blocked_task(&self) -> bool {
+        self.blocked_task_count() > 0
     }
 
     fn available_todo_count(&self) -> usize {
@@ -8216,7 +8319,7 @@ impl AgentProjectScan {
     }
 
     fn has_schedulable_work(&self) -> bool {
-        self.has_pending_task() || self.all_actionable_tasks_blocked()
+        self.has_pending_task() || self.has_blocked_task()
     }
 
     fn pending_signal(&self) -> &'static str {
@@ -8593,16 +8696,22 @@ fn agent_task_cooldown_reason(
 
     agent_project_cooldown_reason(project, now, success_cooldown, failure_backoff).or_else(|| {
         (task_selection == AgentTaskSelection::RecoverBlocked)
-            .then(|| {
-                remaining_agent_delay(
-                    project.last_blocked_recovery_at.as_deref(),
-                    now,
-                    failure_backoff,
-                )
-            })
+            .then(|| blocked_recovery_backoff_reason(project, now, failure_backoff))
             .flatten()
-            .map(|remaining| format!("blocked-task recovery backoff active for {remaining}s"))
     })
+}
+
+fn blocked_recovery_backoff_reason(
+    project: &agent_store::AgentProject,
+    now: u64,
+    failure_backoff: Duration,
+) -> Option<String> {
+    remaining_agent_delay(
+        project.last_blocked_recovery_at.as_deref(),
+        now,
+        failure_backoff,
+    )
+    .map(|remaining| format!("blocked-task recovery backoff active for {remaining}s"))
 }
 
 fn remaining_agent_delay(last_at: Option<&str>, now: u64, delay: Duration) -> Option<u64> {
@@ -11196,10 +11305,12 @@ mod agent_store {
                                     run_token = ?5
                                     OR (run_token IS NULL AND ?5 IS NULL)
                                 )
-                                AND (
-                                    SELECT COUNT(*) FROM session_controls
+                                AND NOT EXISTS (
+                                    SELECT 1 FROM session_controls
                                      WHERE project_id = ?3
-                                ) = 1",
+                                       AND codex_session_id <> ?4
+                                       AND state <> 'stopped'
+                                )",
                             params![
                                 interactive_holder,
                                 agent_timestamp(),
@@ -11217,7 +11328,12 @@ mod agent_store {
                              )
                              SELECT ?1, ?2, 'ready_interactive', NULL, ?3, ?4
                               WHERE NOT EXISTS (
-                                SELECT 1 FROM session_controls WHERE project_id = ?1
+                                SELECT 1 FROM session_controls
+                                 WHERE project_id = ?1 AND codex_session_id = ?2
+                              )
+                                AND NOT EXISTS (
+                                SELECT 1 FROM session_controls
+                                 WHERE project_id = ?1 AND state <> 'stopped'
                               )
                              ON CONFLICT(project_id, codex_session_id) DO NOTHING",
                             params![
@@ -11238,6 +11354,92 @@ mod agent_store {
                 })
         }
 
+        pub(crate) fn reserve_read_only_session_interactive_blocking(
+            &self,
+            project_id: i64,
+            codex_session_id: &str,
+            interactive_holder: &str,
+            expected_stopped_run_token: Option<&str>,
+        ) -> Result<bool> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(async {
+                    let conn = self.connect().await?;
+                    let restore_stopped = interactive_holder
+                        .starts_with("clt-stopped-readonly-interactive-");
+                    let changed = if restore_stopped {
+                        conn.execute(
+                            "UPDATE session_controls
+                                SET state = 'ready_interactive', child_pid = NULL,
+                                    interactive_holder = ?1,
+                                    interactive_launch_token = NULL, updated_at = ?2
+                              WHERE project_id = ?3 AND codex_session_id = ?4
+                                AND state = 'stopped'
+                                AND (
+                                    run_token = ?5
+                                    OR (run_token IS NULL AND ?5 IS NULL)
+                                )
+                                AND (
+                                    EXISTS (
+                                        SELECT 1 FROM leases WHERE project_id = ?3
+                                    )
+                                    OR EXISTS (
+                                        SELECT 1 FROM session_controls
+                                         WHERE project_id = ?3
+                                           AND codex_session_id <> ?4
+                                           AND state <> 'stopped'
+                                    )
+                                )",
+                            params![
+                                interactive_holder,
+                                agent_timestamp(),
+                                project_id,
+                                codex_session_id,
+                                expected_stopped_run_token
+                            ],
+                        )
+                        .await
+                    } else {
+                        conn.execute(
+                            "INSERT INTO session_controls (
+                                project_id, codex_session_id, state, child_pid,
+                                interactive_holder, updated_at
+                             )
+                             SELECT ?1, ?2, 'ready_interactive', NULL, ?3, ?4
+                              WHERE NOT EXISTS (
+                                SELECT 1 FROM session_controls
+                                 WHERE project_id = ?1 AND codex_session_id = ?2
+                              )
+                                AND (
+                                    EXISTS (
+                                        SELECT 1 FROM leases WHERE project_id = ?1
+                                    )
+                                    OR EXISTS (
+                                        SELECT 1 FROM session_controls
+                                         WHERE project_id = ?1
+                                           AND codex_session_id <> ?2
+                                           AND state <> 'stopped'
+                                    )
+                                )
+                             ON CONFLICT(project_id, codex_session_id) DO NOTHING",
+                            params![
+                                project_id,
+                                codex_session_id,
+                                interactive_holder,
+                                agent_timestamp()
+                            ],
+                        )
+                        .await
+                    }
+                    .with_context(|| {
+                        format!(
+                            "Failed to reserve Codex session {codex_session_id} for read-only interactive use"
+                        )
+                    })?;
+                    Ok(changed > 0)
+                })
+        }
+
         pub(crate) fn cancel_idle_session_interactive_blocking(
             &self,
             project_id: i64,
@@ -11248,8 +11450,10 @@ mod agent_store {
                 .context("Failed to create async runtime for agent store")?
                 .block_on(async {
                     let conn = self.connect().await?;
-                    let restore_stopped =
-                        interactive_holder.starts_with("clt-stopped-interactive-");
+                    let restore_stopped = interactive_holder
+                        .starts_with("clt-stopped-interactive-")
+                        || interactive_holder
+                            .starts_with("clt-stopped-readonly-interactive-");
                     let changed = if restore_stopped {
                         conn.execute(
                             "UPDATE session_controls
@@ -11722,33 +11926,39 @@ mod agent_store {
             tokio::runtime::Runtime::new()
                 .context("Failed to create async runtime for agent store")?
                 .block_on(async {
+                    let disposition = InteractiveGuardianDisposition::from_guardian_holder(
+                        guardian_holder,
+                    )
+                    .context("Invalid interactive guardian holder")?;
                     let mut conn = self.connect().await?;
                     let transaction = conn.transaction().await.with_context(|| {
                         format!("Failed to begin interactive guardian for project {project_id}")
                     })?;
-                    let acquired_at = agent_timestamp();
-                    let expires_at = agent_timestamp_after(lease_timeout_seconds);
-                    let transferred = transaction
-                        .execute(
-                            "UPDATE leases
-                                SET holder = ?1, acquired_at = ?2, expires_at = ?3
-                              WHERE project_id = ?4 AND holder = ?5",
-                            params![
-                                guardian_holder,
-                                acquired_at,
-                                expires_at,
-                                project_id,
-                                from_holder
-                            ],
-                        )
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "Failed to transfer project {project_id} lease to its interactive guardian"
+                    if disposition.holds_project_lease() {
+                        let acquired_at = agent_timestamp();
+                        let expires_at = agent_timestamp_after(lease_timeout_seconds);
+                        let transferred = transaction
+                            .execute(
+                                "UPDATE leases
+                                    SET holder = ?1, acquired_at = ?2, expires_at = ?3
+                                  WHERE project_id = ?4 AND holder = ?5",
+                                params![
+                                    guardian_holder,
+                                    acquired_at,
+                                    expires_at,
+                                    project_id,
+                                    from_holder
+                                ],
                             )
-                        })?;
-                    if transferred == 0 {
-                        return Ok(false);
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "Failed to transfer project {project_id} lease to its interactive guardian"
+                                )
+                            })?;
+                        if transferred == 0 {
+                            return Ok(false);
+                        }
                     }
                     if let Some(codex_session_id) = codex_session_id {
                         let changed = transaction
@@ -11798,34 +12008,40 @@ mod agent_store {
             tokio::runtime::Runtime::new()
                 .context("Failed to create async runtime for agent store")?
                 .block_on(async {
+                    let disposition = InteractiveGuardianDisposition::from_guardian_holder(
+                        guardian_holder,
+                    )
+                    .context("Invalid interactive guardian holder")?;
                     let mut conn = self.connect().await?;
                     let now = agent_timestamp();
-                    let fresh_expiry = agent_timestamp_after(lease_timeout_seconds);
                     let transaction = conn.transaction().await.with_context(|| {
                         format!(
                             "Failed to begin interactive child registration for project {project_id}"
                         )
                     })?;
-                    let lease_changed = transaction
-                        .execute(
-                            "UPDATE leases SET expires_at = ?1
-                              WHERE project_id = ?2 AND holder = ?3
-                                AND expires_at > ?4",
-                            params![
-                                fresh_expiry.as_str(),
-                                project_id,
-                                guardian_holder,
-                                now.as_str()
-                            ],
-                        )
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "Failed to renew interactive guardian lease for project {project_id}"
+                    if disposition.holds_project_lease() {
+                        let fresh_expiry = agent_timestamp_after(lease_timeout_seconds);
+                        let lease_changed = transaction
+                            .execute(
+                                "UPDATE leases SET expires_at = ?1
+                                  WHERE project_id = ?2 AND holder = ?3
+                                    AND expires_at > ?4",
+                                params![
+                                    fresh_expiry.as_str(),
+                                    project_id,
+                                    guardian_holder,
+                                    now.as_str()
+                                ],
                             )
-                        })?;
-                    if lease_changed != 1 {
-                        return Ok(false);
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "Failed to renew interactive guardian lease for project {project_id}"
+                                )
+                            })?;
+                        if lease_changed != 1 {
+                            return Ok(false);
+                        }
                     }
                     let control_changed = transaction
                         .execute(
@@ -11899,22 +12115,24 @@ mod agent_store {
                                     "Failed to hand Codex session {codex_session_id} back to exec mode"
                                 )
                             })?,
-                        InteractiveGuardianDisposition::DeleteIdleReservation => transaction
-                            .execute(
+                        InteractiveGuardianDisposition::DeleteIdleReservation
+                        | InteractiveGuardianDisposition::DeleteReadOnlyReservation => {
+                            transaction.execute(
                                 "DELETE FROM session_controls
                                   WHERE project_id = ?1 AND codex_session_id = ?2
                                     AND state = 'interactive'
                                     AND interactive_holder = ?3",
                                 params![project_id, codex_session_id, guardian_holder],
                             )
-                            .await
-                            .with_context(|| {
+                            .await.with_context(|| {
                                 format!(
                                     "Failed to finish idle interactive Codex session {codex_session_id}"
                                 )
-                            })?,
-                        InteractiveGuardianDisposition::RestoreStopped => transaction
-                            .execute(
+                            })?
+                        }
+                        InteractiveGuardianDisposition::RestoreStopped
+                        | InteractiveGuardianDisposition::RestoreStoppedReadOnly => {
+                            transaction.execute(
                                 "UPDATE session_controls
                                     SET state = 'stopped', child_pid = NULL,
                                         interactive_holder = NULL,
@@ -11929,27 +12147,29 @@ mod agent_store {
                                     guardian_holder
                                 ],
                             )
-                            .await
-                            .with_context(|| {
+                            .await.with_context(|| {
                                 format!(
                                     "Failed to restore stopped Codex session {codex_session_id} after interactive use"
                                 )
-                            })?,
+                            })?
+                        }
                     };
                     if changed == 0 {
                         return Ok(false);
                     }
-                    let _released = transaction
-                        .execute(
-                            "DELETE FROM leases WHERE project_id = ?1 AND holder = ?2",
-                            params![project_id, guardian_holder],
-                        )
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "Failed to release project {project_id} interactive guardian lease"
+                    if disposition.holds_project_lease() {
+                        let _released = transaction
+                            .execute(
+                                "DELETE FROM leases WHERE project_id = ?1 AND holder = ?2",
+                                params![project_id, guardian_holder],
                             )
-                        })?;
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "Failed to release project {project_id} interactive guardian lease"
+                                )
+                            })?;
+                    }
                     // The child is already reaped before this transaction begins. A
                     // missing exact-holder lease can only mean it expired or was
                     // independently cleared; the generation-scoped control CAS above
@@ -12005,8 +12225,9 @@ mod agent_store {
                                 ],
                             )
                             .await,
-                        InteractiveGuardianDisposition::DeleteIdleReservation => transaction
-                            .execute(
+                        InteractiveGuardianDisposition::DeleteIdleReservation
+                        | InteractiveGuardianDisposition::DeleteReadOnlyReservation => {
+                            transaction.execute(
                                 "DELETE FROM session_controls
                                   WHERE project_id = ?1 AND codex_session_id = ?2
                                     AND state = 'interactive'
@@ -12023,9 +12244,11 @@ mod agent_store {
                                     expected_child_pid.map(i64::from)
                                 ],
                             )
-                            .await,
-                        InteractiveGuardianDisposition::RestoreStopped => transaction
-                            .execute(
+                            .await
+                        }
+                        InteractiveGuardianDisposition::RestoreStopped
+                        | InteractiveGuardianDisposition::RestoreStoppedReadOnly => {
+                            transaction.execute(
                                 "UPDATE session_controls
                                     SET state = 'stopped', child_pid = NULL,
                                         interactive_holder = NULL,
@@ -12046,7 +12269,8 @@ mod agent_store {
                                     expected_child_pid.map(i64::from)
                                 ],
                             )
-                            .await,
+                            .await
+                        }
                     }
                     .with_context(|| {
                         format!(
@@ -12056,17 +12280,19 @@ mod agent_store {
                     if changed != 1 {
                         return Ok(false);
                     }
-                    let _ = transaction
-                        .execute(
-                            "DELETE FROM leases WHERE project_id = ?1 AND holder = ?2",
-                            params![project_id, guardian_holder],
-                        )
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "Failed to release stale interactive guardian lease for project {project_id}"
+                    if disposition.holds_project_lease() {
+                        let _ = transaction
+                            .execute(
+                                "DELETE FROM leases WHERE project_id = ?1 AND holder = ?2",
+                                params![project_id, guardian_holder],
                             )
-                        })?;
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "Failed to release stale interactive guardian lease for project {project_id}"
+                                )
+                            })?;
+                    }
                     transaction.commit().await.with_context(|| {
                         format!(
                             "Failed to commit stale interactive guardian recovery for project {project_id}"
@@ -14527,40 +14753,19 @@ fn task_tui_display_text(entry: &TaskEntry, is_selected: bool) -> String {
 
 type TaskAgentSessionStates = HashMap<String, AgentSessionControlState>;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TaskAgentFlag {
-    Clt,
-    Stopped,
-}
-
-impl TaskAgentFlag {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Clt => "CLT",
-            Self::Stopped => "STOPPED",
-        }
-    }
-}
-
-fn task_agent_flag(
+fn task_has_stopped_agent_flag(
     status: &str,
     entry: &TaskEntry,
     session_states: &TaskAgentSessionStates,
-) -> Option<TaskAgentFlag> {
+) -> bool {
     if status == "done" {
-        return None;
+        return false;
     }
 
-    let session_id = recoverable_codex_session_id_from_task_content(&entry.content)?;
-    match session_states.get(session_id)? {
-        AgentSessionControlState::Stopped => Some(TaskAgentFlag::Stopped),
-        AgentSessionControlState::Running
-        | AgentSessionControlState::StopRequested
-        | AgentSessionControlState::InterruptRequested
-        | AgentSessionControlState::ReadyInteractive
-        | AgentSessionControlState::Interactive
-        | AgentSessionControlState::ResumeRequested => Some(TaskAgentFlag::Clt),
-    }
+    let Some(session_id) = recoverable_codex_session_id_from_task_content(&entry.content) else {
+        return false;
+    };
+    session_states.get(session_id) == Some(&AgentSessionControlState::Stopped)
 }
 
 fn prefix_task_agent_flag(
@@ -14569,9 +14774,10 @@ fn prefix_task_agent_flag(
     entry: &TaskEntry,
     session_states: &TaskAgentSessionStates,
 ) -> String {
-    match task_agent_flag(status, entry, session_states) {
-        Some(flag) => format!("[{}] {text}", flag.label()),
-        None => text,
+    if task_has_stopped_agent_flag(status, entry, session_states) {
+        format!("[STOPPED] {text}")
+    } else {
+        text
     }
 }
 
@@ -16275,7 +16481,7 @@ struct TuiStartState {
 }
 
 fn tui_task_board_instructions() -> &'static str {
-    "Arrows navigate boards and tasks, Enter opens subtasks or edits the selected task, Space creates a task, e edits, s stops/resumes the selected linked Codex session, i interrupts an active linked session into interactive Codex and restarts exec on exit, c opens an idle selected Done or blocked session in Codex, Backspace returns to the parent board, a archives, A opens Archive, b moves to Backlog, B shows/hides Backlog, r enters Reorganize mode, Shift+Arrows move/reorder, Ctrl-P/N reorder, d/Delete deletes, l shows agent output, Tab opens Agent Projects, M opens Models, h/? opens Help, q quits."
+    "Arrows navigate boards and tasks, Enter opens subtasks or edits the selected task, Space creates a task, e edits, s stops/resumes the selected linked Codex session, i interrupts an active linked session into interactive Codex and restarts exec on exit, c opens a selected Done or blocked session (read-only if the project is busy), Backspace returns to the parent board, a archives, A opens Archive, b moves to Backlog, B shows/hides Backlog, r enters Reorganize mode, Shift+Arrows move/reorder, Ctrl-P/N reorder, d/Delete deletes, l shows agent output, Tab opens Agent Projects, M opens Models, h/? opens Help, q quits."
 }
 
 fn tui_start_state(active_board: bool) -> TuiStartState {
@@ -18348,6 +18554,23 @@ fn reserve_tui_idle_codex_session_interactive(
     })
 }
 
+fn reserve_tui_read_only_codex_session_interactive(
+    project_id: i64,
+    session_id: &str,
+    interactive_holder: &str,
+    expected_stopped_run_token: Option<&str>,
+) -> Result<bool> {
+    let state_dir = ensure_agent_state_dir()?;
+    with_agent_store_at(&state_dir, |store| {
+        store.reserve_read_only_session_interactive_blocking(
+            project_id,
+            session_id,
+            interactive_holder,
+            expected_stopped_run_token,
+        )
+    })
+}
+
 fn cancel_tui_idle_codex_session_interactive(
     project_id: i64,
     session_id: &str,
@@ -18366,7 +18589,8 @@ fn cancel_tui_idle_codex_session_interactive(
         Ok(match control {
             None => true,
             Some(control) => {
-                interactive_holder.starts_with("clt-stopped-interactive-")
+                (interactive_holder.starts_with("clt-stopped-interactive-")
+                    || interactive_holder.starts_with("clt-stopped-readonly-interactive-"))
                     && control.state == AgentSessionControlState::Stopped
                     && control.interactive_holder.is_none()
             }
@@ -18564,41 +18788,57 @@ fn active_agent_log_for_codex_session(
     Ok((agent_codex_session_id_from_log(&path)?.as_deref() == Some(session_id)).then_some(path))
 }
 
-fn tui_codex_session_is_busy_for_path(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TuiCodexSessionAvailability {
+    Idle,
+    SelectedSessionBusy,
+    ProjectBusy,
+}
+
+fn tui_codex_session_availability_for_path(
     panel: &mut TuiAgentPanel,
     project_path: &Path,
     session_id: &str,
-) -> Result<bool> {
+) -> Result<TuiCodexSessionAvailability> {
     let state_dir = agent_state_dir()?;
-    tui_codex_session_is_busy_for_path_at(panel, project_path, session_id, &state_dir)
+    tui_codex_session_availability_for_path_at(panel, project_path, session_id, &state_dir)
 }
 
-fn tui_codex_session_is_busy_for_path_at(
+fn tui_codex_session_availability_for_path_at(
     panel: &mut TuiAgentPanel,
     project_path: &Path,
     session_id: &str,
     state_dir: &Path,
-) -> Result<bool> {
+) -> Result<TuiCodexSessionAvailability> {
     if !panel.select_project_for_path(project_path) {
-        return Ok(false);
+        return Ok(TuiCodexSessionAvailability::Idle);
     }
     let Some(selected) = panel.selected_project() else {
-        return Ok(false);
+        return Ok(TuiCodexSessionAvailability::Idle);
     };
 
     let store = open_agent_store_at(state_dir)?;
     let controls = store.session_controls_for_project_blocking(selected.project.id)?;
-    let selected_stopped_session = controls.len() == 1
-        && controls[0].codex_session_id == session_id
-        && controls[0].state == AgentSessionControlState::Stopped;
-    if !controls.is_empty() && !selected_stopped_session {
-        return Ok(true);
+    if controls.iter().any(|control| {
+        control.codex_session_id == session_id && control.state != AgentSessionControlState::Stopped
+    }) {
+        return Ok(TuiCodexSessionAvailability::SelectedSessionBusy);
     }
-    if selected_stopped_session {
-        return Ok(false);
+    if controls.iter().any(|control| {
+        control.codex_session_id != session_id && control.state != AgentSessionControlState::Stopped
+    }) {
+        return Ok(TuiCodexSessionAvailability::ProjectBusy);
     }
 
-    Ok(active_agent_log_for_codex_session(selected, state_dir, session_id)?.is_some())
+    if selected.runtime_state.is_running() {
+        if active_agent_log_for_codex_session(selected, state_dir, session_id)?.is_some() {
+            Ok(TuiCodexSessionAvailability::SelectedSessionBusy)
+        } else {
+            Ok(TuiCodexSessionAvailability::ProjectBusy)
+        }
+    } else {
+        Ok(TuiCodexSessionAvailability::Idle)
+    }
 }
 
 fn tui_stopped_codex_session_control(
@@ -20199,7 +20439,9 @@ fn tui_console_block<'a>(title: &'a str, right_title: Option<&'a str>) -> Block<
 enum TuiCodexHandoffStage {
     WaitingForAutomatedExit,
     PreparingIdleSession,
+    PreparingReadOnlySession,
     EnteringInteractive,
+    EnteringReadOnly,
     QueueingExecResume,
     RestoringTaskControls,
 }
@@ -20213,8 +20455,14 @@ impl TuiCodexHandoffStage {
             Self::PreparingIdleSession => {
                 "Reserving the Codex session for interactive use...\nThe session will open as soon as the handoff is ready."
             }
+            Self::PreparingReadOnlySession => {
+                "Another Codex task is using this project.\nReserving this idle session for read-only interactive use..."
+            }
             Self::EnteringInteractive => {
                 "Entering interactive Codex...\nExit Codex when you are ready to return to CLT."
+            }
+            Self::EnteringReadOnly => {
+                "Entering read-only interactive Codex...\nYou can inspect and discuss, but this session cannot modify the project."
             }
             Self::QueueingExecResume => {
                 "Interactive Codex exited.\nReturning the same session to automated exec mode..."
@@ -20806,7 +21054,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                  [g]            - Cycle selected project's Git mode: off/commit/push\n\
                                  [s]            - Stop linked active session / resume exact stopped session in exec\n\
                                  [i]            - Interrupt linked active session; interact, then auto-restart exec\n\
-                                 [c]            - Open idle Done or blocked session in interactive Codex\n\
+                                 [c]            - Open Done/blocked session (read-only if project busy)\n\
                                  [l]            - Toggle active/selected project's live/current agent output\n\
                                  [a]            - Move selected task to archive\n\
                                  [A]            - Toggle archive view\n\
@@ -21688,7 +21936,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                             project_id,
                                             &session_id,
                                             &provisional_holder,
-                                            true,
+                                            InteractiveCodexResumeMode::ResumeExec,
                                         );
                                         let _ = write_tui_codex_handoff_status(
                                             &mut stdout(),
@@ -21812,25 +22060,30 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                             Some(session_id) => {
                                                 agent_panel.refresh(&active_root);
                                                 last_agent_panel_refresh = Instant::now();
-                                                match tui_codex_session_is_busy_for_path(
-                                                    &mut agent_panel,
-                                                    &active_root,
-                                                    &session_id,
-                                                ) {
-                                                    Ok(true) => {
+                                                let availability =
+                                                    match tui_codex_session_availability_for_path(
+                                                        &mut agent_panel,
+                                                        &active_root,
+                                                        &session_id,
+                                                    ) {
+                                                        Ok(availability) => availability,
+                                                        Err(error) => {
+                                                            feedback_buffer = format!(
+                                                                "Unable to check whether the Codex session is available: {error}"
+                                                            );
+                                                            continue;
+                                                        }
+                                                    };
+                                                if availability
+                                                    == TuiCodexSessionAvailability::SelectedSessionBusy
+                                                {
                                                         feedback_buffer =
-                                                            "This Codex session is still busy; stop or wait for the automated run before resuming it interactively."
+                                                            "This exact Codex session is already running or in an interactive handoff; stop or wait for it before resuming it again."
                                                                 .to_string();
                                                         continue;
-                                                    }
-                                                    Ok(false) => {}
-                                                    Err(error) => {
-                                                        feedback_buffer = format!(
-                                                            "Unable to check whether the Codex session is busy: {error}"
-                                                        );
-                                                        continue;
-                                                    }
                                                 }
+                                                let read_only = availability
+                                                    == TuiCodexSessionAvailability::ProjectBusy;
 
                                                 let Some(project_id) = agent_panel
                                                     .selected_project()
@@ -21843,7 +22096,11 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                                 };
                                                 draw_tui_codex_handoff_status(
                                                     &mut terminal,
-                                                    TuiCodexHandoffStage::PreparingIdleSession,
+                                                    if read_only {
+                                                        TuiCodexHandoffStage::PreparingReadOnlySession
+                                                    } else {
+                                                        TuiCodexHandoffStage::PreparingIdleSession
+                                                    },
                                                 )?;
                                                 let stopped_control =
                                                     match tui_stopped_codex_session_control(
@@ -21859,104 +22116,146 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                                         }
                                                     };
                                                 let restore_stopped = stopped_control.is_some();
-                                                let interactive_lease =
-                                                    match InteractiveAgentLease::try_acquire_idle(
-                                                        project_id,
-                                                        restore_stopped,
-                                                    ) {
-                                                        Ok(Some(lease)) => lease,
-                                                        Ok(None) => {
-                                                            feedback_buffer =
-                                                                "This project became busy before the Codex handoff; wait for the active run and try again."
-                                                                    .to_string();
-                                                            continue;
-                                                        }
-                                                        Err(error) => {
-                                                            feedback_buffer = format!(
-                                                                "Unable to reserve the Codex session for interactive use: {error}"
-                                                            );
-                                                            continue;
-                                                        }
+                                                let (interactive_lease, provisional_holder) =
+                                                    if read_only {
+                                                        (
+                                                            None,
+                                                            InteractiveAgentLease::holder_for_read_only_session(
+                                                                restore_stopped,
+                                                            ),
+                                                        )
+                                                    } else {
+                                                        let lease = match InteractiveAgentLease::try_acquire_idle(
+                                                            project_id,
+                                                            restore_stopped,
+                                                        ) {
+                                                            Ok(Some(lease)) => lease,
+                                                            Ok(None) => {
+                                                                feedback_buffer =
+                                                                    "Another Codex task began using this project before the handoff; press c again to open this session read-only."
+                                                                        .to_string();
+                                                                continue;
+                                                            }
+                                                            Err(error) => {
+                                                                feedback_buffer = format!(
+                                                                    "Unable to reserve the Codex session for interactive use: {error}"
+                                                                );
+                                                                continue;
+                                                            }
+                                                        };
+                                                        let holder = lease.holder.clone();
+                                                        (Some(lease), holder)
                                                     };
-                                                match codex_session_task_supports_interactive_resume(
-                                                    &active_root,
-                                                    &session_id,
-                                                ) {
-                                                    Ok(true) => {}
-                                                    Ok(false) => {
-                                                        feedback_buffer = match interactive_lease
-                                                            .release()
-                                                        {
-                                                            Ok(()) =>
-                                                                "This task changed before its Codex session could open; c is only available from Done or currently blocked tasks."
-                                                                    .to_string(),
-                                                            Err(error) => format!(
-                                                                "This task is no longer eligible for interactive resume, and its project lease could not be released: {error}"
-                                                            ),
-                                                        };
-                                                        continue;
-                                                    }
-                                                    Err(error) => {
-                                                        let release_result =
-                                                            interactive_lease.release();
-                                                        feedback_buffer = match release_result {
-                                                            Ok(()) => format!(
-                                                                "Unable to revalidate the Codex task before interactive resume: {error}"
-                                                            ),
-                                                            Err(release_error) => format!(
-                                                                "Unable to revalidate the Codex task: {error}. Its project lease also could not be released: {release_error}"
-                                                            ),
-                                                        };
-                                                        continue;
-                                                    }
-                                                }
-                                                let provisional_holder =
-                                                    interactive_lease.holder.clone();
-                                                let reservation_result =
+                                                let stopped_run_token =
+                                                    stopped_control.as_ref().and_then(|control| {
+                                                        control.run_token.as_deref()
+                                                    });
+                                                let reservation_result = if read_only {
+                                                    reserve_tui_read_only_codex_session_interactive(
+                                                        project_id,
+                                                        &session_id,
+                                                        &provisional_holder,
+                                                        stopped_run_token,
+                                                    )
+                                                } else {
                                                     reserve_tui_idle_codex_session_interactive(
                                                         project_id,
                                                         &session_id,
                                                         &provisional_holder,
-                                                        stopped_control.as_ref().and_then(
-                                                            |control| control.run_token.as_deref(),
-                                                        ),
-                                                    );
+                                                        stopped_run_token,
+                                                    )
+                                                };
                                                 if !reservation_result
                                                     .as_ref()
                                                     .is_ok_and(|reserved| *reserved)
                                                 {
-                                                    let release_result =
-                                                        interactive_lease.release();
+                                                    let release_result = interactive_lease.map_or(
+                                                        Ok(()),
+                                                        InteractiveAgentLease::release,
+                                                    );
                                                     feedback_buffer = match (
                                                         reservation_result,
                                                         release_result,
                                                     ) {
+                                                        (Ok(false), Ok(())) if read_only =>
+                                                            "The active project run or selected session changed before read-only Codex could open; try again."
+                                                                .to_string(),
                                                         (Ok(false), Ok(())) =>
-                                                            "This Codex session became busy before it could be reserved; try again when it is idle."
+                                                            "This Codex session became busy before it could be reserved; try again."
                                                                 .to_string(),
                                                         (Err(error), Ok(())) => format!(
-                                                            "Unable to reserve the idle Codex session: {error}"
+                                                            "Unable to reserve the Codex session: {error}"
                                                         ),
                                                         (Ok(false), Err(error)) => format!(
-                                                            "This Codex session became busy, and its project lease could not be released: {error}"
+                                                            "The Codex session changed, and its project lease could not be released: {error}"
                                                         ),
                                                         (Err(reserve_error), Err(release_error)) => format!(
-                                                            "Unable to reserve the idle Codex session: {reserve_error}. Its project lease also could not be released: {release_error}"
+                                                            "Unable to reserve the Codex session: {reserve_error}. Its project lease also could not be released: {release_error}"
                                                         ),
                                                         (Ok(true), _) => unreachable!(),
                                                     };
                                                     continue;
                                                 }
 
+                                                match codex_session_task_supports_interactive_resume(
+                                                    &active_root,
+                                                    &session_id,
+                                                ) {
+                                                    Ok(true) => {}
+                                                    revalidation => {
+                                                        let cancel_result =
+                                                            cancel_tui_idle_codex_session_interactive(
+                                                                project_id,
+                                                                &session_id,
+                                                                &provisional_holder,
+                                                            );
+                                                        let release_result = interactive_lease
+                                                            .map_or(
+                                                                Ok(()),
+                                                                InteractiveAgentLease::release,
+                                                            );
+                                                        feedback_buffer = match (
+                                                            revalidation,
+                                                            cancel_result,
+                                                            release_result,
+                                                        ) {
+                                                            (Ok(false), Ok(true), Ok(())) =>
+                                                                "This task changed before its Codex session could open; c is only available from Done or currently blocked tasks."
+                                                                    .to_string(),
+                                                            (Err(error), Ok(true), Ok(())) => format!(
+                                                                "Unable to revalidate the Codex task before interactive resume: {error}"
+                                                            ),
+                                                            (revalidation, cancel, release) => format!(
+                                                                "Unable to open the Codex task safely (task: {}; reservation: {}; lease: {})",
+                                                                revalidation
+                                                                    .map(|_| "changed".to_string())
+                                                                    .unwrap_or_else(|error| error.to_string()),
+                                                                cancel
+                                                                    .map(|cancelled| if cancelled { "released" } else { "still fenced" }.to_string())
+                                                                    .unwrap_or_else(|error| error.to_string()),
+                                                                release
+                                                                    .map(|()| "released".to_string())
+                                                                    .unwrap_or_else(|error| error.to_string()),
+                                                            ),
+                                                        };
+                                                        continue;
+                                                    }
+                                                }
+
                                                 agent_log_view = None;
+                                                let entering_stage = if read_only {
+                                                    TuiCodexHandoffStage::EnteringReadOnly
+                                                } else {
+                                                    TuiCodexHandoffStage::EnteringInteractive
+                                                };
                                                 let _ = draw_tui_codex_handoff_status(
                                                     &mut terminal,
-                                                    TuiCodexHandoffStage::EnteringInteractive,
+                                                    entering_stage,
                                                 );
                                                 terminal_session.suspend();
                                                 let _ = write_tui_codex_handoff_status(
                                                     &mut stdout(),
-                                                    TuiCodexHandoffStage::EnteringInteractive,
+                                                    entering_stage,
                                                 );
                                                 let resume_result =
                                                     resume_codex_session_interactively(
@@ -21964,7 +22263,11 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                                         project_id,
                                                         &session_id,
                                                         &provisional_holder,
-                                                        false,
+                                                        if read_only {
+                                                            InteractiveCodexResumeMode::ReadOnly
+                                                        } else {
+                                                            InteractiveCodexResumeMode::WritableIdle
+                                                        },
                                                     );
                                                 let _ = write_tui_codex_handoff_status(
                                                     &mut stdout(),
@@ -21988,7 +22291,8 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                                         Err(error) => Err(error),
                                                     }
                                                 };
-                                                let release_result = interactive_lease.release();
+                                                let release_result = interactive_lease
+                                                    .map_or(Ok(()), InteractiveAgentLease::release);
                                                 terminal_session
                                                     .resume(&app_title(&active_root))?;
                                                 terminal.clear()?;
@@ -22004,6 +22308,14 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                                     cancel_result,
                                                     release_result,
                                                 ) {
+                                                    (Ok(status), Ok(()), Ok(()))
+                                                        if status.success() && read_only =>
+                                                    {
+                                                        format!(
+                                                            "Returned from read-only Codex for: {}",
+                                                            task_display_text(&task)
+                                                        )
+                                                    }
                                                     (Ok(status), Ok(()), Ok(()))
                                                         if status.success() =>
                                                     {
@@ -23675,7 +23987,7 @@ mod tests {
     }
 
     #[test]
-    fn linked_unfinished_tasks_display_clt_and_stopped_flags() {
+    fn linked_unfinished_tasks_only_display_stopped_flags() {
         let running = task_entry_from_text(
             TaskSource::MarkdownLine { line_index: 0 },
             "running task codex:session-running",
@@ -23701,7 +24013,7 @@ mod tests {
 
         assert_eq!(
             task_display_text_with_agent_flag(&running, "doing", &session_states),
-            "[CLT] running task"
+            "running task"
         );
         assert_eq!(
             task_tui_display_text_with_agent_flag(&stopped, "doing", true, &session_states),
@@ -24171,7 +24483,12 @@ mod tests {
         let project_root = PathBuf::from("/tmp/project with spaces");
         let mut command = Command::new("codex");
 
-        configure_interactive_codex_resume_command(&mut command, &project_root, "session-123");
+        configure_interactive_codex_resume_command(
+            &mut command,
+            &project_root,
+            "session-123",
+            InteractiveCodexResumeMode::WritableIdle,
+        );
 
         let args: Vec<OsString> = command.get_args().map(OsStr::to_os_string).collect();
         assert_eq!(
@@ -24189,6 +24506,20 @@ mod tests {
             ]
         );
         assert_eq!(command.get_current_dir(), Some(project_root.as_path()));
+
+        let mut read_only_command = Command::new("codex");
+        configure_interactive_codex_resume_command(
+            &mut read_only_command,
+            &project_root,
+            "session-123",
+            InteractiveCodexResumeMode::ReadOnly,
+        );
+        let read_only_args: Vec<OsString> = read_only_command
+            .get_args()
+            .map(OsStr::to_os_string)
+            .collect();
+        assert_eq!(read_only_args[3], OsString::from("read-only"));
+        assert_eq!(read_only_args[5], OsString::from("never"));
     }
 
     #[test]
@@ -26580,14 +26911,15 @@ mod tests {
         };
         panel.state.select(Some(0));
 
-        assert!(
-            tui_codex_session_is_busy_for_path_at(
+        assert_eq!(
+            tui_codex_session_availability_for_path_at(
                 &mut panel,
                 &project_root,
                 "session-123",
                 &state_dir,
             )
-            .unwrap()
+            .unwrap(),
+            TuiCodexSessionAvailability::SelectedSessionBusy
         );
         store
             .set_session_control_state_blocking(
@@ -26596,24 +26928,206 @@ mod tests {
                 AgentSessionControlState::Stopped,
             )
             .unwrap();
-        assert!(
-            !tui_codex_session_is_busy_for_path_at(
+        assert_eq!(
+            tui_codex_session_availability_for_path_at(
                 &mut panel,
                 &project_root,
                 "session-123",
                 &state_dir,
             )
-            .unwrap()
+            .unwrap(),
+            TuiCodexSessionAvailability::Idle
         );
-        assert!(
-            tui_codex_session_is_busy_for_path_at(
+        assert_eq!(
+            tui_codex_session_availability_for_path_at(
                 &mut panel,
                 &project_root,
                 "different-session",
                 &state_dir,
             )
-            .unwrap()
+            .unwrap(),
+            TuiCodexSessionAvailability::Idle
         );
+        store
+            .set_session_control_state_blocking(
+                project_id,
+                "session-other",
+                AgentSessionControlState::Running,
+            )
+            .unwrap();
+        assert_eq!(
+            tui_codex_session_availability_for_path_at(
+                &mut panel,
+                &project_root,
+                "session-123",
+                &state_dir,
+            )
+            .unwrap(),
+            TuiCodexSessionAvailability::ProjectBusy
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn read_only_interactive_reservation_coexists_with_another_active_session() {
+        let root = temp_root("read-only-interactive-reservation");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project_id = store.list_projects_blocking().unwrap().remove(0).id;
+        let active_holder = "clt-worker-active";
+        assert!(
+            store
+                .try_acquire_lease_blocking(project_id, active_holder, "100", "9999999999")
+                .unwrap()
+        );
+        store
+            .set_session_control_state_blocking(
+                project_id,
+                "session-active",
+                AgentSessionControlState::Running,
+            )
+            .unwrap();
+
+        let requester = InteractiveAgentLease::holder_for_read_only_session(false);
+        assert!(
+            store
+                .reserve_read_only_session_interactive_blocking(
+                    project_id,
+                    "session-blocked",
+                    &requester,
+                    None,
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .lease_for_project_blocking(project_id)
+                .unwrap()
+                .unwrap()
+                .holder,
+            active_holder
+        );
+
+        let guardian =
+            interactive_guardian_holder(InteractiveGuardianDisposition::DeleteReadOnlyReservation);
+        assert!(
+            store
+                .adopt_interactive_guardian_blocking(
+                    project_id,
+                    Some("session-blocked"),
+                    &requester,
+                    &guardian,
+                    60,
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .register_interactive_guardian_child_blocking(
+                    project_id,
+                    "session-blocked",
+                    &guardian,
+                    std::process::id(),
+                    60,
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .finish_interactive_guardian_blocking(
+                    project_id,
+                    "session-blocked",
+                    &guardian,
+                    InteractiveGuardianDisposition::DeleteReadOnlyReservation,
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .session_control_blocking(project_id, "session-blocked")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .session_control_blocking(project_id, "session-active")
+                .unwrap()
+                .unwrap()
+                .state,
+            AgentSessionControlState::Running
+        );
+        assert_eq!(
+            store
+                .lease_for_project_blocking(project_id)
+                .unwrap()
+                .unwrap()
+                .holder,
+            active_holder
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cancelling_read_only_resume_restores_a_stopped_session() {
+        let root = temp_root("read-only-stopped-reservation");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project_id = store.list_projects_blocking().unwrap().remove(0).id;
+        store
+            .set_session_control_state_blocking(
+                project_id,
+                "session-active",
+                AgentSessionControlState::Running,
+            )
+            .unwrap();
+        store
+            .set_session_control_state_blocking(
+                project_id,
+                "session-stopped",
+                AgentSessionControlState::Stopped,
+            )
+            .unwrap();
+
+        let requester = InteractiveAgentLease::holder_for_read_only_session(true);
+        assert!(
+            store
+                .reserve_read_only_session_interactive_blocking(
+                    project_id,
+                    "session-stopped",
+                    &requester,
+                    None,
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .cancel_idle_session_interactive_blocking(
+                    project_id,
+                    "session-stopped",
+                    &requester,
+                )
+                .unwrap()
+        );
+        let stopped = store
+            .session_control_blocking(project_id, "session-stopped")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stopped.state, AgentSessionControlState::Stopped);
+        assert!(stopped.interactive_holder.is_none());
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -26818,23 +27332,25 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(completed_view.is_live);
-        assert!(
-            tui_codex_session_is_busy_for_path_at(
+        assert_eq!(
+            tui_codex_session_availability_for_path_at(
                 &mut panel,
                 &active_path,
                 "session-live",
                 &state_dir,
             )
-            .unwrap()
+            .unwrap(),
+            TuiCodexSessionAvailability::SelectedSessionBusy
         );
-        assert!(
-            !tui_codex_session_is_busy_for_path_at(
+        assert_eq!(
+            tui_codex_session_availability_for_path_at(
                 &mut panel,
                 &active_path,
                 "different-session",
                 &state_dir,
             )
-            .unwrap()
+            .unwrap(),
+            TuiCodexSessionAvailability::ProjectBusy
         );
 
         fs::remove_dir_all(root).unwrap();
@@ -27530,7 +28046,9 @@ mod tests {
         assert!(instructions.contains(
             "i interrupts an active linked session into interactive Codex and restarts exec on exit"
         ));
-        assert!(instructions.contains("c opens an idle selected Done or blocked session"));
+        assert!(instructions.contains(
+            "c opens a selected Done or blocked session (read-only if the project is busy)"
+        ));
         assert!(instructions.contains("r enters Reorganize mode"));
         assert!(instructions.contains("Tab opens Agent Projects"));
         assert!(!instructions.contains("toggles ON/OFF"));
@@ -27746,6 +28264,7 @@ mod tests {
                         session_id,
                         from_holder,
                         resume_exec,
+                        read_only,
                         control_fd,
                     },
             }) => {
@@ -27753,6 +28272,7 @@ mod tests {
                 assert_eq!(session_id, "session-123");
                 assert_eq!(from_holder, "clt-interactive-7-generation-2");
                 assert!(resume_exec);
+                assert!(!read_only);
                 assert_eq!(control_fd, None);
             }
             _ => panic!("expected interactive guardian worker command"),
@@ -31080,7 +31600,7 @@ mod tests {
         assert!(
             completion
                 .summary
-                .contains("left all 3 task(s) blocked across todo and doing")
+                .contains("left 3 blocked task(s) unresolved across todo and doing")
         );
 
         let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
@@ -31097,8 +31617,8 @@ mod tests {
     }
 
     #[test]
-    fn agent_scheduler_prefers_todo_work_over_blocked_task_monitoring() {
-        let root = temp_root("agent-blocked-prefers-todo");
+    fn agent_scheduler_rechecks_blocked_work_before_todo_then_uses_backoff() {
+        let root = temp_root("agent-blocked-before-todo");
         let state_dir = root.join("state/clt");
         let project_root = root.join("project");
         init_tasks(&project_root, false).unwrap();
@@ -31119,17 +31639,37 @@ mod tests {
             .unwrap();
         drop(store);
 
-        let start = run_agent_scheduler_pass(&state_dir, false, &[]).unwrap();
+        let mut start = run_agent_scheduler_pass(&state_dir, false, &[]).unwrap();
 
         assert_eq!(start.jobs.len(), 1);
-        assert_eq!(start.jobs[0].task_selection, AgentTaskSelection::NextTodo);
+        assert_eq!(
+            start.jobs[0].task_selection,
+            AgentTaskSelection::RecoverBlocked
+        );
         assert_eq!(start.jobs[0].blocked_task_count_before, 2);
+
+        let runner = FakeAgentRunner::new(&state_dir, "success");
+        let shutdown = new_agent_shutdown_signal();
+        let completion = run_agent_job(start.jobs.pop().unwrap(), &runner, &shutdown).unwrap();
+        assert_eq!(completion.status, "blocked");
+        assert!(
+            completion
+                .summary
+                .contains("left 2 blocked task(s) unresolved")
+        );
+
+        let during_backoff = run_agent_scheduler_pass(&state_dir, false, &[]).unwrap();
+        assert_eq!(during_backoff.jobs.len(), 1);
+        assert_eq!(
+            during_backoff.jobs[0].task_selection,
+            AgentTaskSelection::NextTodo
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn agent_scheduler_leaves_unblocked_doing_work_for_its_owner() {
+    fn agent_scheduler_recovers_blocked_work_without_taking_unblocked_doing() {
         let root = temp_root("agent-unblocked-doing");
         let state_dir = root.join("state/clt");
         let project_root = root.join("project");
@@ -31153,9 +31693,13 @@ mod tests {
 
         let start = run_agent_scheduler_pass(&state_dir, false, &[]).unwrap();
 
-        assert!(start.jobs.is_empty());
-        assert_eq!(start.pass.pending_projects, 0);
-        assert_eq!(start.pass.runs_started, 0);
+        assert_eq!(start.jobs.len(), 1);
+        assert_eq!(start.pass.pending_projects, 1);
+        assert_eq!(start.pass.runs_started, 1);
+        assert_eq!(
+            start.jobs[0].task_selection,
+            AgentTaskSelection::RecoverBlocked
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -33048,8 +33592,9 @@ mod tests {
         let blocked_prompt =
             build_agent_codex_prompt(&project, AgentTaskSelection::RecoverBlocked, true, true);
         assert!(blocked_prompt.contains("Blocked-task monitor:"));
-        assert!(blocked_prompt.contains("every task across todo and doing is currently blocked"));
-        assert!(blocked_prompt.contains("Todo does not have to be empty"));
+        assert!(blocked_prompt.contains("at least one blocked task in todo or doing"));
+        assert!(blocked_prompt.contains("before starting fresh Todo work"));
+        assert!(blocked_prompt.contains("whether the recorded blocking conditions still exist"));
         assert!(blocked_prompt.contains("blocked task from todo or doing"));
         assert!(blocked_prompt.contains("Update the existing task; do not create a replacement"));
         assert!(blocked_prompt.contains("`UNBLOCKED YYYY-MM-DD:` note"));

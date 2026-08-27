@@ -16,10 +16,10 @@ Use this section while developing the next release.
 - Added a TUI Models page with provider presets, custom Responses-compatible endpoints, enabled model targets, favorites, a CLT-wide default, and per-project provider/model overrides.
 - Added `x`/`Delete` removal for non-built-in providers on the Models page, including dependent model, selection, and Codex configuration cleanup.
 - Added explicit, backup-protected Codex `config.toml` actions for custom provider definitions and the user's top-level default while keeping API keys exclusively in environment variables.
-- Added an idle Done-or-blocked-task `c` shortcut to resume that task's Codex session interactively, returning to the same board after Codex exits.
+- Added an idle Done-or-blocked-task `c` shortcut to resume that task's Codex session interactively, using strict read-only mode when another Codex task is already using the project and returning to the same board after Codex exits.
 - Added task-level `s` controls to stop a selected task's linked active Codex session and later queue that exact session ID for automated `codex exec resume`, without stopping the agent service.
 - Added task-level `i` interruption to stop a selected task's linked active Codex process, open the same ID in interactive Codex, and automatically restart that session in `codex exec resume` mode after exit.
-- Added blocked-task monitoring: blocked Todo entries are skipped during normal selection, and when every task across Todo and Doing is blocked, the agent revisits one existing blocker at a time and backs off unchanged recovery attempts.
+- Added blocked-task monitoring that revisits one existing blocker at a time and backs off unresolved recovery attempts.
 - Added the current local time to the agent projects pane's top border before the daemon status.
 - Added `clt shell-init bash|zsh` integration so quitting after opening a registered project can change the calling shell to that project's directory.
 - Added a first-class Backlog status for Markdown- and folder-backed boards, including CLI listing and status transitions.
@@ -38,6 +38,7 @@ Use this section while developing the next release.
 
 ### Changed
 
+- Task titles now use only the actionable `[STOPPED]` session prefix; active CLT work remains visible in the Agent Projects runtime column without a redundant `[CLT]` task prefix.
 - `clt agent start` now snapshots the current executable into an immutable generation, while `clt agent stop` stops only the scheduler and leaves already-dispatched workers running on their original binary generation.
 - Codex session IDs are now attached while automated work is active, stored with generation-safe live process and log metadata, and reused by unambiguous stop, interactive handoff, and interrupted/blocked recovery through `codex exec resume`.
 - Automated commit and commit-and-push runs now use the isolated `CLT Agent <clt-agent@localhost>` Git author and committer identity without modifying Git configuration.
@@ -57,6 +58,7 @@ Use this section while developing the next release.
 
 ### Fixed
 
+- Recheck blocked Todo and Doing tasks before fresh Todo work whenever recovery backoff permits, while allowing ready work to proceed during an unresolved blocker's backoff.
 - Distinguished independent scheduler dispatch leases from legacy in-process runs so `clt agent stop` no longer reports a false legacy-run fence during post-reboot worker handoff.
 - Moved independent-worker dispatch off the daemon's async runtime so blocking agent-store operations cannot panic and restart the scheduler before the worker service is launched.
 - Reclaimed dead or expired agent leases for disabled projects and during unregister, while continuing to protect live, unknown, and independent-worker leases from deletion.
