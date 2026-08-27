@@ -16101,6 +16101,14 @@ fn tui_task_reorder_direction(key: &crossterm::event::KeyEvent) -> Option<TuiTas
     }
 }
 
+fn tui_starts_subtask_input(key: &crossterm::event::KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Char('n') => key.modifiers.is_empty(),
+        KeyCode::Char('+') => key.modifiers.difference(KeyModifiers::SHIFT).is_empty(),
+        _ => false,
+    }
+}
+
 fn tui_task_reorganize_direction(
     key: &crossterm::event::KeyEvent,
 ) -> Option<TuiTaskReorganizeDirection> {
@@ -16552,7 +16560,7 @@ struct TuiStartState {
 }
 
 fn tui_task_board_instructions() -> &'static str {
-    "Arrows navigate boards and tasks, Enter opens subtasks, e edits, n creates a subtask under the selected task, and Space creates a task. Press r to reorganize; use Shift+Arrows to move tasks. Tab opens Agent Projects, M opens Models, and h/? opens Help. Codex: s stops/resumes, i interrupts for interaction, c opens completed or blocked sessions, and l shows logs."
+    "Arrows navigate boards and tasks, Enter opens subtasks, e edits, n or + creates a subtask under the selected task, and Space creates a task. Press r to reorganize; use Shift+Arrows to move tasks. Tab opens Agent Projects, M opens Models, and h/? opens Help. Codex: s stops/resumes, i interrupts for interaction, c opens completed or blocked sessions, and l shows logs."
 }
 
 fn tui_start_state(active_board: bool) -> TuiStartState {
@@ -21129,7 +21137,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
             if matches!(current_mode, Mode::Help) {
                 let help_text = "TUI Commands:\n\n\
                                  [Space]        - Create new task / toggle selected agent project\n\
-                                 [n]            - Create subtask under selected task\n\
+                                 [n/+]          - Create subtask under selected task\n\
                                  [Enter]        - Open subtasks, edit selected task, or open selected agent project\n\
                                  [e]            - Edit selected task\n\
                                  [g]            - Cycle selected project's Git mode: off/commit/push\n\
@@ -21810,6 +21818,22 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                 feedback_buffer =
                                 "Reorganize mode active: use Arrows to move tasks; press r or Esc to exit."
                                     .to_string();
+                            } else if tui_starts_subtask_input(&key) {
+                                if let Some((idx, entry)) = selected_task_entry_in_board(
+                                    &board_dir,
+                                    statuses[selected_board],
+                                    &board_states[selected_board],
+                                ) {
+                                    current_mode = Mode::Input;
+                                    subtask_parent = Some((idx + 1, entry));
+                                    task_input.reset();
+                                    feedback_buffer =
+                                        "Enter the new subtask description.".to_string();
+                                } else {
+                                    feedback_buffer =
+                                        "Select a parent task before creating a subtask."
+                                            .to_string();
+                                }
                             } else if key.modifiers.contains(KeyModifiers::SHIFT) {
                                 match key.code {
                                     KeyCode::Char('A') | KeyCode::Char('a') => {
@@ -22602,23 +22626,6 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                         current_mode = Mode::Input;
                                         subtask_parent = None;
                                         task_input.reset();
-                                    }
-                                    KeyCode::Char('n') => {
-                                        if let Some((idx, entry)) = selected_task_entry_in_board(
-                                            &board_dir,
-                                            statuses[selected_board],
-                                            &board_states[selected_board],
-                                        ) {
-                                            current_mode = Mode::Input;
-                                            subtask_parent = Some((idx + 1, entry));
-                                            task_input.reset();
-                                            feedback_buffer =
-                                                "Enter the new subtask description.".to_string();
-                                        } else {
-                                            feedback_buffer =
-                                                "Select a parent task before creating a subtask."
-                                                    .to_string();
-                                        }
                                     }
                                     KeyCode::Char('0') => {
                                         backlog_visible = true;
@@ -23615,6 +23622,32 @@ mod tests {
         assert_eq!(
             tui_task_reorder_direction(&key(KeyCode::Char('p'), KeyModifiers::NONE)),
             None
+        );
+    }
+
+    #[test]
+    fn tui_subtask_shortcuts_support_n_and_both_terminal_forms_of_plus() {
+        let key = |code, modifiers| crossterm::event::KeyEvent::new(code, modifiers);
+
+        assert!(tui_starts_subtask_input(&key(
+            KeyCode::Char('n'),
+            KeyModifiers::NONE
+        )));
+        assert!(tui_starts_subtask_input(&key(
+            KeyCode::Char('+'),
+            KeyModifiers::NONE
+        )));
+        assert!(tui_starts_subtask_input(&key(
+            KeyCode::Char('+'),
+            KeyModifiers::SHIFT
+        )));
+        assert!(!tui_starts_subtask_input(&key(
+            KeyCode::Char('n'),
+            KeyModifiers::CONTROL
+        )));
+        assert_eq!(
+            tui_task_reorder_direction(&key(KeyCode::Char('n'), KeyModifiers::CONTROL)),
+            Some(TuiTaskReorderDirection::Down)
         );
     }
 
@@ -28295,7 +28328,7 @@ mod tests {
         let instructions = tui_task_board_instructions();
 
         assert!(instructions.contains("Space creates a task"));
-        assert!(instructions.contains("n creates a subtask under the selected task"));
+        assert!(instructions.contains("n or + creates a subtask under the selected task"));
         assert!(instructions.contains("e edits"));
         assert!(instructions.contains("Codex: s stops/resumes"));
         assert!(instructions.contains("i interrupts for interaction"));

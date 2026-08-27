@@ -10,7 +10,7 @@ Use this section while developing the next release.
 
 ### Added
 
-- Added an `n` TUI shortcut that creates a Todo subtask under the selected task, automatically expands Markdown-backed parent storage, and opens the resulting nested board.
+- Added `n` and `+` TUI shortcuts that create a Todo subtask under the selected task, automatically expand Markdown-backed parent storage, and open the resulting nested board.
 - Added durable per-run agent workers: macOS uses one-shot launchd jobs and Linux uses transient user services, with persisted launch contracts, fenced worker records, heartbeats, crash recovery, and idempotent run finalization.
 - Added `/goal`-prefixed task support for automated Codex runs, including explicit goals feature enablement and prompt guidance that removes the directive from the persistent goal objective.
 - Added confirmed `Delete`-key removal for registered projects in the Agent Projects pane without deleting project files.
