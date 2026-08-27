@@ -91,7 +91,7 @@ Open the interactive TUI Kanban board:
 ```bash
 clt
 ```
-Press `Enter` to open a folder task with subtasks, `e` to edit the selected task, `Space` to create a task, `Backspace` to return to the parent board, and `q` to quit.
+Press `Enter` to open a folder task with subtasks, `n` to create a subtask under the selected task, `e` to edit the selected task, `Space` to create a task, `Backspace` to return to the parent board, and `q` to quit. Creating a subtask automatically expands a Markdown-backed parent status to folder-backed storage, preserving the original status file as a `.bak`, converts the selected task into a nested board, and opens that board after the subtask is saved. Cancelling the prompt leaves storage unchanged.
 
 Press `r` to enter sticky Reorganize mode, then use the arrow keys as many times as needed: Up/Down changes the selected task's position and Left/Right moves it between columns. The task-board borders turn yellow and the selected column shows `REORGANIZE MODE` while the mode is active. Press `r` again or `Esc` to return to normal navigation.
 
@@ -360,7 +360,7 @@ tasks/
       done.md
 ```
 
-The folder's `task.md` provides the parent task text. Inside the TUI, selecting that task and pressing `Enter` opens its nested board.
+The folder's `task.md` provides the parent task text. Inside the TUI, selecting that task and pressing `Enter` opens its nested board. Pressing `n` on any selected task creates its nested board automatically when needed and prompts for a new Todo subtask.
 
 
 ## Development

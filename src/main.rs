@@ -15728,6 +15728,77 @@ fn insert_task_at_selection_in_board(
     insert_task_in_board(board_dir, status, index, description, metadata)
 }
 
+fn insert_subtask_in_board(
+    board_dir: &Path,
+    status: &str,
+    parent_task_index: usize,
+    expected_parent: &TaskEntry,
+    description: &str,
+    metadata: Option<String>,
+) -> Result<PathBuf> {
+    let content = content_with_metadata(description, metadata);
+    let _mutation_lock = acquire_board_mutation_lock(board_dir)?;
+    let current_parent = task_entry_at(board_dir, status, parent_task_index)?;
+    if current_parent.source != expected_parent.source
+        || current_parent.content != expected_parent.content
+    {
+        anyhow::bail!(
+            "Parent task changed while creating its subtask; retry with a fresh selection."
+        );
+    }
+    let subtask_board = ensure_subtask_board_after_lock(board_dir, status, parent_task_index)?;
+    insert_task_content(&subtask_board, "todo", None, &content)?;
+    Ok(subtask_board)
+}
+
+fn ensure_subtask_board_after_lock(
+    board_dir: &Path,
+    status: &str,
+    parent_task_index: usize,
+) -> Result<PathBuf> {
+    let status_dir = convert_status_to_directory(board_dir, status)?;
+    let entry = task_entry_at(board_dir, status, parent_task_index)?;
+
+    let task_dir = match entry.source {
+        TaskSource::Path { path, is_dir: true } => path,
+        TaskSource::Path {
+            path,
+            is_dir: false,
+        } => {
+            let preferred_name = path
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .unwrap_or("task");
+            let task_dir = unique_child_path(&status_dir, preferred_name);
+            fs::create_dir(&task_dir)
+                .with_context(|| format!("Failed to create subtask board {:?}", task_dir))?;
+            let detail_path = task_dir.join(TASK_DETAIL_FILES[0]);
+            if let Err(error) = fs::rename(&path, &detail_path) {
+                let _ = fs::remove_dir(&task_dir);
+                return Err(error).with_context(|| {
+                    format!(
+                        "Failed to move task {:?} into subtask board {:?}",
+                        path, task_dir
+                    )
+                });
+            }
+            ensure_board_store(&task_dir)?;
+            reorder_path_in_directory(&status_dir, &task_dir, parent_task_index - 1)?;
+
+            match task_entry_at(board_dir, status, parent_task_index)?.source {
+                TaskSource::Path { path, is_dir: true } => path,
+                _ => anyhow::bail!("Task storage changed while creating its subtask board."),
+            }
+        }
+        TaskSource::MarkdownLine { .. } => {
+            anyhow::bail!("Task storage did not expand before creating its subtask board.")
+        }
+    };
+
+    ensure_board_store(&task_dir)?;
+    Ok(task_dir)
+}
+
 #[cfg(test)]
 fn read_tasks(root: &Path, status: &str) -> Result<Vec<String>> {
     read_tasks_in_board(&get_tasks_dir(root), status)
@@ -16481,7 +16552,7 @@ struct TuiStartState {
 }
 
 fn tui_task_board_instructions() -> &'static str {
-    "Arrows navigate boards and tasks, Enter opens subtasks, e edits, and Space creates a task. Press r to reorganize; use Shift+Arrows to move tasks. Tab opens Agent Projects, M opens Models, and h/? opens Help. Codex: s stops/resumes, i interrupts for interaction, c opens completed or blocked sessions, and l shows logs."
+    "Arrows navigate boards and tasks, Enter opens subtasks, e edits, n creates a subtask under the selected task, and Space creates a task. Press r to reorganize; use Shift+Arrows to move tasks. Tab opens Agent Projects, M opens Models, and h/? opens Help. Codex: s stops/resumes, i interrupts for interaction, c opens completed or blocked sessions, and l shows logs."
 }
 
 fn tui_start_state(active_board: bool) -> TuiStartState {
@@ -20550,6 +20621,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
 
     let mut selected_board = TODO_BOARD_INDEX;
     let mut editing_task_idx: Option<usize> = None;
+    let mut subtask_parent: Option<(usize, TaskEntry)> = None;
     let mut board_states = [
         ListState::default(),
         ListState::default(),
@@ -20654,7 +20726,11 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                 3
             } else if matches!(current_mode, Mode::Input) || matches!(current_mode, Mode::Edit) {
                     let label = if matches!(current_mode, Mode::Input) {
-                        " Add Task: "
+                        if subtask_parent.is_some() {
+                            " Add Subtask: "
+                        } else {
+                            " Add Task: "
+                        }
                     } else {
                         " Edit Task: "
                     };
@@ -20984,7 +21060,11 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                 ));
             } else if matches!(current_mode, Mode::Input) || matches!(current_mode, Mode::Edit) {
                 let label = if matches!(current_mode, Mode::Input) {
-                    " Add Task: "
+                    if subtask_parent.is_some() {
+                        " Add Subtask: "
+                    } else {
+                        " Add Task: "
+                    }
                 } else {
                     " Edit Task: "
                 };
@@ -21049,6 +21129,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
             if matches!(current_mode, Mode::Help) {
                 let help_text = "TUI Commands:\n\n\
                                  [Space]        - Create new task / toggle selected agent project\n\
+                                 [n]            - Create subtask under selected task\n\
                                  [Enter]        - Open subtasks, edit selected task, or open selected agent project\n\
                                  [e]            - Edit selected task\n\
                                  [g]            - Cycle selected project's Git mode: off/commit/push\n\
@@ -22487,6 +22568,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                         } else {
                                             board_states[selected_board].select(None);
                                             current_mode = Mode::Input;
+                                            subtask_parent = None;
                                             task_input.reset();
                                         }
                                     }
@@ -22518,7 +22600,25 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                             board_states[selected_board].select(None);
                                         }
                                         current_mode = Mode::Input;
+                                        subtask_parent = None;
                                         task_input.reset();
+                                    }
+                                    KeyCode::Char('n') => {
+                                        if let Some((idx, entry)) = selected_task_entry_in_board(
+                                            &board_dir,
+                                            statuses[selected_board],
+                                            &board_states[selected_board],
+                                        ) {
+                                            current_mode = Mode::Input;
+                                            subtask_parent = Some((idx + 1, entry));
+                                            task_input.reset();
+                                            feedback_buffer =
+                                                "Enter the new subtask description.".to_string();
+                                        } else {
+                                            feedback_buffer =
+                                                "Select a parent task before creating a subtask."
+                                                    .to_string();
+                                        }
                                     }
                                     KeyCode::Char('0') => {
                                         backlog_visible = true;
@@ -22731,35 +22831,75 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                             KeyCode::Enter => {
                                 let task_value = task_input.submitted_value();
                                 if !task_value.trim().is_empty() {
-                                    match insert_task_at_selection_in_board(
-                                        &board_dir,
-                                        statuses[selected_board],
-                                        &board_states[selected_board],
-                                        &task_value,
-                                        None,
-                                    ) {
-                                        Ok(_) => {
-                                            feedback_buffer = "Task added successfully.".to_string()
+                                    if let Some((parent_idx, expected_parent)) =
+                                        subtask_parent.as_ref()
+                                    {
+                                        match insert_subtask_in_board(
+                                            &board_dir,
+                                            statuses[selected_board],
+                                            *parent_idx,
+                                            expected_parent,
+                                            &task_value,
+                                            None,
+                                        ) {
+                                            Ok(subtask_board) => {
+                                                board_stack.push(subtask_board.clone());
+                                                selected_board = TODO_BOARD_INDEX;
+                                                for state in board_states.iter_mut() {
+                                                    state.select(None);
+                                                }
+                                                select_last_task_if_present_in_board(
+                                                    &subtask_board,
+                                                    statuses[selected_board],
+                                                    &mut board_states[selected_board],
+                                                );
+                                                feedback_buffer =
+                                                    "Subtask added and nested board opened."
+                                                        .to_string();
+                                            }
+                                            Err(e) => feedback_buffer = format!("Error: {}", e),
                                         }
-                                        Err(e) => feedback_buffer = format!("Error: {}", e),
+                                    } else {
+                                        match insert_task_at_selection_in_board(
+                                            &board_dir,
+                                            statuses[selected_board],
+                                            &board_states[selected_board],
+                                            &task_value,
+                                            None,
+                                        ) {
+                                            Ok(_) => {
+                                                feedback_buffer =
+                                                    "Task added successfully.".to_string()
+                                            }
+                                            Err(e) => feedback_buffer = format!("Error: {}", e),
+                                        }
                                     }
                                 } else {
                                     feedback_buffer =
                                         "Task description cannot be empty.".to_string();
                                 }
                                 current_mode = Mode::View;
+                                subtask_parent = None;
                                 task_input.reset();
                             }
                             KeyCode::Esc => {
                                 current_mode = Mode::View;
+                                subtask_parent = None;
                                 task_input.reset();
                             }
-                            _ => handle_input_key(
-                                &mut task_input.input,
-                                key,
-                                " Add Task: ",
-                                input_available_width,
-                            ),
+                            _ => {
+                                let label = if subtask_parent.is_some() {
+                                    " Add Subtask: "
+                                } else {
+                                    " Add Task: "
+                                };
+                                handle_input_key(
+                                    &mut task_input.input,
+                                    key,
+                                    label,
+                                    input_available_width,
+                                )
+                            }
                         },
                         Mode::Edit => match key.code {
                             KeyCode::Enter => {
@@ -27947,6 +28087,120 @@ mod tests {
     }
 
     #[test]
+    fn insert_subtask_expands_markdown_parent_and_reuses_nested_board() {
+        let root = temp_root("insert-subtask-markdown");
+        add_task(&root, "Ship dashboard", Some("FEATURE".to_string())).unwrap();
+        add_task(&root, "Keep sibling", None).unwrap();
+        let tasks_dir = root.join("tasks");
+        let expected_parent = task_entry_at(&tasks_dir, "todo", 1).unwrap();
+
+        let subtask_board = insert_subtask_in_board(
+            &tasks_dir,
+            "todo",
+            1,
+            &expected_parent,
+            "Draft dashboard spec",
+            Some("DOCS".to_string()),
+        )
+        .unwrap();
+
+        assert!(tasks_dir.join("todo").is_dir());
+        assert!(tasks_dir.join("todo.md.bak").is_file());
+        let parent_entries = read_task_entries(&tasks_dir, "todo").unwrap();
+        assert_eq!(parent_entries.len(), 2);
+        assert_eq!(parent_entries[0].summary, "Ship dashboard");
+        assert_eq!(parent_entries[0].metadata.as_deref(), Some("FEATURE"));
+        assert!(parent_entries[0].has_subtasks);
+        assert_eq!(parent_entries[1].summary, "Keep sibling");
+        assert_eq!(
+            fs::read_to_string(subtask_board.join("task.md")).unwrap(),
+            "Ship dashboard (FEATURE)\n"
+        );
+        assert_eq!(
+            read_tasks_in_board(&subtask_board, "todo").unwrap(),
+            vec!["- Draft dashboard spec (DOCS)"]
+        );
+
+        let expected_parent = task_entry_at(&tasks_dir, "todo", 1).unwrap();
+        let reused_board = insert_subtask_in_board(
+            &tasks_dir,
+            "todo",
+            1,
+            &expected_parent,
+            "Build dashboard",
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(reused_board, subtask_board);
+        assert_eq!(
+            read_tasks_in_board(&subtask_board, "todo").unwrap(),
+            vec!["- Draft dashboard spec (DOCS)", "- Build dashboard"]
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn insert_subtask_preserves_folder_backed_parent_detail() {
+        let root = temp_root("insert-subtask-folder");
+        init_tasks(&root, true).unwrap();
+        let tasks_dir = root.join("tasks");
+        let parent_path = tasks_dir.join("doing/0001-research-api.md");
+        let parent_content =
+            "Research the API. Keep detailed notes.\n\n- Audit callers\n- Draft rollout\n";
+        fs::write(&parent_path, parent_content).unwrap();
+        let expected_parent = task_entry_at(&tasks_dir, "doing", 1).unwrap();
+
+        let subtask_board = insert_subtask_in_board(
+            &tasks_dir,
+            "doing",
+            1,
+            &expected_parent,
+            "Audit callers",
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(subtask_board.join("task.md")).unwrap(),
+            parent_content
+        );
+        assert_eq!(
+            read_tasks_in_board(&subtask_board, "todo").unwrap(),
+            vec!["- Audit callers"]
+        );
+        assert!(!tasks_dir.join("doing.md.bak").exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn insert_subtask_rejects_parent_changed_while_prompt_was_open() {
+        let root = temp_root("insert-subtask-stale-parent");
+        add_task(&root, "Original parent", None).unwrap();
+        let tasks_dir = root.join("tasks");
+        let expected_parent = task_entry_at(&tasks_dir, "todo", 1).unwrap();
+        update_task_in_board(&tasks_dir, "todo", 1, "Changed parent").unwrap();
+
+        let error = insert_subtask_in_board(
+            &tasks_dir,
+            "todo",
+            1,
+            &expected_parent,
+            "Must not attach",
+            None,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("Parent task changed"));
+        assert!(tasks_dir.join("todo.md").is_file());
+        assert!(!tasks_dir.join("todo").exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn parse_add_task_args_joins_unquoted_description_words() {
         let (description, metadata) = parse_add_task_args(vec![
             "write".to_string(),
@@ -28041,6 +28295,7 @@ mod tests {
         let instructions = tui_task_board_instructions();
 
         assert!(instructions.contains("Space creates a task"));
+        assert!(instructions.contains("n creates a subtask under the selected task"));
         assert!(instructions.contains("e edits"));
         assert!(instructions.contains("Codex: s stops/resumes"));
         assert!(instructions.contains("i interrupts for interaction"));
