@@ -609,7 +609,7 @@ enum AgentSessionControlState {
 enum InteractiveCodexResumeMode {
     ResumeExec,
     WritableIdle,
-    ReadOnly,
+    WritableShared,
 }
 
 impl InteractiveCodexResumeMode {
@@ -617,8 +617,8 @@ impl InteractiveCodexResumeMode {
         self == Self::ResumeExec
     }
 
-    fn is_read_only(self) -> bool {
-        self == Self::ReadOnly
+    fn shares_project(self) -> bool {
+        self == Self::WritableShared
     }
 }
 
@@ -627,19 +627,19 @@ enum InteractiveGuardianDisposition {
     ResumeExec,
     DeleteIdleReservation,
     RestoreStopped,
-    DeleteReadOnlyReservation,
-    RestoreStoppedReadOnly,
+    DeleteSharedReservation,
+    RestoreStoppedShared,
 }
 
 impl InteractiveGuardianDisposition {
     fn from_handoff(mode: InteractiveCodexResumeMode, from_holder: &str) -> Self {
         if mode.resumes_exec() {
             Self::ResumeExec
-        } else if mode.is_read_only() {
-            if from_holder.starts_with("clt-stopped-readonly-interactive-") {
-                Self::RestoreStoppedReadOnly
+        } else if mode.shares_project() {
+            if is_stopped_shared_interactive_holder(from_holder) {
+                Self::RestoreStoppedShared
             } else {
-                Self::DeleteReadOnlyReservation
+                Self::DeleteSharedReservation
             }
         } else if from_holder.starts_with("clt-stopped-interactive-") {
             Self::RestoreStopped
@@ -655,12 +655,8 @@ impl InteractiveGuardianDisposition {
     fn holds_project_lease(self) -> bool {
         !matches!(
             self,
-            Self::DeleteReadOnlyReservation | Self::RestoreStoppedReadOnly
+            Self::DeleteSharedReservation | Self::RestoreStoppedShared
         )
-    }
-
-    fn is_read_only(self) -> bool {
-        !self.holds_project_lease()
     }
 
     fn guardian_holder_prefix(self) -> &'static str {
@@ -668,18 +664,26 @@ impl InteractiveGuardianDisposition {
             Self::ResumeExec => "clt-interactive-worker",
             Self::DeleteIdleReservation => "clt-idle-interactive-worker",
             Self::RestoreStopped => "clt-stopped-interactive-worker",
-            Self::DeleteReadOnlyReservation => "clt-readonly-interactive-worker",
-            Self::RestoreStoppedReadOnly => "clt-stopped-readonly-interactive-worker",
+            Self::DeleteSharedReservation => "clt-shared-interactive-worker",
+            Self::RestoreStoppedShared => "clt-stopped-shared-interactive-worker",
         }
     }
 
     fn from_guardian_holder(holder: &str) -> Option<Self> {
+        // Recognize guardians left by the brief read-only implementation so a
+        // newer CLT can still recover their persisted session controls.
+        if holder.starts_with("clt-stopped-readonly-interactive-worker-") {
+            return Some(Self::RestoreStoppedShared);
+        }
+        if holder.starts_with("clt-readonly-interactive-worker-") {
+            return Some(Self::DeleteSharedReservation);
+        }
         [
             Self::ResumeExec,
             Self::DeleteIdleReservation,
             Self::RestoreStopped,
-            Self::DeleteReadOnlyReservation,
-            Self::RestoreStoppedReadOnly,
+            Self::DeleteSharedReservation,
+            Self::RestoreStoppedShared,
         ]
         .into_iter()
         .find(|disposition| holder.starts_with(disposition.guardian_holder_prefix()))
@@ -699,6 +703,11 @@ impl InteractiveGuardianDisposition {
         };
         local_process_is_running(pid) == Some(false)
     }
+}
+
+fn is_stopped_shared_interactive_holder(holder: &str) -> bool {
+    holder.starts_with("clt-stopped-shared-interactive-")
+        || holder.starts_with("clt-stopped-readonly-interactive-")
 }
 
 impl AgentSessionControlState {
@@ -938,8 +947,8 @@ enum AgentCommands {
         from_holder: String,
         #[arg(long, default_value_t = false)]
         resume_exec: bool,
-        #[arg(long, default_value_t = false)]
-        read_only: bool,
+        #[arg(long, alias = "read-only", default_value_t = false)]
+        shared_project: bool,
         #[arg(long)]
         control_fd: Option<i32>,
     },
@@ -1257,13 +1266,13 @@ fn handle_agent_command(command: AgentCommands, local: bool, default_root: &Path
             session_id,
             from_holder,
             resume_exec,
-            read_only,
+            shared_project,
             control_fd,
         } => {
             let mode = if resume_exec {
                 InteractiveCodexResumeMode::ResumeExec
-            } else if read_only {
-                InteractiveCodexResumeMode::ReadOnly
+            } else if shared_project {
+                InteractiveCodexResumeMode::WritableShared
             } else {
                 InteractiveCodexResumeMode::WritableIdle
             };
@@ -2438,23 +2447,14 @@ fn configure_interactive_codex_resume_command(
     command: &mut Command,
     project_root: &Path,
     session_id: &str,
-    mode: InteractiveCodexResumeMode,
 ) {
     command
         .arg("resume")
         .arg("--include-non-interactive")
         .arg("--sandbox")
-        .arg(if mode.is_read_only() {
-            "read-only"
-        } else {
-            "workspace-write"
-        })
+        .arg("workspace-write")
         .arg("--ask-for-approval")
-        .arg(if mode.is_read_only() {
-            "never"
-        } else {
-            "on-request"
-        })
+        .arg("on-request")
         .arg("-C")
         .arg(project_root)
         .arg(session_id)
@@ -3441,11 +3441,11 @@ impl InteractiveAgentLease {
         Self::holder_for_current_process_with_prefix("clt-stopped-interactive")
     }
 
-    fn holder_for_read_only_session(restore_stopped: bool) -> String {
+    fn holder_for_shared_session(restore_stopped: bool) -> String {
         let prefix = if restore_stopped {
-            "clt-stopped-readonly-interactive"
+            "clt-stopped-shared-interactive"
         } else {
-            "clt-readonly-interactive"
+            "clt-shared-interactive"
         };
         Self::holder_for_current_process_with_prefix(prefix)
     }
@@ -3575,8 +3575,8 @@ fn resume_codex_session_interactively(
     if mode.resumes_exec() {
         command.arg("--resume-exec");
     }
-    if mode.is_read_only() {
-        command.arg("--read-only");
+    if mode.shares_project() {
+        command.arg("--shared-project");
     }
     #[cfg(unix)]
     let (control_fd, guardian_lifeline) = configure_inherited_child_control(&mut command)?;
@@ -4603,11 +4603,11 @@ fn finish_interactive_guardian_after_reap(
                             })
                         }
                         InteractiveGuardianDisposition::DeleteIdleReservation
-                        | InteractiveGuardianDisposition::DeleteReadOnlyReservation => {
+                        | InteractiveGuardianDisposition::DeleteSharedReservation => {
                             control.is_none()
                         }
                         InteractiveGuardianDisposition::RestoreStopped
-                        | InteractiveGuardianDisposition::RestoreStoppedReadOnly => control
+                        | InteractiveGuardianDisposition::RestoreStoppedShared => control
                             .is_some_and(|control| {
                                 control.state == AgentSessionControlState::Stopped
                                     && control.interactive_holder.is_none()
@@ -4947,16 +4947,7 @@ fn run_guarded_interactive_codex(
     let mut terminal_foreground = InteractiveTerminalForeground::capture(&terminal_input)?;
     let codex_command = agent_codex_command();
     let mut target = Command::new(&codex_command);
-    configure_interactive_codex_resume_command(
-        &mut target,
-        &project.path,
-        session_id,
-        if disposition.is_read_only() {
-            InteractiveCodexResumeMode::ReadOnly
-        } else {
-            InteractiveCodexResumeMode::WritableIdle
-        },
-    );
+    configure_interactive_codex_resume_command(&mut target, &project.path, session_id);
     let mut command = interactive_exec_gate_command(&target)?;
     configure_interactive_child_command(command.command_mut());
     let (mut child, mut launch_gate) = match command.spawn() {
@@ -11414,7 +11405,7 @@ mod agent_store {
                 })
         }
 
-        pub(crate) fn reserve_read_only_session_interactive_blocking(
+        pub(crate) fn reserve_shared_session_interactive_blocking(
             &self,
             project_id: i64,
             codex_session_id: &str,
@@ -11425,8 +11416,8 @@ mod agent_store {
                 .context("Failed to create async runtime for agent store")?
                 .block_on(async {
                     let conn = self.connect().await?;
-                    let restore_stopped = interactive_holder
-                        .starts_with("clt-stopped-readonly-interactive-");
+                    let restore_stopped =
+                        is_stopped_shared_interactive_holder(interactive_holder);
                     let changed = if restore_stopped {
                         conn.execute(
                             "UPDATE session_controls
@@ -11493,7 +11484,7 @@ mod agent_store {
                     }
                     .with_context(|| {
                         format!(
-                            "Failed to reserve Codex session {codex_session_id} for read-only interactive use"
+                            "Failed to reserve Codex session {codex_session_id} for shared interactive use"
                         )
                     })?;
                     Ok(changed > 0)
@@ -11512,8 +11503,7 @@ mod agent_store {
                     let conn = self.connect().await?;
                     let restore_stopped = interactive_holder
                         .starts_with("clt-stopped-interactive-")
-                        || interactive_holder
-                            .starts_with("clt-stopped-readonly-interactive-");
+                        || is_stopped_shared_interactive_holder(interactive_holder);
                     let changed = if restore_stopped {
                         conn.execute(
                             "UPDATE session_controls
@@ -12176,7 +12166,7 @@ mod agent_store {
                                 )
                             })?,
                         InteractiveGuardianDisposition::DeleteIdleReservation
-                        | InteractiveGuardianDisposition::DeleteReadOnlyReservation => {
+                        | InteractiveGuardianDisposition::DeleteSharedReservation => {
                             transaction.execute(
                                 "DELETE FROM session_controls
                                   WHERE project_id = ?1 AND codex_session_id = ?2
@@ -12191,7 +12181,7 @@ mod agent_store {
                             })?
                         }
                         InteractiveGuardianDisposition::RestoreStopped
-                        | InteractiveGuardianDisposition::RestoreStoppedReadOnly => {
+                        | InteractiveGuardianDisposition::RestoreStoppedShared => {
                             transaction.execute(
                                 "UPDATE session_controls
                                     SET state = 'stopped', child_pid = NULL,
@@ -12286,7 +12276,7 @@ mod agent_store {
                             )
                             .await,
                         InteractiveGuardianDisposition::DeleteIdleReservation
-                        | InteractiveGuardianDisposition::DeleteReadOnlyReservation => {
+                        | InteractiveGuardianDisposition::DeleteSharedReservation => {
                             transaction.execute(
                                 "DELETE FROM session_controls
                                   WHERE project_id = ?1 AND codex_session_id = ?2
@@ -12307,7 +12297,7 @@ mod agent_store {
                             .await
                         }
                         InteractiveGuardianDisposition::RestoreStopped
-                        | InteractiveGuardianDisposition::RestoreStoppedReadOnly => {
+                        | InteractiveGuardianDisposition::RestoreStoppedShared => {
                             transaction.execute(
                                 "UPDATE session_controls
                                     SET state = 'stopped', child_pid = NULL,
@@ -18739,7 +18729,7 @@ fn reserve_tui_idle_codex_session_interactive(
     })
 }
 
-fn reserve_tui_read_only_codex_session_interactive(
+fn reserve_tui_shared_codex_session_interactive(
     project_id: i64,
     session_id: &str,
     interactive_holder: &str,
@@ -18747,7 +18737,7 @@ fn reserve_tui_read_only_codex_session_interactive(
 ) -> Result<bool> {
     let state_dir = ensure_agent_state_dir()?;
     with_agent_store_at(&state_dir, |store| {
-        store.reserve_read_only_session_interactive_blocking(
+        store.reserve_shared_session_interactive_blocking(
             project_id,
             session_id,
             interactive_holder,
@@ -18775,7 +18765,7 @@ fn cancel_tui_idle_codex_session_interactive(
             None => true,
             Some(control) => {
                 (interactive_holder.starts_with("clt-stopped-interactive-")
-                    || interactive_holder.starts_with("clt-stopped-readonly-interactive-"))
+                    || is_stopped_shared_interactive_holder(interactive_holder))
                     && control.state == AgentSessionControlState::Stopped
                     && control.interactive_holder.is_none()
             }
@@ -20639,9 +20629,8 @@ fn tui_console_block<'a>(title: &'a str, right_title: Option<&'a str>) -> Block<
 enum TuiCodexHandoffStage {
     WaitingForAutomatedExit,
     PreparingIdleSession,
-    PreparingReadOnlySession,
+    PreparingSharedSession,
     EnteringInteractive,
-    EnteringReadOnly,
     QueueingExecResume,
     RestoringTaskControls,
 }
@@ -20655,14 +20644,11 @@ impl TuiCodexHandoffStage {
             Self::PreparingIdleSession => {
                 "Reserving the Codex session for interactive use...\nThe session will open as soon as the handoff is ready."
             }
-            Self::PreparingReadOnlySession => {
-                "Another Codex task is using this project.\nReserving this idle session for read-only interactive use..."
+            Self::PreparingSharedSession => {
+                "Another Codex task is using this project.\nReserving this idle session for writable interactive use alongside it..."
             }
             Self::EnteringInteractive => {
                 "Entering interactive Codex...\nExit Codex when you are ready to return to CLT."
-            }
-            Self::EnteringReadOnly => {
-                "Entering read-only interactive Codex...\nYou can inspect and discuss, but this session cannot modify the project."
             }
             Self::QueueingExecResume => {
                 "Interactive Codex exited.\nReturning the same session to automated exec mode..."
@@ -21264,7 +21250,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                  [g]            - Cycle selected project's Git mode: off/commit/push\n\
                                  [s]            - Stop linked active session / resume exact stopped session in exec\n\
                                  [i]            - Interrupt linked active session; interact, then auto-restart exec\n\
-                                 [c]            - Open Done/blocked session (read-only if project busy)\n\
+                                 [c]            - Open Done/blocked session (writable alongside active work)\n\
                                  [l]            - Toggle active/selected project's live/current agent output\n\
                                  [a]            - Move selected task to archive\n\
                                  [A]            - Toggle archive view\n\
@@ -22308,7 +22294,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                                                 .to_string();
                                                         continue;
                                                 }
-                                                let read_only = availability
+                                                let shares_project = availability
                                                     == TuiCodexSessionAvailability::ProjectBusy;
 
                                                 let Some(project_id) = agent_panel
@@ -22322,8 +22308,8 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                                 };
                                                 draw_tui_codex_handoff_status(
                                                     &mut terminal,
-                                                    if read_only {
-                                                        TuiCodexHandoffStage::PreparingReadOnlySession
+                                                    if shares_project {
+                                                        TuiCodexHandoffStage::PreparingSharedSession
                                                     } else {
                                                         TuiCodexHandoffStage::PreparingIdleSession
                                                     },
@@ -22343,10 +22329,10 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                                     };
                                                 let restore_stopped = stopped_control.is_some();
                                                 let (interactive_lease, provisional_holder) =
-                                                    if read_only {
+                                                    if shares_project {
                                                         (
                                                             None,
-                                                            InteractiveAgentLease::holder_for_read_only_session(
+                                                            InteractiveAgentLease::holder_for_shared_session(
                                                                 restore_stopped,
                                                             ),
                                                         )
@@ -22358,7 +22344,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                                             Ok(Some(lease)) => lease,
                                                             Ok(None) => {
                                                                 feedback_buffer =
-                                                                    "Another Codex task began using this project before the handoff; press c again to open this session read-only."
+                                                                    "Another Codex task began using this project before the handoff; press c again to open this session alongside it."
                                                                         .to_string();
                                                                 continue;
                                                             }
@@ -22376,8 +22362,8 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                                     stopped_control.as_ref().and_then(|control| {
                                                         control.run_token.as_deref()
                                                     });
-                                                let reservation_result = if read_only {
-                                                    reserve_tui_read_only_codex_session_interactive(
+                                                let reservation_result = if shares_project {
+                                                    reserve_tui_shared_codex_session_interactive(
                                                         project_id,
                                                         &session_id,
                                                         &provisional_holder,
@@ -22403,8 +22389,8 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                                         reservation_result,
                                                         release_result,
                                                     ) {
-                                                        (Ok(false), Ok(())) if read_only =>
-                                                            "The active project run or selected session changed before read-only Codex could open; try again."
+                                                        (Ok(false), Ok(())) if shares_project =>
+                                                            "The active project run or selected session changed before shared Codex could open; try again."
                                                                 .to_string(),
                                                         (Ok(false), Ok(())) =>
                                                             "This Codex session became busy before it could be reserved; try again."
@@ -22469,11 +22455,8 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                                 }
 
                                                 agent_log_view = None;
-                                                let entering_stage = if read_only {
-                                                    TuiCodexHandoffStage::EnteringReadOnly
-                                                } else {
-                                                    TuiCodexHandoffStage::EnteringInteractive
-                                                };
+                                                let entering_stage =
+                                                    TuiCodexHandoffStage::EnteringInteractive;
                                                 let _ = draw_tui_codex_handoff_status(
                                                     &mut terminal,
                                                     entering_stage,
@@ -22489,8 +22472,8 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                                         project_id,
                                                         &session_id,
                                                         &provisional_holder,
-                                                        if read_only {
-                                                            InteractiveCodexResumeMode::ReadOnly
+                                                        if shares_project {
+                                                            InteractiveCodexResumeMode::WritableShared
                                                         } else {
                                                             InteractiveCodexResumeMode::WritableIdle
                                                         },
@@ -22534,14 +22517,6 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                                     cancel_result,
                                                     release_result,
                                                 ) {
-                                                    (Ok(status), Ok(()), Ok(()))
-                                                        if status.success() && read_only =>
-                                                    {
-                                                        format!(
-                                                            "Returned from read-only Codex for: {}",
-                                                            task_display_text(&task)
-                                                        )
-                                                    }
                                                     (Ok(status), Ok(()), Ok(()))
                                                         if status.success() =>
                                                     {
@@ -24777,16 +24752,11 @@ mod tests {
     }
 
     #[test]
-    fn interactive_codex_resume_command_uses_safe_task_session_settings() {
+    fn interactive_codex_resume_command_is_always_writable() {
         let project_root = PathBuf::from("/tmp/project with spaces");
         let mut command = Command::new("codex");
 
-        configure_interactive_codex_resume_command(
-            &mut command,
-            &project_root,
-            "session-123",
-            InteractiveCodexResumeMode::WritableIdle,
-        );
+        configure_interactive_codex_resume_command(&mut command, &project_root, "session-123");
 
         let args: Vec<OsString> = command.get_args().map(OsStr::to_os_string).collect();
         assert_eq!(
@@ -24804,20 +24774,25 @@ mod tests {
             ]
         );
         assert_eq!(command.get_current_dir(), Some(project_root.as_path()));
+    }
 
-        let mut read_only_command = Command::new("codex");
-        configure_interactive_codex_resume_command(
-            &mut read_only_command,
-            &project_root,
-            "session-123",
-            InteractiveCodexResumeMode::ReadOnly,
+    #[test]
+    fn legacy_read_only_guardian_holders_recover_as_shared_sessions() {
+        assert_eq!(
+            InteractiveGuardianDisposition::from_guardian_holder(
+                "clt-readonly-interactive-worker-42-generation"
+            ),
+            Some(InteractiveGuardianDisposition::DeleteSharedReservation)
         );
-        let read_only_args: Vec<OsString> = read_only_command
-            .get_args()
-            .map(OsStr::to_os_string)
-            .collect();
-        assert_eq!(read_only_args[3], OsString::from("read-only"));
-        assert_eq!(read_only_args[5], OsString::from("never"));
+        assert_eq!(
+            InteractiveGuardianDisposition::from_guardian_holder(
+                "clt-stopped-readonly-interactive-worker-42-generation"
+            ),
+            Some(InteractiveGuardianDisposition::RestoreStoppedShared)
+        );
+        assert!(is_stopped_shared_interactive_holder(
+            "clt-stopped-readonly-interactive-42-generation"
+        ));
     }
 
     #[test]
@@ -27269,8 +27244,8 @@ mod tests {
     }
 
     #[test]
-    fn read_only_interactive_reservation_coexists_with_another_active_session() {
-        let root = temp_root("read-only-interactive-reservation");
+    fn writable_shared_interactive_reservation_coexists_with_another_active_session() {
+        let root = temp_root("writable-shared-interactive-reservation");
         let state_dir = root.join("state/clt");
         let project_root = root.join("project");
         fs::create_dir_all(&project_root).unwrap();
@@ -27294,10 +27269,10 @@ mod tests {
             )
             .unwrap();
 
-        let requester = InteractiveAgentLease::holder_for_read_only_session(false);
+        let requester = InteractiveAgentLease::holder_for_shared_session(false);
         assert!(
             store
-                .reserve_read_only_session_interactive_blocking(
+                .reserve_shared_session_interactive_blocking(
                     project_id,
                     "session-blocked",
                     &requester,
@@ -27315,7 +27290,7 @@ mod tests {
         );
 
         let guardian =
-            interactive_guardian_holder(InteractiveGuardianDisposition::DeleteReadOnlyReservation);
+            interactive_guardian_holder(InteractiveGuardianDisposition::DeleteSharedReservation);
         assert!(
             store
                 .adopt_interactive_guardian_blocking(
@@ -27344,7 +27319,7 @@ mod tests {
                     project_id,
                     "session-blocked",
                     &guardian,
-                    InteractiveGuardianDisposition::DeleteReadOnlyReservation,
+                    InteractiveGuardianDisposition::DeleteSharedReservation,
                 )
                 .unwrap()
         );
@@ -27375,8 +27350,8 @@ mod tests {
     }
 
     #[test]
-    fn cancelling_read_only_resume_restores_a_stopped_session() {
-        let root = temp_root("read-only-stopped-reservation");
+    fn cancelling_shared_resume_restores_a_stopped_session() {
+        let root = temp_root("shared-stopped-reservation");
         let state_dir = root.join("state/clt");
         let project_root = root.join("project");
         fs::create_dir_all(&project_root).unwrap();
@@ -27401,10 +27376,10 @@ mod tests {
             )
             .unwrap();
 
-        let requester = InteractiveAgentLease::holder_for_read_only_session(true);
+        let requester = InteractiveAgentLease::holder_for_shared_session(true);
         assert!(
             store
-                .reserve_read_only_session_interactive_blocking(
+                .reserve_shared_session_interactive_blocking(
                     project_id,
                     "session-stopped",
                     &requester,
@@ -28709,7 +28684,7 @@ mod tests {
                         session_id,
                         from_holder,
                         resume_exec,
-                        read_only,
+                        shared_project,
                         control_fd,
                     },
             }) => {
@@ -28717,10 +28692,36 @@ mod tests {
                 assert_eq!(session_id, "session-123");
                 assert_eq!(from_holder, "clt-interactive-7-generation-2");
                 assert!(resume_exec);
-                assert!(!read_only);
+                assert!(!shared_project);
                 assert_eq!(control_fd, None);
             }
             _ => panic!("expected interactive guardian worker command"),
+        }
+
+        for shared_flag in ["--shared-project", "--read-only"] {
+            let shared = Cli::try_parse_from([
+                "clt",
+                "agent",
+                "interactive-session-worker",
+                "--project-id",
+                "42",
+                "--session-id",
+                "session-123",
+                "--from-holder",
+                "clt-shared-interactive-7-generation-2",
+                shared_flag,
+            ])
+            .unwrap();
+            assert!(matches!(
+                shared.command,
+                Some(Commands::Agent {
+                    command: AgentCommands::InteractiveSessionWorker {
+                        resume_exec: false,
+                        shared_project: true,
+                        ..
+                    },
+                })
+            ));
         }
     }
 

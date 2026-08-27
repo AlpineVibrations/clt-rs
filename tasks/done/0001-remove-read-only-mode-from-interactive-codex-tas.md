@@ -1,0 +1,3 @@
+Remove read-only mode from interactive Codex task resume so eligible c resumes stay writable even while another task is active (FEATURE, AGENT, TUI)
+
+Completion note: COMPLETED 2026-08-27: Replaced the busy-project read-only `c` resume path with a writable shared-project path. Interactive resumes now always launch Codex with `workspace-write` and `on-request` approval settings, while retaining exact-session fencing, active-run bookkeeping, stopped-session restoration, and compatibility recovery for reservations created by the prior read-only build. Updated TUI guidance, README, changelog, and regression coverage. Checks: `cargo fmt -- --check`; `cargo test -- --test-threads=1` (311 passed); `cargo clippy --all-targets -- -D warnings`; `git diff --check`.

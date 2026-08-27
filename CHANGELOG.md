@@ -18,7 +18,7 @@ Use this section while developing the next release.
 - Added a TUI Models page with provider presets, custom Responses-compatible endpoints, enabled model targets, favorites, a CLT-wide default, and per-project provider/model overrides.
 - Added `x`/`Delete` removal for non-built-in providers on the Models page, including dependent model, selection, and Codex configuration cleanup.
 - Added explicit, backup-protected Codex `config.toml` actions for custom provider definitions and the user's top-level default while keeping API keys exclusively in environment variables.
-- Added an idle Done-or-blocked-task `c` shortcut to resume that task's Codex session interactively, using strict read-only mode when another Codex task is already using the project and returning to the same board after Codex exits.
+- Added an idle Done-or-blocked-task `c` shortcut to resume that task's Codex session interactively with workspace-write access, including while another Codex task is using the project, and return to the same board after Codex exits.
 - Added task-level `s` controls to stop a selected task's linked active Codex session and later queue that exact session ID for automated `codex exec resume`, without stopping the agent service.
 - Added task-level `i` interruption to stop a selected task's linked active Codex process, open the same ID in interactive Codex, and automatically restart that session in `codex exec resume` mode after exit.
 - Added blocked-task monitoring that revisits one existing blocker at a time and backs off unresolved recovery attempts.
