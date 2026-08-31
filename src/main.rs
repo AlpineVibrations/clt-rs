@@ -77,6 +77,14 @@ const AGENT_DAEMON_DATABASE_LOCK_RETRY_ATTEMPTS: usize = 20;
 const AGENT_DAEMON_DATABASE_LOCK_RETRY_MILLIS: u64 = 5;
 const AGENT_DATABASE_OPEN_RETRY_ATTEMPTS: usize = 100;
 const AGENT_DATABASE_OPEN_RETRY_MILLIS: u64 = 10;
+#[cfg(unix)]
+const TURSO_SHARED_WAL_HEADER_MIN_BYTES: usize = 48;
+#[cfg(unix)]
+const TURSO_SHARED_WAL_INDEX_OVERFLOW_OFFSET: usize = 44;
+#[cfg(unix)]
+const TURSO_SHARED_WAL_MAGIC: &[u8; 8] = b"TSHMWAL\0";
+#[cfg(unix)]
+const TURSO_SHARED_WAL_VERSION: u32 = 1;
 const AGENT_DEFAULT_RUN_TIMEOUT_SECONDS: u64 = 45 * 60;
 const AGENT_DEFAULT_SUCCESS_COOLDOWN_SECONDS: u64 = 5;
 const AGENT_DAEMON_CHECKIN_STALE_SECONDS: u64 = 45;
@@ -110,6 +118,8 @@ const AGENT_SESSION_CONTROL_POLL_MILLIS: u64 = 500;
 const AGENT_SUPERVISOR_READY_TIMEOUT_SECONDS: u64 = 10;
 #[cfg(all(unix, test))]
 const TEST_AUTOMATED_SUPERVISOR_ENV: &str = "CLT_TEST_AUTOMATED_SUPERVISOR";
+#[cfg(all(unix, test))]
+const TEST_AGENT_SHARED_WAL_REBUILD_MARKER_ENV: &str = "CLT_TEST_AGENT_SHARED_WAL_REBUILD_MARKER";
 const TUI_AGENT_TABLE_CODEX_LAST_RUN_GAP: &str = "   ";
 const TUI_AGENT_TABLE_CODEX_MAX_WIDTH: usize = 20;
 const TUI_MODEL_DISCOVERY_TIMEOUT_SECONDS: u64 = 5;
@@ -9401,6 +9411,149 @@ mod agent_store {
     // sleeps and retries while a statement reports that the database is busy.
     const AGENT_DB_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
+    pub(crate) fn shared_wal_path(db_path: &Path) -> PathBuf {
+        let mut path = db_path.as_os_str().to_os_string();
+        path.push("-tshm");
+        PathBuf::from(path)
+    }
+
+    fn error_indicates_stale_shared_wal_index(error: &turso::Error) -> bool {
+        let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+        while let Some(source) = current {
+            let message = source.to_string();
+            if message.contains("Invalid page type:") || message.contains("non-index page") {
+                return true;
+            }
+            current = source.source();
+        }
+        false
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn request_shared_wal_index_rebuild(db_path: &Path) -> Result<bool> {
+        let shared_wal_path = shared_wal_path(db_path);
+        let file = match fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&shared_wal_path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "Failed to open Turso shared WAL coordination file {:?}",
+                        shared_wal_path
+                    )
+                });
+            }
+        };
+        let file_len = file
+            .metadata()
+            .with_context(|| {
+                format!(
+                    "Failed to inspect Turso shared WAL coordination file {:?}",
+                    shared_wal_path
+                )
+            })?
+            .len() as usize;
+        if file_len < TURSO_SHARED_WAL_HEADER_MIN_BYTES {
+            return Ok(false);
+        }
+
+        // The overflow fallback is safe for future opens, but an already-open
+        // Turso process may not have a local WAL scan to fall back to. Only
+        // request the rebuild after taking Turso's byte-0 lifetime lock
+        // exclusively, which proves no peer process is still using this map.
+        let mut lifetime_lock: libc::flock = unsafe { std::mem::zeroed() };
+        lifetime_lock.l_type = libc::F_WRLCK as _;
+        lifetime_lock.l_whence = libc::SEEK_SET as _;
+        lifetime_lock.l_start = 0;
+        lifetime_lock.l_len = 1;
+        let lock_result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &lifetime_lock) };
+        if lock_result == -1 {
+            let error = io::Error::last_os_error();
+            if error
+                .raw_os_error()
+                .is_some_and(|code| code == libc::EACCES || code == libc::EAGAIN)
+            {
+                return Ok(false);
+            }
+            return Err(error).with_context(|| {
+                format!(
+                    "Failed to lock Turso shared WAL coordination file {:?}",
+                    shared_wal_path
+                )
+            });
+        }
+
+        let mapping_len = file_len.min(4096);
+        let mapping = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                mapping_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if mapping == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error()).with_context(|| {
+                format!(
+                    "Failed to map Turso shared WAL coordination file {:?}",
+                    shared_wal_path
+                )
+            });
+        }
+
+        let result = (|| {
+            let bytes = unsafe { std::slice::from_raw_parts(mapping.cast::<u8>(), mapping_len) };
+            if bytes.get(..TURSO_SHARED_WAL_MAGIC.len()) != Some(TURSO_SHARED_WAL_MAGIC) {
+                return Ok(false);
+            }
+            let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+            if version != TURSO_SHARED_WAL_VERSION {
+                return Ok(false);
+            }
+
+            // Turso treats this bit as a correctness fallback: every process
+            // stops trusting the persisted page-to-frame index, scans the WAL,
+            // and the first idle opener republishes a rebuilt index. The field
+            // is a naturally aligned AtomicU32 in the version-1 tshm layout.
+            let overflow = unsafe {
+                &*mapping
+                    .cast::<u8>()
+                    .add(TURSO_SHARED_WAL_INDEX_OVERFLOW_OFFSET)
+                    .cast::<std::sync::atomic::AtomicU32>()
+            };
+            overflow.store(1, Ordering::Release);
+            #[cfg(test)]
+            if let Some(marker_path) = std::env::var_os(TEST_AGENT_SHARED_WAL_REBUILD_MARKER_ENV) {
+                fs::write(&marker_path, b"requested").with_context(|| {
+                    format!("Failed to write shared WAL rebuild marker {marker_path:?}")
+                })?;
+            }
+            Ok(true)
+        })();
+
+        let unmap_result = unsafe { libc::munmap(mapping, mapping_len) };
+        if unmap_result != 0 {
+            return Err(io::Error::last_os_error()).with_context(|| {
+                format!(
+                    "Failed to unmap Turso shared WAL coordination file {:?}",
+                    shared_wal_path
+                )
+            });
+        }
+        result
+    }
+
+    #[cfg(not(unix))]
+    fn request_shared_wal_index_rebuild(_db_path: &Path) -> Result<bool> {
+        Ok(false)
+    }
+
     struct AgentMigration<'a> {
         version: i64,
         statements: &'a [&'static str],
@@ -9662,6 +9815,7 @@ mod agent_store {
         db_path: PathBuf,
         db: Database,
         pending_migration_version: Option<i64>,
+        checkpoint_pin: Option<Connection>,
     }
 
     #[derive(Clone, Debug)]
@@ -9870,6 +10024,7 @@ mod agent_store {
             })?;
             let db_path = state_dir.join(AGENT_DB_FILE);
             let mut open_attempt = 0;
+            let mut shared_wal_rebuild_requested = false;
             let db = loop {
                 match Builder::new_local(db_path.to_string_lossy().as_ref())
                     .experimental_multiprocess_wal(true)
@@ -9888,6 +10043,29 @@ mod agent_store {
                             .await;
                     }
                     Err(error) => {
+                        if !shared_wal_rebuild_requested
+                            && error_indicates_stale_shared_wal_index(&error)
+                        {
+                            match request_shared_wal_index_rebuild(&db_path) {
+                                Ok(true) => {
+                                    shared_wal_rebuild_requested = true;
+                                    tokio::time::sleep(Duration::from_millis(
+                                        AGENT_DATABASE_OPEN_RETRY_MILLIS,
+                                    ))
+                                    .await;
+                                    continue;
+                                }
+                                Ok(false) => {}
+                                Err(rebuild_error) => {
+                                    return Err(error).with_context(|| {
+                                        format!(
+                                            "Failed to open agent database {:?}; also failed to request a shared WAL index rebuild: {rebuild_error:#}",
+                                            db_path
+                                        )
+                                    });
+                                }
+                            }
+                        }
                         return Err(error).with_context(|| {
                             format!("Failed to open agent database {:?}", db_path)
                         });
@@ -9901,15 +10079,40 @@ mod agent_store {
 
             let pending_migration_version = apply_migrations(&mut conn, AGENT_MIGRATIONS).await?;
 
+            let checkpoint_pin = open_checkpoint_pin(&db, &db_path).await?;
+
             Ok(Self {
                 db_path,
                 db,
                 pending_migration_version,
+                checkpoint_pin: Some(checkpoint_pin),
             })
         }
 
         pub(crate) fn pending_migration_version(&self) -> Option<i64> {
             self.pending_migration_version
+        }
+
+        #[cfg(test)]
+        pub(crate) fn write_checkpoint_pressure_blocking(
+            &self,
+            project_id: i64,
+            writes: usize,
+        ) -> Result<()> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(async {
+                    let conn = self.connect().await?;
+                    for value in 0..writes {
+                        conn.execute(
+                            "UPDATE projects SET failure_count = ?1 WHERE id = ?2",
+                            params![value as i64, project_id],
+                        )
+                        .await
+                        .context("Failed to create agent database checkpoint pressure")?;
+                    }
+                    Ok(())
+                })
         }
 
         #[cfg(test)]
@@ -13922,6 +14125,52 @@ mod agent_store {
                     Ok(())
                 })
         }
+    }
+
+    impl Drop for TursoAgentStore {
+        fn drop(&mut self) {
+            let Some(checkpoint_pin) = self.checkpoint_pin.take() else {
+                return;
+            };
+            // Drop may run from inside a Tokio runtime. Roll the pin back on a
+            // short-lived helper thread so we can drive Turso's async state
+            // machine without nesting runtimes or leaving a shared read mark.
+            let rollback = thread::Builder::new()
+                .name("clt-agent-wal-pin-release".to_string())
+                .spawn(move || {
+                    tokio::runtime::Runtime::new().ok().and_then(|runtime| {
+                        runtime
+                            .block_on(checkpoint_pin.execute("ROLLBACK", ()))
+                            .ok()
+                    })
+                });
+            if let Ok(handle) = rollback {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    async fn open_checkpoint_pin(db: &Database, db_path: &Path) -> Result<Connection> {
+        let pin = db.connect().with_context(|| {
+            format!(
+                "Failed to connect the agent database checkpoint pin {:?}",
+                db_path
+            )
+        })?;
+        configure_agent_connection(&pin).await?;
+        pin.execute("BEGIN DEFERRED", ())
+            .await
+            .context("Failed to begin the agent database checkpoint pin")?;
+        let mut rows = pin
+            .query("SELECT version FROM schema_migrations LIMIT 1", ())
+            .await
+            .context("Failed to establish the agent database checkpoint pin")?;
+        rows.next()
+            .await
+            .context("Failed to read the agent database checkpoint pin")?
+            .ok_or_else(|| anyhow::anyhow!("Agent database has no applied migrations"))?;
+        drop(rows);
+        Ok(pin)
     }
 
     async fn configure_agent_connection(conn: &Connection) -> Result<()> {
@@ -29853,6 +30102,37 @@ mod tests {
         "CLT_TEST_AGENT_STORE_MULTIPROCESS_STATE_DIR";
     const AGENT_STORE_MULTIPROCESS_GATE_ENV: &str = "CLT_TEST_AGENT_STORE_MULTIPROCESS_GATE";
     const AGENT_STORE_MULTIPROCESS_READY_ENV: &str = "CLT_TEST_AGENT_STORE_MULTIPROCESS_READY";
+    const AGENT_STORE_MULTIPROCESS_HOLD_GATE_ENV: &str =
+        "CLT_TEST_AGENT_STORE_MULTIPROCESS_HOLD_GATE";
+    const AGENT_STORE_MULTIPROCESS_HOLD_READY_ENV: &str =
+        "CLT_TEST_AGENT_STORE_MULTIPROCESS_HOLD_READY";
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_store_marks_a_versioned_turso_frame_index_for_rebuild() {
+        let root = temp_root("agent-store-shared-wal-rebuild-bit");
+        fs::create_dir_all(&root).unwrap();
+        let db_path = root.join(AGENT_DB_FILE);
+        let shared_wal_path = agent_store::shared_wal_path(&db_path);
+        let mut bytes = vec![0u8; 4096];
+        bytes[..TURSO_SHARED_WAL_MAGIC.len()].copy_from_slice(TURSO_SHARED_WAL_MAGIC);
+        bytes[8..12].copy_from_slice(&TURSO_SHARED_WAL_VERSION.to_le_bytes());
+        fs::write(&shared_wal_path, bytes).unwrap();
+
+        assert!(agent_store::request_shared_wal_index_rebuild(&db_path).unwrap());
+        let bytes = fs::read(&shared_wal_path).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(
+                bytes[TURSO_SHARED_WAL_INDEX_OVERFLOW_OFFSET
+                    ..TURSO_SHARED_WAL_INDEX_OVERFLOW_OFFSET + 4]
+                    .try_into()
+                    .unwrap()
+            ),
+            1
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn agent_store_allows_a_second_process_to_open_the_database() {
@@ -29880,6 +30160,254 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn agent_store_long_lived_peer_pins_the_wal_before_auto_checkpoint_restart() {
+        const WAL_HEADER_BYTES: usize = 32;
+        const WAL_FRAME_HEADER_BYTES: usize = 24;
+        const CHECKPOINT_PRESSURE_WRITES: usize = 1_100;
+
+        let root = temp_root("agent-store-checkpoint-pin");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "checkpoint-pin-project")
+            .unwrap();
+        let project_id = store.list_projects_blocking().unwrap()[0].id;
+        store
+            .write_checkpoint_pressure_blocking(project_id, CHECKPOINT_PRESSURE_WRITES)
+            .unwrap();
+
+        let mut wal_path = store.db_path().as_os_str().to_os_string();
+        wal_path.push("-wal");
+        let wal = fs::read(PathBuf::from(wal_path)).unwrap();
+        let page_size = u32::from_be_bytes(wal[8..12].try_into().unwrap()) as usize;
+        let frame_count = (wal.len() - WAL_HEADER_BYTES) / (WAL_FRAME_HEADER_BYTES + page_size);
+        assert!(
+            frame_count > 1_000,
+            "the WAL restarted despite the long-lived store's checkpoint pin: {frame_count} frames"
+        );
+
+        let child_output = Command::new(std::env::current_exe().unwrap())
+            .arg("tests::agent_store_multiprocess_child_opens_database")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(AGENT_STORE_MULTIPROCESS_STATE_DIR_ENV, &state_dir)
+            .output()
+            .unwrap();
+        assert!(
+            child_output.status.success(),
+            "second process failed after checkpoint pressure: stdout={}; stderr={}",
+            String::from_utf8_lossy(&child_output.stdout),
+            String::from_utf8_lossy(&child_output.stderr)
+        );
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn corrupt_shared_wal_page_one_mapping(db_path: &Path) {
+        use std::os::unix::fs::FileExt;
+
+        const WAL_HEADER_BYTES: usize = 32;
+        const WAL_FRAME_HEADER_BYTES: usize = 24;
+        const SHARED_WAL_BASE_BYTES: usize = 4096;
+        const FRAME_INDEX_BLOCK_CAPACITY: usize = 4096;
+        const FRAME_INDEX_HASH_SLOTS: usize = FRAME_INDEX_BLOCK_CAPACITY * 2;
+        const FRAME_INDEX_ENTRY_BYTES: usize = 16;
+        const FRAME_INDEX_ENTRY_REGION_BYTES: usize =
+            FRAME_INDEX_BLOCK_CAPACITY * FRAME_INDEX_ENTRY_BYTES;
+        const FRAME_INDEX_HASH_REGION_BYTES: usize = FRAME_INDEX_HASH_SLOTS * 2;
+        const FRAME_INDEX_BLOCK_BYTES: usize =
+            FRAME_INDEX_ENTRY_REGION_BYTES + FRAME_INDEX_HASH_REGION_BYTES;
+
+        let mut wal_path = db_path.as_os_str().to_os_string();
+        wal_path.push("-wal");
+        let wal = fs::read(PathBuf::from(wal_path)).unwrap();
+        let page_size = u32::from_be_bytes(wal[8..12].try_into().unwrap()) as usize;
+        let frame_size = WAL_FRAME_HEADER_BYTES + page_size;
+        let frame_count = (wal.len() - WAL_HEADER_BYTES) / frame_size;
+        let target_frame = (0..frame_count)
+            .rev()
+            .find(|frame_index| {
+                let frame_offset = WAL_HEADER_BYTES + frame_index * frame_size;
+                let page_id =
+                    u32::from_be_bytes(wal[frame_offset..frame_offset + 4].try_into().unwrap());
+                page_id != 1
+                    && wal[frame_offset + WAL_FRAME_HEADER_BYTES + 100] == 0
+                    && (*frame_index + 1..frame_count).all(|later_frame_index| {
+                        let later_offset = WAL_HEADER_BYTES + later_frame_index * frame_size;
+                        u32::from_be_bytes(wal[later_offset..later_offset + 4].try_into().unwrap())
+                            != 1
+                    })
+            })
+            .map(|frame_index| frame_index as u64 + 1)
+            .expect("test WAL needs a non-page-one tail frame with an invalid page-one header");
+
+        let shared_wal_path = agent_store::shared_wal_path(db_path);
+        let mut shared_wal = fs::read(&shared_wal_path).unwrap();
+        let frame_index_blocks =
+            u32::from_le_bytes(shared_wal[32..36].try_into().unwrap()) as usize;
+        let frame_index_len = u32::from_le_bytes(shared_wal[40..44].try_into().unwrap()) as usize;
+        let target_slot = (0..frame_index_len)
+            .find(|slot| {
+                let block = slot / FRAME_INDEX_BLOCK_CAPACITY;
+                let local_slot = slot % FRAME_INDEX_BLOCK_CAPACITY;
+                let entry_offset = SHARED_WAL_BASE_BYTES
+                    + block * FRAME_INDEX_BLOCK_BYTES
+                    + local_slot * FRAME_INDEX_ENTRY_BYTES;
+                u64::from_le_bytes(
+                    shared_wal[entry_offset + 8..entry_offset + 16]
+                        .try_into()
+                        .unwrap(),
+                ) == target_frame
+            })
+            .expect("test WAL frame must be represented in the shared index");
+        let target_block = target_slot / FRAME_INDEX_BLOCK_CAPACITY;
+        let target_local_slot = target_slot % FRAME_INDEX_BLOCK_CAPACITY;
+        let target_entry_offset = SHARED_WAL_BASE_BYTES
+            + target_block * FRAME_INDEX_BLOCK_BYTES
+            + target_local_slot * FRAME_INDEX_ENTRY_BYTES;
+        shared_wal[target_entry_offset..target_entry_offset + 8]
+            .copy_from_slice(&1u64.to_le_bytes());
+
+        for block in 0..frame_index_blocks {
+            let hash_offset = SHARED_WAL_BASE_BYTES
+                + block * FRAME_INDEX_BLOCK_BYTES
+                + FRAME_INDEX_ENTRY_REGION_BYTES;
+            shared_wal[hash_offset..hash_offset + FRAME_INDEX_HASH_REGION_BYTES].fill(0);
+        }
+        for slot in 0..frame_index_len {
+            let block = slot / FRAME_INDEX_BLOCK_CAPACITY;
+            let local_slot = slot % FRAME_INDEX_BLOCK_CAPACITY;
+            let block_offset = SHARED_WAL_BASE_BYTES + block * FRAME_INDEX_BLOCK_BYTES;
+            let entry_offset = block_offset + local_slot * FRAME_INDEX_ENTRY_BYTES;
+            let page_id = u64::from_le_bytes(
+                shared_wal[entry_offset..entry_offset + 8]
+                    .try_into()
+                    .unwrap(),
+            );
+            let hash_offset = block_offset + FRAME_INDEX_ENTRY_REGION_BYTES;
+            let mut hash_slot = page_id.wrapping_mul(383) as usize % FRAME_INDEX_HASH_SLOTS;
+            loop {
+                let value_offset = hash_offset + hash_slot * 2;
+                if u16::from_le_bytes(
+                    shared_wal[value_offset..value_offset + 2]
+                        .try_into()
+                        .unwrap(),
+                ) == 0
+                {
+                    shared_wal[value_offset..value_offset + 2]
+                        .copy_from_slice(&((local_slot + 1) as u16).to_le_bytes());
+                    break;
+                }
+                hash_slot = (hash_slot + 1) % FRAME_INDEX_HASH_SLOTS;
+            }
+        }
+        shared_wal
+            [TURSO_SHARED_WAL_INDEX_OVERFLOW_OFFSET..TURSO_SHARED_WAL_INDEX_OVERFLOW_OFFSET + 4]
+            .copy_from_slice(&0u32.to_le_bytes());
+
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(&shared_wal_path)
+            .unwrap();
+        file.write_all_at(&shared_wal, 0).unwrap();
+        file.sync_data().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_store_defers_stale_index_recovery_until_the_live_peer_exits() {
+        let root = temp_root("agent-store-stale-shared-wal-index");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        let recovery_marker = root.join("recovery-requested");
+        let holder_ready = root.join("holder-ready");
+        let holder_gate = root.join("holder-gate");
+        fs::create_dir_all(&project_root).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "stale-index-project")
+            .unwrap();
+
+        let mut holder = Command::new(std::env::current_exe().unwrap())
+            .arg("tests::agent_store_multiprocess_child_opens_database")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(AGENT_STORE_MULTIPROCESS_STATE_DIR_ENV, &state_dir)
+            .env(AGENT_STORE_MULTIPROCESS_HOLD_READY_ENV, &holder_ready)
+            .env(AGENT_STORE_MULTIPROCESS_HOLD_GATE_ENV, &holder_gate)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let holder_deadline = Instant::now() + Duration::from_secs(5);
+        while !holder_ready.exists() && Instant::now() < holder_deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if !holder_ready.exists() {
+            let _ = holder.kill();
+            let holder_output = holder.wait_with_output().unwrap();
+            panic!(
+                "peer process did not open the agent store: stdout={}; stderr={}",
+                String::from_utf8_lossy(&holder_output.stdout),
+                String::from_utf8_lossy(&holder_output.stderr)
+            );
+        }
+        corrupt_shared_wal_page_one_mapping(store.db_path());
+
+        let blocked_output = Command::new(std::env::current_exe().unwrap())
+            .arg("tests::agent_store_multiprocess_child_opens_database")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(AGENT_STORE_MULTIPROCESS_STATE_DIR_ENV, &state_dir)
+            .env(TEST_AGENT_SHARED_WAL_REBUILD_MARKER_ENV, &recovery_marker)
+            .output()
+            .unwrap();
+
+        assert!(
+            !blocked_output.status.success(),
+            "stale-index recovery must wait for the live peer: stdout={}; stderr={}",
+            String::from_utf8_lossy(&blocked_output.stdout),
+            String::from_utf8_lossy(&blocked_output.stderr)
+        );
+        assert!(
+            !recovery_marker.exists(),
+            "recovery was requested while a peer still held the Turso lifetime lock"
+        );
+
+        drop(store);
+        holder.kill().unwrap();
+        let _ = holder.wait_with_output().unwrap();
+
+        let recovered_output = Command::new(std::env::current_exe().unwrap())
+            .arg("tests::agent_store_multiprocess_child_opens_database")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(AGENT_STORE_MULTIPROCESS_STATE_DIR_ENV, &state_dir)
+            .env(TEST_AGENT_SHARED_WAL_REBUILD_MARKER_ENV, &recovery_marker)
+            .output()
+            .unwrap();
+        assert!(
+            recovered_output.status.success(),
+            "agent store did not recover after its peer exited: stdout={}; stderr={}",
+            String::from_utf8_lossy(&recovered_output.stdout),
+            String::from_utf8_lossy(&recovered_output.stderr)
+        );
+        assert!(recovery_marker.is_file());
+
+        let recovered_store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        assert!(recovered_store.table_exists_blocking("projects").unwrap());
+        drop(recovered_store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn agent_store_multiprocess_child_opens_database() {
         let Some(state_dir) = std::env::var_os(AGENT_STORE_MULTIPROCESS_STATE_DIR_ENV) else {
@@ -29903,6 +30431,20 @@ mod tests {
 
         let store = agent_store::TursoAgentStore::open_blocking(Path::new(&state_dir)).unwrap();
         assert!(store.table_exists_blocking("projects").unwrap());
+        if let Some(ready_path) = std::env::var_os(AGENT_STORE_MULTIPROCESS_HOLD_READY_ENV) {
+            fs::write(ready_path, b"ready").unwrap();
+        }
+        if let Some(gate_path) = std::env::var_os(AGENT_STORE_MULTIPROCESS_HOLD_GATE_ENV) {
+            let gate_path = PathBuf::from(gate_path);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !gate_path.exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for multiprocess hold gate"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
     }
 
     #[test]
