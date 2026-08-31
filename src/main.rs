@@ -9828,6 +9828,7 @@ mod agent_store {
         pub(crate) stdout_path: Option<String>,
         pub(crate) stderr_path: Option<String>,
         pub(crate) summary: Option<String>,
+        pub(crate) codex_session_id: Option<String>,
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -12945,7 +12946,8 @@ mod agent_store {
             let mut rows = conn
                 .query(
                     "SELECT r.id, r.project_id, p.name, p.path, r.status, r.started_at,
-                            r.finished_at, r.exit_code, r.stdout_path, r.stderr_path, r.summary
+                            r.finished_at, r.exit_code, r.stdout_path, r.stderr_path, r.summary,
+                            r.codex_session_id
                      FROM runs r
                      JOIN projects p ON p.id = r.project_id
                      ORDER BY r.id DESC
@@ -12969,6 +12971,7 @@ mod agent_store {
                     stdout_path: row_optional_text(&row, 8, "stdout_path")?,
                     stderr_path: row_optional_text(&row, 9, "stderr_path")?,
                     summary: row_optional_text(&row, 10, "summary")?,
+                    codex_session_id: row_optional_text(&row, 11, "codex_session_id")?,
                 });
             }
 
@@ -12989,7 +12992,8 @@ mod agent_store {
             let mut rows = conn
                 .query(
                     "SELECT r.id, r.project_id, p.name, p.path, r.status, r.started_at,
-                            r.finished_at, r.exit_code, r.stdout_path, r.stderr_path, r.summary
+                            r.finished_at, r.exit_code, r.stdout_path, r.stderr_path, r.summary,
+                            r.codex_session_id
                      FROM runs r
                      JOIN projects p ON p.id = r.project_id
                      WHERE r.project_id = ?1
@@ -13020,6 +13024,7 @@ mod agent_store {
                 stdout_path: row_optional_text(&row, 8, "stdout_path")?,
                 stderr_path: row_optional_text(&row, 9, "stderr_path")?,
                 summary: row_optional_text(&row, 10, "summary")?,
+                codex_session_id: row_optional_text(&row, 11, "codex_session_id")?,
             }))
         }
 
@@ -13042,7 +13047,8 @@ mod agent_store {
             let mut rows = conn
                 .query(
                     "SELECT r.id, r.project_id, p.name, p.path, r.status, r.started_at,
-                            r.finished_at, r.exit_code, r.stdout_path, r.stderr_path, r.summary
+                            r.finished_at, r.exit_code, r.stdout_path, r.stderr_path, r.summary,
+                            r.codex_session_id
                      FROM runs r
                      JOIN projects p ON p.id = r.project_id
                      WHERE r.project_id = ?1 AND r.codex_session_id = ?2
@@ -13077,6 +13083,7 @@ mod agent_store {
                 stdout_path: row_optional_text(&row, 8, "stdout_path")?,
                 stderr_path: row_optional_text(&row, 9, "stderr_path")?,
                 summary: row_optional_text(&row, 10, "summary")?,
+                codex_session_id: row_optional_text(&row, 11, "codex_session_id")?,
             }))
         }
 
@@ -16793,20 +16800,44 @@ impl TuiModelInput {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TuiCodexSessionTarget {
+    project_id: i64,
+    project_path: PathBuf,
+    session_id: String,
+}
+
+impl TuiCodexSessionTarget {
+    fn new(project: &agent_store::AgentProject, session_id: String) -> Self {
+        Self {
+            project_id: project.id,
+            project_path: project.path.clone(),
+            session_id,
+        }
+    }
+}
+
 struct TuiAgentLogView {
     project_name: String,
     path: Option<PathBuf>,
     content: String,
     is_live: bool,
+    session_target: Option<TuiCodexSessionTarget>,
 }
 
 impl TuiAgentLogView {
-    fn new(project_name: String, path: PathBuf, is_live: bool) -> Result<Self> {
+    fn new(
+        project_name: String,
+        path: PathBuf,
+        is_live: bool,
+        session_target: Option<TuiCodexSessionTarget>,
+    ) -> Result<Self> {
         let mut view = Self {
             project_name,
             path: Some(path),
             content: String::new(),
             is_live,
+            session_target,
         };
         view.refresh()?;
         Ok(view)
@@ -16818,6 +16849,7 @@ impl TuiAgentLogView {
             path: None,
             content,
             is_live: false,
+            session_target: None,
         }
     }
 
@@ -18394,7 +18426,7 @@ fn tui_agent_log_refresh_interval() -> Duration {
 }
 
 fn tui_agent_panel_instructions() -> &'static str {
-    "Up/Down selects, Enter opens/adds, Space toggles ON/OFF, Delete removes with confirmation, g cycles Git off/commit/push, m cycles the selected target, M opens Models, f toggles fast, t cycles thinking, l shows output. Tab returns to Kanban."
+    "Up/Down selects, Enter opens/adds, Space toggles ON/OFF, Delete removes with confirmation, g cycles Git off/commit/push, m cycles the selected target, M opens Models, f toggles fast, t cycles thinking, l shows output. With output open: s stops/resumes, i takes over a live session, and c continues an idle session. Tab returns to Kanban."
 }
 
 fn parse_agent_codex_session_id(line: &str) -> Option<String> {
@@ -18420,9 +18452,14 @@ fn agent_codex_session_id_from_log(path: &Path) -> Result<Option<String>> {
 
 fn tui_agent_log_title(log_view: &TuiAgentLogView) -> String {
     let status = if log_view.is_live { "LIVE" } else { "LATEST" };
+    let controls = if log_view.session_target.is_some() {
+        "s/i/c controls; l/Esc closes"
+    } else {
+        "l/Esc closes"
+    };
     format!(
-        "Agent Output [{status}]: {} (l/Esc closes)",
-        log_view.project_name
+        "Agent Output [{status}]: {} ({controls})",
+        log_view.project_name,
     )
 }
 
@@ -18445,8 +18482,8 @@ fn latest_agent_log_path(log_dir: &Path, extension: &str) -> Result<Option<PathB
     Ok(paths.pop())
 }
 
-fn preferred_recorded_agent_output_path(run: agent_store::AgentRunRecord) -> Option<PathBuf> {
-    let stdout_path = run.stdout_path.map(PathBuf::from);
+fn preferred_recorded_agent_output_path(run: &agent_store::AgentRunRecord) -> Option<PathBuf> {
+    let stdout_path = run.stdout_path.as_ref().map(PathBuf::from);
     let stdout_has_output = stdout_path
         .as_ref()
         .and_then(|path| fs::metadata(path).ok())
@@ -18455,7 +18492,7 @@ fn preferred_recorded_agent_output_path(run: agent_store::AgentRunRecord) -> Opt
     if stdout_has_output {
         stdout_path
     } else {
-        run.stderr_path.map(PathBuf::from).or(stdout_path)
+        run.stderr_path.as_ref().map(PathBuf::from).or(stdout_path)
     }
 }
 
@@ -18903,6 +18940,10 @@ fn selected_tui_task_log_view_at(
     let Some(session_id) = codex_session_for_task(task) else {
         return Ok(None);
     };
+    let session_target = Some(TuiCodexSessionTarget::new(
+        &selected.project,
+        session_id.clone(),
+    ));
 
     let live_path = if selected.runtime_state.is_running() {
         active_agent_log_for_codex_session(selected, state_dir, &session_id)?
@@ -18917,14 +18958,17 @@ fn selected_tui_task_log_view_at(
             (
                 store
                     .latest_run_for_codex_session_blocking(selected.project.id, &session_id)?
+                    .as_ref()
                     .and_then(preferred_recorded_agent_output_path),
                 false,
             )
         }
     };
 
-    path.map(|path| TuiAgentLogView::new(selected.project.name.clone(), path, is_live))
-        .transpose()
+    path.map(|path| {
+        TuiAgentLogView::new(selected.project.name.clone(), path, is_live, session_target)
+    })
+    .transpose()
 }
 
 fn active_agent_log_for_codex_session(
@@ -19045,21 +19089,28 @@ fn selected_tui_agent_log_view_at(
         None
     };
 
-    let (path, is_live) = match live_path {
-        Some(path) => (Some(path), true),
+    let (path, is_live, session_target) = match live_path {
+        Some(path) => {
+            let session_target = agent_codex_session_id_from_log(&path)?
+                .map(|session_id| TuiCodexSessionTarget::new(&selected.project, session_id));
+            (Some(path), true, session_target)
+        }
         None => {
             let store = open_agent_store_at(state_dir)?;
-            (
-                store
-                    .latest_run_for_project_blocking(selected.project.id)?
-                    .and_then(preferred_recorded_agent_output_path),
-                false,
-            )
+            let run = store.latest_run_for_project_blocking(selected.project.id)?;
+            let session_target = run
+                .as_ref()
+                .and_then(|run| run.codex_session_id.clone())
+                .map(|session_id| TuiCodexSessionTarget::new(&selected.project, session_id));
+            let path = run.as_ref().and_then(preferred_recorded_agent_output_path);
+            (path, false, session_target)
         }
     };
 
-    path.map(|path| TuiAgentLogView::new(selected.project.name.clone(), path, is_live))
-        .transpose()
+    path.map(|path| {
+        TuiAgentLogView::new(selected.project.name.clone(), path, is_live, session_target)
+    })
+    .transpose()
 }
 
 fn sync_open_tui_agent_log_view(panel: &TuiAgentPanel, log_view: &mut Option<TuiAgentLogView>) {
@@ -20695,6 +20746,279 @@ fn write_tui_codex_handoff_status<W: Write>(
     output.flush()
 }
 
+type TuiTerminal = Terminal<CrosstermBackend<std::io::Stdout>>;
+
+fn viewed_tui_codex_session_target(
+    log_view: Option<&TuiAgentLogView>,
+) -> Result<TuiCodexSessionTarget> {
+    let log_view = log_view.context("Open agent output with l before controlling its session")?;
+    log_view.session_target.clone().context(
+        "The displayed output does not identify a Codex session yet; wait for its session ID",
+    )
+}
+
+fn run_tui_codex_session_interrupt(
+    terminal: &mut TuiTerminal,
+    terminal_session: &mut TerminalSession,
+    return_title: &str,
+    target: &TuiCodexSessionTarget,
+    label: &str,
+) -> Result<String> {
+    draw_tui_codex_handoff_status(terminal, TuiCodexHandoffStage::WaitingForAutomatedExit)?;
+    let interactive_lease =
+        prepare_tui_codex_session_interrupt(target.project_id, &target.session_id)?;
+
+    let _ = draw_tui_codex_handoff_status(terminal, TuiCodexHandoffStage::EnteringInteractive);
+    terminal_session.suspend();
+    let _ =
+        write_tui_codex_handoff_status(&mut stdout(), TuiCodexHandoffStage::EnteringInteractive);
+    let provisional_holder = interactive_lease.holder.clone();
+    let resume_result = resume_codex_session_interactively(
+        &target.project_path,
+        target.project_id,
+        &target.session_id,
+        &provisional_holder,
+        InteractiveCodexResumeMode::ResumeExec,
+    );
+    let _ = write_tui_codex_handoff_status(&mut stdout(), TuiCodexHandoffStage::QueueingExecResume);
+    let guardian_completed = resume_result.as_ref().is_ok_and(|status| status.success());
+    let queue_result = if guardian_completed {
+        Ok(())
+    } else {
+        queue_tui_codex_session_exec_resume(
+            target.project_id,
+            &target.session_id,
+            &provisional_holder,
+        )
+    };
+    let release_result = interactive_lease.release();
+    let worker_result = if guardian_completed {
+        Ok(None)
+    } else if queue_result.is_ok() {
+        spawn_agent_session_resume_worker(
+            &target.project_path,
+            target.project_id,
+            &target.session_id,
+        )
+        .map(Some)
+    } else {
+        Ok(None)
+    };
+    terminal_session.resume(return_title)?;
+    terminal.clear()?;
+
+    let interactive_summary = match resume_result {
+        Ok(status) if status.success() => {
+            format!("Returned from interactive Codex for {label}.")
+        }
+        Ok(status) => format!("Interactive Codex exited with {status}."),
+        Err(error) => format!("Interactive Codex error: {error}."),
+    };
+    let supervision_log = if guardian_completed {
+        agent_state_dir().ok().map(|state_dir| {
+            agent_session_resume_worker_log_path(&state_dir, target.project_id, &target.session_id)
+                .display()
+                .to_string()
+        })
+    } else {
+        worker_result
+            .as_ref()
+            .ok()
+            .and_then(|path| path.as_ref())
+            .map(|path| path.display().to_string())
+    };
+    let mut followup_errors = Vec::new();
+    if let Err(error) = queue_result {
+        followup_errors.push(format!("could not queue exact exec resume: {error}"));
+    }
+    if let Err(error) = release_result {
+        followup_errors.push(format!("could not release the interactive lease: {error}"));
+    }
+    if let Err(error) = worker_result {
+        followup_errors.push(format!(
+            "could not start the exact-session resume worker: {error}"
+        ));
+    }
+
+    Ok(if followup_errors.is_empty() {
+        match supervision_log {
+            Some(log) => format!(
+                "{interactive_summary} The same session is queued and supervised for automated exec resume (worker log: {log})."
+            ),
+            None => interactive_summary,
+        }
+    } else {
+        format!("{interactive_summary} CLT {}", followup_errors.join("; "))
+    })
+}
+
+fn run_tui_codex_session_continue(
+    terminal: &mut TuiTerminal,
+    terminal_session: &mut TerminalSession,
+    return_title: &str,
+    target: &TuiCodexSessionTarget,
+    label: &str,
+    shares_project: bool,
+    require_resumable_task: bool,
+) -> Result<String> {
+    draw_tui_codex_handoff_status(
+        terminal,
+        if shares_project {
+            TuiCodexHandoffStage::PreparingSharedSession
+        } else {
+            TuiCodexHandoffStage::PreparingIdleSession
+        },
+    )?;
+    let stopped_control = tui_stopped_codex_session_control(target.project_id, &target.session_id)?;
+    let restore_stopped = stopped_control.is_some();
+    let (interactive_lease, provisional_holder) = if shares_project {
+        (
+            None,
+            InteractiveAgentLease::holder_for_shared_session(restore_stopped),
+        )
+    } else {
+        let lease = InteractiveAgentLease::try_acquire_idle(target.project_id, restore_stopped)?
+            .context(
+                "Another Codex task began using this project; press c again to open this session alongside it",
+            )?;
+        let holder = lease.holder.clone();
+        (Some(lease), holder)
+    };
+    let stopped_run_token = stopped_control
+        .as_ref()
+        .and_then(|control| control.run_token.as_deref());
+    let reservation_result = if shares_project {
+        reserve_tui_shared_codex_session_interactive(
+            target.project_id,
+            &target.session_id,
+            &provisional_holder,
+            stopped_run_token,
+        )
+    } else {
+        reserve_tui_idle_codex_session_interactive(
+            target.project_id,
+            &target.session_id,
+            &provisional_holder,
+            stopped_run_token,
+        )
+    };
+    if !reservation_result.as_ref().is_ok_and(|reserved| *reserved) {
+        let release_result = interactive_lease.map_or(Ok(()), InteractiveAgentLease::release);
+        return match (reservation_result, release_result) {
+            (Ok(false), Ok(())) if shares_project => anyhow::bail!(
+                "The active project run or selected session changed before shared Codex could open; try again"
+            ),
+            (Ok(false), Ok(())) => {
+                anyhow::bail!(
+                    "This Codex session became busy before it could be reserved; try again"
+                )
+            }
+            (Err(error), Ok(())) => Err(error),
+            (Ok(false), Err(error)) => Err(error)
+                .context("The Codex session changed, and its project lease could not be released"),
+            (Err(reserve_error), Err(release_error)) => Err(reserve_error).context(format!(
+                "The project lease also could not be released: {release_error}"
+            )),
+            (Ok(true), _) => unreachable!(),
+        };
+    }
+
+    if require_resumable_task {
+        let task_is_resumable = codex_session_task_supports_interactive_resume(
+            &target.project_path,
+            &target.session_id,
+        );
+        if !task_is_resumable.as_ref().is_ok_and(|resumable| *resumable) {
+            let cancel_result = cancel_tui_idle_codex_session_interactive(
+                target.project_id,
+                &target.session_id,
+                &provisional_holder,
+            );
+            let release_result = interactive_lease.map_or(Ok(()), InteractiveAgentLease::release);
+            return match (task_is_resumable, cancel_result, release_result) {
+                (Ok(false), Ok(true), Ok(())) => anyhow::bail!(
+                    "This task changed before its Codex session could open; c is only available from Done or currently blocked tasks"
+                ),
+                (Err(error), Ok(true), Ok(())) => Err(error)
+                    .context("Unable to revalidate the Codex task before interactive resume"),
+                (task, cancel, release) => anyhow::bail!(
+                    "Unable to open the Codex task safely (task: {}; reservation: {}; lease: {})",
+                    task.map(|_| "changed".to_string())
+                        .unwrap_or_else(|error| error.to_string()),
+                    cancel
+                        .map(|cancelled| if cancelled {
+                            "released"
+                        } else {
+                            "still fenced"
+                        }
+                        .to_string())
+                        .unwrap_or_else(|error| error.to_string()),
+                    release
+                        .map(|()| "released".to_string())
+                        .unwrap_or_else(|error| error.to_string()),
+                ),
+            };
+        }
+    }
+
+    let _ = draw_tui_codex_handoff_status(terminal, TuiCodexHandoffStage::EnteringInteractive);
+    terminal_session.suspend();
+    let _ =
+        write_tui_codex_handoff_status(&mut stdout(), TuiCodexHandoffStage::EnteringInteractive);
+    let resume_result = resume_codex_session_interactively(
+        &target.project_path,
+        target.project_id,
+        &target.session_id,
+        &provisional_holder,
+        if shares_project {
+            InteractiveCodexResumeMode::WritableShared
+        } else {
+            InteractiveCodexResumeMode::WritableIdle
+        },
+    );
+    let _ =
+        write_tui_codex_handoff_status(&mut stdout(), TuiCodexHandoffStage::RestoringTaskControls);
+    let guardian_completed = resume_result.as_ref().is_ok_and(|status| status.success());
+    let cancel_result = if guardian_completed {
+        Ok(())
+    } else {
+        match cancel_tui_idle_codex_session_interactive(
+            target.project_id,
+            &target.session_id,
+            &provisional_holder,
+        ) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(anyhow::anyhow!(
+                "the guardian-owned session reservation remains fenced"
+            )),
+            Err(error) => Err(error),
+        }
+    };
+    let release_result = interactive_lease.map_or(Ok(()), InteractiveAgentLease::release);
+    terminal_session.resume(return_title)?;
+    terminal.clear()?;
+
+    Ok(match (resume_result, cancel_result, release_result) {
+        (Ok(status), Ok(()), Ok(())) if status.success() => {
+            format!("Returned from Codex session for {label}")
+        }
+        (Ok(status), Ok(()), Ok(())) => format!("Codex session exited with status {status}"),
+        (Err(error), Ok(()), Ok(())) => format!("Error: {error}"),
+        (resume_result, cancel_result, release_result) => format!(
+            "Codex interactive cleanup was incomplete (session: {}; reservation: {}; lease: {})",
+            resume_result
+                .map(|status| status.to_string())
+                .unwrap_or_else(|error| error.to_string()),
+            cancel_result
+                .map(|()| "released".to_string())
+                .unwrap_or_else(|error| error.to_string()),
+            release_result
+                .map(|()| "released".to_string())
+                .unwrap_or_else(|error| error.to_string()),
+        ),
+    })
+}
+
 fn tui_view(root: &Path) -> Result<PathBuf> {
     tui_view_with_active_board(root, true)
 }
@@ -21248,9 +21572,9 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                  [Enter]        - Open subtasks, edit selected task, or open selected agent project\n\
                                  [e]            - Edit selected task\n\
                                  [g]            - Cycle selected project's Git mode: off/commit/push\n\
-                                 [s]            - Stop linked active session / resume exact stopped session in exec\n\
-                                 [i]            - Interrupt linked active session; interact, then auto-restart exec\n\
-                                 [c]            - Open Done/blocked session (writable alongside active work)\n\
+                                 [s]            - Stop/resume linked task or displayed Agent Output session\n\
+                                 [i]            - Take over linked/displayed live session, then auto-restart exec\n\
+                                 [c]            - Open Done/blocked task or displayed idle/latest session\n\
                                  [l]            - Toggle active/selected project's live/current agent output\n\
                                  [a]            - Move selected task to archive\n\
                                  [A]            - Toggle archive view\n\
@@ -21806,6 +22130,144 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                             Err(e) => feedback_buffer = format!("Error: {}", e),
                                         }
                                     }
+                                    KeyCode::Char('s') => {
+                                        let target = match viewed_tui_codex_session_target(
+                                            agent_log_view.as_ref(),
+                                        ) {
+                                            Ok(target) => target,
+                                            Err(error) => {
+                                                feedback_buffer = error.to_string();
+                                                continue;
+                                            }
+                                        };
+                                        feedback_buffer = match toggle_tui_codex_session_stop(
+                                            target.project_id,
+                                            &target.session_id,
+                                        ) {
+                                            Ok(message) => message,
+                                            Err(error) => format!(
+                                                "Unable to stop or resume the displayed Codex session: {error}"
+                                            ),
+                                        };
+                                        agent_panel.refresh(&active_root);
+                                        last_agent_panel_refresh = Instant::now();
+                                    }
+                                    KeyCode::Char('i') => {
+                                        let label = agent_log_view
+                                            .as_ref()
+                                            .map(|view| view.project_name.clone())
+                                            .unwrap_or_else(|| "the selected project".to_string());
+                                        let target = match viewed_tui_codex_session_target(
+                                            agent_log_view.as_ref(),
+                                        ) {
+                                            Ok(target) => target,
+                                            Err(error) => {
+                                                feedback_buffer = error.to_string();
+                                                continue;
+                                            }
+                                        };
+                                        match run_tui_codex_session_interrupt(
+                                            &mut terminal,
+                                            &mut terminal_session,
+                                            &app_title(&active_root),
+                                            &target,
+                                            &label,
+                                        ) {
+                                            Ok(message) => {
+                                                agent_log_view = None;
+                                                feedback_buffer = message;
+                                            }
+                                            Err(error) if !terminal_session.active => {
+                                                return Err(error);
+                                            }
+                                            Err(error) => {
+                                                feedback_buffer = format!(
+                                                    "Unable to interrupt the displayed Codex session: {error}"
+                                                );
+                                            }
+                                        }
+                                        agent_panel.refresh(&active_root);
+                                        last_agent_panel_refresh = Instant::now();
+                                        if active_board {
+                                            normalize_board_selections_in_board(
+                                                &board_dir,
+                                                &statuses,
+                                                &mut board_states,
+                                            );
+                                        }
+                                    }
+                                    KeyCode::Char('c') => {
+                                        let label = agent_log_view
+                                            .as_ref()
+                                            .map(|view| view.project_name.clone())
+                                            .unwrap_or_else(|| "the selected project".to_string());
+                                        let target = match viewed_tui_codex_session_target(
+                                            agent_log_view.as_ref(),
+                                        ) {
+                                            Ok(target) => target,
+                                            Err(error) => {
+                                                feedback_buffer = error.to_string();
+                                                continue;
+                                            }
+                                        };
+                                        agent_panel.refresh(&active_root);
+                                        last_agent_panel_refresh = Instant::now();
+                                        let availability =
+                                            match tui_codex_session_availability_for_path(
+                                                &mut agent_panel,
+                                                &target.project_path,
+                                                &target.session_id,
+                                            ) {
+                                                Ok(availability) => availability,
+                                                Err(error) => {
+                                                    feedback_buffer = format!(
+                                                        "Unable to check the displayed Codex session: {error}"
+                                                    );
+                                                    continue;
+                                                }
+                                            };
+                                        if availability
+                                            == TuiCodexSessionAvailability::SelectedSessionBusy
+                                        {
+                                            feedback_buffer =
+                                                "The displayed Codex session is active; press i to take it over interactively."
+                                                    .to_string();
+                                            continue;
+                                        }
+                                        let shares_project = availability
+                                            == TuiCodexSessionAvailability::ProjectBusy;
+                                        match run_tui_codex_session_continue(
+                                            &mut terminal,
+                                            &mut terminal_session,
+                                            &app_title(&active_root),
+                                            &target,
+                                            &label,
+                                            shares_project,
+                                            false,
+                                        ) {
+                                            Ok(message) => {
+                                                agent_log_view = None;
+                                                feedback_buffer = message;
+                                            }
+                                            Err(error) if !terminal_session.active => {
+                                                return Err(error);
+                                            }
+                                            Err(error) => {
+                                                feedback_buffer = format!(
+                                                    "Unable to continue the displayed Codex session: {error}"
+                                                );
+                                            }
+                                        }
+                                        agent_panel.refresh(&active_root);
+                                        last_agent_panel_refresh = Instant::now();
+                                        if active_board {
+                                            normalize_board_selections_in_board(
+                                                &board_dir,
+                                                &statuses,
+                                                &mut board_states,
+                                            );
+                                        }
+                                    }
                                     KeyCode::Char('l') | KeyCode::Char('L') => {
                                         if agent_log_view.take().is_some() {
                                             feedback_buffer = "Closed agent output log".to_string();
@@ -22105,82 +22567,38 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                                     .to_string();
                                             continue;
                                         }
-                                        let Some(project_id) = agent_panel
+                                        let Some(project) = agent_panel
                                             .selected_project()
-                                            .map(|selected| selected.project.id)
+                                            .map(|selected| selected.project.clone())
                                         else {
                                             feedback_buffer =
                                                 "Register this project before interrupting its Codex session."
                                                     .to_string();
                                             continue;
                                         };
-                                        draw_tui_codex_handoff_status(
+                                        let target =
+                                            TuiCodexSessionTarget::new(&project, session_id);
+                                        let label = task_display_text(&task);
+                                        match run_tui_codex_session_interrupt(
                                             &mut terminal,
-                                            TuiCodexHandoffStage::WaitingForAutomatedExit,
-                                        )?;
-                                        let interactive_lease =
-                                            match prepare_tui_codex_session_interrupt(
-                                                project_id,
-                                                &session_id,
-                                            ) {
-                                                Ok(lease) => lease,
-                                                Err(error) => {
-                                                    feedback_buffer = format!(
-                                                        "Unable to interrupt the Codex session: {error}"
-                                                    );
-                                                    continue;
-                                                }
-                                            };
-
-                                        agent_log_view = None;
-                                        let _ = draw_tui_codex_handoff_status(
-                                            &mut terminal,
-                                            TuiCodexHandoffStage::EnteringInteractive,
-                                        );
-                                        terminal_session.suspend();
-                                        let _ = write_tui_codex_handoff_status(
-                                            &mut stdout(),
-                                            TuiCodexHandoffStage::EnteringInteractive,
-                                        );
-                                        let provisional_holder = interactive_lease.holder.clone();
-                                        let resume_result = resume_codex_session_interactively(
-                                            &active_root,
-                                            project_id,
-                                            &session_id,
-                                            &provisional_holder,
-                                            InteractiveCodexResumeMode::ResumeExec,
-                                        );
-                                        let _ = write_tui_codex_handoff_status(
-                                            &mut stdout(),
-                                            TuiCodexHandoffStage::QueueingExecResume,
-                                        );
-                                        let guardian_completed = resume_result
-                                            .as_ref()
-                                            .is_ok_and(|status| status.success());
-                                        let queue_result = if guardian_completed {
-                                            Ok(())
-                                        } else {
-                                            queue_tui_codex_session_exec_resume(
-                                                project_id,
-                                                &session_id,
-                                                &provisional_holder,
-                                            )
-                                        };
-                                        let release_result = interactive_lease.release();
-                                        let worker_result = if guardian_completed {
-                                            Ok(None)
-                                        } else if queue_result.is_ok() {
-                                            spawn_agent_session_resume_worker(
-                                                &active_root,
-                                                project_id,
-                                                &session_id,
-                                            )
-                                            .map(Some)
-                                        } else {
-                                            Ok(None)
-                                        };
-                                        terminal_session.resume(&app_title(&active_root))?;
-                                        terminal.clear()?;
+                                            &mut terminal_session,
+                                            &app_title(&active_root),
+                                            &target,
+                                            &label,
+                                        ) {
+                                            Ok(message) => {
+                                                agent_log_view = None;
+                                                feedback_buffer = message;
+                                            }
+                                            Err(error) if !terminal_session.active => {
+                                                return Err(error);
+                                            }
+                                            Err(error) => {
+                                                feedback_buffer = format!(
+                                                    "Unable to interrupt the Codex session: {error}"
+                                                );
+                                            }
+                                        }
                                         agent_panel.refresh(&active_root);
                                         last_agent_panel_refresh = Instant::now();
                                         normalize_board_selections_in_board(
@@ -22188,64 +22606,6 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                             &statuses,
                                             &mut board_states,
                                         );
-                                        let interactive_summary = match resume_result {
-                                            Ok(status) if status.success() => format!(
-                                                "Returned from interactive Codex for: {}.",
-                                                task_display_text(&task)
-                                            ),
-                                            Ok(status) => {
-                                                format!("Interactive Codex exited with {status}.")
-                                            }
-                                            Err(error) => {
-                                                format!("Interactive Codex error: {error}.")
-                                            }
-                                        };
-                                        let supervision_log = if guardian_completed {
-                                            agent_state_dir().ok().map(|state_dir| {
-                                                agent_session_resume_worker_log_path(
-                                                    &state_dir,
-                                                    project_id,
-                                                    &session_id,
-                                                )
-                                                .display()
-                                                .to_string()
-                                            })
-                                        } else {
-                                            worker_result
-                                                .as_ref()
-                                                .ok()
-                                                .and_then(|path| path.as_ref())
-                                                .map(|path| path.display().to_string())
-                                        };
-                                        let mut followup_errors = Vec::new();
-                                        if let Err(error) = queue_result {
-                                            followup_errors.push(format!(
-                                                "could not queue exact exec resume: {error}"
-                                            ));
-                                        }
-                                        if let Err(error) = release_result {
-                                            followup_errors.push(format!(
-                                                "could not release the interactive lease: {error}"
-                                            ));
-                                        }
-                                        if let Err(error) = worker_result {
-                                            followup_errors.push(format!(
-                                                "could not start the exact-session resume worker: {error}"
-                                            ));
-                                        }
-                                        feedback_buffer = if followup_errors.is_empty() {
-                                            match supervision_log {
-                                                Some(log) => format!(
-                                                    "{interactive_summary} The same session is queued and supervised for automated exec resume (worker log: {log})."
-                                                ),
-                                                None => interactive_summary,
-                                            }
-                                        } else {
-                                            format!(
-                                                "{interactive_summary} CLT {}",
-                                                followup_errors.join("; ")
-                                            )
-                                        };
                                     }
                                     KeyCode::Char('c') => {
                                         let selected_status = statuses[selected_board];
@@ -22268,299 +22628,76 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                             continue;
                                         }
 
-                                        match codex_session_for_task(&task) {
-                                            Some(session_id) => {
-                                                agent_panel.refresh(&active_root);
-                                                last_agent_panel_refresh = Instant::now();
-                                                let availability =
-                                                    match tui_codex_session_availability_for_path(
-                                                        &mut agent_panel,
-                                                        &active_root,
-                                                        &session_id,
-                                                    ) {
-                                                        Ok(availability) => availability,
-                                                        Err(error) => {
-                                                            feedback_buffer = format!(
-                                                                "Unable to check whether the Codex session is available: {error}"
-                                                            );
-                                                            continue;
-                                                        }
-                                                    };
-                                                if availability
-                                                    == TuiCodexSessionAvailability::SelectedSessionBusy
-                                                {
-                                                        feedback_buffer =
-                                                            "This exact Codex session is already running or in an interactive handoff; stop or wait for it before resuming it again."
-                                                                .to_string();
-                                                        continue;
-                                                }
-                                                let shares_project = availability
-                                                    == TuiCodexSessionAvailability::ProjectBusy;
-
-                                                let Some(project_id) = agent_panel
-                                                    .selected_project()
-                                                    .map(|selected| selected.project.id)
-                                                else {
-                                                    feedback_buffer =
-                                                        "Register this project before resuming its Codex session."
-                                                            .to_string();
-                                                    continue;
-                                                };
-                                                draw_tui_codex_handoff_status(
-                                                    &mut terminal,
-                                                    if shares_project {
-                                                        TuiCodexHandoffStage::PreparingSharedSession
-                                                    } else {
-                                                        TuiCodexHandoffStage::PreparingIdleSession
-                                                    },
-                                                )?;
-                                                let stopped_control =
-                                                    match tui_stopped_codex_session_control(
-                                                        project_id,
-                                                        &session_id,
-                                                    ) {
-                                                        Ok(control) => control,
-                                                        Err(error) => {
-                                                            feedback_buffer = format!(
-                                                                "Unable to inspect the idle Codex session: {error}"
-                                                            );
-                                                            continue;
-                                                        }
-                                                    };
-                                                let restore_stopped = stopped_control.is_some();
-                                                let (interactive_lease, provisional_holder) =
-                                                    if shares_project {
-                                                        (
-                                                            None,
-                                                            InteractiveAgentLease::holder_for_shared_session(
-                                                                restore_stopped,
-                                                            ),
-                                                        )
-                                                    } else {
-                                                        let lease = match InteractiveAgentLease::try_acquire_idle(
-                                                            project_id,
-                                                            restore_stopped,
-                                                        ) {
-                                                            Ok(Some(lease)) => lease,
-                                                            Ok(None) => {
-                                                                feedback_buffer =
-                                                                    "Another Codex task began using this project before the handoff; press c again to open this session alongside it."
-                                                                        .to_string();
-                                                                continue;
-                                                            }
-                                                            Err(error) => {
-                                                                feedback_buffer = format!(
-                                                                    "Unable to reserve the Codex session for interactive use: {error}"
-                                                                );
-                                                                continue;
-                                                            }
-                                                        };
-                                                        let holder = lease.holder.clone();
-                                                        (Some(lease), holder)
-                                                    };
-                                                let stopped_run_token =
-                                                    stopped_control.as_ref().and_then(|control| {
-                                                        control.run_token.as_deref()
-                                                    });
-                                                let reservation_result = if shares_project {
-                                                    reserve_tui_shared_codex_session_interactive(
-                                                        project_id,
-                                                        &session_id,
-                                                        &provisional_holder,
-                                                        stopped_run_token,
-                                                    )
-                                                } else {
-                                                    reserve_tui_idle_codex_session_interactive(
-                                                        project_id,
-                                                        &session_id,
-                                                        &provisional_holder,
-                                                        stopped_run_token,
-                                                    )
-                                                };
-                                                if !reservation_result
-                                                    .as_ref()
-                                                    .is_ok_and(|reserved| *reserved)
-                                                {
-                                                    let release_result = interactive_lease.map_or(
-                                                        Ok(()),
-                                                        InteractiveAgentLease::release,
+                                        let Some(session_id) = codex_session_for_task(&task) else {
+                                            feedback_buffer =
+                                                "No Codex session linked to this task.".to_string();
+                                            continue;
+                                        };
+                                        agent_panel.refresh(&active_root);
+                                        last_agent_panel_refresh = Instant::now();
+                                        let availability =
+                                            match tui_codex_session_availability_for_path(
+                                                &mut agent_panel,
+                                                &active_root,
+                                                &session_id,
+                                            ) {
+                                                Ok(availability) => availability,
+                                                Err(error) => {
+                                                    feedback_buffer = format!(
+                                                        "Unable to check whether the Codex session is available: {error}"
                                                     );
-                                                    feedback_buffer = match (
-                                                        reservation_result,
-                                                        release_result,
-                                                    ) {
-                                                        (Ok(false), Ok(())) if shares_project =>
-                                                            "The active project run or selected session changed before shared Codex could open; try again."
-                                                                .to_string(),
-                                                        (Ok(false), Ok(())) =>
-                                                            "This Codex session became busy before it could be reserved; try again."
-                                                                .to_string(),
-                                                        (Err(error), Ok(())) => format!(
-                                                            "Unable to reserve the Codex session: {error}"
-                                                        ),
-                                                        (Ok(false), Err(error)) => format!(
-                                                            "The Codex session changed, and its project lease could not be released: {error}"
-                                                        ),
-                                                        (Err(reserve_error), Err(release_error)) => format!(
-                                                            "Unable to reserve the Codex session: {reserve_error}. Its project lease also could not be released: {release_error}"
-                                                        ),
-                                                        (Ok(true), _) => unreachable!(),
-                                                    };
                                                     continue;
                                                 }
-
-                                                match codex_session_task_supports_interactive_resume(
-                                                    &active_root,
-                                                    &session_id,
-                                                ) {
-                                                    Ok(true) => {}
-                                                    revalidation => {
-                                                        let cancel_result =
-                                                            cancel_tui_idle_codex_session_interactive(
-                                                                project_id,
-                                                                &session_id,
-                                                                &provisional_holder,
-                                                            );
-                                                        let release_result = interactive_lease
-                                                            .map_or(
-                                                                Ok(()),
-                                                                InteractiveAgentLease::release,
-                                                            );
-                                                        feedback_buffer = match (
-                                                            revalidation,
-                                                            cancel_result,
-                                                            release_result,
-                                                        ) {
-                                                            (Ok(false), Ok(true), Ok(())) =>
-                                                                "This task changed before its Codex session could open; c is only available from Done or currently blocked tasks."
-                                                                    .to_string(),
-                                                            (Err(error), Ok(true), Ok(())) => format!(
-                                                                "Unable to revalidate the Codex task before interactive resume: {error}"
-                                                            ),
-                                                            (revalidation, cancel, release) => format!(
-                                                                "Unable to open the Codex task safely (task: {}; reservation: {}; lease: {})",
-                                                                revalidation
-                                                                    .map(|_| "changed".to_string())
-                                                                    .unwrap_or_else(|error| error.to_string()),
-                                                                cancel
-                                                                    .map(|cancelled| if cancelled { "released" } else { "still fenced" }.to_string())
-                                                                    .unwrap_or_else(|error| error.to_string()),
-                                                                release
-                                                                    .map(|()| "released".to_string())
-                                                                    .unwrap_or_else(|error| error.to_string()),
-                                                            ),
-                                                        };
-                                                        continue;
-                                                    }
-                                                }
-
+                                            };
+                                        if availability
+                                            == TuiCodexSessionAvailability::SelectedSessionBusy
+                                        {
+                                            feedback_buffer =
+                                                "This exact Codex session is already running or in an interactive handoff; stop or wait for it before resuming it again."
+                                                    .to_string();
+                                            continue;
+                                        }
+                                        let shares_project = availability
+                                            == TuiCodexSessionAvailability::ProjectBusy;
+                                        let Some(project) = agent_panel
+                                            .selected_project()
+                                            .map(|selected| selected.project.clone())
+                                        else {
+                                            feedback_buffer =
+                                                "Register this project before resuming its Codex session."
+                                                    .to_string();
+                                            continue;
+                                        };
+                                        let target =
+                                            TuiCodexSessionTarget::new(&project, session_id);
+                                        let label = task_display_text(&task);
+                                        match run_tui_codex_session_continue(
+                                            &mut terminal,
+                                            &mut terminal_session,
+                                            &app_title(&active_root),
+                                            &target,
+                                            &label,
+                                            shares_project,
+                                            true,
+                                        ) {
+                                            Ok(message) => {
                                                 agent_log_view = None;
-                                                let entering_stage =
-                                                    TuiCodexHandoffStage::EnteringInteractive;
-                                                let _ = draw_tui_codex_handoff_status(
-                                                    &mut terminal,
-                                                    entering_stage,
-                                                );
-                                                terminal_session.suspend();
-                                                let _ = write_tui_codex_handoff_status(
-                                                    &mut stdout(),
-                                                    entering_stage,
-                                                );
-                                                let resume_result =
-                                                    resume_codex_session_interactively(
-                                                        &active_root,
-                                                        project_id,
-                                                        &session_id,
-                                                        &provisional_holder,
-                                                        if shares_project {
-                                                            InteractiveCodexResumeMode::WritableShared
-                                                        } else {
-                                                            InteractiveCodexResumeMode::WritableIdle
-                                                        },
-                                                    );
-                                                let _ = write_tui_codex_handoff_status(
-                                                    &mut stdout(),
-                                                    TuiCodexHandoffStage::RestoringTaskControls,
-                                                );
-                                                let guardian_completed = resume_result
-                                                    .as_ref()
-                                                    .is_ok_and(|status| status.success());
-                                                let cancel_result = if guardian_completed {
-                                                    Ok(())
-                                                } else {
-                                                    match cancel_tui_idle_codex_session_interactive(
-                                                        project_id,
-                                                        &session_id,
-                                                        &provisional_holder,
-                                                    ) {
-                                                        Ok(true) => Ok(()),
-                                                        Ok(false) => Err(anyhow::anyhow!(
-                                                            "the guardian-owned session reservation remains fenced"
-                                                        )),
-                                                        Err(error) => Err(error),
-                                                    }
-                                                };
-                                                let release_result = interactive_lease
-                                                    .map_or(Ok(()), InteractiveAgentLease::release);
-                                                terminal_session
-                                                    .resume(&app_title(&active_root))?;
-                                                terminal.clear()?;
-                                                agent_panel.refresh(&active_root);
-                                                last_agent_panel_refresh = Instant::now();
-                                                normalize_board_selections_in_board(
-                                                    &board_dir,
-                                                    &statuses,
-                                                    &mut board_states,
-                                                );
-                                                feedback_buffer = match (
-                                                    resume_result,
-                                                    cancel_result,
-                                                    release_result,
-                                                ) {
-                                                    (Ok(status), Ok(()), Ok(()))
-                                                        if status.success() =>
-                                                    {
-                                                        format!(
-                                                            "Returned from Codex session for: {}",
-                                                            task_display_text(&task)
-                                                        )
-                                                    }
-                                                    (Ok(status), Ok(()), Ok(())) => format!(
-                                                        "Codex session exited with status {status}"
-                                                    ),
-                                                    (Err(error), Ok(()), Ok(())) => {
-                                                        format!("Error: {error}")
-                                                    }
-                                                    (
-                                                        resume_result,
-                                                        cancel_result,
-                                                        release_result,
-                                                    ) => format!(
-                                                        "Codex interactive cleanup was incomplete (session: {}; reservation: {}; lease: {})",
-                                                        resume_result
-                                                            .map(|status| status.to_string())
-                                                            .unwrap_or_else(
-                                                                |error| error.to_string()
-                                                            ),
-                                                        cancel_result
-                                                            .map(|()| "released".to_string())
-                                                            .unwrap_or_else(
-                                                                |error| error.to_string()
-                                                            ),
-                                                        release_result
-                                                            .map(|()| "released".to_string())
-                                                            .unwrap_or_else(
-                                                                |error| error.to_string()
-                                                            ),
-                                                    ),
-                                                };
+                                                feedback_buffer = message;
                                             }
-                                            None => {
-                                                feedback_buffer =
-                                                    "No Codex session linked to this task."
-                                                        .to_string();
+                                            Err(error) if !terminal_session.active => {
+                                                return Err(error);
+                                            }
+                                            Err(error) => {
+                                                feedback_buffer = format!("Error: {error}");
                                             }
                                         }
+                                        agent_panel.refresh(&active_root);
+                                        last_agent_panel_refresh = Instant::now();
+                                        normalize_board_selections_in_board(
+                                            &board_dir,
+                                            &statuses,
+                                            &mut board_states,
+                                        );
                                     }
                                     KeyCode::Char('l') | KeyCode::Char('L') => {
                                         if agent_log_view.take().is_some() {
@@ -27492,9 +27629,13 @@ mod tests {
             stdout_path: Some(stdout_path.display().to_string()),
             stderr_path: Some(stderr_path.display().to_string()),
             summary: Some("completed".to_string()),
+            codex_session_id: Some("session-recorded".to_string()),
         };
 
-        assert_eq!(preferred_recorded_agent_output_path(run), Some(stderr_path));
+        assert_eq!(
+            preferred_recorded_agent_output_path(&run),
+            Some(stderr_path)
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -27510,7 +27651,7 @@ mod tests {
         let stdout_path = log_dir.join("200-000-p1-1.out");
         let stderr_path = log_dir.join("200-000-p1-1.err");
         fs::write(&stdout_path, "").unwrap();
-        fs::write(&stderr_path, "started\n").unwrap();
+        fs::write(&stderr_path, "session id: session-live\nstarted\n").unwrap();
 
         let mut panel = TuiAgentPanel {
             projects: vec![project],
@@ -27527,7 +27668,16 @@ mod tests {
             .unwrap();
         assert!(log_view.is_live);
         assert!(tui_agent_log_title(&log_view).contains("[LIVE]"));
-        assert_eq!(log_view.content, "started\n");
+        assert!(tui_agent_log_title(&log_view).contains("s/i/c controls"));
+        assert_eq!(log_view.content, "session id: session-live\nstarted\n");
+        assert_eq!(
+            viewed_tui_codex_session_target(Some(&log_view)).unwrap(),
+            TuiCodexSessionTarget {
+                project_id: 1,
+                project_path: panel.projects[0].project.path.clone(),
+                session_id: "session-live".to_string(),
+            }
+        );
 
         append_agent_log_line(&stderr_path, "still working").unwrap();
         log_view.refresh().unwrap();
@@ -27727,6 +27877,13 @@ mod tests {
         let project_log_view = log_view.unwrap();
         assert_eq!(project_log_view.content, "second task output");
         assert!(!project_log_view.is_live);
+        assert_eq!(
+            project_log_view
+                .session_target
+                .as_ref()
+                .map(|target| target.session_id.as_str()),
+            Some("session-two")
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
