@@ -60,6 +60,7 @@ Use this section while developing the next release.
 
 ### Fixed
 
+- Rebuild the derived active-worker project index after Turso reports a missing index entry, retry the scheduler pass once, and keep the daemon alive for later retries if a pass still fails.
 - Kept TUI startup and keyboard input responsive while agent-panel refreshes or stale-service recovery are slow.
 - Made Ctrl-C cancel TUI task creation and editing prompts, matching Escape without saving changes.
 - Recheck blocked Todo and Doing tasks before fresh Todo work whenever recovery backoff permits, while allowing ready work to proceed during an unresolved blocker's backoff.

@@ -93,6 +93,11 @@ const AGENT_LEASE_RENEW_MAX_INTERVAL_MILLIS: u64 = 15_000;
 const AGENT_WORKER_STARTUP_TIMEOUT_SECONDS: u64 = 60;
 const AGENT_WORKER_HEARTBEAT_TIMEOUT_SECONDS: u64 = 60;
 const AGENT_WORKER_PROTOCOL_VERSION: i64 = 1;
+const AGENT_WORKERS_ACTIVE_PROJECT_INDEX: &str = "agent_workers_active_project_unique";
+const AGENT_WORKERS_ACTIVE_PROJECT_INDEX_SQL: &str =
+    "CREATE UNIQUE INDEX IF NOT EXISTS agent_workers_active_project_unique
+        ON agent_workers(project_id)
+        WHERE state IN ('dispatching', 'running', 'finalizing')";
 // Any future migration above this version is deferred while a pinned worker is
 // active. Store access remains available for cross-generation control and
 // recovery; the scheduler waits in compatibility mode until it can migrate.
@@ -4258,7 +4263,19 @@ async fn run_agent_daemon_loop_async(
             }
 
             let handle = active_passes.swap_remove(index);
-            let start = handle.await.context("Agent scheduler pass task failed")??;
+            let start = match handle.await {
+                Ok(Ok(start)) => start,
+                Ok(Err(error)) => {
+                    eprintln!("Agent scheduler pass failed; the daemon will retry: {error:#}");
+                    next_sleep = poll_interval;
+                    continue;
+                }
+                Err(error) => {
+                    eprintln!("Agent scheduler pass task failed; the daemon will retry: {error}");
+                    next_sleep = poll_interval;
+                    continue;
+                }
+            };
             print_agent_scheduler_pass(&start.pass);
             next_sleep = agent_daemon_sleep_interval(&start.pass, poll_interval);
             for job in start.jobs {
@@ -5386,23 +5403,55 @@ fn run_agent_daemon_scheduler_pass_with_active_and_checkin(
     active_project_ids: Vec<i64>,
     daemon_checkin: Option<&AgentDaemonCheckinSource>,
 ) -> Result<AgentSchedulerStart> {
-    let mut attempts = 0;
+    run_agent_daemon_database_operation_with_recovery(
+        || {
+            run_agent_scheduler_pass_with_daemon_checkin(
+                state_dir,
+                false,
+                &active_project_ids,
+                daemon_checkin,
+            )
+        },
+        || {
+            with_agent_store_at(state_dir, |store| {
+                store.rebuild_active_worker_project_index_blocking()
+            })
+        },
+    )
+}
+
+fn run_agent_daemon_database_operation_with_recovery<T>(
+    mut operation: impl FnMut() -> Result<T>,
+    mut rebuild_active_worker_index: impl FnMut() -> Result<()>,
+) -> Result<T> {
+    let mut database_lock_attempts = 0;
+    let mut worker_index_rebuild_attempted = false;
     loop {
-        match run_agent_scheduler_pass_with_daemon_checkin(
-            state_dir,
-            false,
-            &active_project_ids,
-            daemon_checkin,
-        ) {
-            Ok(start) => return Ok(start),
+        match operation() {
+            Ok(result) => return Ok(result),
+            Err(err)
+                if agent_error_indicates_damaged_active_worker_index(&err)
+                    && !worker_index_rebuild_attempted =>
+            {
+                worker_index_rebuild_attempted = true;
+                let original_error = format!("{err:#}");
+                rebuild_active_worker_index().with_context(|| {
+                    format!(
+                        "Failed to rebuild {AGENT_WORKERS_ACTIVE_PROJECT_INDEX} after scheduler error: {original_error}"
+                    )
+                })?;
+                eprintln!(
+                    "Scheduler pass recovery: rebuilt index={AGENT_WORKERS_ACTIVE_PROJECT_INDEX}; retrying"
+                );
+            }
             Err(err)
                 if agent_error_is_database_locked(&err)
-                    && attempts < AGENT_DAEMON_DATABASE_LOCK_RETRY_ATTEMPTS =>
+                    && database_lock_attempts < AGENT_DAEMON_DATABASE_LOCK_RETRY_ATTEMPTS =>
             {
-                attempts += 1;
+                database_lock_attempts += 1;
                 println!(
                     "Scheduler pass retry: reason=database_locked attempt={} max_attempts={}",
-                    attempts, AGENT_DAEMON_DATABASE_LOCK_RETRY_ATTEMPTS
+                    database_lock_attempts, AGENT_DAEMON_DATABASE_LOCK_RETRY_ATTEMPTS
                 );
                 thread::sleep(Duration::from_millis(
                     AGENT_DAEMON_DATABASE_LOCK_RETRY_MILLIS,
@@ -5411,6 +5460,12 @@ fn run_agent_daemon_scheduler_pass_with_active_and_checkin(
             Err(err) => return Err(err),
         }
     }
+}
+
+fn agent_error_indicates_damaged_active_worker_index(err: &anyhow::Error) -> bool {
+    let rendered = format!("{err:#}");
+    rendered.contains("IdxDelete: no matching index entry found for key")
+        && rendered.contains("worker")
 }
 
 fn agent_error_is_database_locked(err: &anyhow::Error) -> bool {
@@ -5457,6 +5512,11 @@ fn run_agent_scheduler_pass_with_max_global_jobs(
         anyhow::bail!("{AGENT_MAX_GLOBAL_JOBS_ENV} must be greater than zero");
     }
 
+    if let Some(checkin) = daemon_checkin {
+        with_agent_store_at(state_dir, |store| {
+            record_agent_daemon_checkin(store, checkin)
+        })?;
+    }
     let durable_workers = reconcile_independent_agent_workers(state_dir)?;
     let abandoned_project_ids = with_agent_store_at(state_dir, |store| {
         Ok(store
@@ -5492,12 +5552,7 @@ fn run_agent_scheduler_pass_with_max_global_jobs(
     };
     let mut jobs = Vec::new();
 
-    let projects = with_agent_store_at(state_dir, |store| {
-        if let Some(checkin) = daemon_checkin {
-            record_agent_daemon_checkin(store, checkin)?;
-        }
-        store.list_projects_blocking()
-    })?;
+    let projects = with_agent_store_at(state_dir, |store| store.list_projects_blocking())?;
 
     for project in projects {
         if durable_project_ids.contains(&project.id) {
@@ -9797,9 +9852,7 @@ mod agent_store {
                     error TEXT,
                     service_cleaned_at TEXT
                 )",
-                "CREATE UNIQUE INDEX IF NOT EXISTS agent_workers_active_project_unique
-                    ON agent_workers(project_id)
-                    WHERE state IN ('dispatching', 'running', 'finalizing')",
+                AGENT_WORKERS_ACTIVE_PROJECT_INDEX_SQL,
             ],
         },
         AgentMigration {
@@ -10135,6 +10188,95 @@ mod agent_store {
                     store.pending_migration_version =
                         apply_migrations(&mut conn, std::slice::from_ref(&migration)).await?;
                     Ok(store)
+                })
+        }
+
+        pub(crate) fn rebuild_active_worker_project_index_blocking(&self) -> Result<()> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(self.rebuild_active_worker_project_index())
+        }
+
+        async fn rebuild_active_worker_project_index(&self) -> Result<()> {
+            let mut conn = self.connect().await?;
+            let transaction = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .await
+                .with_context(|| {
+                    format!("Failed to begin rebuilding index {AGENT_WORKERS_ACTIVE_PROJECT_INDEX}")
+                })?;
+            transaction
+                .execute(
+                    &format!("DROP INDEX IF EXISTS {AGENT_WORKERS_ACTIVE_PROJECT_INDEX}"),
+                    (),
+                )
+                .await
+                .with_context(|| {
+                    format!("Failed to drop damaged index {AGENT_WORKERS_ACTIVE_PROJECT_INDEX}")
+                })?;
+            transaction
+                .execute(AGENT_WORKERS_ACTIVE_PROJECT_INDEX_SQL, ())
+                .await
+                .with_context(|| {
+                    format!("Failed to recreate index {AGENT_WORKERS_ACTIVE_PROJECT_INDEX}")
+                })?;
+            transaction.commit().await.with_context(|| {
+                format!("Failed to commit rebuilt index {AGENT_WORKERS_ACTIVE_PROJECT_INDEX}")
+            })?;
+
+            let mut rows = conn
+                .query("PRAGMA integrity_check", ())
+                .await
+                .context("Failed to verify the agent database after rebuilding its worker index")?;
+            let mut integrity_failures = Vec::new();
+            while let Some(row) = rows
+                .next()
+                .await
+                .context("Failed to read the agent database integrity check")?
+            {
+                let message = row_text(&row, 0, "integrity_check")?;
+                if message != "ok" && integrity_failures.len() < 8 {
+                    integrity_failures.push(message);
+                }
+            }
+            if !integrity_failures.is_empty() {
+                anyhow::bail!(
+                    "Agent database integrity check still fails after rebuilding {AGENT_WORKERS_ACTIVE_PROJECT_INDEX}: {}",
+                    integrity_failures.join("; ")
+                );
+            }
+            Ok(())
+        }
+
+        #[cfg(test)]
+        pub(crate) fn active_worker_project_index_exists_blocking(&self) -> Result<bool> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(async {
+                    let conn = self.connect().await?;
+                    Ok(query_count(
+                        &conn,
+                        "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'index' AND name = ?1",
+                        [AGENT_WORKERS_ACTIVE_PROJECT_INDEX],
+                    )
+                    .await?
+                        == 1)
+                })
+        }
+
+        #[cfg(test)]
+        pub(crate) fn drop_active_worker_project_index_blocking(&self) -> Result<()> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(async {
+                    let conn = self.connect().await?;
+                    conn.execute(
+                        &format!("DROP INDEX {AGENT_WORKERS_ACTIVE_PROJECT_INDEX}"),
+                        (),
+                    )
+                    .await
+                    .context("Failed to drop the active-worker project index for a test")?;
+                    Ok(())
                 })
         }
 
@@ -29477,6 +29619,50 @@ mod tests {
     }
 
     #[test]
+    fn agent_daemon_rebuilds_a_damaged_active_worker_index_once_and_retries() {
+        let operation_calls = Cell::new(0);
+        let rebuild_calls = Cell::new(0);
+
+        let result = run_agent_daemon_database_operation_with_recovery(
+            || {
+                operation_calls.set(operation_calls.get() + 1);
+                if operation_calls.get() == 1 {
+                    anyhow::bail!(
+                        "Failed to abandon worker token: IdxDelete: no matching index entry found for key"
+                    );
+                }
+                Ok("recovered")
+            },
+            || {
+                rebuild_calls.set(rebuild_calls.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result, "recovered");
+        assert_eq!(operation_calls.get(), 2);
+        assert_eq!(rebuild_calls.get(), 1);
+    }
+
+    #[test]
+    fn agent_daemon_does_not_rebuild_indexes_for_unrelated_errors() {
+        let rebuild_calls = Cell::new(0);
+
+        let result: Result<()> = run_agent_daemon_database_operation_with_recovery(
+            || anyhow::bail!("Failed to scan project"),
+            || {
+                rebuild_calls.set(rebuild_calls.get() + 1);
+                Ok(())
+            },
+        );
+        let error = result.unwrap_err();
+
+        assert!(error.to_string().contains("Failed to scan project"));
+        assert_eq!(rebuild_calls.get(), 0);
+    }
+
+    #[test]
     fn agent_max_global_jobs_defaults_to_twelve_and_requires_positive_integer() {
         assert_eq!(AGENT_DEFAULT_MAX_GLOBAL_JOBS, 12);
         assert_eq!(
@@ -30280,6 +30466,24 @@ mod tests {
         }
         assert!(!store.runs_has_task_content_column_blocking().unwrap());
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_store_rebuilds_the_derived_active_worker_index() {
+        let root = temp_root("agent-store-rebuild-active-worker-index");
+        let state_dir = root.join("state/clt");
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+
+        assert!(store.active_worker_project_index_exists_blocking().unwrap());
+        store.drop_active_worker_project_index_blocking().unwrap();
+        assert!(!store.active_worker_project_index_exists_blocking().unwrap());
+
+        store
+            .rebuild_active_worker_project_index_blocking()
+            .unwrap();
+
+        assert!(store.active_worker_project_index_exists_blocking().unwrap());
         fs::remove_dir_all(root).unwrap();
     }
 
