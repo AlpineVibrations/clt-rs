@@ -12,6 +12,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, Ordering},
+    mpsc::{self, Receiver, TryRecvError},
 };
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -16926,6 +16927,63 @@ struct TuiAgentPanelSnapshot {
     daemon_status: String,
 }
 
+struct TuiAgentPanelRefreshResult {
+    active_root: PathBuf,
+    panel_snapshot: Result<TuiAgentPanelSnapshot>,
+    task_session_states: Result<TaskAgentSessionStates>,
+}
+
+struct TuiAgentPanelRefreshWorker {
+    receiver: Option<Receiver<TuiAgentPanelRefreshResult>>,
+}
+
+impl TuiAgentPanelRefreshWorker {
+    fn new() -> Self {
+        Self { receiver: None }
+    }
+
+    fn request(&mut self, active_root: &Path) -> bool {
+        self.request_with(active_root, |active_root| TuiAgentPanelRefreshResult {
+            panel_snapshot: load_tui_agent_panel_snapshot_with_service_recovery(&active_root),
+            task_session_states: try_load_task_agent_session_states(&active_root),
+            active_root,
+        })
+    }
+
+    fn request_with(
+        &mut self,
+        active_root: &Path,
+        load: impl FnOnce(PathBuf) -> TuiAgentPanelRefreshResult + Send + 'static,
+    ) -> bool {
+        if self.receiver.is_some() {
+            return false;
+        }
+
+        let (sender, receiver) = mpsc::channel();
+        let active_root = active_root.to_path_buf();
+        thread::spawn(move || {
+            let _ = sender.send(load(active_root));
+        });
+        self.receiver = Some(receiver);
+        true
+    }
+
+    fn try_result(&mut self) -> Option<TuiAgentPanelRefreshResult> {
+        let result = self.receiver.as_ref()?.try_recv();
+        match result {
+            Ok(result) => {
+                self.receiver = None;
+                Some(result)
+            }
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => {
+                self.receiver = None;
+                None
+            }
+        }
+    }
+}
+
 struct TuiCurrentProjectRegistration {
     path: PathBuf,
     name: String,
@@ -17127,13 +17185,13 @@ impl TuiAgentPanel {
     fn new(active_root: &Path) -> Self {
         let mut panel = Self {
             projects: Vec::new(),
-            current_project_registration: None,
-            daemon_status: "unknown".to_string(),
+            current_project_registration: current_project_registration(active_root, &[]),
+            daemon_status: "loading".to_string(),
             state: ListState::default(),
             scroll_offset: 0,
             last_error: None,
         };
-        panel.refresh(active_root);
+        panel.restore_or_normalize_selection(None);
         panel
     }
 
@@ -17358,7 +17416,7 @@ impl TuiAgentPanel {
 
 impl TuiModelsPanel {
     fn new() -> Self {
-        let mut panel = Self {
+        Self {
             providers: Vec::new(),
             models: Vec::new(),
             defaults: agent_store::AgentModelDefaults::default(),
@@ -17372,9 +17430,7 @@ impl TuiModelsPanel {
             provider_viewport_height: 0,
             model_viewport_height: 0,
             last_error: None,
-        };
-        panel.refresh();
-        panel
+        }
     }
 
     fn selected_provider(&self) -> Option<&agent_store::AgentModelProvider> {
@@ -18186,13 +18242,27 @@ enum TuiAgentPanelRowIdentity {
     Project(i64),
 }
 
-fn load_tui_agent_panel_snapshot(_active_root: &Path) -> Result<TuiAgentPanelSnapshot> {
+fn load_tui_agent_panel_snapshot(active_root: &Path) -> Result<TuiAgentPanelSnapshot> {
+    load_tui_agent_panel_snapshot_inner(active_root, false)
+}
+
+fn load_tui_agent_panel_snapshot_with_service_recovery(
+    active_root: &Path,
+) -> Result<TuiAgentPanelSnapshot> {
+    load_tui_agent_panel_snapshot_inner(active_root, true)
+}
+
+fn load_tui_agent_panel_snapshot_inner(
+    _active_root: &Path,
+    recover_stale_service: bool,
+) -> Result<TuiAgentPanelSnapshot> {
     let state_dir = agent_state_dir()?;
     let service_status = agent_service_status(&state_dir);
     let store = open_agent_store_at(&state_dir)?;
     let mut checkins = store.list_daemon_checkins_blocking()?;
     let now = agent_timestamp_seconds();
-    let service_restarted = agent_service_needs_restart(&service_status, &checkins, now);
+    let service_restarted =
+        recover_stale_service && agent_service_needs_restart(&service_status, &checkins, now);
     if service_restarted {
         restart_running_agent_service().context("Failed to restart stale agent service")?;
         for checkin in checkins
@@ -21304,12 +21374,14 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
     let mut current_pane = start_state.current_pane;
     let mut models_return_pane = tui_models_return_pane(current_pane);
     let mut agent_panel = TuiAgentPanel::new(&active_root);
-    let mut task_agent_session_states = load_task_agent_session_states(&active_root);
+    let mut task_agent_session_states = TaskAgentSessionStates::default();
     let mut models_panel = TuiModelsPanel::new();
     let mut model_input: Option<TuiModelInput> = None;
     let mut awaiting_model_provider_choice = false;
     let mut pending_agent_project_removal: Option<TuiAgentProjectRemoval> = None;
+    let mut agent_panel_refresh = TuiAgentPanelRefreshWorker::new();
     let mut last_agent_panel_refresh = Instant::now();
+    agent_panel_refresh.request(&active_root);
     let mut agent_log_view: Option<TuiAgentLogView> = None;
     let mut last_agent_log_refresh = Instant::now();
 
@@ -21357,26 +21429,43 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
             }
         }
 
-        if last_agent_panel_refresh.elapsed() >= tui_agent_panel_refresh_interval() {
-            agent_panel.refresh(&active_root);
-            task_agent_session_states = load_task_agent_session_states(&active_root);
-            if current_pane == TuiPane::AgentProjects {
-                sync_open_tui_agent_log_view(&agent_panel, &mut agent_log_view);
-            } else if current_pane == TuiPane::Tasks && active_board && !archive_view {
-                let selected_task = selected_task_entry_in_board(
-                    &board_dir,
-                    statuses[selected_board],
-                    &board_states[selected_board],
-                )
-                .map(|(_, task)| task);
-                sync_open_tui_task_log_view(
-                    &mut agent_panel,
+        if let Some(refresh) = agent_panel_refresh.try_result() {
+            if refresh.active_root == active_root {
+                let selected_row = agent_panel.selected_row_identity();
+                agent_panel.apply_refresh_result(
                     &active_root,
-                    statuses[selected_board],
-                    selected_task.as_ref(),
-                    &mut agent_log_view,
+                    selected_row,
+                    refresh.panel_snapshot,
                 );
+                if let Ok(states) = refresh.task_session_states {
+                    task_agent_session_states = states;
+                }
+                if current_pane == TuiPane::AgentProjects {
+                    sync_open_tui_agent_log_view(&agent_panel, &mut agent_log_view);
+                } else if current_pane == TuiPane::Tasks && active_board && !archive_view {
+                    let selected_task = selected_task_entry_in_board(
+                        &board_dir,
+                        statuses[selected_board],
+                        &board_states[selected_board],
+                    )
+                    .map(|(_, task)| task);
+                    sync_open_tui_task_log_view(
+                        &mut agent_panel,
+                        &active_root,
+                        statuses[selected_board],
+                        selected_task.as_ref(),
+                        &mut agent_log_view,
+                    );
+                }
+            } else {
+                last_agent_panel_refresh = Instant::now()
+                    .checked_sub(tui_agent_panel_refresh_interval())
+                    .unwrap_or_else(Instant::now);
             }
+        }
+        if last_agent_panel_refresh.elapsed() >= tui_agent_panel_refresh_interval()
+            && agent_panel_refresh.request(&active_root)
+        {
             last_agent_panel_refresh = Instant::now();
         }
         if last_agent_log_refresh.elapsed() >= tui_agent_log_refresh_interval() {
@@ -21991,12 +22080,13 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                     tui_pane_after_tab(current_pane, active_board)
                                 };
                                 if current_pane == TuiPane::AgentProjects {
-                                    agent_panel.refresh(&active_root);
                                     if previous_pane == TuiPane::Tasks {
                                         agent_panel.select_project_for_path(&active_root);
                                     }
                                     sync_open_tui_agent_log_view(&agent_panel, &mut agent_log_view);
-                                    last_agent_panel_refresh = Instant::now();
+                                    if agent_panel_refresh.request(&active_root) {
+                                        last_agent_panel_refresh = Instant::now();
+                                    }
                                 } else if current_pane == TuiPane::Tasks {
                                     let selected_task = selected_task_entry_in_board(
                                         &board_dir,
@@ -22216,8 +22306,16 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                         match std::env::set_current_dir(&project.path) {
                                             Ok(_) => {
                                                 active_root = project.path.clone();
-                                                task_agent_session_states =
-                                                    load_task_agent_session_states(&active_root);
+                                                task_agent_session_states.clear();
+                                                if agent_panel_refresh.request(&active_root) {
+                                                    last_agent_panel_refresh = Instant::now();
+                                                } else {
+                                                    last_agent_panel_refresh = Instant::now()
+                                                        .checked_sub(
+                                                            tui_agent_panel_refresh_interval(),
+                                                        )
+                                                        .unwrap_or_else(Instant::now);
+                                                }
                                                 active_board = true;
                                                 board_stack.clear();
                                                 board_stack.push(get_tasks_dir(&active_root));
@@ -24386,6 +24484,61 @@ mod tests {
             runtime_state: TuiAgentRuntimeState::Idle,
             daemon_scan_problem: None,
         }
+    }
+
+    #[test]
+    fn tui_agent_panel_starts_in_loading_state_without_fetching_a_snapshot() {
+        let active_root = PathBuf::from("/tmp/current");
+
+        let panel = TuiAgentPanel::new(&active_root);
+
+        assert!(panel.projects.is_empty());
+        assert_eq!(panel.daemon_status, "loading");
+        assert_eq!(
+            panel
+                .selected_current_project_registration()
+                .map(|registration| registration.path.as_path()),
+            Some(active_root.as_path())
+        );
+    }
+
+    #[test]
+    fn tui_agent_panel_refresh_worker_does_not_block_the_caller() {
+        let active_root = PathBuf::from("/tmp/current");
+        let (started_sender, started_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let mut worker = TuiAgentPanelRefreshWorker::new();
+
+        assert!(worker.request_with(&active_root, move |active_root| {
+            started_sender.send(()).unwrap();
+            release_receiver.recv().unwrap();
+            TuiAgentPanelRefreshResult {
+                active_root,
+                panel_snapshot: Ok(TuiAgentPanelSnapshot {
+                    projects: Vec::new(),
+                    daemon_status: "running".to_string(),
+                }),
+                task_session_states: Ok(TaskAgentSessionStates::default()),
+            }
+        }));
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(worker.try_result().is_none());
+        assert!(!worker.request_with(&active_root, |_| unreachable!()));
+
+        release_sender.send(()).unwrap();
+        let started = Instant::now();
+        let result = loop {
+            if let Some(result) = worker.try_result() {
+                break result;
+            }
+            assert!(started.elapsed() < Duration::from_secs(1));
+            thread::yield_now();
+        };
+
+        assert_eq!(result.active_root, active_root);
+        assert_eq!(result.panel_snapshot.unwrap().daemon_status, "running");
     }
 
     #[test]
