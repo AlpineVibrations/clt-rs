@@ -917,6 +917,11 @@ enum AgentCommands {
         /// Project path to resume. Defaults to the current directory.
         path: Option<PathBuf>,
     },
+    /// Clears a registered project's failure cooldown for an immediate retry
+    Retry {
+        /// Project path to retry. Defaults to the current directory.
+        path: Option<PathBuf>,
+    },
     /// Configures the git-commit skill for a registered project
     GitCommit {
         #[command(subcommand)]
@@ -1227,6 +1232,10 @@ fn handle_agent_command(command: AgentCommands, local: bool, default_root: &Path
             let store = open_agent_store()?;
             set_agent_project_enabled(&store, path.as_deref(), local, default_root, true)?;
         }
+        AgentCommands::Retry { path } => {
+            let store = open_agent_store()?;
+            retry_agent_project(&store, path.as_deref(), local, default_root)?;
+        }
         AgentCommands::GitCommit { command } => {
             let store = open_agent_store()?;
             match command {
@@ -1393,6 +1402,24 @@ fn set_agent_project_enabled(
         println!("Project was not registered: {}", project_root.display());
     }
 
+    Ok(())
+}
+
+fn retry_agent_project(
+    store: &agent_store::TursoAgentStore,
+    path: Option<&Path>,
+    local: bool,
+    default_root: &Path,
+) -> Result<()> {
+    let project_root = resolve_agent_project_root(path, local, default_root)?;
+    if store.clear_project_failure_backoff_for_path_blocking(&project_root)? {
+        println!(
+            "Queued project for immediate retry: {}",
+            project_root.display()
+        );
+    } else {
+        println!("Project was not registered: {}", project_root.display());
+    }
     Ok(())
 }
 
@@ -5601,16 +5628,14 @@ fn run_agent_scheduler_pass_with_max_global_jobs(
             reclaim_current_process_leases,
             now,
         )?;
-        let (resume_session_id, controls_after_initial_check) =
+        let resume_session_id = resumable_codex_session_for_project(state_dir, &project, now)?;
+        let controls_after_initial_check = if resume_session_id.is_none() {
             with_agent_store_at(state_dir, |store| {
-                let resume_session_id = store.resume_requested_session_blocking(project.id)?;
-                let controls = if resume_session_id.is_none() {
-                    store.session_controls_for_project_blocking(project.id)?
-                } else {
-                    Vec::new()
-                };
-                Ok((resume_session_id, controls))
-            })?;
+                store.session_controls_for_project_blocking(project.id)
+            })?
+        } else {
+            Vec::new()
+        };
         let has_suspended_session = resume_session_id.is_none()
             && session_controls_suspend_project(&controls_after_initial_check);
         if has_suspended_session {
@@ -6651,7 +6676,10 @@ fn renew_agent_job_worker_fence(job: &AgentRunJob) -> Result<()> {
         )
     })?;
     if !renewed {
-        anyhow::bail!("Agent worker {worker_token} lost its durable ownership fence");
+        let snapshot = with_agent_store_at(&job.state_dir, |store| {
+            store.worker_fence_snapshot_blocking(worker_token, std::process::id())
+        })?;
+        anyhow::bail!("Agent worker {worker_token} lost its durable ownership fence ({snapshot})");
     }
     Ok(())
 }
@@ -7270,6 +7298,40 @@ fn task_status_for_codex_session(
     session_id: &str,
 ) -> Result<Option<&'static str>> {
     task_status_for_codex_session_in_board(&get_tasks_dir(project_root), session_id)
+}
+
+fn resumable_codex_session_for_project(
+    state_dir: &Path,
+    project: &agent_store::AgentProject,
+    now: u64,
+) -> Result<Option<String>> {
+    loop {
+        let Some(session_id) = with_agent_store_at(state_dir, |store| {
+            store.resume_requested_session_blocking(project.id)
+        })?
+        else {
+            return Ok(None);
+        };
+        if task_status_for_codex_session(&project.path, &session_id)?.is_some() {
+            return Ok(Some(session_id));
+        }
+
+        let cleared = with_agent_store_at(state_dir, |store| {
+            store.clear_orphaned_resume_requested_session_blocking(project.id, &session_id, now)
+        })?;
+        if !cleared {
+            // Another scheduler or worker may have claimed the project after this
+            // pass took its initial snapshot. Keep the session fenced and let the
+            // normal lease checks settle that race instead of deleting live state.
+            return Ok(Some(session_id));
+        }
+        eprintln!(
+            "Project {}: action=orphaned_session_cleared session={} reason=task_marker_missing path={}",
+            project.name,
+            session_id,
+            project.path.display()
+        );
+    }
 }
 
 fn task_status_for_codex_session_in_board(
@@ -10865,6 +10927,72 @@ mod agent_store {
                 ))
         }
 
+        pub(crate) fn worker_fence_snapshot_blocking(
+            &self,
+            worker_token: &str,
+            expected_worker_pid: u32,
+        ) -> Result<String> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(async {
+                    let conn = self.connect().await?;
+                    let mut rows = conn
+                        .query(
+                            "SELECT project_id, state, worker_pid, lease_holder, heartbeat_at
+                               FROM agent_workers WHERE worker_token = ?1",
+                            [worker_token],
+                        )
+                        .await
+                        .with_context(|| {
+                            format!("Failed to inspect worker {worker_token} ownership fence")
+                        })?;
+                    let Some(row) = rows
+                        .next()
+                        .await
+                        .context("Failed to read worker ownership fence row")?
+                    else {
+                        return Ok(format!(
+                            "worker=missing expected_pid={expected_worker_pid}"
+                        ));
+                    };
+                    let project_id = row_integer(&row, 0, "project_id")?;
+                    let state = row_text(&row, 1, "state")?;
+                    let worker_pid = row_optional_integer(&row, 2, "worker_pid")?;
+                    let worker_lease_holder = row_text(&row, 3, "lease_holder")?;
+                    let heartbeat_at = row_optional_text(&row, 4, "heartbeat_at")?;
+                    drop(rows);
+                    let mut lease_rows = conn
+                        .query(
+                            "SELECT holder, expires_at FROM leases WHERE project_id = ?1",
+                            [project_id],
+                        )
+                        .await
+                        .with_context(|| {
+                            format!("Failed to inspect worker {worker_token} project lease")
+                        })?;
+                    let lease = lease_rows
+                        .next()
+                        .await
+                        .context("Failed to read worker project lease row")?
+                        .map(|row| {
+                            Ok::<String, anyhow::Error>(format!(
+                                "{}@{}",
+                                row_text(&row, 0, "holder")?,
+                                row_text(&row, 1, "expires_at")?
+                            ))
+                        })
+                        .transpose()?
+                        .unwrap_or_else(|| "missing".to_string());
+                    Ok(format!(
+                        "state={state} worker_pid={} expected_pid={expected_worker_pid} worker_lease_holder={worker_lease_holder} project_lease={lease} heartbeat_at={}",
+                        worker_pid
+                            .map(|pid| pid.to_string())
+                            .unwrap_or_else(|| "missing".to_string()),
+                        heartbeat_at.as_deref().unwrap_or("missing")
+                    ))
+                })
+        }
+
         async fn renew_worker(
             &self,
             worker_token: &str,
@@ -10877,21 +11005,53 @@ mod agent_store {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .await
                 .with_context(|| format!("Failed to begin worker {worker_token} heartbeat"))?;
+            let (project_id, lease_holder) = {
+                let mut rows = transaction
+                    .query(
+                        "SELECT w.project_id, w.lease_holder
+                           FROM agent_workers w
+                           JOIN leases l
+                             ON l.project_id = w.project_id AND l.holder = w.lease_holder
+                          WHERE w.worker_token = ?1 AND w.state = 'running'
+                            AND w.worker_pid = ?2",
+                        params![worker_token, i64::from(worker_pid)],
+                    )
+                    .await
+                    .with_context(|| {
+                        format!("Failed to verify worker {worker_token} heartbeat ownership")
+                    })?;
+                let Some(row) = rows
+                    .next()
+                    .await
+                    .context("Failed to read worker heartbeat ownership row")?
+                else {
+                    return Ok(false);
+                };
+                (
+                    row_integer(&row, 0, "project_id")?,
+                    row_text(&row, 1, "lease_holder")?,
+                )
+            };
             let worker_changed = transaction
                 .execute(
                     "UPDATE agent_workers
                         SET heartbeat_at = ?1
-                      WHERE worker_token = ?2 AND state = 'running' AND worker_pid = ?3
-                        AND EXISTS (
-                            SELECT 1 FROM leases
-                             WHERE leases.project_id = agent_workers.project_id
-                               AND leases.holder = agent_workers.lease_holder
-                        )",
+                      WHERE worker_token = ?2 AND state = 'running' AND worker_pid = ?3",
                     params![heartbeat_at, worker_token, i64::from(worker_pid)],
                 )
                 .await
                 .with_context(|| format!("Failed to update worker {worker_token} heartbeat"))?;
-            if worker_changed != 1 {
+            if worker_changed != 1
+                && query_count(
+                    &transaction,
+                    "SELECT COUNT(*) FROM agent_workers
+                      WHERE worker_token = ?1 AND state = 'running' AND worker_pid = ?2
+                        AND heartbeat_at = ?3",
+                    params![worker_token, i64::from(worker_pid), heartbeat_at],
+                )
+                .await?
+                    != 1
+            {
                 return Ok(false);
             }
 
@@ -10899,17 +11059,21 @@ mod agent_store {
                 .execute(
                     "UPDATE leases
                         SET expires_at = ?1
-                      WHERE project_id = (
-                                SELECT project_id FROM agent_workers WHERE worker_token = ?2
-                            )
-                        AND holder = (
-                                SELECT lease_holder FROM agent_workers WHERE worker_token = ?2
-                            )",
-                    params![lease_expires_at, worker_token],
+                      WHERE project_id = ?2 AND holder = ?3",
+                    params![lease_expires_at, project_id, lease_holder.as_str()],
                 )
                 .await
                 .with_context(|| format!("Failed to renew worker {worker_token} lease"))?;
-            if lease_changed != 1 {
+            if lease_changed != 1
+                && query_count(
+                    &transaction,
+                    "SELECT COUNT(*) FROM leases
+                      WHERE project_id = ?1 AND holder = ?2 AND expires_at = ?3",
+                    params![project_id, lease_holder.as_str(), lease_expires_at],
+                )
+                .await?
+                    != 1
+            {
                 return Ok(false);
             }
 
@@ -12983,6 +13147,68 @@ mod agent_store {
                 })
         }
 
+        pub(crate) fn clear_orphaned_resume_requested_session_blocking(
+            &self,
+            project_id: i64,
+            codex_session_id: &str,
+            now: u64,
+        ) -> Result<bool> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(async {
+                    let mut conn = self.connect().await?;
+                    let transaction = conn
+                        .transaction_with_behavior(TransactionBehavior::Immediate)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "Failed to begin clearing orphaned Codex session {codex_session_id} for project {project_id}"
+                            )
+                        })?;
+                    if query_count(
+                        &transaction,
+                        "SELECT COUNT(*) FROM agent_workers
+                          WHERE project_id = ?1
+                            AND state IN ('dispatching', 'running', 'finalizing')",
+                        [project_id],
+                    )
+                    .await?
+                        > 0
+                        || query_count(
+                            &transaction,
+                            "SELECT COUNT(*) FROM leases
+                              WHERE project_id = ?1
+                                AND CAST(expires_at AS INTEGER) > CAST(?2 AS INTEGER)",
+                            params![project_id, now.to_string()],
+                        )
+                        .await?
+                            > 0
+                    {
+                        return Ok(false);
+                    }
+                    let removed = transaction
+                        .execute(
+                            "DELETE FROM session_controls
+                              WHERE project_id = ?1 AND codex_session_id = ?2
+                                AND state = 'resume_requested' AND child_pid IS NULL
+                                AND interactive_holder IS NULL",
+                            params![project_id, codex_session_id],
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "Failed to clear orphaned Codex session {codex_session_id} for project {project_id}"
+                            )
+                        })?;
+                    transaction.commit().await.with_context(|| {
+                        format!(
+                            "Failed to commit clearing orphaned Codex session {codex_session_id} for project {project_id}"
+                        )
+                    })?;
+                    Ok(removed > 0)
+                })
+        }
+
         pub(crate) fn register_known_session_with_child_blocking(
             &self,
             registration: AgentKnownSessionRegistration<'_>,
@@ -13770,6 +13996,58 @@ mod agent_store {
                 .with_context(|| format!("Failed to set project {} enabled state", path))?;
 
             Ok(changed > 0)
+        }
+
+        pub(crate) fn clear_project_failure_backoff_for_path_blocking(
+            &self,
+            project_root: &Path,
+        ) -> Result<bool> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(async {
+                    let mut conn = self.connect().await?;
+                    let path = project_root.display().to_string();
+                    let transaction = conn
+                        .transaction_with_behavior(TransactionBehavior::Immediate)
+                        .await
+                        .with_context(|| {
+                            format!("Failed to begin retrying registered project {path}")
+                        })?;
+                    if query_count(
+                        &transaction,
+                        "SELECT COUNT(*) FROM agent_workers
+                          WHERE project_id = (SELECT id FROM projects WHERE path = ?1)
+                            AND state IN ('dispatching', 'running', 'finalizing')",
+                        [path.as_str()],
+                    )
+                    .await?
+                        > 0
+                        || query_count(
+                            &transaction,
+                            "SELECT COUNT(*) FROM leases
+                              WHERE project_id = (SELECT id FROM projects WHERE path = ?1)
+                                AND CAST(expires_at AS INTEGER) > CAST(?2 AS INTEGER)",
+                            params![path.as_str(), agent_timestamp()],
+                        )
+                        .await?
+                            > 0
+                    {
+                        anyhow::bail!("Cannot retry project {path} while its agent worker or lease is active");
+                    }
+                    let changed = transaction
+                        .execute(
+                            "UPDATE projects SET failure_count = 0, updated_at = ?1 WHERE path = ?2",
+                            params![agent_timestamp(), path.as_str()],
+                        )
+                        .await
+                        .with_context(|| {
+                            format!("Failed to clear project {path} failure cooldown")
+                        })?;
+                    transaction.commit().await.with_context(|| {
+                        format!("Failed to commit project {path} immediate retry")
+                    })?;
+                    Ok(changed > 0)
+                })
         }
 
         pub(crate) fn set_project_git_mode_blocking(
@@ -26729,6 +27007,53 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_clears_orphaned_resume_session_and_runs_next_todo() {
+        let root = temp_root("scheduler-orphaned-resume-session");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        add_task(&project_root, "next task", None).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project_id = store.list_projects_blocking().unwrap().remove(0).id;
+        store
+            .set_session_control_state_blocking(
+                project_id,
+                "session-without-task-marker",
+                AgentSessionControlState::ResumeRequested,
+            )
+            .unwrap();
+        drop(store);
+
+        let scheduled = run_agent_scheduler_pass(&state_dir, false, &[]).unwrap();
+
+        assert_eq!(scheduled.jobs.len(), 1);
+        assert_eq!(scheduled.pass.runs_started, 1);
+        assert_eq!(
+            scheduled.jobs[0].task_selection,
+            AgentTaskSelection::NextTodo
+        );
+        assert!(scheduled.jobs[0].resume_session_id.is_none());
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        assert!(
+            store
+                .session_control_blocking(project_id, "session-without-task-marker")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .release_lease_blocking(project_id, &scheduled.jobs[0].holder)
+                .unwrap()
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn interactive_guardian_adoption_and_finish_are_atomic_full_holder_cas() {
         let root = temp_root("interactive-guardian-holder-cas");
         let state_dir = root.join("state/clt");
@@ -29305,6 +29630,16 @@ mod tests {
             }
             _ => panic!("expected agent resume command"),
         }
+
+        let retry_cli = Cli::try_parse_from(["clt", "agent", "retry", "/tmp/project"]).unwrap();
+        match retry_cli.command {
+            Some(Commands::Agent {
+                command: AgentCommands::Retry { path },
+            }) => {
+                assert_eq!(path, Some(PathBuf::from("/tmp/project")));
+            }
+            _ => panic!("expected agent retry command"),
+        }
     }
 
     #[test]
@@ -29462,6 +29797,7 @@ mod tests {
     fn agent_top_level_subcommands_parse() {
         for subcommand in [
             "projects", "daemon", "start", "stop", "status", "logs", "clean", "pause", "resume",
+            "retry",
         ] {
             let cli = Cli::try_parse_from(["clt", "agent", subcommand]).unwrap();
 
@@ -31355,6 +31691,50 @@ mod tests {
         );
         let project = store.list_projects_blocking().unwrap().remove(0);
         assert!(project.enabled);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_store_immediate_retry_clears_only_the_selected_project_failure_count() {
+        let root = temp_root("agent-immediate-retry");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project_id = store.list_projects_blocking().unwrap()[0].id;
+        store
+            .record_run_outcome_blocking(agent_store::AgentRunOutcome {
+                project_id,
+                status: "failure",
+                started_at: "100",
+                finished_at: Some("101"),
+                exit_code: Some(1),
+                log_dir: None,
+                stdout_path: None,
+                stderr_path: None,
+                summary: Some("failed"),
+                codex_session_id: None,
+            })
+            .unwrap();
+        assert_eq!(store.list_projects_blocking().unwrap()[0].failure_count, 1);
+        assert!(
+            store
+                .try_acquire_lease_blocking(project_id, "expired-holder", "98", "99")
+                .unwrap()
+        );
+
+        assert!(
+            store
+                .clear_project_failure_backoff_for_path_blocking(&project_root)
+                .unwrap()
+        );
+        assert_eq!(store.list_projects_blocking().unwrap()[0].failure_count, 0);
+        assert_eq!(store.run_count_blocking().unwrap(), 1);
 
         fs::remove_dir_all(root).unwrap();
     }
