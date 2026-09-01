@@ -60,6 +60,7 @@ Use this section while developing the next release.
 
 ### Fixed
 
+- Made Ctrl-C cancel TUI task creation and editing prompts, matching Escape without saving changes.
 - Recheck blocked Todo and Doing tasks before fresh Todo work whenever recovery backoff permits, while allowing ready work to proceed during an unresolved blocker's backoff.
 - Distinguished independent scheduler dispatch leases from legacy in-process runs so `clt agent stop` no longer reports a false legacy-run fence during post-reboot worker handoff.
 - Moved independent-worker dispatch off the daemon's async runtime so blocking agent-store operations cannot panic and restart the scheduler before the worker service is launched.

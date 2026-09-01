@@ -16415,6 +16415,12 @@ fn tui_starts_subtask_input(key: &crossterm::event::KeyEvent) -> bool {
     }
 }
 
+fn tui_cancels_task_prompt(key: &crossterm::event::KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Esc)
+        || (matches!(key.code, KeyCode::Char('c' | 'C'))
+            && key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
 fn tui_task_reorganize_direction(
     key: &crossterm::event::KeyEvent,
 ) -> Option<TuiTaskReorganizeDirection> {
@@ -23316,6 +23322,11 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                             }
                             _ => {}
                         },
+                        Mode::Input if tui_cancels_task_prompt(&key) => {
+                            current_mode = Mode::View;
+                            subtask_parent = None;
+                            task_input.reset();
+                        }
                         Mode::Input => match key.code {
                             KeyCode::Enter => {
                                 let task_value = task_input.submitted_value();
@@ -23371,11 +23382,6 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                 subtask_parent = None;
                                 task_input.reset();
                             }
-                            KeyCode::Esc => {
-                                current_mode = Mode::View;
-                                subtask_parent = None;
-                                task_input.reset();
-                            }
                             _ => {
                                 let label = if subtask_parent.is_some() {
                                     " Add Subtask: "
@@ -23390,6 +23396,11 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                 )
                             }
                         },
+                        Mode::Edit if tui_cancels_task_prompt(&key) => {
+                            current_mode = Mode::View;
+                            task_input.reset();
+                            editing_task_idx = None;
+                        }
                         Mode::Edit => match key.code {
                             KeyCode::Enter => {
                                 let task_value = task_input.submitted_value();
@@ -23412,11 +23423,6 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                     feedback_buffer =
                                         "Task description cannot be empty.".to_string();
                                 }
-                                current_mode = Mode::View;
-                                task_input.reset();
-                                editing_task_idx = None;
-                            }
-                            KeyCode::Esc => {
                                 current_mode = Mode::View;
                                 task_input.reset();
                                 editing_task_idx = None;
@@ -24131,6 +24137,32 @@ mod tests {
             tui_task_reorder_direction(&key(KeyCode::Char('n'), KeyModifiers::CONTROL)),
             Some(TuiTaskReorderDirection::Down)
         );
+    }
+
+    #[test]
+    fn tui_task_prompt_cancel_shortcuts_support_escape_and_control_c() {
+        let key = |code, modifiers| crossterm::event::KeyEvent::new(code, modifiers);
+
+        assert!(tui_cancels_task_prompt(&key(
+            KeyCode::Esc,
+            KeyModifiers::NONE
+        )));
+        assert!(tui_cancels_task_prompt(&key(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(tui_cancels_task_prompt(&key(
+            KeyCode::Char('C'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT
+        )));
+        assert!(!tui_cancels_task_prompt(&key(
+            KeyCode::Char('c'),
+            KeyModifiers::NONE
+        )));
+        assert!(!tui_cancels_task_prompt(&key(
+            KeyCode::Char('c'),
+            KeyModifiers::ALT
+        )));
     }
 
     #[test]
