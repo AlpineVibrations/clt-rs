@@ -22,7 +22,7 @@ chrono = "0.4"
 libc = "0.2"
 tui-input = "0.15.3"
 tokio = { version = "1.52", features = ["macros", "rt-multi-thread", "signal", "time"] }
-turso = { version = "0.7", default-features = false }
+turso = { version = "=0.7.0", default-features = false }
 toml_edit = "0.23"
 serde_json = "1.0"
 ureq = { version = "3.4", default-features = false, features = ["json", "rustls"] }

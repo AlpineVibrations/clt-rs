@@ -10208,6 +10208,7 @@ fn ensure_agent_state_dir_at(state_dir: &Path) -> Result<()> {
         .with_context(|| format!("Failed to create agent state directory {:?}", state_dir))
 }
 
+#[cfg(not(test))]
 fn agent_state_dir() -> Result<PathBuf> {
     resolve_agent_state_dir(
         current_agent_platform(),
@@ -10215,6 +10216,29 @@ fn agent_state_dir() -> Result<PathBuf> {
         std::env::var_os("XDG_STATE_HOME").map(PathBuf::from),
         std::env::var_os("HOME").map(PathBuf::from),
     )
+}
+
+#[cfg(test)]
+fn agent_state_dir() -> Result<PathBuf> {
+    Ok(isolated_unit_test_agent_state_dir())
+}
+
+#[cfg(test)]
+fn isolated_unit_test_agent_state_dir() -> PathBuf {
+    static STATE_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+    STATE_DIR
+        .get_or_init(|| {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0);
+            std::env::temp_dir().join(format!(
+                "clt-unit-test-agent-state-{}-{nonce}",
+                std::process::id()
+            ))
+        })
+        .clone()
 }
 
 fn current_agent_platform() -> AgentPlatform {
@@ -38485,6 +38509,34 @@ mod tests {
         .unwrap();
 
         assert_eq!(state_dir, override_dir);
+    }
+
+    #[test]
+    fn unit_test_agent_state_dir_is_isolated_from_user_defaults() {
+        let state_dir = agent_state_dir().unwrap();
+
+        assert_eq!(state_dir, isolated_unit_test_agent_state_dir());
+        assert!(state_dir.starts_with(std::env::temp_dir()));
+        assert_ne!(
+            state_dir,
+            resolve_agent_state_dir(
+                AgentPlatform::Linux,
+                None,
+                None,
+                Some(PathBuf::from("/home/alex")),
+            )
+            .unwrap()
+        );
+        assert_ne!(
+            state_dir,
+            resolve_agent_state_dir(
+                AgentPlatform::Macos,
+                None,
+                None,
+                Some(PathBuf::from("/Users/alex")),
+            )
+            .unwrap()
+        );
     }
 
     #[test]

@@ -2,8 +2,7 @@
 
 ## Codebase Architecture
 
-- Split `src/main.rs` (~18K LOC) into proper modules: `src/agent.rs`, `src/tui.rs`, `src/cli.rs`, `src/tasks.rs`, etc.
-- Introduce integration and unit tests for each module.
+- Execute the staged [CLT codebase refactor plan](refactor-plan.md) to split the monolithic binary into tested task, agent, CLI, and TUI modules.
 
 ## Quality of Life
 
