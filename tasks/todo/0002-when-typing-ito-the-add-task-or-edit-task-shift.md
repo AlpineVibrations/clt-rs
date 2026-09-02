@@ -1,0 +1,1 @@
+when typing ito the add task or edit task shift is still being captured for the task movment. its not possible to move a task while in the task editing typing. so the bug is that we cant enter capital letters or use shift with the keybaord. bug

@@ -5,13 +5,13 @@ description: Start repository tasks from the latest safe upstream state, then co
 
 # Git Commit Workflow
 
-Use shell/Bash Git commands for inspection, staging, committing, rebasing, and pushing. Prefer non-interactive commands. Do not change Git config.
+For ordinary manual or external work, use shell/Bash Git commands for inspection, staging, committing, rebasing, and pushing. Prefer non-interactive commands. Do not change Git config. In a released automated CLT run, use Git only for the permitted inspection, staging, and sealed local commit; never rebase or push.
 
-The caller may request either a commit-only or commit-and-push workflow. An automated agent prompt that explicitly selects commit and push authorizes pushing the completed task for that run.
+For ordinary manual work, the caller may request either a commit-only or commit-and-push workflow. In automated CLT commit-and-push mode, Codex is authorized only to create the sealed local commit; CLT alone owns publication.
 
 ## Start-of-Task Sync
 
-Before editing files for each new task in an existing Git repository, inspect the checkout:
+For ordinary interactive work, before editing files for each new task in an existing Git repository, inspect the checkout:
 
 ```bash
 git status --short --branch
@@ -25,6 +25,12 @@ git pull --ff-only
 
 Use fast-forward-only here so the startup sync cannot create a merge commit, rebase local commits, or disturb user work. If the checkout is dirty, detached, has no upstream, or cannot fast-forward, do not stash, discard, commit, switch branches, or integrate changes solely to make the pull succeed. Continue from the current checkout when safe and mention that the startup pull was skipped or could not complete.
 
+Do not run that startup procedure from inside a released automated CLT task. For a fresh task in `commit` or `commit-and-push` mode, the intended checkout, branch, and upstream must be configured before scheduling, and the selected Todo task must already exist in `HEAD`; commit a newly created task definition before asking automation to execute it. Before spawning or releasing Codex, CLT requires the index to match `HEAD` and performs the safe fast-forward-only startup sync unless an older `WORKING` journal requires preserving its history. It captures the resulting commit, branch, worktree baseline, and upstream configuration and persists that server-owned launch state. Any spawned child remains gated until its remaining session fences are registered. It releases the agent only after preparation succeeds. Commit-and-push requires an attached branch with exactly one configured upstream at that boundary.
+
+After release, inspect the frozen state but do not pull, fetch/synchronize, merge, rebase, switch branches, reset history, reconfigure the upstream, or push. Move the selected Todo task to Doing before implementation so CLT can recheck and bind the frozen launch record to the session's `WORKING` journal.
+
+An unconsumed pre-registration launch boundary is immutable. Do not retry by recapturing it from the current checkout or by cleaning/unregistering the project. Even if a reaped child exits before announcing a session, CLT preserves the record until the exact worker is terminal, no session-control row owns the run token, and the checkout and Git mode still match; otherwise it fails closed.
+
 ## Shared Dirty Worktrees
 
 A dirty worktree is expected when a person, an interactive session, or an independent worker has changes in progress. Dirtiness alone is never a reason to block or abandon the current task.
@@ -34,6 +40,8 @@ A dirty worktree is expected when a person, an interactive session, or an indepe
 - A pre-existing change in the same file is not automatically a conflict. Re-read the affected area, apply the task's change against the current contents, and preserve both changes when the combined result is clear.
 - Stop only for a real conflict: the same behavior or lines require incompatible outcomes and the correct combined result cannot be determined safely.
 - At commit time, stage only the current task's paths or hunks. Leave unrelated unstaged changes in place. When a file contains mixed changes, use patch staging and verify the cached diff before committing.
+
+Unstaged work can safely coexist because CLT records a baseline. The Git index is a cooperative boundary during an automated finalization: humans, interactive sessions, and parallel tools sharing the checkout must not stage or unstage until it settles. CLT rejects a fresh run with pre-existing staged changes and detects many later changes, but Git does not record which actor staged a new clean-file change.
 
 ## Default Flow
 
@@ -52,20 +60,22 @@ Then:
 2. Stage the intended files.
 3. Verify the staged diff.
 4. Commit with a message based on the staged diff.
-5. Push only if requested by the user or explicitly selected by the automated agent prompt, after `git pull --autostash`.
+5. Push only when explicitly requested for ordinary manual/external work. In automated CLT mode, stop after the verified local commit and let CLT publish it.
 
 ## Safety Rules
 
 - Follow repo instructions in `AGENTS.md`, `README`, `CONTRIBUTING`, or project docs when present.
 - Do not create or switch branches unless the user asks or the repo explicitly requires it.
 - If the repo has no branch rule, committing on the current branch is acceptable, including `main` or `master`.
-- Do not push unless the user asks to push or the automated agent prompt explicitly selects commit and push.
+- Do not push unless the user asks during ordinary manual/external work. Never push from an automated CLT task, even when its mode is commit-and-push.
 - Do not force-push unless the user explicitly asks; use `--force-with-lease`, never plain `--force`.
 - Do not amend commits unless the user asks.
 - Do not skip hooks with `--no-verify` unless the user explicitly asks.
 - Never commit secrets, credentials, tokens, private keys, `.env` files, local config, logs, caches, or temporary/generated output unless the user explicitly asks.
 
 ## Branch Instructions
+
+These instructions apply to ordinary interactive work. In an automated CLT Git-enabled run, the branch was selected and frozen before the agent was released; do not create or switch branches.
 
 Repo instructions may specify a required branch for a feature, bugfix, or plan. Check `AGENTS.md`, project docs, feature plans, and design docs for branch guidance when they are relevant to the work.
 
@@ -109,6 +119,8 @@ If changes are already staged:
 - Mention unstaged or untracked changes only if they look relevant.
 - Add more files only when they clearly belong to the same logical change or the user asked to commit everything.
 
+The exception is an automated CLT finalization. Pre-existing staged changes are not implicitly part of the task commit. Isolate the current task's paths or hunks and stop if that cannot be done without disturbing or committing another actor's staged work.
+
 If nothing is staged:
 
 - Stage all changes with `git add -A` only when they form one logical commit.
@@ -145,6 +157,37 @@ git diff --staged -- tasks/
 ```
 
 Stage the current task's content and status transition, including both sides of a move or deletion. Use `git add -A -- tasks/` only when every task-board change belongs to the same logical commit; otherwise stage the exact task paths and leave unrelated task changes untouched.
+
+For managed Git automation, directory-backed status moves preserve the existing task path and order rather than converting or renumbering it. CLT rejects folder-backed Todo-to-Markdown Doing and folder-backed Doing-to-Markdown Done routes before release. Exact session-linked duplicates left by a crash are repaired; ambiguous copies remain fenced.
+
+## Automated CLT Finalization
+
+When an automated CLT prompt enables `commit` or `commit-and-push` mode, `clt done` starts a durable task finalization. The task may already appear in the Done store, but that move is provisional while CLT reports `FINALIZING`.
+
+CLT already completed its scheduler-owned startup preparation and branch/upstream validation, persisted the server-owned launch state, and only then released this automated run. That preparation may deliberately preserve the current commit when an older `WORKING` journal depends on it. Do not repeat the preparation. Move the selected committed Todo task to Doing before implementation; CLT rechecks the starting commit, branch, baseline, and upstream configuration and binds the session journal at that seam. Do not pull, fetch/synchronize, merge, rebase, switch branches, reset, reconfigure the destination, or rewrite history afterward.
+
+Before `clt done`, run every available formatter, linter, signing check, and hook check that can mutate files. Then stage the verified implementation plus the active Doing task with its dated completion note and terminal session marker. Inspect the staged diff, and leave all unrelated baseline work unstaged. `clt done` uses a private index to project that task into Done and seals the exact resulting full repository tree, not merely the changed paths or patch. It then moves the worktree entry provisionally. Stage only the resulting board transition and inspect the complete staged diff again before committing.
+
+Create exactly one normal commit containing all of the following:
+
+- the implementation and tests or documentation belonging to the task;
+- its `COMPLETED YYYY-MM-DD:` note;
+- the complete task-board transition into Done; and
+- one exact commit trailer identifying the linked task session: `CLT-Task: codex:<session-id>`.
+
+Read the terminal `codex:<session-id>` marker from the task entry and preserve it in the board change. Add the trailer as a separate commit-message paragraph, for example:
+
+```bash
+git commit \
+  -m "Clear summary message" \
+  -m "CLT-Task: codex:019abcde-1234-7890-abcd-0123456789ab"
+```
+
+Use ordinary `git commit` so repository hooks and signing behavior remain active. Do not use `commit-tree`, an alternate index, amend, a merge commit, or a second board-only commit to simulate finalization. After the command returns, inspect the created commit. CLT will accept only the exact sealed full tree and manifest parent together with the matching task identity, CLT Agent author/committer identity, and one exact trailer.
+
+If a commit hook changes files or fails after sealing, fix and stage the complete corrected payload, run `clt list done` to confirm the current index, then run `clt done done <index>` to reseal that provisional Done entry. Inspect the new staged diff and retry the one commit. If the process stops, CLT resumes this exact session and checks whether the intended commit already exists before creating anything. Never move the provisional Done entry back to Doing merely because acknowledgement was lost, and never duplicate a commit that CLT can prove already succeeded. If completed-task evidence exists but the frozen start journal was lost, stop: CLT deliberately fails closed because it cannot reconstruct the exact-one-commit boundary safely.
+
+After creating and inspecting the exact task commit, exit without pushing. In commit-and-push mode CLT proves the local commit, performs publication itself, and retries `PUSH-PENDING` without resuming Codex. A blocked `WORKING` journal may yield to another Todo during blocked-recovery backoff while its history is preserved; `FINALIZING` and `PUSH-PENDING` block later project work.
 
 ## Commit Message
 
@@ -188,6 +231,8 @@ or, when a body is useful:
 git commit -m "Clear summary message" -m "Explain the relevant context."
 ```
 
+For automated CLT finalization, the required `CLT-Task: codex:<session-id>` trailer is the final message paragraph even when no other body is needed.
+
 ## Hook Failures
 
 If a commit hook fails:
@@ -199,9 +244,9 @@ If a commit hook fails:
 
 If the fix is unclear, report the failure and ask before continuing. Do not bypass hooks unless explicitly requested.
 
-## Pull And Push
+## Manual Or External Pull And Push
 
-When the user asks to push or the automated agent prompt explicitly selects commit and push, sync first. Use a normal pull so Git honors the user's existing `pull.rebase` or branch configuration instead of forcing a different integration strategy:
+When the user asks to push outside automated CLT finalization, sync first. Use a normal pull so Git honors the user's existing `pull.rebase` or branch configuration:
 
 ```bash
 git pull --autostash
@@ -209,26 +254,28 @@ git pull --autostash
 
 The pull may merge or rebase according to that configuration. Do not pass `--rebase` or `--no-rebase`, and do not change Git configuration, unless the user explicitly asks for a specific strategy.
 
-If conflicts occur:
+Outside automated CLT finalization, if conflicts occur:
 
 1. Inspect the conflict.
 2. Resolve only when the correct resolution is clear.
 3. Continue with `git rebase --continue` for a rebase or `git merge --continue` for a merge.
 4. Ask the user when the correct resolution is ambiguous.
 
-Then push:
+Outside automated CLT finalization, then push:
 
 ```bash
 git push
 ```
 
-If the branch has no upstream:
+Outside automated CLT finalization, if the branch has no upstream:
 
 ```bash
 git push -u origin "$(git branch --show-current)"
 ```
 
 Do not push tags unless the user explicitly asks.
+
+The commands above are never part of an automated CLT run. In automated commit-and-push mode, CLT resolves the effective remote using `branch.<name>.pushRemote`, then `remote.pushDefault`, then the upstream remote, and freezes its one concrete push URL plus the upstream merge ref. After local proof, CLT alone invokes an explicit non-force `<frozen-oid>:<frozen-ref>` publication to the frozen URL, ignoring implicit routing at publication time, and independently proves remote containment. A failure remains `PUSH-PENDING`; the scheduler retries it without Codex and blocks later project work. External recovery may publish deliberately, but the automated agent must never run a push command.
 
 ## Final Response
 

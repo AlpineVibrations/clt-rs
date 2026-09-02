@@ -1,0 +1,5 @@
+Make Git-backed agent completion a durable FINALIZING transaction (AGENT, GIT, RELIABILITY)
+
+Progress note:
+
+2026-09-02: Implemented the persisted, generation-fenced Git finalization transaction with prelaunch start-state capture, provisional Done sealing, exact one-commit/tree/identity/trailer proof, hook resealing, exact-session crash recovery, an independently verified frozen-destination push, task-evidence mutation guards, a renewable finalizer lease, and fail-closed recovery when the original journal is unavailable. Foreground Git runs now use the same durable worker generation, launch evidence survives no-session exits until it can be proven safe to reclaim, and shared writable interactive sessions are fenced from managed Git boundaries. Normal commit, signing, and pre-push policy remains active. Updated the CLT and Git skills plus README/design/agent documentation. Checks: `cargo test --locked -- --test-threads=1` (391 passed); `cargo clippy --locked -- -D warnings`; `cargo fmt --check`; `git diff --check`. The task remains Doing because this shared worktree contains inseparable pre-existing changes, so no safe isolated task commit was created.

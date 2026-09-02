@@ -3,14 +3,14 @@ use chrono::{DateTime, Local, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 use ratatui::layout::{Alignment, Position, Rect};
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write, stdout};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{
-    Arc,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc::{self, Receiver, TryRecvError},
 };
@@ -57,6 +57,9 @@ const ARCHIVE_STATUS_CANDIDATES: [&str; 2] = ["archived", "archive"];
 const BOARD_MUTATION_LOCK_TIMEOUT_MILLIS: u64 = 10_000;
 const BOARD_MUTATION_LOCK_RETRY_MILLIS: u64 = 10;
 const AGENT_STATE_DIR_ENV: &str = "CLT_AGENT_STATE_DIR";
+const AGENT_PROJECT_ID_ENV: &str = "CLT_AGENT_PROJECT_ID";
+const AGENT_RUN_TOKEN_ENV: &str = "CLT_AGENT_RUN_TOKEN";
+const AGENT_GIT_FINALIZATION_RESUME_TOKEN_PREFIX: &str = "clt-git-finalization:";
 const AGENT_DB_FILE: &str = "agent.db";
 const AGENT_FAILURE_BACKOFF_SECONDS_ENV: &str = "CLT_AGENT_FAILURE_BACKOFF_SECONDS";
 const AGENT_HEARTBEAT_TAIL_ENV: &str = "CLT_AGENT_HEARTBEAT_TAIL";
@@ -87,12 +90,18 @@ const TURSO_SHARED_WAL_MAGIC: &[u8; 8] = b"TSHMWAL\0";
 #[cfg(unix)]
 const TURSO_SHARED_WAL_VERSION: u32 = 1;
 const AGENT_DEFAULT_RUN_TIMEOUT_SECONDS: u64 = 45 * 60;
+const AGENT_GIT_REMOTE_TIMEOUT_SECONDS: u64 = 30;
+// A commit-and-push reconciliation can perform two three-step remote proofs
+// around one push. Its dedicated renewable lease stays beyond that bounded
+// single-pass worst case without inheriting the ordinary one-hour worker TTL.
+const AGENT_GIT_FINALIZATION_LEASE_SECONDS: u64 = AGENT_GIT_REMOTE_TIMEOUT_SECONDS * 8 + 60;
 const AGENT_DEFAULT_SUCCESS_COOLDOWN_SECONDS: u64 = 5;
 const AGENT_DAEMON_CHECKIN_STALE_SECONDS: u64 = 45;
 const AGENT_LEASE_RENEW_MAX_INTERVAL_MILLIS: u64 = 15_000;
 const AGENT_WORKER_STARTUP_TIMEOUT_SECONDS: u64 = 60;
 const AGENT_WORKER_HEARTBEAT_TIMEOUT_SECONDS: u64 = 60;
-const AGENT_WORKER_PROTOCOL_VERSION: i64 = 1;
+const AGENT_WORKER_PROTOCOL_VERSION: i64 = 2;
+const AGENT_INLINE_WORKER_SERVICE_LABEL_PREFIX: &str = "clt-inline-worker-";
 const AGENT_WORKERS_ACTIVE_PROJECT_INDEX: &str = "agent_workers_active_project_unique";
 const AGENT_WORKERS_ACTIVE_PROJECT_INDEX_SQL: &str =
     "CREATE UNIQUE INDEX IF NOT EXISTS agent_workers_active_project_unique
@@ -133,6 +142,7 @@ const TUI_NO_ACTIVE_BOARD_MESSAGE: &str =
     "No active board. Open a project from Agent Projects, or press M for Models.";
 static INTERACTIVE_LEASE_GENERATION: AtomicU64 = AtomicU64::new(1);
 static AGENT_WORKER_GENERATION: AtomicU64 = AtomicU64::new(1);
+static ACTIVE_INLINE_AGENT_WORKERS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 #[derive(Clone, Copy)]
 struct AgentProviderPreset {
@@ -190,8 +200,9 @@ Your job for this run:
 2. Pick the next available unblocked TODO / ready task.
 3. If there are no available tasks, say exactly: NO_TASKS_LEFT
 4. If there is a task:
-   - move it to doing
-   - inspect its full content before starting work
+   - inspect its full content and applicable repository instructions before starting work
+   - follow the applicable mode-specific pre-task Git boundary; when a Git appendix says CLT already prepared and froze the checkout, do not sync or switch it yourself
+   - move it to doing only after that preparation
    - if the first non-whitespace token is exactly `/goal`, treat that as an explicit Goal mode request: remove that token, trim the remaining task content, create a persistent goal from the result without including `/goal` in the goal objective, and then work toward it
    - if `/goal` has no non-empty objective after it, add a concise `BLOCKED YYYY-MM-DD:` note explaining that the goal objective is missing and stop
    - do not create a goal when `/goal` appears anywhere except at the start of the task content
@@ -218,18 +229,27 @@ Safety rules:
 const AGENT_GIT_COMMIT_PROMPT_APPENDIX: &str = r#"
 
 Git commit:
-- After completing and verifying the task, use the $git-commit skill to create one git commit for the completed work.
-- Include the code changes and related task-board updates in the commit when they are part of the same logical change.
+- This finalization contract is authoritative for the automated run and overrides older installed skill guidance when they differ.
+- Before this process was released, CLT completed the scheduler-owned startup preparation, using a safe fast-forward-only sync only when no older WORKING journal required preserving its history, then froze HEAD, the worktree baseline, branch, and upstream state and persisted that launch record. The selected task must already be committed exactly once on the board. Do not pull, fetch or otherwise synchronize, merge, rebase, switch branches, reset history, or reconfigure Git after release.
+- Move the selected Todo task to Doing before implementation. CLT rechecks the frozen launch record and binds it to the session's durable WORKING journal at that transition; do not edit or commit implementation first.
+- After completing and verifying the task, run all formatting, lint, signing, and hook checks that can mutate files before sealing. Add its dated COMPLETED note. Stage the implementation and the active Doing task, including its terminal `codex:<session-id>` marker, then inspect the staged diff.
+- Run `clt done` only after that staged diff is complete. CLT seals its durable task manifest and makes the board move provisionally; it is not terminal completion by itself.
+- Stage only the resulting board transition, inspect the complete staged diff again, then use the $git-commit skill to create exactly one normal git commit containing the sealed implementation, completion note, and complete task-board move.
+- Give that commit one exact final message paragraph: `CLT-Task: codex:<session-id>`.
+- If a commit hook changes files or fails after the seal, fix and stage the complete corrected payload, run `clt done done <index>` to reseal that provisional Done entry, inspect it, and retry the one commit.
 - Pre-existing unstaged changes do not prevent a commit. Stage only this task's paths or hunks, verify the staged diff, and leave unrelated changes untouched.
 - Do not require the worktree to be clean before committing.
 - The scheduler supplies the isolated Git identity `CLT Agent <clt-agent@localhost>` for clear automated-commit attribution; do not change Git configuration.
+- Do not exit merely because the task appears in Done. Inspect the created commit and keep working until CLT can prove the task-specific commit. If this is a resumed finalization, inspect existing Git state before committing and never duplicate an already-created task commit.
 - Do not commit when there are no tasks left, the task is blocked, checks fail, or the work cannot be completed safely.
 "#;
 const AGENT_GIT_PUSH_PROMPT_APPENDIX: &str = r#"
 
 Git push:
-- This project is configured for commit and push. After creating the verified commit, use the $git-commit skill to pull first with the locally configured merge/rebase strategy, then push the current branch.
-- Do not push when no commit was created or when synchronization, hooks, checks, or the commit fail.
+- This project is configured for commit and push. CLT already froze the attached branch's single intended push URL and upstream before release.
+- Do not run `git push`. After CLT proves the sealed local commit, its finalizer sends exactly that frozen OID to exactly the frozen URL and merge ref with an explicit non-force refspec, then independently proves the remote result.
+- Exit after creating and inspecting the verified commit. The task remains PUSH-PENDING until CLT's bounded push and remote proof succeed.
+- If the remote advanced and rejects publication, CLT leaves the task PUSH-PENDING for a later scheduler retry or explicit external recovery; do not pull, fetch, merge, rebase, amend, switch branches, or change the destination.
 - Never force-push.
 "#;
 const AGENT_RESUME_DOING_PROMPT_APPENDIX: &str = r#"
@@ -259,6 +279,7 @@ const AGENT_RESUME_SESSION_PROMPT_APPENDIX: &str = r#"
 
 Interactive handoff recovery:
 - Resume the exact task and Codex session that CLT handed back from interactive mode.
+- If CLT reports this task as FINALIZING, inspect the existing commit first and continue only the first unproven local step. A PUSH-PENDING task is scheduler-owned and must not resume Codex merely to publish. Never create a duplicate completion commit or move a successfully committed task back to Doing.
 - Inspect the linked task, current project state, and any interactive instructions, then continue from the next unfinished substantive step in the conversation context.
 - A prior assistant plan, progress message, draft, summary, or claimed completion is not proof that requested work finished.
 - If the linked task or interactive instructions request project, file, code, configuration, or task-board changes, do not mark the task done until those durable changes actually exist and the relevant checks pass.
@@ -274,6 +295,22 @@ enum AgentGitMode {
     Off,
     Commit,
     CommitAndPush,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AutomatedAgentChildContext {
+    project_id: i64,
+    run_token: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GitFinalizationState {
+    Working,
+    Tracking,
+    CommitPending,
+    PushPending,
+    Completed,
+    Cancelled,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -385,6 +422,105 @@ impl AgentGitMode {
             Self::Off => "OFF",
             Self::Commit => "COM",
             Self::CommitAndPush => "PUSH",
+        }
+    }
+}
+
+fn automated_agent_child_context() -> Result<Option<AutomatedAgentChildContext>> {
+    automated_agent_child_context_from_values(
+        std::env::var_os(AGENT_PROJECT_ID_ENV),
+        std::env::var_os(AGENT_RUN_TOKEN_ENV),
+    )
+}
+
+fn automated_agent_child_context_from_values(
+    project_id: Option<OsString>,
+    run_token: Option<OsString>,
+) -> Result<Option<AutomatedAgentChildContext>> {
+    let (project_id, run_token) = match (project_id, run_token) {
+        (None, None) => return Ok(None),
+        (Some(project_id), Some(run_token)) => (project_id, run_token),
+        _ => {
+            anyhow::bail!(
+                "Incomplete automated agent context: {AGENT_PROJECT_ID_ENV} and {AGENT_RUN_TOKEN_ENV} must be set together"
+            )
+        }
+    };
+    let project_id = project_id
+        .to_str()
+        .context("Automated agent project ID is not valid UTF-8")?
+        .parse::<i64>()
+        .with_context(|| format!("{AGENT_PROJECT_ID_ENV} must be a positive integer"))?;
+    if project_id <= 0 {
+        anyhow::bail!("{AGENT_PROJECT_ID_ENV} must be a positive integer");
+    }
+    let run_token = run_token
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("{AGENT_RUN_TOKEN_ENV} is not valid UTF-8"))?;
+    validate_agent_worker_token(&run_token)
+        .with_context(|| format!("Invalid {AGENT_RUN_TOKEN_ENV}"))?;
+
+    Ok(Some(AutomatedAgentChildContext {
+        project_id,
+        run_token,
+    }))
+}
+
+impl GitFinalizationState {
+    fn database_value(self) -> &'static str {
+        match self {
+            Self::Working => "working",
+            Self::Tracking => "tracking",
+            Self::CommitPending => "commit_pending",
+            Self::PushPending => "push_pending",
+            Self::Completed => "completed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    fn from_database(value: &str) -> Result<Self> {
+        match value {
+            "working" => Ok(Self::Working),
+            "tracking" => Ok(Self::Tracking),
+            "commit_pending" => Ok(Self::CommitPending),
+            "push_pending" => Ok(Self::PushPending),
+            "completed" => Ok(Self::Completed),
+            "cancelled" => Ok(Self::Cancelled),
+            _ => anyhow::bail!("Unknown Git finalization state: {value}"),
+        }
+    }
+
+    fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Cancelled)
+    }
+
+    fn is_finalizing(self) -> bool {
+        matches!(
+            self,
+            Self::Tracking | Self::CommitPending | Self::PushPending
+        )
+    }
+
+    fn status_label(self) -> &'static str {
+        match self {
+            Self::Working => "WORKING",
+            Self::Tracking | Self::CommitPending => "FINALIZING",
+            Self::PushPending => "PUSH-PENDING",
+            Self::Completed => "DONE",
+            Self::Cancelled => "CANCELLED",
+        }
+    }
+
+    fn can_transition_to(self, next: Self) -> bool {
+        match self {
+            Self::Working => matches!(next, Self::Working | Self::Tracking | Self::Cancelled),
+            Self::Tracking => matches!(next, Self::Tracking | Self::CommitPending),
+            Self::CommitPending => matches!(
+                next,
+                Self::CommitPending | Self::PushPending | Self::Completed
+            ),
+            Self::PushPending => matches!(next, Self::PushPending | Self::Completed),
+            Self::Completed | Self::Cancelled => false,
         }
     }
 }
@@ -641,9 +777,9 @@ impl InteractiveCodexResumeMode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InteractiveGuardianDisposition {
     ResumeExec,
-    DeleteIdleReservation,
+    PreserveIdleSession,
     RestoreStopped,
-    DeleteSharedReservation,
+    PreserveSharedSession,
     RestoreStoppedShared,
 }
 
@@ -655,28 +791,30 @@ impl InteractiveGuardianDisposition {
             if is_stopped_shared_interactive_holder(from_holder) {
                 Self::RestoreStoppedShared
             } else {
-                Self::DeleteSharedReservation
+                Self::PreserveSharedSession
             }
         } else if from_holder.starts_with("clt-stopped-interactive-") {
             Self::RestoreStopped
         } else {
-            Self::DeleteIdleReservation
+            Self::PreserveIdleSession
         }
     }
 
     fn holds_project_lease(self) -> bool {
         !matches!(
             self,
-            Self::DeleteSharedReservation | Self::RestoreStoppedShared
+            Self::PreserveSharedSession | Self::RestoreStoppedShared
         )
     }
 
     fn guardian_holder_prefix(self) -> &'static str {
         match self {
             Self::ResumeExec => "clt-interactive-worker",
-            Self::DeleteIdleReservation => "clt-idle-interactive-worker",
+            // Keep the established holder prefixes so a newer CLT can recover
+            // guardians started by an older binary.
+            Self::PreserveIdleSession => "clt-idle-interactive-worker",
             Self::RestoreStopped => "clt-stopped-interactive-worker",
-            Self::DeleteSharedReservation => "clt-shared-interactive-worker",
+            Self::PreserveSharedSession => "clt-shared-interactive-worker",
             Self::RestoreStoppedShared => "clt-stopped-shared-interactive-worker",
         }
     }
@@ -688,13 +826,13 @@ impl InteractiveGuardianDisposition {
             return Some(Self::RestoreStoppedShared);
         }
         if holder.starts_with("clt-readonly-interactive-worker-") {
-            return Some(Self::DeleteSharedReservation);
+            return Some(Self::PreserveSharedSession);
         }
         [
             Self::ResumeExec,
-            Self::DeleteIdleReservation,
+            Self::PreserveIdleSession,
             Self::RestoreStopped,
-            Self::DeleteSharedReservation,
+            Self::PreserveSharedSession,
             Self::RestoreStoppedShared,
         ]
         .into_iter()
@@ -781,6 +919,7 @@ trait AgentRunner: Send + Sync {
         task_selection: AgentTaskSelection,
         resume_session_id: Option<&str>,
         lease_holder: &str,
+        run_token: Option<&str>,
         shutdown: &AgentShutdownSignal,
     ) -> Result<AgentRunResult>;
 }
@@ -1132,14 +1271,32 @@ fn main() -> Result<()> {
             task_index,
             to,
         }) => {
-            move_task(&root, &from, &to, &task_index)?;
+            if to == "done" {
+                move_task_to_done(&root, &from, &task_index)?;
+            } else {
+                move_task(&root, &from, &to, &task_index)?;
+            }
         }
         Some(Commands::Done { status, task_index }) => {
             if status == "done" {
-                println!("Task is already done.");
+                if reseal_provisional_done_task(&root, &task_index)? {
+                    println!(
+                        "Task {} in done was resealed; Git finalization is pending.",
+                        task_index
+                    );
+                } else {
+                    println!("Task is already done.");
+                }
             } else {
-                move_task(&root, &status, "done", &task_index)?;
-                println!("Task {} from {} marked as done.", task_index, status);
+                let provisional = move_task_to_done(&root, &status, &task_index)?;
+                if provisional {
+                    println!(
+                        "Task {} from {} moved provisionally; Git finalization is pending.",
+                        task_index, status
+                    );
+                } else {
+                    println!("Task {} from {} marked as done.", task_index, status);
+                }
             }
         }
         Some(Commands::Delete { status, task_index }) => {
@@ -1467,6 +1624,11 @@ fn show_agent_status(store: &agent_store::TursoAgentStore) -> Result<()> {
     let active_workers = store.list_active_workers_blocking()?;
     let recent_runs = store.list_recent_runs_blocking(5)?;
     let daemon_checkins = store.list_daemon_checkins_blocking()?;
+    let pending_git_finalizations = if store.pending_migration_version().is_some() {
+        Vec::new()
+    } else {
+        store.list_pending_git_finalizations_blocking(None)?
+    };
     let service_status = agent_service_status(&state_dir);
     let daemon_status = format_agent_daemon_runtime_status(
         &service_status,
@@ -1494,10 +1656,11 @@ fn show_agent_status(store: &agent_store::TursoAgentStore) -> Result<()> {
         println!("schema=current");
     }
     println!(
-        "registered_projects={} enabled={} pending={} active_workers={} active_leases={}",
+        "registered_projects={} enabled={} pending={} finalizing={} active_workers={} active_leases={}",
         projects.len(),
         enabled_count,
         pending_count,
+        pending_git_finalizations.len(),
         active_workers.len(),
         active_leases.len()
     );
@@ -1556,6 +1719,27 @@ fn show_agent_status(store: &agent_store::TursoAgentStore) -> Result<()> {
                 format_agent_timestamp(&lease.acquired_at),
                 format_agent_timestamp(&lease.expires_at),
                 lease.project_path.display()
+            );
+        }
+    }
+
+    if !pending_git_finalizations.is_empty() {
+        println!();
+        println!("Git finalizations:");
+        for finalization in pending_git_finalizations {
+            let project_name = projects
+                .iter()
+                .find(|project| project.id == finalization.project_id)
+                .map(|project| project.name.as_str())
+                .unwrap_or("<unregistered>");
+            println!(
+                "project={} {} state={} session={} commit={} error={}",
+                finalization.project_id,
+                project_name,
+                finalization.state.status_label(),
+                finalization.codex_session_id,
+                finalization.commit_oid.as_deref().unwrap_or("-"),
+                finalization.last_error.as_deref().unwrap_or("-")
             );
         }
     }
@@ -2199,6 +2383,41 @@ fn next_agent_worker_token(project_id: i64) -> String {
 
 fn agent_worker_lease_holder(worker_token: &str) -> String {
     format!("clt-worker-{worker_token}")
+}
+
+struct InlineAgentWorkerGeneration {
+    worker_token: String,
+}
+
+impl InlineAgentWorkerGeneration {
+    fn register(worker_token: &str) -> Self {
+        ACTIVE_INLINE_AGENT_WORKERS
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(worker_token.to_string());
+        Self {
+            worker_token: worker_token.to_string(),
+        }
+    }
+}
+
+impl Drop for InlineAgentWorkerGeneration {
+    fn drop(&mut self) {
+        ACTIVE_INLINE_AGENT_WORKERS
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.worker_token);
+    }
+}
+
+fn inline_agent_worker_generation_is_registered(worker_token: &str) -> bool {
+    ACTIVE_INLINE_AGENT_WORKERS
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains(worker_token)
 }
 
 fn agent_worker_service_label(platform: AgentPlatform, worker_token: &str) -> Result<String> {
@@ -3056,6 +3275,65 @@ fn supervised_session_control(
 }
 
 #[cfg(unix)]
+fn finalize_reaped_unregistered_agent_worker(
+    store: &agent_store::TursoAgentStore,
+    project_id: i64,
+    run_token: &str,
+    lease_holder: &str,
+) -> Result<bool> {
+    if let Some(worker) = store
+        .list_active_workers_blocking()?
+        .into_iter()
+        .find(|worker| worker.worker_token == run_token)
+    {
+        if worker.project_id != project_id || worker.lease_holder != lease_holder {
+            anyhow::bail!(
+                "Reaped supervisor worker {run_token} does not match its exact project and lease fence"
+            );
+        }
+        let lease = store.lease_for_project_blocking(project_id)?;
+        let permitted_successor_holder = lease
+            .as_ref()
+            .filter(|lease| lease.holder != worker.lease_holder)
+            .map(|lease| lease.holder.as_str());
+        return store.abandon_worker_blocking(agent_store::AgentWorkerAbandonment {
+            worker_token: run_token,
+            expected_state: &worker.state,
+            expected_worker_pid: worker.worker_pid,
+            expected_heartbeat_at: worker.heartbeat_at.as_deref(),
+            finished_at: &agent_timestamp(),
+            error: "Automated runner disconnected after its supervised Codex process group was proven reaped",
+            permitted_successor_holder,
+        });
+    }
+
+    if let Some(worker) = store
+        .list_terminal_workers_blocking()?
+        .into_iter()
+        .find(|worker| worker.worker_token == run_token)
+    {
+        if worker.project_id != project_id || worker.lease_holder != lease_holder {
+            anyhow::bail!(
+                "Terminal supervisor worker {run_token} does not match its exact project and lease fence"
+            );
+        }
+        store.release_lease_blocking(project_id, lease_holder)?;
+        return Ok(true);
+    }
+
+    if store
+        .git_launch_state_blocking(project_id, run_token)?
+        .is_some()
+    {
+        anyhow::bail!(
+            "Reaped Git launch {run_token} has no exact durable worker to finalize; preserving its launch boundary and lease"
+        );
+    }
+    store.release_lease_blocking(project_id, lease_holder)?;
+    Ok(true)
+}
+
+#[cfg(unix)]
 fn stop_supervised_automated_child_until_reaped(
     child: &mut Child,
     reason: &str,
@@ -3143,12 +3421,27 @@ fn finalize_disconnected_automated_supervisor(
                 supervised_session_control(store, project_id, child_pid, run_token)
             }) {
                 Ok(None) => {
-                    let _ = with_agent_store_at(state_dir, |store| {
-                        store
-                            .release_lease_blocking(project_id, lease_holder)
-                            .map(|_| ())
-                    });
-                    return;
+                    match with_agent_store_at(state_dir, |store| {
+                        finalize_reaped_unregistered_agent_worker(
+                            store,
+                            project_id,
+                            run_token,
+                            lease_holder,
+                        )
+                    }) {
+                        Ok(true) => return,
+                        Ok(false) => {}
+                        Err(error) => {
+                            let should_warn = last_warning
+                                .is_none_or(|warning| warning.elapsed() >= Duration::from_secs(5));
+                            if should_warn {
+                                eprintln!(
+                                    "Automated supervisor is retrying exact worker finalization after reaping Codex: {error:#}"
+                                );
+                                last_warning = Some(Instant::now());
+                            }
+                        }
+                    }
                 }
                 Ok(Some(_)) => {}
                 Err(error) => {
@@ -4687,11 +4980,9 @@ fn finish_interactive_guardian_after_reap(
                                 }
                             })
                         }
-                        InteractiveGuardianDisposition::DeleteIdleReservation
-                        | InteractiveGuardianDisposition::DeleteSharedReservation => {
-                            control.is_none().then_some(false)
-                        }
-                        InteractiveGuardianDisposition::RestoreStopped
+                        InteractiveGuardianDisposition::PreserveIdleSession
+                        | InteractiveGuardianDisposition::PreserveSharedSession
+                        | InteractiveGuardianDisposition::RestoreStopped
                         | InteractiveGuardianDisposition::RestoreStoppedShared => control
                             .is_some_and(|control| {
                                 control.state == AgentSessionControlState::Stopped
@@ -5564,6 +5855,271 @@ fn run_agent_scheduler_pass_with_daemon_checkin(
     )
 }
 
+struct AgentGitFinalizationLease {
+    lease: Option<InteractiveAgentLease>,
+    holder: String,
+    stop_heartbeat: Option<mpsc::Sender<()>>,
+    heartbeat: Option<thread::JoinHandle<()>>,
+    heartbeat_error: Arc<Mutex<Option<String>>>,
+}
+
+impl AgentGitFinalizationLease {
+    fn start(lease: InteractiveAgentLease, timeout: Duration) -> Result<Self> {
+        let state_dir = lease.state_dir.clone();
+        let project_id = lease.project_id;
+        let holder = lease.holder.clone();
+        let timeout_seconds = timeout.as_secs().max(1);
+        let renew_interval = agent_lease_renew_interval(timeout);
+        let (stop_heartbeat, stop_receiver) = mpsc::channel();
+        let heartbeat_error = Arc::new(Mutex::new(None));
+        let heartbeat_error_for_thread = Arc::clone(&heartbeat_error);
+        let heartbeat_holder = holder.clone();
+        let heartbeat = thread::Builder::new()
+            .name(format!("clt-git-finalizer-{project_id}"))
+            .spawn(move || loop {
+                match stop_receiver.recv_timeout(renew_interval) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                }
+                let expires_at = agent_timestamp_after(timeout_seconds);
+                let renewal = with_agent_store_at(&state_dir, |store| {
+                    store.renew_git_finalization_lease_blocking(
+                        project_id,
+                        &heartbeat_holder,
+                        &expires_at,
+                    )
+                });
+                let error = match renewal {
+                    Ok(true) => continue,
+                    Ok(false) => format!(
+                        "Git finalizer lost its exact project lease for project {project_id}"
+                    ),
+                    Err(error) => format!(
+                        "Git finalizer could not renew its exact project lease for project {project_id}: {error:#}"
+                    ),
+                };
+                let mut recorded = heartbeat_error_for_thread
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if recorded.is_none() {
+                    *recorded = Some(error);
+                }
+                break;
+            })
+            .context("Failed to start the Git finalization lease heartbeat")?;
+        Ok(Self {
+            lease: Some(lease),
+            holder,
+            stop_heartbeat: Some(stop_heartbeat),
+            heartbeat: Some(heartbeat),
+            heartbeat_error,
+        })
+    }
+
+    fn project_id(&self) -> i64 {
+        self.lease
+            .as_ref()
+            .expect("Git finalization lease remains present until release")
+            .project_id
+    }
+
+    fn state_dir(&self) -> &Path {
+        &self
+            .lease
+            .as_ref()
+            .expect("Git finalization lease remains present until release")
+            .state_dir
+    }
+
+    fn heartbeat_error(&self) -> Option<String> {
+        self.heartbeat_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn ensure_owned(&self) -> Result<()> {
+        if let Some(error) = self.heartbeat_error() {
+            anyhow::bail!(error);
+        }
+        let owned = with_agent_store_at(self.state_dir(), |store| {
+            store.git_finalization_lease_is_owned_blocking(
+                self.project_id(),
+                &self.holder,
+                &agent_timestamp(),
+            )
+        })?;
+        if !owned {
+            anyhow::bail!(
+                "Git finalizer lost its exact project lease for project {}",
+                self.project_id()
+            );
+        }
+        if let Some(error) = self.heartbeat_error() {
+            anyhow::bail!(error);
+        }
+        Ok(())
+    }
+
+    fn stop_heartbeat(&mut self) -> Result<()> {
+        if let Some(stop) = self.stop_heartbeat.take() {
+            let _ = stop.send(());
+        }
+        if let Some(heartbeat) = self.heartbeat.take() {
+            heartbeat
+                .join()
+                .map_err(|_| anyhow::anyhow!("Git finalization lease heartbeat panicked"))?;
+        }
+        Ok(())
+    }
+
+    fn release(mut self) -> Result<()> {
+        let heartbeat_result = self.stop_heartbeat();
+        let fence_result = self.ensure_owned();
+        let release_result = self
+            .lease
+            .take()
+            .expect("Git finalization lease is released once")
+            .release();
+        heartbeat_result?;
+        fence_result?;
+        release_result
+    }
+}
+
+impl Drop for AgentGitFinalizationLease {
+    fn drop(&mut self) {
+        let _ = self.stop_heartbeat();
+        drop(self.lease.take());
+    }
+}
+
+fn try_acquire_agent_git_finalization_lease_with_timeout(
+    state_dir: &Path,
+    project: &agent_store::AgentProject,
+    reclaim_current_process_leases: bool,
+    timeout: Duration,
+) -> Result<Option<AgentGitFinalizationLease>> {
+    let holder = InteractiveAgentLease::holder_for_current_process_with_prefix("clt-git-finalizer");
+    let existing = agent_lease_for_project(state_dir, project.id)?;
+    let reclaim_holder = existing.as_ref().and_then(|lease| {
+        matches!(
+            agent_lease_holder_liveness(&lease.holder),
+            AgentLeaseHolderLiveness::Dead
+        )
+        .then_some(lease.holder.as_str())
+        .or_else(|| {
+            (reclaim_current_process_leases
+                && agent_lease_holder_liveness(&lease.holder)
+                    == AgentLeaseHolderLiveness::CurrentProcess)
+                .then_some(lease.holder.as_str())
+        })
+    });
+    let acquired_at = agent_timestamp();
+    let expires_at = agent_timestamp_after(timeout.as_secs().max(1));
+    let acquired = with_agent_store_at(state_dir, |store| {
+        store.try_acquire_git_finalization_lease_blocking(
+            project.id,
+            &holder,
+            &acquired_at,
+            &expires_at,
+            reclaim_holder,
+        )
+    })?;
+    if !acquired {
+        return Ok(None);
+    }
+    let lease = InteractiveAgentLease {
+        state_dir: state_dir.to_path_buf(),
+        project_id: project.id,
+        holder,
+        released: false,
+    };
+    AgentGitFinalizationLease::start(lease, timeout).map(Some)
+}
+
+fn try_acquire_agent_git_finalization_lease(
+    state_dir: &Path,
+    project: &agent_store::AgentProject,
+    reclaim_current_process_leases: bool,
+) -> Result<Option<AgentGitFinalizationLease>> {
+    try_acquire_agent_git_finalization_lease_with_timeout(
+        state_dir,
+        project,
+        reclaim_current_process_leases,
+        Duration::from_secs(AGENT_GIT_FINALIZATION_LEASE_SECONDS),
+    )
+}
+
+fn record_agent_git_push_retry_error(
+    state_dir: &Path,
+    project_id: i64,
+    error: &anyhow::Error,
+    finalization_lease: &AgentGitFinalizationLease,
+) -> Result<()> {
+    record_agent_git_push_retry_error_message(
+        state_dir,
+        project_id,
+        &format!("{error:#}"),
+        finalization_lease,
+    )
+}
+
+fn record_agent_git_push_retry_error_message(
+    state_dir: &Path,
+    project_id: i64,
+    error: &str,
+    finalization_lease: &AgentGitFinalizationLease,
+) -> Result<()> {
+    for _ in 0..3 {
+        finalization_lease.ensure_owned()?;
+        let finalization = with_agent_store_at(state_dir, |store| {
+            Ok(store
+                .list_pending_git_finalizations_blocking(Some(project_id))?
+                .into_iter()
+                .find(|finalization| finalization.state == GitFinalizationState::PushPending))
+        })?;
+        let Some(finalization) = finalization else {
+            return Ok(());
+        };
+        finalization_lease.ensure_owned()?;
+        let changed = with_agent_store_at(state_dir, |store| {
+            store.compare_and_set_git_finalization_blocking(
+                finalization.project_id,
+                &finalization.codex_session_id,
+                finalization.generation,
+                GitFinalizationState::PushPending,
+                finalization.owner_run_token.as_deref(),
+                None,
+                Some(error),
+                &agent_timestamp(),
+            )
+        })?;
+        if changed {
+            return Ok(());
+        }
+    }
+    anyhow::bail!(
+        "Git push retry state changed repeatedly before CLT could persist its retry backoff"
+    )
+}
+
+fn agent_git_push_retry_backoff_remaining(
+    finalizations: &[agent_store::GitFinalizationRecord],
+    now: u64,
+    failure_backoff: Duration,
+) -> Option<u64> {
+    finalizations
+        .iter()
+        .find(|finalization| {
+            finalization.state == GitFinalizationState::PushPending
+                && finalization.last_error.is_some()
+        })
+        .and_then(|finalization| {
+            remaining_agent_delay(Some(&finalization.updated_at), now, failure_backoff)
+        })
+}
+
 fn run_agent_scheduler_pass_with_max_global_jobs(
     state_dir: &Path,
     reclaim_current_process_leases: bool,
@@ -5580,7 +6136,38 @@ fn run_agent_scheduler_pass_with_max_global_jobs(
             record_agent_daemon_checkin(store, checkin)
         })?;
     }
+    let now = agent_timestamp_seconds();
     let durable_workers = reconcile_independent_agent_workers(state_dir)?;
+    let mut busy_project_ids = durable_workers
+        .iter()
+        .map(|worker| worker.project_id)
+        .collect::<HashSet<_>>();
+    busy_project_ids.extend(active_project_ids.iter().copied());
+    let leased_project_ids = with_agent_store_at(state_dir, |store| {
+        Ok(store
+            .list_active_leases_blocking(&agent_timestamp())?
+            .into_iter()
+            .filter(|lease| !agent_lease_is_reclaimable(lease, reclaim_current_process_leases, now))
+            .map(|lease| lease.project_id)
+            .collect::<Vec<_>>())
+    })?;
+    busy_project_ids.extend(leased_project_ids);
+    let completed_to_acknowledge = with_agent_store_at(state_dir, |store| {
+        store.list_unacknowledged_completed_git_finalizations_blocking(None)
+    })?;
+    for finalization in completed_to_acknowledge
+        .iter()
+        .filter(|finalization| !busy_project_ids.contains(&finalization.project_id))
+    {
+        with_agent_store_at(state_dir, |store| {
+            store
+                .acknowledge_completed_git_finalization_session_blocking(
+                    finalization.project_id,
+                    &finalization.codex_session_id,
+                )
+                .map(|_| ())
+        })?;
+    }
     let abandoned_project_ids = with_agent_store_at(state_dir, |store| {
         Ok(store
             .list_terminal_workers_blocking()?
@@ -5603,7 +6190,6 @@ fn run_agent_scheduler_pass_with_max_global_jobs(
     let lease_timeout = agent_lease_timeout()?;
     let success_cooldown = agent_success_cooldown()?;
     let failure_backoff = agent_failure_backoff()?;
-    let now = agent_timestamp_seconds();
     let mut pass = AgentSchedulerPass {
         scanned_projects: 0,
         pending_projects: 0,
@@ -5617,7 +6203,7 @@ fn run_agent_scheduler_pass_with_max_global_jobs(
 
     let projects = with_agent_store_at(state_dir, |store| store.list_projects_blocking())?;
 
-    for project in projects {
+    for mut project in projects {
         if durable_project_ids.contains(&project.id) {
             if project.enabled {
                 pass.scanned_projects += 1;
@@ -5656,7 +6242,7 @@ fn run_agent_scheduler_pass_with_max_global_jobs(
             )
         })?;
 
-        let existing_lease = agent_lease_for_project(state_dir, project.id)?;
+        let mut existing_lease = agent_lease_for_project(state_dir, project.id)?;
         reconcile_stale_agent_session_controls(
             state_dir,
             project.id,
@@ -5664,7 +6250,229 @@ fn run_agent_scheduler_pass_with_max_global_jobs(
             reclaim_current_process_leases,
             now,
         )?;
-        let resume_session_id = resumable_codex_session_for_project(state_dir, &project, now)?;
+        existing_lease = agent_lease_for_project(state_dir, project.id)?;
+        let finalizations_before_reconcile = with_agent_store_at(state_dir, |store| {
+            store.list_pending_git_finalizations_blocking(Some(project.id))
+        })?;
+        if !finalizations_before_reconcile.is_empty() {
+            for finalization in finalizations_before_reconcile
+                .iter()
+                .filter(|finalization| {
+                    finalization.state.is_finalizing()
+                        && finalization.state != GitFinalizationState::PushPending
+                })
+            {
+                with_agent_store_at(state_dir, |store| {
+                    store
+                        .ensure_pending_git_finalization_resume_requested_blocking(
+                            project.id,
+                            &finalization.codex_session_id,
+                        )
+                        .map(|_| ())
+                })?;
+            }
+            for finalization in finalizations_before_reconcile
+                .iter()
+                .filter(|finalization| finalization.state == GitFinalizationState::PushPending)
+            {
+                with_agent_store_at(state_dir, |store| {
+                    store
+                        .clear_autonomous_push_resume_request_blocking(
+                            project.id,
+                            &finalization.codex_session_id,
+                        )
+                        .map(|_| ())
+                })?;
+            }
+        }
+        let finalizations = if finalizations_before_reconcile.is_empty() {
+            Vec::new()
+        } else {
+            let Some(finalization_lease) = try_acquire_agent_git_finalization_lease(
+                state_dir,
+                &project,
+                reclaim_current_process_leases,
+            )?
+            else {
+                pass.skipped_active_lease += 1;
+                print_active_lease_skip(
+                    &project,
+                    &scan,
+                    agent_lease_for_project(state_dir, project.id)?.as_ref(),
+                );
+                continue;
+            };
+
+            let reconciliation_result = (|| -> Result<Vec<agent_store::GitFinalizationRecord>> {
+                let current = with_agent_store_at(state_dir, |store| {
+                    store.list_pending_git_finalizations_blocking(Some(project.id))
+                })?;
+                if agent_git_push_retry_backoff_remaining(&current, now, failure_backoff).is_some()
+                {
+                    return Ok(current);
+                }
+                let reconciled = match reconcile_pending_agent_git_finalizations(
+                    state_dir,
+                    &project,
+                    Some(&finalization_lease),
+                ) {
+                    Ok(finalizations)
+                        if finalizations.iter().any(|finalization| {
+                            finalization.state == GitFinalizationState::PushPending
+                        }) =>
+                    {
+                        record_agent_git_push_retry_error_message(
+                            state_dir,
+                            project.id,
+                            "CLT's bounded publication attempt made no remotely provable progress; the exact frozen publication remains pending",
+                            &finalization_lease,
+                        )?;
+                        with_agent_store_at(state_dir, |store| {
+                            store.list_pending_git_finalizations_blocking(Some(project.id))
+                        })?
+                    }
+                    Ok(finalizations) => finalizations,
+                    Err(error) => {
+                        if let Err(fence_error) = finalization_lease.ensure_owned() {
+                            return Err(fence_error.context(format!(
+                                "Git reconciliation stopped after losing its ownership fence: {error:#}"
+                            )));
+                        }
+                        record_agent_git_push_retry_error(
+                            state_dir,
+                            project.id,
+                            &error,
+                            &finalization_lease,
+                        )?;
+                        eprintln!(
+                            "Project {}: action=git_finalization_wait reason=proof_error error={error:#} path={}",
+                            project.name,
+                            project.path.display()
+                        );
+                        with_agent_store_at(state_dir, |store| {
+                            store.list_pending_git_finalizations_blocking(Some(project.id))
+                        })?
+                    }
+                };
+                for finalization in reconciled
+                    .iter()
+                    .filter(|finalization| finalization.state == GitFinalizationState::Working)
+                {
+                    finalization_lease.ensure_owned()?;
+                    with_agent_store_at(state_dir, |store| {
+                        repair_working_git_task_link(store, &project.path, finalization)
+                    })?;
+                    finalization_lease.ensure_owned()?;
+                }
+                Ok(reconciled)
+            })();
+            let release_result = finalization_lease.release();
+            let reconciled = reconciliation_result?;
+            release_result?;
+            existing_lease = agent_lease_for_project(state_dir, project.id)?;
+            reconciled
+        };
+        let completed_finalizations = finalizations
+            .iter()
+            .filter(|finalization| finalization.state == GitFinalizationState::Completed)
+            .collect::<Vec<_>>();
+        let rolled_forward_git_finalization = !completed_finalizations.is_empty();
+        if !completed_finalizations.is_empty() {
+            with_agent_store_at(state_dir, |store| {
+                for finalization in &completed_finalizations {
+                    store.acknowledge_completed_git_finalization_session_blocking(
+                        project.id,
+                        &finalization.codex_session_id,
+                    )?;
+                }
+                Ok(())
+            })?;
+            project = with_agent_store_at(state_dir, |store| {
+                store
+                    .list_projects_blocking()?
+                    .into_iter()
+                    .find(|candidate| candidate.id == project.id)
+                    .context("Acknowledged Git finalization project disappeared")
+            })?;
+        }
+        if let Some(finalization) = finalizations
+            .iter()
+            .find(|finalization| finalization.state == GitFinalizationState::PushPending)
+        {
+            with_agent_store_at(state_dir, |store| {
+                store
+                    .clear_autonomous_push_resume_request_blocking(
+                        project.id,
+                        &finalization.codex_session_id,
+                    )
+                    .map(|_| ())
+            })?;
+            if let Some(remaining) =
+                agent_git_push_retry_backoff_remaining(&finalizations, now, failure_backoff)
+            {
+                println!(
+                    "Project {}: action=skip reason=autonomous_git_push_backoff remaining_seconds={} session={} path={}",
+                    project.name,
+                    remaining,
+                    finalization.codex_session_id,
+                    project.path.display()
+                );
+            } else {
+                println!(
+                    "Project {}: action=skip reason=autonomous_git_push_pending session={} path={}",
+                    project.name,
+                    finalization.codex_session_id,
+                    project.path.display()
+                );
+            }
+            continue;
+        }
+        let pending_git_finalization = finalizations
+            .iter()
+            .find(|finalization| finalization.state.is_finalizing());
+        let blocked_recovery_backoff_active = scan.has_blocked_task()
+            && blocked_recovery_backoff_reason(&project, now, failure_backoff).is_some();
+        let mut working_git_finalization = None;
+        for finalization in finalizations
+            .iter()
+            .filter(|finalization| finalization.state == GitFinalizationState::Working)
+        {
+            let Some((status, task)) = terminal_task_for_codex_session_in_board(
+                &get_tasks_dir(&project.path),
+                &finalization.codex_session_id,
+            )?
+            else {
+                continue;
+            };
+            let eligible = matches!(status, "todo" | "doing")
+                && (!task_entry_is_blocked(&task) || !blocked_recovery_backoff_active);
+            if eligible {
+                working_git_finalization = Some(finalization);
+                break;
+            }
+        }
+        let git_session_to_resume = pending_git_finalization.or(working_git_finalization);
+        let resume_session_id = if let Some(finalization) = git_session_to_resume {
+            let ready = with_agent_store_at(state_dir, |store| {
+                store.ensure_pending_git_finalization_resume_requested_blocking(
+                    project.id,
+                    &finalization.codex_session_id,
+                )
+            })?;
+            if !ready {
+                println!(
+                    "Project {}: action=skip reason=git_finalization_session_suspended state={} session={} path={}",
+                    project.name,
+                    finalization.state.status_label(),
+                    finalization.codex_session_id,
+                    project.path.display()
+                );
+                continue;
+            }
+            Some(finalization.codex_session_id.clone())
+        } else {
+            resumable_codex_session_for_project(state_dir, &project, now)?
+        };
         let controls_after_initial_check = if resume_session_id.is_none() {
             with_agent_store_at(state_dir, |store| {
                 store.session_controls_for_project_blocking(project.id)
@@ -5692,8 +6500,6 @@ fn run_agent_scheduler_pass_with_max_global_jobs(
                 || existing_lease.as_ref().is_some_and(|lease| {
                     agent_lease_is_reclaimable(lease, reclaim_current_process_leases, now)
                 }));
-        let blocked_recovery_backoff_active = scan.has_blocked_task()
-            && blocked_recovery_backoff_reason(&project, now, failure_backoff).is_some();
         let task_selection = if resume_session_id.is_some() {
             Some(AgentTaskSelection::ResumeSession)
         } else if resume_interrupted_task {
@@ -5723,13 +6529,18 @@ fn run_agent_scheduler_pass_with_max_global_jobs(
             continue;
         };
 
-        if let Some(reason) = agent_task_cooldown_reason(
-            &project,
-            task_selection,
-            now,
-            success_cooldown,
-            failure_backoff,
-        ) {
+        if let Some(reason) = (!rolled_forward_git_finalization)
+            .then(|| {
+                agent_task_cooldown_reason(
+                    &project,
+                    task_selection,
+                    now,
+                    success_cooldown,
+                    failure_backoff,
+                )
+            })
+            .flatten()
+        {
             println!(
                 "Project {}: action=skip reason=\"{}\" work={} todo={} ready_todo={} blocked_todo={} doing={} blocked_doing={} scan_status={} path={}",
                 project.name,
@@ -5883,6 +6694,12 @@ fn agent_worker_observation_is_stale(raw: Option<&str>, now: u64, timeout_second
         .is_none_or(|observed| now.saturating_sub(observed) >= timeout_seconds)
 }
 
+fn is_inline_agent_worker(worker: &agent_store::AgentWorkerRecord) -> bool {
+    worker
+        .service_label
+        .starts_with(AGENT_INLINE_WORKER_SERVICE_LABEL_PREFIX)
+}
+
 fn reconcile_independent_agent_workers_with(
     state_dir: &Path,
     store: &agent_store::TursoAgentStore,
@@ -5908,6 +6725,52 @@ fn reconcile_independent_agent_workers_with(
             .as_ref()
             .is_some_and(|lease| lease.holder == worker.lease_holder);
         let process_state = worker.worker_pid.and_then(local_process_is_running);
+        let inline_worker = is_inline_agent_worker(&worker);
+        let inline_launch_pending = inline_worker
+            && store
+                .git_launch_state_blocking(worker.project_id, &worker.worker_token)?
+                .is_some();
+        if inline_launch_pending {
+            println!(
+                "Project {}: action=inline_worker_launch_reap_wait worker_token={} path={}",
+                worker.project_name,
+                worker.worker_token,
+                worker.project_path.display()
+            );
+            continue;
+        }
+        let inline_current_generation_registered = inline_worker
+            && worker.worker_pid == Some(std::process::id())
+            && inline_agent_worker_generation_is_registered(&worker.worker_token);
+        let inline_current_generation_missing = inline_worker
+            && worker.worker_pid == Some(std::process::id())
+            && !inline_current_generation_registered;
+        if inline_current_generation_registered
+            && matches!(
+                worker.state.as_str(),
+                AGENT_WORKER_STATE_RUNNING | AGENT_WORKER_STATE_FINALIZING
+            )
+        {
+            continue;
+        }
+        if inline_worker
+            && worker.worker_pid != Some(std::process::id())
+            && worker.worker_pid.is_some()
+            && process_state != Some(false)
+            && matches!(
+                worker.state.as_str(),
+                AGENT_WORKER_STATE_RUNNING | AGENT_WORKER_STATE_FINALIZING
+            )
+        {
+            println!(
+                "Project {}: action=inline_worker_liveness_unproven_wait worker_token={} worker_pid={} path={}",
+                worker.project_name,
+                worker.worker_token,
+                worker.worker_pid.unwrap_or_default(),
+                worker.project_path.display()
+            );
+            continue;
+        }
         let startup_stale = worker.state == AGENT_WORKER_STATE_DISPATCHING
             && agent_worker_observation_is_stale(
                 Some(&worker.created_at),
@@ -5923,7 +6786,12 @@ fn reconcile_independent_agent_workers_with(
             AGENT_WORKER_HEARTBEAT_TIMEOUT_SECONDS,
         );
 
-        let abandonment_reason = if !owns_lease {
+        let abandonment_reason = if inline_worker && worker.state == AGENT_WORKER_STATE_DISPATCHING
+        {
+            Some("Inline worker reservation was not atomically claimed".to_string())
+        } else if inline_current_generation_missing {
+            Some("Inline worker generation is no longer owned by this CLT process".to_string())
+        } else if !owns_lease {
             if process_state == Some(true) && !heartbeat_stale {
                 println!(
                     "Project {}: action=worker_fenced_wait worker_token={} worker_pid={} path={}",
@@ -6089,6 +6957,9 @@ fn cleanup_terminal_agent_worker_services(
 
 #[cfg(not(test))]
 fn drain_agent_worker_service(worker: &agent_store::AgentWorkerRecord) -> Result<bool> {
+    if is_inline_agent_worker(worker) {
+        return Ok(true);
+    }
     match current_agent_platform() {
         AgentPlatform::Macos => {
             let target = format!("{}/{}", launchd_user_domain()?, worker.service_label);
@@ -6371,6 +7242,16 @@ fn abandon_agent_worker_after_error(
     else {
         return Ok(());
     };
+    if is_inline_agent_worker(&worker)
+        && store
+            .git_launch_state_blocking(worker.project_id, worker_token)?
+            .is_some()
+    {
+        eprintln!(
+            "Agent inline worker {worker_token} is preserving its durable fence until the supervised Codex child consumes the launch boundary or is proven reaped"
+        );
+        return Ok(());
+    }
     let lease = store.lease_for_project_blocking(worker.project_id)?;
     let permitted_successor_holder = lease
         .as_ref()
@@ -6394,6 +7275,152 @@ fn abandon_agent_worker_after_error(
 }
 
 fn run_agent_job(
+    mut job: AgentRunJob,
+    runner: &dyn AgentRunner,
+    shutdown: &AgentShutdownSignal,
+) -> Result<AgentRunCompletion> {
+    let _inline_generation = ensure_durable_inline_git_worker(&mut job)?;
+    let state_dir = job.state_dir.clone();
+    let worker_token = job.worker_token.clone();
+    match run_agent_job_inner(job, runner, shutdown) {
+        Ok(completion) => Ok(completion),
+        Err(error) => {
+            let Some(worker_token) = worker_token.as_deref() else {
+                return Err(error);
+            };
+            if let Err(abandonment_error) =
+                abandon_agent_worker_after_error(&state_dir, worker_token, &error)
+            {
+                return Err(error.context(format!(
+                    "Abandoning durable worker {worker_token} after the run error also failed: {abandonment_error:#}"
+                )));
+            }
+            Err(error)
+        }
+    }
+}
+
+fn ensure_durable_inline_git_worker(
+    job: &mut AgentRunJob,
+) -> Result<Option<InlineAgentWorkerGeneration>> {
+    if job.worker_token.is_some() || !agent_job_uses_git(job)? {
+        return Ok(None);
+    }
+
+    let worker_token = next_agent_worker_token(job.project.id);
+    let generation = InlineAgentWorkerGeneration::register(&worker_token);
+    let lease_holder = agent_worker_lease_holder(&worker_token);
+    let service_label = format!("{AGENT_INLINE_WORKER_SERVICE_LABEL_PREFIX}{worker_token}");
+    let binary_path = std::env::current_exe()
+        .context("Failed to resolve the current CLT executable for inline worker ownership")?;
+    let command_arguments = serde_json::to_string(
+        &std::env::args_os()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+    )
+    .context("Failed to serialize inline worker invocation")?;
+    let path_env = std::env::var_os("PATH").unwrap_or_default();
+    let codex_path = agent_codex_path_env();
+    let started_at = agent_timestamp();
+    let reservation_result = with_agent_store_at(&job.state_dir, |store| {
+        store.reserve_and_claim_worker_blocking(
+            agent_store::AgentWorkerReservation {
+                project_id: job.project.id,
+                worker_token: &worker_token,
+                expected_lease_holder: &job.holder,
+                max_active_workers: job.max_global_jobs,
+                protocol_version: AGENT_WORKER_PROTOCOL_VERSION,
+                service_label: &service_label,
+                binary_path: &binary_path,
+                command_arguments: &command_arguments,
+                path_env: &path_env,
+                codex_path: codex_path.as_deref(),
+                task_selection: job.task_selection.label(),
+                resume_session_id: job.resume_session_id.as_deref(),
+                created_at: &started_at,
+            },
+            std::process::id(),
+            &started_at,
+        )
+    });
+    let reserved = match reservation_result {
+        Ok(reserved) => reserved,
+        Err(error) => {
+            let committed = with_agent_store_at(&job.state_dir, |store| {
+                Ok(store
+                    .list_active_workers_blocking()?
+                    .into_iter()
+                    .any(|worker| {
+                        worker.worker_token == worker_token
+                            && worker.project_id == job.project.id
+                            && worker.state == AGENT_WORKER_STATE_RUNNING
+                            && worker.worker_pid == Some(std::process::id())
+                            && worker.lease_holder == lease_holder
+                    }))
+            });
+            match committed {
+                Ok(true) => true,
+                Ok(false) => {
+                    let release_result = with_agent_store_at(&job.state_dir, |store| {
+                        store
+                            .release_lease_blocking(job.project.id, &job.holder)
+                            .map(|_| ())
+                    });
+                    return match release_result {
+                        Ok(()) => Err(error).context(
+                            "Failed to atomically reserve and claim inline agent ownership",
+                        ),
+                        Err(release_error) => Err(error).context(format!(
+                            "Failed to atomically reserve and claim inline agent ownership; releasing its scheduler lease also failed: {release_error:#}"
+                        )),
+                    };
+                }
+                Err(inspection_error) => {
+                    return Err(error).context(format!(
+                        "Inline worker reservation outcome was ambiguous and its durable state could not be inspected: {inspection_error:#}"
+                    ));
+                }
+            }
+        }
+    };
+    if !reserved {
+        let release_result = with_agent_store_at(&job.state_dir, |store| {
+            store
+                .release_lease_blocking(job.project.id, &job.holder)
+                .map(|_| ())
+        });
+        return match release_result {
+            Ok(()) => Err(anyhow::anyhow!(
+                "Project {} lost its lease or global worker capacity before inline ownership could be reserved",
+                job.project.id
+            )),
+            Err(release_error) => Err(release_error).context(format!(
+                "Project {} could not reserve inline ownership or release its scheduler lease",
+                job.project.id
+            )),
+        };
+    }
+
+    job.holder = lease_holder;
+    job.worker_token = Some(worker_token);
+    Ok(Some(generation))
+}
+
+fn agent_job_uses_git(job: &AgentRunJob) -> Result<bool> {
+    if job.project.git_mode != AgentGitMode::Off {
+        return Ok(true);
+    }
+    let Some(session_id) = job.resume_session_id.as_deref() else {
+        return Ok(false);
+    };
+    with_agent_store_at(&job.state_dir, |store| {
+        Ok(store
+            .git_finalization_blocking(job.project.id, session_id)?
+            .is_some_and(|finalization| finalization.git_mode != AgentGitMode::Off))
+    })
+}
+
+fn run_agent_job_inner(
     job: AgentRunJob,
     runner: &dyn AgentRunner,
     shutdown: &AgentShutdownSignal,
@@ -6405,12 +7432,38 @@ fn run_agent_job(
                 .map(|_| ())
         })?;
     }
+    let git_finalization_before_run = job
+        .resume_session_id
+        .as_deref()
+        .map(|session_id| {
+            with_agent_store_at(&job.state_dir, |store| {
+                store.git_finalization_blocking(job.project.id, session_id)
+            })
+        })
+        .transpose()?
+        .flatten();
+    let git_proof_recovery_before_run = job
+        .resume_session_id
+        .as_deref()
+        .map(|session_id| {
+            with_agent_store_at(&job.state_dir, |store| {
+                Ok(store
+                    .session_control_blocking(job.project.id, session_id)?
+                    .and_then(|control| control.run_token)
+                    .is_some_and(|run_token| {
+                        run_token.starts_with(AGENT_GIT_FINALIZATION_RESUME_TOKEN_PREFIX)
+                    }))
+            })
+        })
+        .transpose()?
+        .unwrap_or(false);
     let started_at = agent_timestamp();
     let run_result = runner.run_project(
         &job.project,
         job.task_selection,
         job.resume_session_id.as_deref(),
         &job.holder,
+        job.worker_token.as_deref(),
         shutdown,
     );
     renew_agent_job_worker_fence(&job)?;
@@ -6473,6 +7526,142 @@ fn run_agent_job(
         ),
     };
 
+    let mut git_finalization_pending = false;
+    let mut autonomous_git_push_pending = false;
+    if control_action.is_none()
+        && let Some(session_id) = codex_session_id
+            .as_deref()
+            .or(job.resume_session_id.as_deref())
+    {
+        let finalization_result = with_agent_store_at(&job.state_dir, |store| {
+            let Some(finalization) = store.git_finalization_blocking(job.project.id, session_id)?
+            else {
+                return Ok(None);
+            };
+            let initial_state = finalization.state;
+            reconcile_agent_git_finalization(
+                store,
+                &job.project.path,
+                finalization,
+                session_run_token.as_deref(),
+                None,
+            )
+            .map(|finalization| Some((initial_state, finalization)))
+        });
+
+        match finalization_result {
+            Ok(Some((initial_state, finalization)))
+                if finalization.state == GitFinalizationState::Completed
+                    && (!initial_state.is_terminal()
+                        || git_finalization_before_run.as_ref().is_some_and(|before| {
+                            !before.state.is_terminal()
+                                && before.codex_session_id == finalization.codex_session_id
+                                && finalization.generation > before.generation
+                        })
+                        || session_run_token.as_deref().is_some_and(|run_token| {
+                            finalization.owner_run_token.as_deref() == Some(run_token)
+                        })
+                        || git_proof_recovery_before_run) =>
+            {
+                status = "success";
+                let commit = finalization
+                    .commit_oid
+                    .as_deref()
+                    .map(|oid| &oid[..oid.len().min(12)])
+                    .unwrap_or("unknown");
+                summary =
+                    format!("CLT proved the task-specific Git finalization at commit {commit}.");
+            }
+            Ok(Some((_, finalization))) if finalization.state == GitFinalizationState::Working => {
+                let linked_task = terminal_task_for_codex_session_in_board(
+                    &get_tasks_dir(&job.project.path),
+                    &finalization.codex_session_id,
+                )?;
+                let durably_blocked = linked_task.as_ref().is_some_and(|(task_status, task)| {
+                    matches!(*task_status, "todo" | "doing") && task_entry_is_blocked(task)
+                });
+                if durably_blocked {
+                    status = "blocked";
+                    summary = "The linked task recorded a durable blocker; its pre-run Git journal remains available for a later recovery without finalizing the task.".to_string();
+                } else if status == "idle" && linked_task.is_none() {
+                    if let Some(owner_run_token) = session_run_token
+                        .as_deref()
+                        .or(finalization.owner_run_token.as_deref())
+                    {
+                        let cancelled = with_agent_store_at(&job.state_dir, |store| {
+                            cancel_unlinked_working_git_finalization(
+                                store,
+                                &job.project.path,
+                                &finalization,
+                                owner_run_token,
+                            )
+                        })?;
+                        if !cancelled {
+                            git_finalization_pending = true;
+                            status = "failure";
+                            summary = "The unused Git journal or its task link changed before CLT could cancel it safely."
+                                .to_string();
+                        }
+                    } else {
+                        git_finalization_pending = true;
+                        status = "failure";
+                        summary = "An unused Git journal could not be cancelled because its running generation was unavailable.".to_string();
+                    }
+                } else if status != "blocked" {
+                    git_finalization_pending = true;
+                    status = "failure";
+                    summary = "The task's Git journal remains WORKING; CLT preserved this exact Codex session because the task is neither durably blocked nor finalized.".to_string();
+                }
+            }
+            Ok(Some((_, finalization)))
+                if finalization.state == GitFinalizationState::PushPending =>
+            {
+                autonomous_git_push_pending = true;
+                status = "failure";
+                summary = "The sealed task commit remains PUSH-PENDING; CLT will retry its exact frozen-OID publication without resuming Codex or scheduling another project task.".to_string();
+            }
+            Ok(Some((_, finalization))) if !finalization.state.is_terminal() => {
+                git_finalization_pending = true;
+                status = "failure";
+                summary = format!(
+                    "Task Git finalization remains {}; CLT will resume this exact Codex session before scheduling other project work.",
+                    finalization.state.status_label()
+                );
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                if job.project.git_mode != AgentGitMode::Off
+                    && worktree_contains_completed_done_task(&job.project.path, session_id)?
+                {
+                    git_finalization_pending = true;
+                    status = "failure";
+                    summary = "The task entered Done without its required durable Git finalization record; CLT preserved the exact session for recovery.".to_string();
+                }
+            }
+            Err(error) => {
+                status = "failure";
+                let autonomous_push_pending = with_agent_store_at(&job.state_dir, |store| {
+                    Ok(store
+                        .git_finalization_blocking(job.project.id, session_id)?
+                        .is_some_and(|finalization| {
+                            finalization.state == GitFinalizationState::PushPending
+                        }))
+                })?;
+                if autonomous_push_pending {
+                    autonomous_git_push_pending = true;
+                    summary = format!(
+                        "The sealed task commit remains PUSH-PENDING after CLT's bounded publication attempt; CLT will retry without resuming Codex: {error:#}"
+                    );
+                } else {
+                    git_finalization_pending = true;
+                    summary = format!(
+                        "Git finalization proof failed and remains resumable in this exact session: {error:#}"
+                    );
+                }
+            }
+        }
+    }
+
     let control_resolution_result: Result<()> = (|| {
         if control_action.is_none()
             && let (Some(session_id), Some(run_token)) =
@@ -6495,9 +7684,10 @@ fn run_agent_job(
                 if control.state != AgentSessionControlState::Running {
                     break;
                 }
-                let preserve_for_exact_retry = job.task_selection
-                    == AgentTaskSelection::ResumeSession
-                    && !matches!(status, "success" | "idle" | "blocked");
+                let preserve_for_exact_retry = !autonomous_git_push_pending
+                    && (git_finalization_pending
+                        || job.task_selection == AgentTaskSelection::ResumeSession
+                            && !matches!(status, "success" | "idle" | "blocked"));
                 if preserve_for_exact_retry {
                     break;
                 }
@@ -6612,8 +7802,10 @@ fn run_agent_job(
                 .as_deref()
                 .or(job.resume_session_id.as_deref())
             {
-                let retry_exact_resume = job.task_selection == AgentTaskSelection::ResumeSession
-                    && !matches!(status, "success" | "idle" | "blocked");
+                let retry_exact_resume = !autonomous_git_push_pending
+                    && (git_finalization_pending
+                        || job.task_selection == AgentTaskSelection::ResumeSession
+                            && !matches!(status, "success" | "idle" | "blocked"));
                 if !retry_exact_resume {
                     with_agent_store_at(&job.state_dir, |store| {
                         store
@@ -7353,6 +8545,46 @@ fn resumable_codex_session_for_project(
         else {
             return Ok(None);
         };
+        let git_finalization = with_agent_store_at(state_dir, |store| {
+            store.git_finalization_blocking(project.id, &session_id)
+        })?;
+        if git_finalization
+            .as_ref()
+            .is_some_and(|finalization| finalization.state == GitFinalizationState::Completed)
+        {
+            let proof_recovery_request = with_agent_store_at(state_dir, |store| {
+                Ok(store
+                    .session_control_blocking(project.id, &session_id)?
+                    .and_then(|control| control.run_token)
+                    .is_some_and(|run_token| {
+                        run_token.starts_with(AGENT_GIT_FINALIZATION_RESUME_TOKEN_PREFIX)
+                    }))
+            })?;
+            if proof_recovery_request {
+                with_agent_store_at(state_dir, |store| {
+                    store.acknowledge_completed_git_finalization_session_blocking(
+                        project.id,
+                        &session_id,
+                    )
+                })?;
+                continue;
+            }
+            return Ok(Some(session_id));
+        }
+        if git_finalization
+            .as_ref()
+            .is_some_and(|finalization| !finalization.state.is_terminal())
+        {
+            if let Some(finalization) = git_finalization.as_ref()
+                && finalization.state == GitFinalizationState::Working
+                && task_status_for_codex_session(&project.path, &session_id)?.is_none()
+            {
+                with_agent_store_at(state_dir, |store| {
+                    repair_working_git_task_link(store, &project.path, finalization)
+                })?;
+            }
+            return Ok(Some(session_id));
+        }
         if task_status_for_codex_session(&project.path, &session_id)?.is_some() {
             return Ok(Some(session_id));
         }
@@ -7373,6 +8605,262 @@ fn resumable_codex_session_for_project(
             project.path.display()
         );
     }
+}
+
+fn repair_working_git_task_link(
+    store: &agent_store::TursoAgentStore,
+    project_root: &Path,
+    finalization: &agent_store::GitFinalizationRecord,
+) -> Result<bool> {
+    repair_working_git_task_link_with_before_lock(store, project_root, finalization, || {})
+}
+
+fn exact_working_git_finalization_snapshot(
+    current: &agent_store::GitFinalizationRecord,
+    expected: &agent_store::GitFinalizationRecord,
+) -> bool {
+    current.state == GitFinalizationState::Working
+        && expected.state == GitFinalizationState::Working
+        && current.project_id == expected.project_id
+        && current.codex_session_id == expected.codex_session_id
+        && current.generation == expected.generation
+        && current.task_identity == expected.task_identity
+        && current.owner_run_token == expected.owner_run_token
+        && current.git_mode == expected.git_mode
+        && current.starting_head == expected.starting_head
+        && current.branch_ref == expected.branch_ref
+        && current.upstream_ref == expected.upstream_ref
+        && current.worktree_baseline == expected.worktree_baseline
+        && current.commit_oid == expected.commit_oid
+        && current.created_at == expected.created_at
+}
+
+fn cancel_unlinked_working_git_finalization(
+    store: &agent_store::TursoAgentStore,
+    project_root: &Path,
+    finalization: &agent_store::GitFinalizationRecord,
+    owner_run_token: &str,
+) -> Result<bool> {
+    cancel_unlinked_working_git_finalization_with_before_lock(
+        store,
+        project_root,
+        finalization,
+        owner_run_token,
+        || {},
+    )
+}
+
+fn cancel_unlinked_working_git_finalization_with_before_lock(
+    store: &agent_store::TursoAgentStore,
+    project_root: &Path,
+    finalization: &agent_store::GitFinalizationRecord,
+    owner_run_token: &str,
+    before_lock: impl FnOnce(),
+) -> Result<bool> {
+    cancel_unlinked_working_git_finalization_with_lock_callbacks(
+        store,
+        project_root,
+        finalization,
+        owner_run_token,
+        before_lock,
+        || {},
+        || {},
+    )
+}
+
+fn cancel_unlinked_working_git_finalization_with_lock_callbacks(
+    store: &agent_store::TursoAgentStore,
+    project_root: &Path,
+    finalization: &agent_store::GitFinalizationRecord,
+    owner_run_token: &str,
+    before_lock: impl FnOnce(),
+    after_validation: impl FnOnce(),
+    on_contention: impl FnOnce(),
+) -> Result<bool> {
+    before_lock();
+    let board_dir = get_tasks_dir(project_root);
+    let _mutation_lock =
+        acquire_board_mutation_lock_with_contention_callback(&board_dir, on_contention)?;
+    if terminal_task_for_codex_session_in_board(&board_dir, &finalization.codex_session_id)?
+        .is_some()
+    {
+        return Ok(false);
+    }
+    let Some(current) =
+        store.git_finalization_blocking(finalization.project_id, &finalization.codex_session_id)?
+    else {
+        return Ok(false);
+    };
+    if !exact_working_git_finalization_snapshot(&current, finalization)
+        || current.owner_run_token.as_deref() != Some(owner_run_token)
+    {
+        return Ok(false);
+    }
+    after_validation();
+    store.compare_and_set_owned_git_finalization_blocking(
+        current.project_id,
+        &current.codex_session_id,
+        current.generation,
+        GitFinalizationState::Cancelled,
+        owner_run_token,
+        None,
+        None,
+        &agent_timestamp(),
+    )
+}
+
+fn repair_working_git_task_link_with_before_lock(
+    store: &agent_store::TursoAgentStore,
+    project_root: &Path,
+    finalization: &agent_store::GitFinalizationRecord,
+    before_lock: impl FnOnce(),
+) -> Result<bool> {
+    repair_working_git_task_link_with_lock_callbacks(
+        store,
+        project_root,
+        finalization,
+        before_lock,
+        || {},
+        || {},
+    )
+}
+
+fn repair_working_git_task_link_with_lock_callbacks(
+    store: &agent_store::TursoAgentStore,
+    project_root: &Path,
+    finalization: &agent_store::GitFinalizationRecord,
+    before_lock: impl FnOnce(),
+    after_validation: impl FnOnce(),
+    on_contention: impl FnOnce(),
+) -> Result<bool> {
+    let Some(task_identity) = finalization.task_identity.as_deref() else {
+        return Ok(false);
+    };
+    let Some(starting_head) = finalization.starting_head.as_deref() else {
+        return Ok(false);
+    };
+    if !working_git_history_is_safe(store, project_root, finalization, starting_head)? {
+        return Ok(false);
+    }
+    before_lock();
+    let board_dir = get_tasks_dir(project_root);
+    let _mutation_lock =
+        acquire_board_mutation_lock_with_contention_callback(&board_dir, on_contention)?;
+    let Some(current) =
+        store.git_finalization_blocking(finalization.project_id, &finalization.codex_session_id)?
+    else {
+        return Ok(false);
+    };
+    if !exact_working_git_finalization_snapshot(&current, finalization)
+        || !working_git_history_is_safe(store, project_root, &current, starting_head)?
+    {
+        return Ok(false);
+    }
+    after_validation();
+    cleanup_clt_atomic_task_temporaries(&board_dir)?;
+    let mut linked = Vec::new();
+    for status in ["todo", "doing"] {
+        for (index, entry) in read_task_entries(&board_dir, status)?
+            .into_iter()
+            .enumerate()
+        {
+            if codex_session_id_from_task_content(&entry.content)
+                == Some(finalization.codex_session_id.as_str())
+                && durable_task_identity(&entry.content).as_deref() == Some(task_identity)
+            {
+                linked.push((status, index + 1, entry));
+            }
+        }
+    }
+    match linked.as_slice() {
+        [("doing", _, _)] => return Ok(true),
+        [("todo", index, _)] => {
+            move_agent_git_task_in_board_after_lock(&board_dir, "todo", "doing", *index)?;
+            return Ok(true);
+        }
+        [(first_status, _, first), (second_status, _, second)]
+            if [*first_status, *second_status].contains(&"todo")
+                && [*first_status, *second_status].contains(&"doing")
+                && first.content.trim_end() == second.content.trim_end()
+                && [first, second].iter().all(|entry| {
+                    matches!(
+                        entry.source,
+                        TaskSource::MarkdownLine { .. } | TaskSource::Path { is_dir: false, .. }
+                    )
+                }) =>
+        {
+            let (_, _, todo_duplicate) = linked
+                .iter()
+                .find(|(status, _, _)| *status == "todo")
+                .expect("one linked crash duplicate is in Todo");
+            remove_agent_git_task_entry_without_reordering(&board_dir, "todo", todo_duplicate)?;
+            return Ok(true);
+        }
+        [] => {}
+        _ => return Ok(false),
+    }
+    let mut matches = Vec::new();
+    for status in ["todo", "doing"] {
+        for (index, entry) in read_task_entries(&board_dir, status)?
+            .into_iter()
+            .enumerate()
+        {
+            if durable_task_identity(&entry.content).as_deref() == Some(task_identity) {
+                matches.push((status, index + 1, entry));
+            }
+        }
+    }
+    let [(status, index, entry)] = matches.as_slice() else {
+        return Ok(false);
+    };
+    attach_codex_session_to_task_after_lock(
+        project_root,
+        status,
+        entry,
+        &finalization.codex_session_id,
+        || {},
+    )?;
+    if *status == "todo" {
+        move_agent_git_task_in_board_after_lock(&board_dir, "todo", "doing", *index)?;
+    }
+    Ok(true)
+}
+
+fn working_git_history_is_safe(
+    store: &agent_store::TursoAgentStore,
+    project_root: &Path,
+    finalization: &agent_store::GitFinalizationRecord,
+    starting_head: &str,
+) -> Result<bool> {
+    let current_branch = git_optional_stdout(
+        project_root,
+        &["symbolic-ref", "-q", "HEAD"],
+        &[1],
+        "verify the Working task repair branch",
+    )?;
+    if current_branch.as_deref() != finalization.branch_ref.as_deref() {
+        return Ok(false);
+    }
+    let current_head = resolve_git_commit(
+        project_root,
+        "HEAD",
+        "verify the Working task repair history",
+    )?;
+    if !git_commit_is_ancestor(project_root, starting_head, &current_head)?
+        || !agent_git_range_is_safe_before_manifest(
+            AgentGitProofContext {
+                store,
+                project_id: finalization.project_id,
+            },
+            project_root,
+            starting_head,
+            &current_head,
+            &finalization.codex_session_id,
+        )?
+    {
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 fn task_status_for_codex_session_in_board(
@@ -7469,6 +8957,16 @@ fn try_reclaim_inactive_agent_lease(
         reclaim_current_process_leases,
         agent_timestamp_seconds(),
     ) {
+        return Ok(false);
+    }
+
+    let lease_is_worker_fenced = with_agent_store_at(state_dir, |store| {
+        Ok(store
+            .list_active_workers_blocking()?
+            .into_iter()
+            .any(|worker| worker.project_id == project.id && worker.lease_holder == lease.holder))
+    })?;
+    if lease_is_worker_fenced {
         return Ok(false);
     }
 
@@ -7662,6 +9160,24 @@ fn agent_codex_prompt(
     )
 }
 
+fn effective_agent_git_mode(
+    store: &agent_store::TursoAgentStore,
+    project: &agent_store::AgentProject,
+    resume_session_id: Option<&str>,
+) -> Result<AgentGitMode> {
+    let Some(session_id) = resume_session_id else {
+        return Ok(project.git_mode);
+    };
+    let Some(finalization) = store.git_finalization_blocking(project.id, session_id)? else {
+        return Ok(project.git_mode);
+    };
+    Ok(if finalization.state.is_terminal() {
+        project.git_mode
+    } else {
+        finalization.git_mode
+    })
+}
+
 fn build_agent_codex_prompt(
     project: &agent_store::AgentProject,
     task_selection: AgentTaskSelection,
@@ -7794,8 +9310,44 @@ impl AgentRunner for CodexAgentRunner {
         task_selection: AgentTaskSelection,
         resume_session_id: Option<&str>,
         lease_holder: &str,
+        run_token: Option<&str>,
         shutdown: &AgentShutdownSignal,
     ) -> Result<AgentRunResult> {
+        let store = open_agent_store_at(&self.state_dir)?;
+        let known_session_id = match resume_session_id {
+            Some(session_id) => Some(session_id.to_string()),
+            None => automated_codex_session_to_resume(&project.path, task_selection)?,
+        };
+        let mut effective_project = project.clone();
+        effective_project.git_mode =
+            effective_agent_git_mode(&store, project, known_session_id.as_deref())?;
+        let project = &effective_project;
+        let effective_worker_token = run_token
+            .map(str::to_string)
+            .or_else(|| self.worker_token.clone());
+        if run_token.is_some()
+            && self.worker_token.is_some()
+            && run_token != self.worker_token.as_deref()
+        {
+            anyhow::bail!("Agent runner received conflicting durable worker tokens");
+        }
+        let run_file_stem = effective_worker_token
+            .clone()
+            .unwrap_or_else(|| agent_log_file_stem(project.id));
+        ensure_agent_git_index_preflight(project, known_session_id.is_some())?;
+        let existing_git_finalization = known_session_id
+            .as_deref()
+            .map(|session_id| store.git_finalization_blocking(project.id, session_id))
+            .transpose()?
+            .flatten();
+        let git_start_state = prepare_agent_git_start_state_for_run(
+            &store,
+            project,
+            task_selection,
+            known_session_id.is_some(),
+            existing_git_finalization.is_some(),
+            &run_file_stem,
+        )?;
         let doing_task_contents_before =
             task_contents_for_status(&project.path, "doing").unwrap_or_default();
         let blocked_task_snapshots_before =
@@ -7804,10 +9356,6 @@ impl AgentRunner for CodexAgentRunner {
         fs::create_dir_all(&log_dir)
             .with_context(|| format!("Failed to create agent run log directory {:?}", log_dir))?;
 
-        let run_file_stem = self
-            .worker_token
-            .clone()
-            .unwrap_or_else(|| agent_log_file_stem(project.id));
         let stdout_path = log_dir.join(format!("{run_file_stem}.out"));
         let stderr_path = log_dir.join(format!("{run_file_stem}.err"));
         let stdout_file = fs::File::create(&stdout_path)
@@ -7828,7 +9376,6 @@ impl AgentRunner for CodexAgentRunner {
             .arg("never")
             .arg("--enable")
             .arg("goals");
-        let store = open_agent_store_at(&self.state_dir)?;
         let model_target = if let Some(model_id) = project.codex_model.as_ref() {
             agent_store::AgentModelDefaults {
                 provider_id: Some(
@@ -7896,11 +9443,35 @@ impl AgentRunner for CodexAgentRunner {
         }
         command.current_dir(&project.path);
         configure_agent_git_identity(&mut command, project.git_mode);
+        configure_automated_agent_child_context(
+            &mut command,
+            &self.state_dir,
+            project.id,
+            &run_file_stem,
+        );
+
+        let persist_git_launch_state = || -> Result<bool> {
+            let Some(git_start_state) = git_start_state.as_ref() else {
+                return Ok(false);
+            };
+            verify_agent_git_start_state_unchanged(
+                &project.path,
+                project.git_mode,
+                git_start_state,
+            )?;
+            store.record_git_launch_state_blocking(
+                project.id,
+                &run_file_stem,
+                project.git_mode,
+                git_start_state,
+                &agent_timestamp(),
+            )
+        };
 
         #[cfg(unix)]
-        let spawn_result = {
+        let spawn_result: Result<_> = (|| {
             drop(stdout_file);
-            spawn_automated_session_supervisor(
+            let supervised = spawn_automated_session_supervisor(
                 &command,
                 AutomatedSupervisorSpec {
                     state_dir: &self.state_dir,
@@ -7911,54 +9482,90 @@ impl AgentRunner for CodexAgentRunner {
                     stderr_path: &stderr_path,
                 },
                 stderr_file,
-            )
-            .map(|supervised| {
-                (
-                    supervised.process,
-                    supervised.child_pid,
-                    Some(supervised.control),
-                    Some(supervised.proof),
-                )
-            })
-        };
+            )?;
+            let AutomatedSupervisorChild {
+                mut process,
+                control,
+                child_pid,
+                mut proof,
+            } = supervised;
+            let git_launch_state_was_created = match persist_git_launch_state() {
+                Ok(created) => created,
+                Err(error) => {
+                    drop(control);
+                    wait_for_automated_supervisor_reaped(&mut process, &mut proof).with_context(
+                        || {
+                            format!(
+                                "Persisting the prelaunch Git state failed ({error:#}), and the automated supervisor did not prove Codex stopped"
+                            )
+                        },
+                    )?;
+                    return Err(error).context(
+                        "Failed to persist the prelaunch Git state behind the Codex launch gate",
+                    );
+                }
+            };
+            Ok((
+                process,
+                child_pid,
+                Some(control),
+                Some(proof),
+                git_launch_state_was_created,
+            ))
+        })();
         #[cfg(not(unix))]
-        let spawn_result = {
+        let spawn_result: Result<_> = (|| {
+            let git_launch_state_was_created = persist_git_launch_state()?;
             command
                 .stdout(Stdio::from(stdout_file))
                 .stderr(Stdio::from(stderr_file));
             configure_agent_child_command(&mut command);
-            command
-                .spawn()
-                .map(|child| {
+            match command.spawn() {
+                Ok(child) => {
                     let child_pid = child.id();
-                    (child, child_pid, None, None)
-                })
-                .map_err(anyhow::Error::from)
-        };
-
-        let (mut child, child_pid, mut supervisor_control, mut supervisor_proof) =
-            match spawn_result {
-                Ok(child) => child,
-                Err(err) => {
-                    let summary = format!(
-                        "Failed to start Codex command {} in {}: {err}",
-                        self.command.display(),
-                        project.path.display()
-                    );
-                    append_agent_log_line(&stderr_path, &summary)?;
-                    return Ok(AgentRunResult {
-                        status: "failure",
-                        exit_code: None,
-                        log_dir,
-                        stdout_path,
-                        stderr_path,
-                        summary,
-                        codex_session_id: configured_session_id,
-                        session_run_token: None,
-                        control_action: None,
-                    });
+                    Ok((child, child_pid, None, None, git_launch_state_was_created))
                 }
-            };
+                Err(error) => {
+                    if git_launch_state_was_created
+                        && !store.delete_git_launch_state_blocking(project.id, &run_file_stem)?
+                    {
+                        anyhow::bail!(
+                            "The Codex process failed to spawn and its exact Git launch boundary could not be deleted"
+                        );
+                    }
+                    Err(error.into())
+                }
+            }
+        })();
+
+        let (
+            mut child,
+            child_pid,
+            mut supervisor_control,
+            mut supervisor_proof,
+            _git_launch_state_was_created,
+        ) = match spawn_result {
+            Ok(child) => child,
+            Err(err) => {
+                let summary = format!(
+                    "Failed to start Codex command {} in {}: {err}",
+                    self.command.display(),
+                    project.path.display()
+                );
+                append_agent_log_line(&stderr_path, &summary)?;
+                return Ok(AgentRunResult {
+                    status: "failure",
+                    exit_code: None,
+                    log_dir,
+                    stdout_path,
+                    stderr_path,
+                    summary,
+                    codex_session_id: configured_session_id,
+                    session_run_token: None,
+                    control_action: None,
+                });
+            }
+        };
         let mut last_heartbeat_stderr_bytes = 0;
         let mut observed_session_id = configured_session_id;
         let mut session_linked = false;
@@ -8014,6 +9621,15 @@ impl AgentRunner for CodexAgentRunner {
                 return Err(error).context("Failed to register known Codex child before launch");
             }
             session_registered = true;
+            ensure_agent_git_working_record(
+                &store,
+                project,
+                session_id,
+                &run_file_stem,
+                git_start_state.as_ref(),
+            )?;
+            let _ =
+                bind_agent_git_working_task_identity(&store, project, session_id, &run_file_stem)?;
         }
         #[cfg(unix)]
         if let Err(error) = supervisor_control
@@ -8065,7 +9681,7 @@ impl AgentRunner for CodexAgentRunner {
             || {
                 if last_lease_renewal.elapsed() >= self.lease_renew_interval {
                     let expires_at = agent_timestamp_after(self.lease_timeout.as_secs());
-                    let renewed = if let Some(worker_token) = self.worker_token.as_deref() {
+                    let renewed = if let Some(worker_token) = effective_worker_token.as_deref() {
                         store.renew_worker_blocking(
                             worker_token,
                             std::process::id(),
@@ -8089,14 +9705,26 @@ impl AgentRunner for CodexAgentRunner {
                 if let Some(session_id) = observed_session_id.as_deref()
                     && !session_registered
                 {
-                    store.mark_session_running_blocking(
-                        project.id,
-                        session_id,
-                        child_pid,
-                        &run_file_stem,
-                        &stdout_path,
-                        &stderr_path,
-                    )?;
+                    if project.git_mode == AgentGitMode::Off {
+                        store.mark_session_running_blocking(
+                            project.id,
+                            session_id,
+                            child_pid,
+                            &run_file_stem,
+                            &stdout_path,
+                            &stderr_path,
+                        )?;
+                    } else {
+                        store.mark_session_running_with_git_finalization_blocking(
+                            project.id,
+                            session_id,
+                            child_pid,
+                            &run_file_stem,
+                            &stdout_path,
+                            &stderr_path,
+                            project.git_mode,
+                        )?;
+                    }
                     session_registered = true;
                 }
                 if let Some(session_id) = observed_session_id.as_deref()
@@ -8109,7 +9737,30 @@ impl AgentRunner for CodexAgentRunner {
                         &blocked_task_snapshots_before,
                         session_id,
                     ) {
-                        Ok(attached) => session_linked = attached,
+                        Ok(attached) => {
+                            session_linked = attached;
+                            if attached {
+                                if store
+                                    .git_finalization_blocking(project.id, session_id)?
+                                    .is_none()
+                                    && project.git_mode != AgentGitMode::Off
+                                {
+                                    ensure_agent_git_working_record(
+                                        &store,
+                                        project,
+                                        session_id,
+                                        &run_file_stem,
+                                        git_start_state.as_ref(),
+                                    )?;
+                                }
+                                let _ = bind_agent_git_working_task_identity(
+                                    &store,
+                                    project,
+                                    session_id,
+                                    &run_file_stem,
+                                )?;
+                            }
+                        }
                         Err(error) if !session_link_error_logged => {
                             append_agent_log_line(
                                 &stderr_path,
@@ -9132,6 +10783,2934 @@ fn configure_agent_git_identity(command: &mut Command, git_mode: AgentGitMode) {
         .env("GIT_COMMITTER_EMAIL", AGENT_GIT_IDENTITY_EMAIL);
 }
 
+fn configure_automated_agent_child_context(
+    command: &mut Command,
+    state_dir: &Path,
+    project_id: i64,
+    run_token: &str,
+) {
+    command
+        .env(AGENT_STATE_DIR_ENV, state_dir)
+        .env(AGENT_PROJECT_ID_ENV, project_id.to_string())
+        .env(AGENT_RUN_TOKEN_ENV, run_token);
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AgentGitStartState {
+    starting_head: String,
+    branch_ref: Option<String>,
+    upstream_ref: Option<String>,
+    worktree_baseline: String,
+}
+
+#[derive(Clone, Copy)]
+struct AgentGitProofContext<'a> {
+    store: &'a agent_store::TursoAgentStore,
+    project_id: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AgentGitUpstreamDestination {
+    remote: String,
+    merge_ref: String,
+    push_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AgentGitWorktreeBaseline {
+    version: u64,
+    tracked_patch_ids: BTreeMap<String, String>,
+    untracked_blob_ids: BTreeMap<String, String>,
+    require_clean: bool,
+    staged_non_task_patch_ids: Option<BTreeMap<String, String>>,
+    staged_index_tree: Option<String>,
+    manifest_parent_head: Option<String>,
+    upstream_remote: Option<String>,
+    upstream_merge_ref: Option<String>,
+    upstream_push_url: Option<String>,
+}
+
+impl Default for AgentGitWorktreeBaseline {
+    fn default() -> Self {
+        Self {
+            version: 2,
+            tracked_patch_ids: BTreeMap::new(),
+            untracked_blob_ids: BTreeMap::new(),
+            require_clean: false,
+            staged_non_task_patch_ids: None,
+            staged_index_tree: None,
+            manifest_parent_head: None,
+            upstream_remote: None,
+            upstream_merge_ref: None,
+            upstream_push_url: None,
+        }
+    }
+}
+
+impl AgentGitWorktreeBaseline {
+    fn to_json(&self) -> Result<String> {
+        serde_json::to_string(&serde_json::json!({
+            "version": self.version,
+            "tracked_patch_ids": self.tracked_patch_ids,
+            "untracked_blob_ids": self.untracked_blob_ids,
+            "require_clean": self.require_clean,
+            "staged_non_task_patch_ids": self.staged_non_task_patch_ids,
+            "staged_index_tree": self.staged_index_tree,
+            "manifest_parent_head": self.manifest_parent_head,
+            "upstream_remote": self.upstream_remote,
+            "upstream_merge_ref": self.upstream_merge_ref,
+            "upstream_push_url": self.upstream_push_url,
+        }))
+        .context("Failed to serialize the automated Git worktree baseline")
+    }
+
+    fn from_json(raw: &str) -> Result<Self> {
+        let value: serde_json::Value = serde_json::from_str(raw)
+            .context("Failed to parse the automated Git worktree baseline")?;
+        let version = value.get("version").and_then(serde_json::Value::as_u64);
+        if !matches!(version, Some(1 | 2)) {
+            anyhow::bail!("Unsupported automated Git worktree baseline version");
+        }
+        let parse_map = |field: &str| -> Result<BTreeMap<String, String>> {
+            let object = value
+                .get(field)
+                .and_then(serde_json::Value::as_object)
+                .with_context(|| format!("Git worktree baseline is missing {field}"))?;
+            object
+                .iter()
+                .map(|(path, value)| {
+                    value
+                        .as_str()
+                        .map(|value| (path.clone(), value.to_string()))
+                        .with_context(|| {
+                            format!("Git worktree baseline entry {field}.{path} is not text")
+                        })
+                })
+                .collect()
+        };
+        Ok(Self {
+            version: version.expect("supported baseline version"),
+            tracked_patch_ids: parse_map("tracked_patch_ids")?,
+            untracked_blob_ids: parse_map("untracked_blob_ids")?,
+            require_clean: value
+                .get("require_clean")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            staged_non_task_patch_ids: value
+                .get("staged_non_task_patch_ids")
+                .and_then(serde_json::Value::as_object)
+                .map(|object| {
+                    object
+                        .iter()
+                        .map(|(path, value)| {
+                            value
+                                .as_str()
+                                .map(|value| (path.clone(), value.to_string()))
+                                .with_context(|| {
+                                    format!(
+                                        "Git worktree baseline entry staged_non_task_patch_ids.{path} is not text"
+                                    )
+                                })
+                        })
+                        .collect::<Result<BTreeMap<_, _>>>()
+                })
+                .transpose()?,
+            staged_index_tree: value
+                .get("staged_index_tree")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            manifest_parent_head: value
+                .get("manifest_parent_head")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            upstream_remote: value
+                .get("upstream_remote")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            upstream_merge_ref: value
+                .get("upstream_merge_ref")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            upstream_push_url: value
+                .get("upstream_push_url")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+        })
+    }
+}
+
+fn ensure_agent_git_index_preflight(
+    project: &agent_store::AgentProject,
+    resuming_known_session: bool,
+) -> Result<()> {
+    if project.git_mode == AgentGitMode::Off || resuming_known_session {
+        return Ok(());
+    }
+
+    let output = Command::new("git")
+        .current_dir(&project.path)
+        .args(["diff", "--cached", "--quiet", "--exit-code", "--"])
+        .output()
+        .with_context(|| {
+            format!(
+                "Failed to inspect the staged Git index in {}",
+                project.path.display()
+            )
+        })?;
+    match output.status.code() {
+        Some(0) => Ok(()),
+        Some(1) => anyhow::bail!(
+            "Refusing to start a fresh automated Git task with pre-existing staged changes; preserve the index and resolve its ownership before retrying"
+        ),
+        _ => anyhow::bail!(
+            "Failed to inspect the staged Git index in {}: {}",
+            project.path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+    }
+}
+
+fn prepare_agent_git_start_state_for_run(
+    store: &agent_store::TursoAgentStore,
+    project: &agent_store::AgentProject,
+    task_selection: AgentTaskSelection,
+    has_known_session: bool,
+    has_existing_session_finalization: bool,
+    run_token: &str,
+) -> Result<Option<AgentGitStartState>> {
+    if project.git_mode == AgentGitMode::Off {
+        return Ok(None);
+    }
+    if has_known_session && !has_existing_session_finalization {
+        anyhow::bail!(
+            "Known Codex session has no frozen Git start journal; CLT will not reconstruct the task boundary from a later checkout"
+        );
+    }
+    if has_existing_session_finalization {
+        return Ok(None);
+    }
+    if task_selection != AgentTaskSelection::NextTodo {
+        anyhow::bail!(
+            "Git-enabled task recovery has no frozen start journal; only a fresh NextTodo run may establish a new task boundary"
+        );
+    }
+    if store.has_other_git_launch_state_blocking(project.id, run_token)? {
+        let (prior_run_token, prior_mode, prior_start) = store
+            .git_launch_state_for_project_blocking(project.id)?
+            .context("The prior Git launch boundary disappeared during recovery")?;
+        let checkout_is_unchanged = prior_mode == project.git_mode
+            && verify_agent_git_start_state_unchanged(&project.path, prior_mode, &prior_start)
+                .is_ok();
+        let reclaimed = checkout_is_unchanged
+            && store.reclaim_unchanged_git_launch_state_blocking(
+                project.id,
+                &prior_run_token,
+                prior_mode,
+                &prior_start,
+            )?;
+        if !reclaimed {
+            anyhow::bail!(
+                "An earlier released Git-enabled run has an unconsumed launch boundary; its exact worker is not proven dead or the checkout changed, so CLT will not overwrite it or start another task"
+            );
+        }
+    }
+    if store
+        .git_launch_state_blocking(project.id, run_token)?
+        .is_some()
+    {
+        anyhow::bail!(
+            "Automated run {run_token} already has an unconsumed Git launch boundary; CLT will not recapture it from a later checkout"
+        );
+    }
+    let project_has_working_boundary = store
+        .list_pending_git_finalizations_blocking(Some(project.id))?
+        .into_iter()
+        .any(|finalization| finalization.state == GitFinalizationState::Working);
+    if task_selection == AgentTaskSelection::NextTodo && !project_has_working_boundary {
+        synchronize_agent_git_checkout_before_launch(&project.path)?;
+    }
+    {
+        let board_dir = get_tasks_dir(&project.path);
+        let _mutation_lock = acquire_board_mutation_lock(&board_dir)?;
+        cleanup_clt_atomic_task_temporaries(&board_dir)?;
+    }
+    require_agent_git_board_storage_compatible(&project.path)?;
+    let start = capture_agent_git_start_state(&project.path, project.git_mode)?;
+    require_agent_git_todo_candidates_committed(&project.path, &start.starting_head)?;
+    Ok(Some(start))
+}
+
+fn require_agent_git_todo_candidates_committed(
+    project_root: &Path,
+    starting_head: &str,
+) -> Result<()> {
+    let candidates = read_task_entries(&get_tasks_dir(project_root), "todo")?
+        .into_iter()
+        .filter(|entry| !task_entry_is_blocked(entry))
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        anyhow::bail!("Fresh Git-enabled automation has no unblocked Todo task to start");
+    }
+    for candidate in candidates {
+        let task_identity = durable_task_identity(&candidate.content)
+            .context("A Todo candidate has no durable task identity")?;
+        require_agent_git_start_task_identity(project_root, starting_head, &task_identity)
+            .with_context(|| {
+                format!(
+                    "Todo candidate {:?} is not committed exactly once at the frozen task boundary",
+                    candidate.summary
+                )
+            })?;
+    }
+    Ok(())
+}
+
+fn require_agent_git_board_storage_compatible(project_root: &Path) -> Result<()> {
+    let board_dir = get_tasks_dir(project_root);
+    let todo_is_directory = matches!(
+        get_status_store(&board_dir, "todo")?,
+        StatusStore::Directory(_)
+    );
+    let doing_is_directory = matches!(
+        get_status_store(&board_dir, "doing")?,
+        StatusStore::Directory(_)
+    );
+    let done_is_directory = matches!(
+        get_status_store(&board_dir, "done")?,
+        StatusStore::Directory(_)
+    );
+    if todo_is_directory && !doing_is_directory {
+        anyhow::bail!(
+            "Git-enabled automation requires folder-backed Doing storage when Todo is folder-backed; expand and commit the board layout before scheduling"
+        );
+    }
+    if doing_is_directory && !done_is_directory {
+        anyhow::bail!(
+            "Git-enabled automation requires folder-backed Done storage when Doing is folder-backed; expand and commit the board layout before scheduling"
+        );
+    }
+    Ok(())
+}
+
+fn synchronize_agent_git_checkout_before_launch(project_root: &Path) -> Result<()> {
+    let branch_ref = git_optional_stdout(
+        project_root,
+        &["symbolic-ref", "-q", "HEAD"],
+        &[1],
+        "resolve the branch for automated startup synchronization",
+    )?;
+    let Some(branch_ref) = branch_ref else {
+        return Ok(());
+    };
+    let upstream_ref = resolve_agent_git_upstream(project_root, Some(&branch_ref))?;
+    let Some(upstream_ref) = upstream_ref else {
+        return Ok(());
+    };
+    let starting_head = resolve_git_commit(
+        project_root,
+        "HEAD",
+        "resolve the commit before automated startup synchronization",
+    )?;
+    let mut command = Command::new("git");
+    command
+        .current_dir(project_root)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args(["pull", "--ff-only", "--no-rebase"]);
+    let output = run_agent_git_remote_command(
+        &mut command,
+        &format!("fast-forward the automated checkout from {upstream_ref}"),
+    )?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to fast-forward the automated checkout from {upstream_ref}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    require_agent_git_index_matches_head(project_root)?;
+    let current_branch = git_optional_stdout(
+        project_root,
+        &["symbolic-ref", "-q", "HEAD"],
+        &[1],
+        "recheck the branch after automated startup synchronization",
+    )?;
+    let current_upstream = resolve_agent_git_upstream(project_root, current_branch.as_deref())?;
+    let current_head = resolve_git_commit(
+        project_root,
+        "HEAD",
+        "recheck the commit after automated startup synchronization",
+    )?;
+    if current_branch.as_deref() != Some(branch_ref.as_str())
+        || current_upstream.as_deref() != Some(upstream_ref.as_str())
+        || !git_commit_is_ancestor(project_root, &starting_head, &current_head)?
+    {
+        anyhow::bail!(
+            "Git branch, upstream, or history changed incompatibly during automated startup synchronization"
+        );
+    }
+    Ok(())
+}
+
+fn git_nul_separated_paths(
+    project_root: &Path,
+    args: &[&str],
+    operation: &str,
+) -> Result<Vec<String>> {
+    let output = Command::new("git")
+        .current_dir(project_root)
+        .args(args)
+        .output()
+        .with_context(|| format!("Failed to {operation} in {}", project_root.display()))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to {operation} in {}: {}",
+            project_root.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| {
+            std::str::from_utf8(path)
+                .with_context(|| {
+                    format!("Git returned a non-UTF-8 path while trying to {operation}")
+                })
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+fn git_hash_stdin(project_root: &Path, bytes: &[u8], operation: &str) -> Result<String> {
+    let mut child = Command::new("git")
+        .current_dir(project_root)
+        .args(["hash-object", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("Failed to start Git while trying to {operation}"))?;
+    child
+        .stdin
+        .take()
+        .context("git hash-object did not expose stdin")?
+        .write_all(bytes)
+        .with_context(|| format!("Failed to send content to Git while trying to {operation}"))?;
+    let output = child
+        .wait_with_output()
+        .with_context(|| format!("Failed to finish Git while trying to {operation}"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to {operation}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    String::from_utf8(output.stdout)
+        .with_context(|| format!("Git returned non-UTF-8 output while trying to {operation}"))
+        .map(|value| value.trim().to_string())
+}
+
+fn git_delta_id_for_path(
+    project_root: &Path,
+    diff_arguments: &[&str],
+    path: &str,
+) -> Result<String> {
+    let diff = Command::new("git")
+        .current_dir(project_root)
+        .arg("diff")
+        .args(diff_arguments)
+        .args([
+            "--no-ext-diff",
+            "--binary",
+            "--full-index",
+            "--unified=0",
+            "--",
+            path,
+        ])
+        .output()
+        .with_context(|| {
+            format!(
+                "Failed to read the Git delta for {path} in {}",
+                project_root.display()
+            )
+        })?;
+    if !diff.status.success() {
+        anyhow::bail!(
+            "Failed to read the Git delta for {path} in {}: {}",
+            project_root.display(),
+            String::from_utf8_lossy(&diff.stderr).trim()
+        );
+    }
+    if diff.stdout.is_empty() {
+        anyhow::bail!("Git state changed while CLT was capturing the delta for {path}");
+    }
+
+    let mut canonical = Vec::new();
+    let mut in_binary_patch = false;
+    let mut in_hunk = false;
+    for line in diff.stdout.split_inclusive(|byte| *byte == b'\n') {
+        if line.starts_with(b"GIT binary patch") {
+            in_binary_patch = true;
+        }
+        if line.starts_with(b"@@") {
+            in_hunk = true;
+            continue;
+        }
+        if in_binary_patch
+            || line.starts_with(b"+")
+            || line.starts_with(b"-")
+            || line.starts_with(b"old mode ")
+            || line.starts_with(b"new mode ")
+            || line.starts_with(b"new file mode ")
+            || line.starts_with(b"deleted file mode ")
+            || line.starts_with(b"rename from ")
+            || line.starts_with(b"rename to ")
+            || line.starts_with(b"copy from ")
+            || line.starts_with(b"copy to ")
+            || line.starts_with(b"\\ No newline at end of file")
+        {
+            if !in_hunk && (line.starts_with(b"--- ") || line.starts_with(b"+++ ")) {
+                continue;
+            }
+            canonical.extend_from_slice(line);
+        }
+    }
+    if canonical.is_empty() {
+        anyhow::bail!("Git produced no canonical delta for {path}");
+    }
+    git_hash_stdin(
+        project_root,
+        &canonical,
+        &format!("fingerprint the exact Git delta for {path}"),
+    )
+}
+
+fn git_worktree_delta_id_for_path(project_root: &Path, path: &str) -> Result<String> {
+    git_delta_id_for_path(project_root, &[], path)
+}
+
+fn git_untracked_blob_id(project_root: &Path, path: &str) -> Result<String> {
+    git_stdout(
+        project_root,
+        &["hash-object", "--no-filters", "--", path],
+        "fingerprint an untracked worktree file",
+    )
+}
+
+fn capture_agent_git_worktree_baseline(project_root: &Path) -> Result<AgentGitWorktreeBaseline> {
+    capture_agent_git_worktree_state(project_root)
+}
+
+fn require_agent_git_index_matches_head(project_root: &Path) -> Result<()> {
+    let cached = Command::new("git")
+        .current_dir(project_root)
+        .args(["diff", "--cached", "--quiet", "--exit-code", "--"])
+        .output()
+        .with_context(|| {
+            format!(
+                "Failed to verify the staged Git index in {}",
+                project_root.display()
+            )
+        })?;
+    match cached.status.code() {
+        Some(0) => Ok(()),
+        Some(1) => {
+            anyhow::bail!("Automated Git finalization requires the staged index to match HEAD")
+        }
+        _ => anyhow::bail!(
+            "Failed to verify the staged Git index in {}: {}",
+            project_root.display(),
+            String::from_utf8_lossy(&cached.stderr).trim()
+        ),
+    }
+}
+
+fn capture_agent_git_worktree_state(project_root: &Path) -> Result<AgentGitWorktreeBaseline> {
+    let tracked_paths = git_nul_separated_paths(
+        project_root,
+        &["diff", "--name-only", "-z", "--"],
+        "list modified tracked files",
+    )?;
+    let untracked_paths = git_nul_separated_paths(
+        project_root,
+        &["ls-files", "--others", "--exclude-standard", "-z", "--"],
+        "list untracked files",
+    )?;
+    let mut baseline = AgentGitWorktreeBaseline::default();
+    for path in tracked_paths {
+        baseline.tracked_patch_ids.insert(
+            path.clone(),
+            git_worktree_delta_id_for_path(project_root, &path)?,
+        );
+    }
+    for path in untracked_paths {
+        baseline
+            .untracked_blob_ids
+            .insert(path.clone(), git_untracked_blob_id(project_root, &path)?);
+    }
+    Ok(baseline)
+}
+
+fn worktree_matches_agent_git_baseline(project_root: &Path, raw_baseline: &str) -> Result<bool> {
+    let expected = AgentGitWorktreeBaseline::from_json(raw_baseline)?;
+    let current = capture_agent_git_worktree_baseline(project_root)?;
+    if expected.require_clean {
+        return Ok(current.tracked_patch_ids.is_empty() && current.untracked_blob_ids.is_empty());
+    }
+    let current_is_subset = current
+        .tracked_patch_ids
+        .iter()
+        .all(|(path, patch_id)| expected.tracked_patch_ids.get(path) == Some(patch_id))
+        && current
+            .untracked_blob_ids
+            .iter()
+            .all(|(path, blob_id)| expected.untracked_blob_ids.get(path) == Some(blob_id));
+    let non_task_baseline_preserved = expected
+        .tracked_patch_ids
+        .iter()
+        .filter(|(path, _)| !path.starts_with("tasks/"))
+        .all(|(path, patch_id)| current.tracked_patch_ids.get(path) == Some(patch_id))
+        && expected
+            .untracked_blob_ids
+            .iter()
+            .filter(|(path, _)| !path.starts_with("tasks/"))
+            .all(|(path, blob_id)| current.untracked_blob_ids.get(path) == Some(blob_id));
+    Ok(current_is_subset && non_task_baseline_preserved)
+}
+
+fn git_ref_has_one_active_session_task(
+    project_root: &Path,
+    reference: &str,
+    session_id: &str,
+    task_identity: &str,
+) -> Result<bool> {
+    let entries = git_ref_task_entries(project_root, reference)?;
+    let marker_count = entries
+        .iter()
+        .flat_map(|entry| codex_session_markers_in_task_content(&entry.content))
+        .filter(|(_, _, candidate)| *candidate == session_id)
+        .count();
+    let active_count = entries
+        .iter()
+        .filter(|entry| {
+            matches!(entry.status.as_str(), "todo" | "doing")
+                && codex_session_id_from_task_content(&entry.content) == Some(session_id)
+                && durable_task_identity(&entry.content).as_deref() == Some(task_identity)
+        })
+        .count();
+    Ok(marker_count == 1 && active_count == 1)
+}
+
+fn git_ref_has_one_completed_session_task(
+    project_root: &Path,
+    reference: &str,
+    session_id: &str,
+    task_identity: &str,
+) -> Result<bool> {
+    let entries = git_ref_task_entries(project_root, reference)?;
+    let marker_count = entries
+        .iter()
+        .flat_map(|entry| codex_session_markers_in_task_content(&entry.content))
+        .filter(|(_, _, candidate)| *candidate == session_id)
+        .count();
+    let completed_count = entries
+        .iter()
+        .filter(|entry| {
+            entry.status == "done"
+                && codex_session_id_from_task_content(&entry.content) == Some(session_id)
+                && durable_task_identity(&entry.content).as_deref() == Some(task_identity)
+                && task_content_has_completed_note(&entry.content)
+        })
+        .count();
+    Ok(marker_count == 1 && completed_count == 1)
+}
+
+struct AgentGitTreeProjection {
+    root: PathBuf,
+}
+
+impl Drop for AgentGitTreeProjection {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+fn run_agent_git_projection_command(
+    project_root: &Path,
+    index_path: &Path,
+    worktree_path: Option<&Path>,
+    args: &[&str],
+    operation: &str,
+) -> Result<String> {
+    let mut command = Command::new("git");
+    command
+        .current_dir(project_root)
+        .env("GIT_INDEX_FILE", index_path)
+        .args(args);
+    if let Some(worktree_path) = worktree_path {
+        command.env("GIT_WORK_TREE", worktree_path);
+    }
+    let output = command.output().with_context(|| {
+        format!(
+            "Failed to {operation} while projecting the sealed task tree in {}",
+            project_root.display()
+        )
+    })?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to {operation} while projecting the sealed task tree in {}: {}",
+            project_root.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    String::from_utf8(output.stdout)
+        .with_context(|| format!("Git returned non-UTF-8 output while trying to {operation}"))
+        .map(|value| value.trim().to_string())
+}
+
+fn materialize_agent_git_task_tree(
+    project_root: &Path,
+    index_path: &Path,
+    staged_tree: &str,
+    checkout_prefix: &str,
+) -> Result<()> {
+    let task_paths = Command::new("git")
+        .current_dir(project_root)
+        .args([
+            "ls-tree",
+            "-r",
+            "-z",
+            "--name-only",
+            staged_tree,
+            "--",
+            "tasks",
+        ])
+        .output()
+        .with_context(|| {
+            format!(
+                "Failed to list the staged task tree in {}",
+                project_root.display()
+            )
+        })?;
+    if !task_paths.status.success() {
+        anyhow::bail!(
+            "Failed to list the staged task tree in {}: {}",
+            project_root.display(),
+            String::from_utf8_lossy(&task_paths.stderr).trim()
+        );
+    }
+    let checkout_argument = format!("--prefix={checkout_prefix}");
+    let mut child = Command::new("git")
+        .current_dir(project_root)
+        .env("GIT_INDEX_FILE", index_path)
+        .args([
+            "checkout-index",
+            "--force",
+            "--stdin",
+            "-z",
+            &checkout_argument,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("Failed to start Git while materializing the staged task tree")?;
+    child
+        .stdin
+        .take()
+        .context("git checkout-index did not expose stdin")?
+        .write_all(&task_paths.stdout)
+        .context("Failed to send staged task paths to git checkout-index")?;
+    let output = child
+        .wait_with_output()
+        .context("Failed to finish materializing the staged task tree")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to materialize the staged task tree in {}: {}",
+            project_root.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+fn create_agent_git_tree_projection(
+    project_root: &Path,
+    source_tree: &str,
+) -> Result<(AgentGitTreeProjection, PathBuf, PathBuf)> {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let projection_root = std::env::temp_dir().join(format!(
+        "clt-git-finalization-{}-{nonce}",
+        std::process::id()
+    ));
+    let mut projection_builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        projection_builder.mode(0o700);
+    }
+    projection_builder
+        .create(&projection_root)
+        .with_context(|| {
+            format!(
+                "Failed to create sealed task projection directory {:?}",
+                projection_root
+            )
+        })?;
+    let projection = AgentGitTreeProjection {
+        root: projection_root,
+    };
+    let index_path = projection.root.join("index");
+    let worktree_path = projection.root.join("worktree");
+    fs::create_dir(&worktree_path).with_context(|| {
+        format!(
+            "Failed to create sealed task projection worktree {:?}",
+            worktree_path
+        )
+    })?;
+    run_agent_git_projection_command(
+        project_root,
+        &index_path,
+        None,
+        &["read-tree", source_tree],
+        "load the staged task tree",
+    )?;
+    let mut checkout_prefix = worktree_path.as_os_str().to_os_string();
+    checkout_prefix.push(std::path::MAIN_SEPARATOR.to_string());
+    let checkout_prefix = checkout_prefix
+        .to_str()
+        .context("Sealed task projection path is not valid UTF-8")?;
+    materialize_agent_git_task_tree(project_root, &index_path, source_tree, checkout_prefix)?;
+    Ok((projection, index_path, worktree_path))
+}
+
+fn git_task_subtree(project_root: &Path, root_tree: &str) -> Result<String> {
+    let tasks_reference = format!("{root_tree}:tasks");
+    git_stdout(
+        project_root,
+        &["rev-parse", "--verify", &tasks_reference],
+        "resolve the exact task-board tree",
+    )
+}
+
+fn stage_projected_task_tree(
+    project_root: &Path,
+    index_path: &Path,
+    worktree_path: &Path,
+    operation: &str,
+) -> Result<String> {
+    run_agent_git_projection_command(
+        project_root,
+        index_path,
+        Some(worktree_path),
+        &["add", "-A", "--", "tasks"],
+        operation,
+    )?;
+    run_agent_git_projection_command(
+        project_root,
+        index_path,
+        Some(worktree_path),
+        &["write-tree"],
+        operation,
+    )
+}
+
+fn projected_task_entry(
+    board_dir: &Path,
+    statuses: &[&str],
+    session_id: Option<&str>,
+    task_identity: &str,
+) -> Result<(String, usize, TaskEntry)> {
+    let mut selected = Vec::new();
+    for status in statuses {
+        for (index, entry) in read_task_entries(board_dir, status)?
+            .into_iter()
+            .enumerate()
+        {
+            if session_id.is_none_or(|session_id| {
+                codex_session_id_from_task_content(&entry.content) == Some(session_id)
+            }) && durable_task_identity(&entry.content).as_deref() == Some(task_identity)
+            {
+                selected.push(((*status).to_string(), index + 1, entry));
+            }
+        }
+    }
+    let [selected] = selected.as_slice() else {
+        anyhow::bail!("The task projection must contain exactly one matching task");
+    };
+    Ok(selected.clone())
+}
+
+fn agent_git_task_scope_without_selected(
+    project_root: &Path,
+    source_tree: &str,
+    task_identity: &str,
+) -> Result<String> {
+    let (_projection, index_path, worktree_path) =
+        create_agent_git_tree_projection(project_root, source_tree)?;
+    let board_dir = get_tasks_dir(&worktree_path);
+    let mut selected = Vec::new();
+    for status in ["todo", "doing"] {
+        for entry in read_task_entries(&board_dir, status)? {
+            if durable_task_identity(&entry.content).as_deref() == Some(task_identity) {
+                selected.push((status, entry));
+            }
+        }
+    }
+    match selected.as_slice() {
+        [] => anyhow::bail!(
+            "The selected Git-enabled task is not present in the manifest parent; commit the task board before starting automated work"
+        ),
+        [(status, entry)] => {
+            remove_agent_git_task_entry_without_reordering(&board_dir, status, entry)?
+        }
+        _ => {
+            anyhow::bail!(
+                "The Git manifest parent contains more than one active task with the selected identity"
+            )
+        }
+    }
+    let sanitized_tree = stage_projected_task_tree(
+        project_root,
+        &index_path,
+        &worktree_path,
+        "sanitize the selected task from the manifest parent",
+    )?;
+    git_task_subtree(project_root, &sanitized_tree)
+}
+
+fn agent_git_completed_scope_without_selected(
+    project_root: &Path,
+    completed_tree: &str,
+    session_id: &str,
+    task_identity: &str,
+) -> Result<String> {
+    let (_projection, index_path, worktree_path) =
+        create_agent_git_tree_projection(project_root, completed_tree)?;
+    let board_dir = get_tasks_dir(&worktree_path);
+    let (_, _, entry) =
+        projected_task_entry(&board_dir, &["done"], Some(session_id), task_identity)?;
+    remove_agent_git_task_entry_without_reordering(&board_dir, "done", &entry)?;
+    let sanitized_tree = stage_projected_task_tree(
+        project_root,
+        &index_path,
+        &worktree_path,
+        "sanitize the selected task from the completed manifest",
+    )?;
+    git_task_subtree(project_root, &sanitized_tree)
+}
+
+fn project_agent_git_completed_tree(
+    project_root: &Path,
+    staged_tree: &str,
+    session_id: &str,
+    task_identity: &str,
+    expected_task_scope_tree: &str,
+) -> Result<String> {
+    let (_projection, index_path, worktree_path) =
+        create_agent_git_tree_projection(project_root, staged_tree)?;
+    let board_dir = get_tasks_dir(&worktree_path);
+    let (status, task_index, _) = projected_task_entry(
+        &board_dir,
+        &["todo", "doing"],
+        Some(session_id),
+        task_identity,
+    )?;
+    move_agent_git_task_in_board_after_lock(&board_dir, &status, "done", task_index)?;
+    let completed_tree = stage_projected_task_tree(
+        project_root,
+        &index_path,
+        &worktree_path,
+        "stage the projected Done transition",
+    )?;
+    if git_ref_completed_task_identity(project_root, &completed_tree, session_id)?.as_deref()
+        != Some(task_identity)
+    {
+        anyhow::bail!("CLT could not project the selected task into an exact completed Git tree");
+    }
+    if agent_git_completed_scope_without_selected(
+        project_root,
+        &completed_tree,
+        session_id,
+        task_identity,
+    )? != expected_task_scope_tree
+    {
+        anyhow::bail!(
+            "The staged task board contains raw changes outside the selected task; leave unrelated task files, ordering, headers, archives, and attachments unstaged"
+        );
+    }
+    Ok(completed_tree)
+}
+
+fn capture_agent_git_staged_manifest(
+    proof: AgentGitProofContext<'_>,
+    project_root: &Path,
+    raw_baseline: &str,
+    session_id: &str,
+    task_identity: &str,
+    starting_head: &str,
+    branch_ref: Option<&str>,
+) -> Result<String> {
+    let baseline = AgentGitWorktreeBaseline::from_json(raw_baseline)?;
+    if !worktree_matches_agent_git_baseline(project_root, raw_baseline)? {
+        anyhow::bail!(
+            "Stage every task-owned change before `clt done`; the remaining unstaged and untracked work must match the pre-task baseline"
+        );
+    }
+    let manifest_parent_head = resolve_git_commit(
+        project_root,
+        "HEAD",
+        "freeze the staged task manifest parent",
+    )?;
+    if !git_commit_is_ancestor(project_root, starting_head, &manifest_parent_head)?
+        || !agent_git_range_is_safe_before_manifest(
+            proof,
+            project_root,
+            starting_head,
+            &manifest_parent_head,
+            session_id,
+        )?
+    {
+        anyhow::bail!(
+            "Automated Git completion found an unproven intervening commit before the sealed manifest; keep the implementation and Done transition in one task commit"
+        );
+    }
+    let expected_task_scope_tree =
+        agent_git_task_scope_without_selected(project_root, &manifest_parent_head, task_identity)?;
+    let staged_paths = git_nul_separated_paths(
+        project_root,
+        &["diff", "--cached", "--name-only", "-z", "--"],
+        "list staged task files",
+    )?;
+    if staged_paths.is_empty() {
+        anyhow::bail!(
+            "Automated Git completion requires the verified task changes to be staged before `clt done`"
+        );
+    }
+    let mut staged_non_task_patch_ids = BTreeMap::new();
+    for path in staged_paths
+        .iter()
+        .filter(|path| !path.starts_with("tasks/"))
+    {
+        staged_non_task_patch_ids.insert(
+            path.clone(),
+            git_delta_id_for_path(project_root, &["--cached"], path)?,
+        );
+    }
+    let staged_index_tree = git_stdout(
+        project_root,
+        &["write-tree"],
+        "snapshot the staged task manifest",
+    )?;
+    if !git_ref_has_one_active_session_task(
+        project_root,
+        &staged_index_tree,
+        session_id,
+        task_identity,
+    )? {
+        anyhow::bail!(
+            "Stage the selected Doing task, including its terminal codex:{session_id} marker and COMPLETED note, before `clt done`"
+        );
+    }
+    if git_ref_other_task_entries_from_start(project_root, &manifest_parent_head, task_identity)?
+        != git_ref_other_task_entries(project_root, &staged_index_tree, session_id)?
+    {
+        anyhow::bail!(
+            "The staged task board contains changes outside the selected task; leave unrelated task-board work unstaged"
+        );
+    }
+    let sealed_commit_tree = project_agent_git_completed_tree(
+        project_root,
+        &staged_index_tree,
+        session_id,
+        task_identity,
+        &expected_task_scope_tree,
+    )?;
+    let rechecked_parent =
+        resolve_git_commit(project_root, "HEAD", "recheck the staged manifest parent")?;
+    let rechecked_tree = git_stdout(
+        project_root,
+        &["write-tree"],
+        "recheck the staged task manifest",
+    )?;
+    let rechecked_branch = git_optional_stdout(
+        project_root,
+        &["symbolic-ref", "-q", "HEAD"],
+        &[1],
+        "recheck the frozen task branch",
+    )?;
+    if rechecked_parent != manifest_parent_head
+        || rechecked_tree != staged_index_tree
+        || rechecked_branch.as_deref() != branch_ref
+        || !git_commit_is_ancestor(project_root, starting_head, &rechecked_parent)?
+        || !worktree_matches_agent_git_baseline(project_root, raw_baseline)?
+    {
+        anyhow::bail!(
+            "Git HEAD, index, or unstaged work changed while CLT was sealing the task manifest; retry `clt done`"
+        );
+    }
+
+    let mut baseline = baseline;
+    baseline.staged_non_task_patch_ids = Some(staged_non_task_patch_ids);
+    baseline.staged_index_tree = Some(sealed_commit_tree);
+    baseline.manifest_parent_head = Some(manifest_parent_head);
+    baseline.to_json()
+}
+
+fn capture_agent_git_resealed_manifest(
+    proof: AgentGitProofContext<'_>,
+    project_root: &Path,
+    raw_baseline: &str,
+    session_id: &str,
+    task_identity: &str,
+    starting_head: &str,
+    branch_ref: Option<&str>,
+) -> Result<String> {
+    let mut baseline = AgentGitWorktreeBaseline::from_json(raw_baseline)?;
+    if baseline.version < 2 {
+        anyhow::bail!("Legacy Git finalizations cannot be resealed");
+    }
+    if !worktree_matches_agent_git_baseline(project_root, raw_baseline)? {
+        anyhow::bail!(
+            "Stage every corrected task-owned change before resealing; remaining unstaged and untracked work must match the pre-task baseline"
+        );
+    }
+    let manifest_parent_head =
+        resolve_git_commit(project_root, "HEAD", "freeze the corrected manifest parent")?;
+    let current_branch = git_optional_stdout(
+        project_root,
+        &["symbolic-ref", "-q", "HEAD"],
+        &[1],
+        "verify the corrected manifest branch",
+    )?;
+    if current_branch.as_deref() != branch_ref
+        || !git_commit_is_ancestor(project_root, starting_head, &manifest_parent_head)?
+        || git_ref_contains_completed_task(project_root, &manifest_parent_head, session_id)?
+        || !agent_git_range_is_safe_before_manifest(
+            proof,
+            project_root,
+            starting_head,
+            &manifest_parent_head,
+            session_id,
+        )?
+    {
+        anyhow::bail!(
+            "The branch or history changed incompatibly before the provisional Done manifest could be resealed"
+        );
+    }
+    let staged_paths = git_nul_separated_paths(
+        project_root,
+        &["diff", "--cached", "--name-only", "-z", "--"],
+        "list corrected staged task files",
+    )?;
+    if staged_paths.is_empty() {
+        anyhow::bail!("Resealing requires the complete corrected task commit to be staged");
+    }
+    let mut staged_non_task_patch_ids = BTreeMap::new();
+    for path in staged_paths
+        .iter()
+        .filter(|path| !path.starts_with("tasks/"))
+    {
+        staged_non_task_patch_ids.insert(
+            path.clone(),
+            git_delta_id_for_path(project_root, &["--cached"], path)?,
+        );
+    }
+    let sealed_commit_tree = git_stdout(
+        project_root,
+        &["write-tree"],
+        "snapshot the corrected completed-task manifest",
+    )?;
+    if !git_ref_has_one_completed_session_task(
+        project_root,
+        &sealed_commit_tree,
+        session_id,
+        task_identity,
+    )? {
+        anyhow::bail!(
+            "The corrected staged index must contain exactly one completed task for Codex session {session_id}"
+        );
+    }
+    let expected_task_scope_tree =
+        agent_git_task_scope_without_selected(project_root, &manifest_parent_head, task_identity)?;
+    if agent_git_completed_scope_without_selected(
+        project_root,
+        &sealed_commit_tree,
+        session_id,
+        task_identity,
+    )? != expected_task_scope_tree
+    {
+        anyhow::bail!("The corrected staged task board changes evidence outside the selected task");
+    }
+    let rechecked_parent = resolve_git_commit(
+        project_root,
+        "HEAD",
+        "recheck the corrected manifest parent",
+    )?;
+    let rechecked_tree = git_stdout(
+        project_root,
+        &["write-tree"],
+        "recheck the corrected completed-task manifest",
+    )?;
+    let rechecked_branch = git_optional_stdout(
+        project_root,
+        &["symbolic-ref", "-q", "HEAD"],
+        &[1],
+        "recheck the corrected manifest branch",
+    )?;
+    if rechecked_parent != manifest_parent_head
+        || rechecked_tree != sealed_commit_tree
+        || rechecked_branch.as_deref() != branch_ref
+        || !worktree_matches_agent_git_baseline(project_root, raw_baseline)?
+    {
+        anyhow::bail!(
+            "Git HEAD, branch, index, or unstaged work changed while CLT was resealing the task manifest; retry"
+        );
+    }
+    baseline.staged_non_task_patch_ids = Some(staged_non_task_patch_ids);
+    baseline.staged_index_tree = Some(sealed_commit_tree);
+    baseline.manifest_parent_head = Some(manifest_parent_head);
+    baseline.to_json()
+}
+
+fn agent_git_range_is_safe_before_manifest(
+    proof: AgentGitProofContext<'_>,
+    project_root: &Path,
+    starting_head: &str,
+    manifest_parent: &str,
+    current_session_id: &str,
+) -> Result<bool> {
+    if starting_head == manifest_parent {
+        return Ok(true);
+    }
+    if !git_commit_is_first_parent_ancestor(project_root, starting_head, manifest_parent)? {
+        return Ok(false);
+    }
+    let range = format!("{starting_head}..{manifest_parent}");
+    let revisions = git_stdout(
+        project_root,
+        &["rev-list", "--first-parent", "--reverse", &range],
+        "audit commits created before the task manifest",
+    )?;
+    for commit in revisions.lines().filter(|commit| !commit.is_empty()) {
+        let is_proven_completed_task = git_commit_is_proven_completed_other_session(
+            proof,
+            project_root,
+            commit,
+            current_session_id,
+        )?;
+        if !is_proven_completed_task {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn git_commit_is_proven_completed_other_session(
+    proof: AgentGitProofContext<'_>,
+    project_root: &Path,
+    commit_oid: &str,
+    current_session_id: &str,
+) -> Result<bool> {
+    let trailers = git_commit_task_trailers(project_root, commit_oid)?;
+    let [trailer] = trailers.as_slice() else {
+        return Ok(false);
+    };
+    let Some(session_id) = trailer.strip_prefix(CODEX_TASK_SESSION_PREFIX) else {
+        return Ok(false);
+    };
+    if session_id.is_empty()
+        || session_id == current_session_id
+        || !git_commit_uses_agent_identity(project_root, commit_oid)?
+    {
+        return Ok(false);
+    }
+    let Some(finalization) = proof
+        .store
+        .git_finalization_blocking(proof.project_id, session_id)?
+    else {
+        return Ok(false);
+    };
+    let Some(task_identity) = finalization.task_identity.as_deref() else {
+        return Ok(false);
+    };
+    let baseline = AgentGitWorktreeBaseline::from_json(&finalization.worktree_baseline)?;
+    if finalization.state != GitFinalizationState::Completed
+        || baseline.version < 2
+        || finalization.commit_oid.as_deref() != Some(commit_oid)
+    {
+        return Ok(false);
+    }
+    git_commit_matches_agent_staged_manifest(
+        project_root,
+        commit_oid,
+        session_id,
+        task_identity,
+        &finalization.worktree_baseline,
+        true,
+    )
+}
+
+fn git_ref_other_task_entries_from_start(
+    project_root: &Path,
+    reference: &str,
+    task_identity: &str,
+) -> Result<Vec<(String, String)>> {
+    let entries = git_ref_task_entries(project_root, reference)?;
+    let mut removed_target = false;
+    let mut others = entries
+        .into_iter()
+        .filter(|entry| {
+            let is_target = !removed_target
+                && matches!(entry.status.as_str(), "todo" | "doing")
+                && durable_task_identity(&entry.content).as_deref() == Some(task_identity);
+            if is_target {
+                removed_target = true;
+                false
+            } else {
+                true
+            }
+        })
+        .map(|entry| (entry.status, entry.content.trim_end().to_string()))
+        .collect::<Vec<_>>();
+    others.sort();
+    Ok(others)
+}
+
+fn git_ref_other_task_entries(
+    project_root: &Path,
+    reference: &str,
+    session_id: &str,
+) -> Result<Vec<(String, String)>> {
+    let mut entries = git_ref_task_entries(project_root, reference)?
+        .into_iter()
+        .filter(|entry| codex_session_id_from_task_content(&entry.content) != Some(session_id))
+        .map(|entry| (entry.status, entry.content.trim_end().to_string()))
+        .collect::<Vec<_>>();
+    entries.sort();
+    Ok(entries)
+}
+
+fn git_commit_matches_agent_staged_manifest(
+    project_root: &Path,
+    commit_oid: &str,
+    session_id: &str,
+    task_identity: &str,
+    raw_baseline: &str,
+    require_manifest_parent: bool,
+) -> Result<bool> {
+    let baseline = AgentGitWorktreeBaseline::from_json(raw_baseline)?;
+    let (Some(_expected_non_task), Some(sealed_commit_tree)) = (
+        baseline.staged_non_task_patch_ids.as_ref(),
+        baseline.staged_index_tree.as_deref(),
+    ) else {
+        // Version-one journals predate staged manifests. Their immutable tree,
+        // identity, trailer, and author proof is still safe to adopt; new
+        // journals always take the stronger manifest path.
+        return Ok(baseline.version == 1);
+    };
+    let parents = git_stdout(
+        project_root,
+        &["show", "-s", "--format=%P", commit_oid],
+        "read the task commit parent for manifest verification",
+    )?;
+    let parent_oids = parents.split_whitespace().collect::<Vec<_>>();
+    if parent_oids.len() != 1 {
+        return Ok(false);
+    }
+    let parent = parent_oids[0];
+    if require_manifest_parent && baseline.manifest_parent_head.as_deref() != Some(parent) {
+        return Ok(false);
+    }
+    let tree_reference = format!("{commit_oid}^{{tree}}");
+    let committed_tree = git_stdout(
+        project_root,
+        &["rev-parse", "--verify", &tree_reference],
+        "resolve the committed task tree",
+    )?;
+    if committed_tree != sealed_commit_tree
+        || git_ref_completed_task_identity(project_root, commit_oid, session_id)?.as_deref()
+            != Some(task_identity)
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn capture_agent_git_start_state(
+    project_root: &Path,
+    git_mode: AgentGitMode,
+) -> Result<AgentGitStartState> {
+    require_agent_git_index_matches_head(project_root)?;
+    let starting_head = git_stdout(
+        project_root,
+        &["rev-parse", "--verify", "HEAD^{commit}"],
+        "resolve the starting Git commit",
+    )?;
+    let branch_ref = git_optional_stdout(
+        project_root,
+        &["symbolic-ref", "-q", "HEAD"],
+        &[1],
+        "resolve the current Git branch",
+    )?;
+    if branch_ref.is_none() {
+        anyhow::bail!(
+            "Git-enabled automated tasks require an attached branch before CLT freezes the task boundary"
+        );
+    }
+    let upstream_ref = git_optional_stdout(
+        project_root,
+        &[
+            "rev-parse",
+            "--symbolic-full-name",
+            "--verify",
+            "@{upstream}",
+        ],
+        &[1, 128],
+        "resolve the current Git upstream",
+    )?;
+    if git_mode == AgentGitMode::CommitAndPush && upstream_ref.is_none() {
+        anyhow::bail!(
+            "Automated commit-and-push tasks require an attached branch with a configured upstream before entering Doing"
+        );
+    }
+    let upstream_destination = if git_mode == AgentGitMode::CommitAndPush {
+        Some(
+            capture_agent_git_upstream_destination(project_root, branch_ref.as_deref())?
+                .context("Automated commit-and-push tasks require one stable push destination")?,
+        )
+    } else {
+        None
+    };
+    let mut baseline = capture_agent_git_worktree_baseline(project_root)?;
+    if let Some(destination) = upstream_destination.as_ref() {
+        baseline.upstream_remote = Some(destination.remote.clone());
+        baseline.upstream_merge_ref = Some(destination.merge_ref.clone());
+        baseline.upstream_push_url = destination.push_url.clone();
+    }
+    let worktree_baseline = baseline.to_json()?;
+    require_agent_git_index_matches_head(project_root)?;
+    let rechecked_head = resolve_git_commit(project_root, "HEAD", "recheck the task start commit")?;
+    let rechecked_branch = git_optional_stdout(
+        project_root,
+        &["symbolic-ref", "-q", "HEAD"],
+        &[1],
+        "recheck the current Git branch",
+    )?;
+    let rechecked_upstream = resolve_agent_git_upstream(project_root, branch_ref.as_deref())?;
+    let rechecked_destination = if git_mode == AgentGitMode::CommitAndPush {
+        capture_agent_git_upstream_destination(project_root, branch_ref.as_deref())?
+    } else {
+        None
+    };
+    if rechecked_head != starting_head
+        || rechecked_branch != branch_ref
+        || rechecked_upstream != upstream_ref
+        || rechecked_destination != upstream_destination
+    {
+        anyhow::bail!(
+            "Git HEAD, branch, upstream, or index changed while CLT was freezing the task start state; retry the Todo-to-Doing move"
+        );
+    }
+
+    Ok(AgentGitStartState {
+        starting_head,
+        branch_ref,
+        upstream_ref,
+        worktree_baseline,
+    })
+}
+
+fn verify_agent_git_start_state_unchanged(
+    project_root: &Path,
+    git_mode: AgentGitMode,
+    start: &AgentGitStartState,
+) -> Result<()> {
+    require_agent_git_index_matches_head(project_root)?;
+    let current_head = resolve_git_commit(project_root, "HEAD", "verify the prelaunch Git commit")?;
+    let current_branch = git_optional_stdout(
+        project_root,
+        &["symbolic-ref", "-q", "HEAD"],
+        &[1],
+        "verify the prelaunch Git branch",
+    )?;
+    let current_upstream = resolve_agent_git_upstream(project_root, current_branch.as_deref())?;
+    let expected_baseline = AgentGitWorktreeBaseline::from_json(&start.worktree_baseline)?;
+    let current_baseline = capture_agent_git_worktree_baseline(project_root)?;
+    let worktree_is_unchanged = current_baseline.tracked_patch_ids
+        == expected_baseline.tracked_patch_ids
+        && current_baseline.untracked_blob_ids == expected_baseline.untracked_blob_ids;
+    let upstream_is_unchanged = if git_mode == AgentGitMode::CommitAndPush {
+        capture_agent_git_upstream_destination(project_root, current_branch.as_deref())?
+            == Some(AgentGitUpstreamDestination {
+                remote: expected_baseline
+                    .upstream_remote
+                    .clone()
+                    .unwrap_or_default(),
+                merge_ref: expected_baseline
+                    .upstream_merge_ref
+                    .clone()
+                    .unwrap_or_default(),
+                push_url: expected_baseline.upstream_push_url.clone(),
+            })
+    } else {
+        true
+    };
+    if current_head != start.starting_head
+        || current_branch != start.branch_ref
+        || current_upstream != start.upstream_ref
+        || !worktree_is_unchanged
+        || !upstream_is_unchanged
+    {
+        anyhow::bail!(
+            "Git HEAD, branch, upstream, index, or worktree changed after CLT froze the automated run; start the task before making implementation changes or commits"
+        );
+    }
+    Ok(())
+}
+
+fn ensure_agent_git_working_record(
+    store: &agent_store::TursoAgentStore,
+    project: &agent_store::AgentProject,
+    session_id: &str,
+    run_token: &str,
+    git_start_state: Option<&AgentGitStartState>,
+) -> Result<()> {
+    if project.git_mode == AgentGitMode::Off {
+        return Ok(());
+    }
+    if let Some(existing) = store.git_finalization_blocking(project.id, session_id)? {
+        if existing.state.is_terminal() {
+            return Ok(());
+        }
+        if existing.git_mode != project.git_mode {
+            anyhow::bail!(
+                "Codex session {session_id} already has a Git journal with mode {}, not {}",
+                existing.git_mode.label(),
+                project.git_mode.label()
+            );
+        }
+        return Ok(());
+    }
+    let git = git_start_state.with_context(|| {
+        format!("Git start state was not captured for Codex session {session_id}")
+    })?;
+    if worktree_completed_task_identity(&project.path, session_id)?.is_some() {
+        anyhow::bail!(
+            "Codex session {session_id} has completed task evidence but no frozen Git start journal; CLT cannot safely reconstruct the exact-one-commit boundary"
+        );
+    }
+    let created = store.create_git_finalization_blocking(agent_store::NewGitFinalization {
+        project_id: project.id,
+        codex_session_id: session_id,
+        git_mode: project.git_mode,
+        starting_head: Some(&git.starting_head),
+        branch_ref: git.branch_ref.as_deref(),
+        upstream_ref: git.upstream_ref.as_deref(),
+        worktree_baseline: &git.worktree_baseline,
+        task_identity: None,
+        owner_run_token: Some(run_token),
+        created_at: &agent_timestamp(),
+    })?;
+    if !created {
+        anyhow::bail!(
+            "Codex session {session_id} lost its running-session fence before CLT could record the Git start state"
+        );
+    }
+    Ok(())
+}
+
+fn bind_agent_git_working_task_identity(
+    store: &agent_store::TursoAgentStore,
+    project: &agent_store::AgentProject,
+    session_id: &str,
+    run_token: &str,
+) -> Result<bool> {
+    let Some(finalization) = store.git_finalization_blocking(project.id, session_id)? else {
+        return Ok(false);
+    };
+    let Some((_, task)) =
+        terminal_task_for_codex_session_in_board(&get_tasks_dir(&project.path), session_id)?
+    else {
+        return Ok(false);
+    };
+    let task_identity = durable_task_identity(&task.content)
+        .context("CLT could not derive a durable identity for the session-linked task")?;
+    let starting_head = finalization
+        .starting_head
+        .as_deref()
+        .context("The Git finalization has no frozen starting commit")?;
+    require_agent_git_start_task_identity(&project.path, starting_head, &task_identity)?;
+    if let Some(bound_identity) = finalization.task_identity.as_deref() {
+        if bound_identity != task_identity {
+            anyhow::bail!(
+                "Codex session {session_id} is attached to task content that no longer matches its frozen Git journal"
+            );
+        }
+        if finalization.state == GitFinalizationState::Working
+            && finalization.owner_run_token.as_deref() != Some(run_token)
+            && !store.compare_and_set_git_finalization_with_identity_blocking(
+                project.id,
+                session_id,
+                finalization.generation,
+                GitFinalizationState::Working,
+                &task_identity,
+                Some(run_token),
+                &agent_timestamp(),
+            )?
+        {
+            anyhow::bail!(
+                "Codex session {session_id} lost its running-session fence while rotating its Working Git journal to the resumed run"
+            );
+        }
+        return Ok(true);
+    }
+    if finalization.state != GitFinalizationState::Working {
+        anyhow::bail!(
+            "Git finalization for Codex session {session_id} entered {} before its task identity was bound",
+            finalization.state.database_value()
+        );
+    }
+    let changed = store.compare_and_set_git_finalization_with_identity_blocking(
+        project.id,
+        session_id,
+        finalization.generation,
+        GitFinalizationState::Working,
+        &task_identity,
+        Some(run_token),
+        &agent_timestamp(),
+    )?;
+    if !changed {
+        anyhow::bail!(
+            "Codex session {session_id} lost its running-session fence before CLT could bind its task identity"
+        );
+    }
+    Ok(true)
+}
+
+fn git_stdout(project_root: &Path, args: &[&str], operation: &str) -> Result<String> {
+    let output = Command::new("git")
+        .current_dir(project_root)
+        .args(args)
+        .output()
+        .with_context(|| format!("Failed to {operation} in {}", project_root.display()))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to {operation} in {}: {}",
+            project_root.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    String::from_utf8(output.stdout)
+        .with_context(|| format!("Git output for {operation} was not valid UTF-8"))
+        .map(|value| value.trim().to_string())
+}
+
+fn git_optional_stdout(
+    project_root: &Path,
+    args: &[&str],
+    absent_exit_codes: &[i32],
+    operation: &str,
+) -> Result<Option<String>> {
+    let output = Command::new("git")
+        .current_dir(project_root)
+        .args(args)
+        .output()
+        .with_context(|| format!("Failed to {operation} in {}", project_root.display()))?;
+    if output.status.success() {
+        return String::from_utf8(output.stdout)
+            .with_context(|| format!("Git output for {operation} was not valid UTF-8"))
+            .map(|value| Some(value.trim().to_string()));
+    }
+    if output
+        .status
+        .code()
+        .is_some_and(|code| absent_exit_codes.contains(&code))
+    {
+        return Ok(None);
+    }
+    anyhow::bail!(
+        "Failed to {operation} in {}: {}",
+        project_root.display(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    )
+}
+
+fn task_content_has_completed_note(content: &str) -> bool {
+    content.lines().any(|line| {
+        let uppercase = line.to_ascii_uppercase();
+        uppercase
+            .match_indices("COMPLETED ")
+            .any(|(index, matched)| {
+                let has_word_boundary = uppercase[..index]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|ch| !ch.is_ascii_alphanumeric() && ch != '_');
+                has_word_boundary
+                    && starts_with_task_note_date(&uppercase.as_bytes()[index + matched.len()..])
+            })
+    })
+}
+
+fn git_ref_contains_completed_task(
+    project_root: &Path,
+    reference: &str,
+    session_id: &str,
+) -> Result<bool> {
+    Ok(git_ref_completed_task_identity(project_root, reference, session_id)?.is_some())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GitTaskProofEntry {
+    status: String,
+    content: String,
+}
+
+fn git_ref_task_entries(project_root: &Path, reference: &str) -> Result<Vec<GitTaskProofEntry>> {
+    let output = Command::new("git")
+        .current_dir(project_root)
+        .args(["ls-tree", "-r", "-z", reference, "--", "tasks"])
+        .output()
+        .with_context(|| {
+            format!(
+                "Failed to list tasks at {reference} in {}",
+                project_root.display()
+            )
+        })?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to list tasks at {reference} in {}: {}",
+            project_root.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    let mut paths = Vec::new();
+    for raw in output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|raw| !raw.is_empty())
+    {
+        let entry = std::str::from_utf8(raw)
+            .context("Git returned a non-UTF-8 tree entry while proving finalization")?;
+        let (metadata, path) = entry
+            .split_once('\t')
+            .context("Git returned an invalid tree entry while proving finalization")?;
+        let mut metadata = metadata.split_whitespace();
+        let mode = metadata.next().unwrap_or_default();
+        let object_type = metadata.next().unwrap_or_default();
+        if mode.starts_with("100") && object_type == "blob" {
+            paths.push(path.to_string());
+        }
+    }
+    let mut entries = Vec::new();
+    collect_git_ref_board_task_entries(project_root, reference, &paths, "tasks", &mut entries)?;
+    Ok(entries)
+}
+
+fn git_tree_has_directory(paths: &[String], directory: &str) -> bool {
+    let prefix = format!("{directory}/");
+    paths.iter().any(|path| path.starts_with(&prefix))
+}
+
+fn git_tree_board_has_any_status_store(paths: &[String], board_dir: &str) -> bool {
+    TASK_STATUSES.iter().any(|status| {
+        paths
+            .iter()
+            .any(|path| path == &format!("{board_dir}/{status}.md"))
+            || git_tree_has_directory(paths, &format!("{board_dir}/{status}"))
+    })
+}
+
+fn git_ref_blob_content(project_root: &Path, reference: &str, path: &str) -> Result<String> {
+    let object = format!("{reference}:{path}");
+    git_stdout(
+        project_root,
+        &["cat-file", "blob", object.as_str()],
+        "read a committed task",
+    )
+}
+
+fn collect_git_ref_board_task_entries(
+    project_root: &Path,
+    reference: &str,
+    paths: &[String],
+    board_dir: &str,
+    entries: &mut Vec<GitTaskProofEntry>,
+) -> Result<()> {
+    for status in TASK_STATUSES {
+        let status_dir = format!("{board_dir}/{status}");
+        if git_tree_has_directory(paths, &status_dir) {
+            let prefix = format!("{status_dir}/");
+            let mut children = BTreeMap::<String, bool>::new();
+            for path in paths.iter().filter(|path| path.starts_with(&prefix)) {
+                let remainder = &path[prefix.len()..];
+                let child = remainder.split('/').next().unwrap_or_default();
+                if child.is_empty() || child.starts_with('.') {
+                    continue;
+                }
+                let is_directory = remainder.len() > child.len();
+                children
+                    .entry(child.to_string())
+                    .and_modify(|known_directory| *known_directory |= is_directory)
+                    .or_insert(is_directory);
+            }
+            for (child, is_directory) in children {
+                let task_path = format!("{status_dir}/{child}");
+                let content = if is_directory {
+                    let detail_path = TASK_DETAIL_FILES
+                        .iter()
+                        .map(|detail| format!("{task_path}/{detail}"))
+                        .find(|detail_path| paths.iter().any(|path| path == detail_path));
+                    match detail_path {
+                        Some(detail_path) => {
+                            git_ref_blob_content(project_root, reference, &detail_path)?
+                        }
+                        None => title_from_path(Path::new(&child)),
+                    }
+                } else {
+                    git_ref_blob_content(project_root, reference, &task_path)?
+                };
+                entries.push(GitTaskProofEntry {
+                    status: status.to_string(),
+                    content,
+                });
+                if is_directory && git_tree_board_has_any_status_store(paths, &task_path) {
+                    collect_git_ref_board_task_entries(
+                        project_root,
+                        reference,
+                        paths,
+                        &task_path,
+                        entries,
+                    )?;
+                }
+            }
+        } else {
+            let markdown_path = format!("{board_dir}/{status}.md");
+            if paths.iter().any(|path| path == &markdown_path) {
+                let content = git_ref_blob_content(project_root, reference, &markdown_path)?;
+                entries.extend(content.lines().filter_map(|line| {
+                    line.strip_prefix("- ").map(|content| GitTaskProofEntry {
+                        status: status.to_string(),
+                        content: content.to_string(),
+                    })
+                }));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn git_ref_completed_task_identity(
+    project_root: &Path,
+    reference: &str,
+    session_id: &str,
+) -> Result<Option<String>> {
+    let entries = git_ref_task_entries(project_root, reference)?;
+    let mut marker_count = 0;
+    let mut completed_matches = 0;
+    let mut completed_identity = None;
+    for entry in entries {
+        let matching_markers = codex_session_markers_in_task_content(&entry.content)
+            .into_iter()
+            .filter(|(_, _, candidate)| *candidate == session_id)
+            .count();
+        marker_count += matching_markers;
+        if matching_markers == 1
+            && codex_session_id_from_task_content(&entry.content) == Some(session_id)
+            && entry.status == "done"
+            && task_content_has_completed_note(&entry.content)
+        {
+            completed_matches += 1;
+            if completed_matches == 1 {
+                completed_identity = durable_task_identity(&entry.content);
+            }
+        }
+    }
+    Ok((marker_count == 1 && completed_matches == 1)
+        .then_some(completed_identity)
+        .flatten())
+}
+
+fn git_ref_active_task_identity_count(
+    project_root: &Path,
+    reference: &str,
+    task_identity: &str,
+) -> Result<usize> {
+    Ok(git_ref_task_entries(project_root, reference)?
+        .into_iter()
+        .filter(|entry| {
+            matches!(entry.status.as_str(), "todo" | "doing")
+                && durable_task_identity(&entry.content).as_deref() == Some(task_identity)
+        })
+        .count())
+}
+
+fn require_agent_git_start_task_identity(
+    project_root: &Path,
+    starting_head: &str,
+    task_identity: &str,
+) -> Result<()> {
+    let count = git_ref_active_task_identity_count(project_root, starting_head, task_identity)?;
+    if count != 1 {
+        anyhow::bail!(
+            "Git-enabled automated work requires the selected task to be committed exactly once in Todo or Doing before the task starts (found {count})"
+        );
+    }
+    Ok(())
+}
+
+fn git_ref_contains_active_task_identity(
+    project_root: &Path,
+    reference: &str,
+    task_identity: &str,
+) -> Result<bool> {
+    Ok(git_ref_task_entries(project_root, reference)?
+        .into_iter()
+        .any(|entry| {
+            matches!(entry.status.as_str(), "todo" | "doing")
+                && durable_task_identity(&entry.content).as_deref() == Some(task_identity)
+        }))
+}
+
+fn git_commit_has_task_trailer(
+    project_root: &Path,
+    commit_oid: &str,
+    session_id: &str,
+) -> Result<bool> {
+    let values = git_commit_task_trailers(project_root, commit_oid)?;
+    let expected = format!("{CODEX_TASK_SESSION_PREFIX}{session_id}");
+    Ok(values == [expected])
+}
+
+fn git_commit_task_trailers(project_root: &Path, commit_oid: &str) -> Result<Vec<String>> {
+    Ok(git_stdout(
+        project_root,
+        &[
+            "show",
+            "-s",
+            "--format=%(trailers:key=CLT-Task,valueonly)",
+            commit_oid,
+        ],
+        "read the task commit trailer",
+    )?
+    .lines()
+    .map(str::trim)
+    .filter(|value| !value.is_empty())
+    .map(str::to_string)
+    .collect())
+}
+
+fn git_commit_uses_agent_identity(project_root: &Path, commit_oid: &str) -> Result<bool> {
+    let identity = git_stdout(
+        project_root,
+        &[
+            "show",
+            "-s",
+            "--format=%an%x00%ae%x00%cn%x00%ce",
+            commit_oid,
+        ],
+        "read commit identity",
+    )?;
+    let fields = identity.split('\0').collect::<Vec<_>>();
+    Ok(fields
+        == [
+            AGENT_GIT_IDENTITY_NAME,
+            AGENT_GIT_IDENTITY_EMAIL,
+            AGENT_GIT_IDENTITY_NAME,
+            AGENT_GIT_IDENTITY_EMAIL,
+        ])
+}
+
+fn git_commit_is_ancestor(project_root: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
+    let output = Command::new("git")
+        .current_dir(project_root)
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .output()
+        .with_context(|| {
+            format!(
+                "Failed to compare Git ancestry in {}",
+                project_root.display()
+            )
+        })?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => anyhow::bail!(
+            "Failed to compare Git ancestry in {}: {}",
+            project_root.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+    }
+}
+
+fn git_commit_is_first_parent_ancestor(
+    project_root: &Path,
+    ancestor: &str,
+    descendant: &str,
+) -> Result<bool> {
+    if ancestor == descendant {
+        return Ok(true);
+    }
+    Ok(git_stdout(
+        project_root,
+        &["rev-list", "--first-parent", descendant],
+        "verify the first-parent task history",
+    )?
+    .lines()
+    .any(|commit| commit == ancestor))
+}
+
+fn resolve_git_commit(project_root: &Path, reference: &str, operation: &str) -> Result<String> {
+    let commit_reference = format!("{reference}^{{commit}}");
+    git_stdout(
+        project_root,
+        &["rev-parse", "--verify", commit_reference.as_str()],
+        operation,
+    )
+}
+
+#[cfg(test)]
+fn find_agent_git_task_commit(
+    project_root: &Path,
+    starting_head: &str,
+    branch_ref: Option<&str>,
+    session_id: &str,
+    task_identity: &str,
+) -> Result<Option<String>> {
+    find_agent_git_task_commit_with_policy(
+        project_root,
+        starting_head,
+        branch_ref,
+        session_id,
+        task_identity,
+        true,
+    )
+}
+
+fn find_agent_git_task_commit_with_policy(
+    project_root: &Path,
+    starting_head: &str,
+    branch_ref: Option<&str>,
+    session_id: &str,
+    task_identity: &str,
+    legacy_identity_checks: bool,
+) -> Result<Option<String>> {
+    let branch_ref = branch_ref.unwrap_or("HEAD");
+    let branch_tip = resolve_git_commit(project_root, branch_ref, "resolve the finalization tip")?;
+    let starting_identity_count =
+        git_ref_active_task_identity_count(project_root, starting_head, task_identity)?;
+    if (legacy_identity_checks && starting_identity_count > 1)
+        || !git_commit_is_first_parent_ancestor(project_root, starting_head, &branch_tip)?
+        || git_ref_completed_task_identity(project_root, &branch_tip, session_id)?.as_deref()
+            != Some(task_identity)
+        || (legacy_identity_checks
+            && git_ref_contains_active_task_identity(project_root, &branch_tip, task_identity)?)
+    {
+        return Ok(None);
+    }
+    if git_ref_contains_completed_task(project_root, starting_head, session_id)? {
+        return Ok(None);
+    }
+
+    let range = format!("{starting_head}..{branch_tip}");
+    let revisions = git_stdout(
+        project_root,
+        &["rev-list", "--first-parent", "--reverse", range.as_str()],
+        "list task finalization commits",
+    )?;
+    let mut candidates = Vec::new();
+    for commit in revisions.lines().filter(|line| !line.is_empty()) {
+        if !git_commit_has_task_trailer(project_root, commit, session_id)?
+            || !git_commit_uses_agent_identity(project_root, commit)?
+            || git_ref_completed_task_identity(project_root, commit, session_id)?.as_deref()
+                != Some(task_identity)
+            || (legacy_identity_checks
+                && git_ref_contains_active_task_identity(project_root, commit, task_identity)?)
+        {
+            continue;
+        }
+        let parents = git_stdout(
+            project_root,
+            &["show", "-s", "--format=%P", commit],
+            "read task commit parents",
+        )?;
+        let parent_oids = parents.split_whitespace().collect::<Vec<_>>();
+        let introduced_completion = parent_oids.len() == 1
+            && !git_ref_contains_completed_task(project_root, parent_oids[0], session_id)?
+            && (!legacy_identity_checks
+                || git_ref_active_task_identity_count(
+                    project_root,
+                    parent_oids[0],
+                    task_identity,
+                )? == starting_identity_count);
+        if introduced_completion {
+            candidates.push(commit.to_string());
+        }
+    }
+    if candidates.len() != 1 {
+        return Ok(None);
+    }
+    let candidate = candidates.remove(0);
+
+    for commit in revisions.lines().filter(|line| !line.is_empty()) {
+        if commit != candidate {
+            return Ok(None);
+        }
+    }
+
+    if resolve_git_commit(project_root, branch_ref, "recheck the finalization tip")? != branch_tip {
+        return Ok(None);
+    }
+
+    Ok(Some(candidate))
+}
+
+fn resolve_agent_git_upstream(
+    project_root: &Path,
+    branch_ref: Option<&str>,
+) -> Result<Option<String>> {
+    let branch = branch_ref
+        .and_then(|branch| branch.strip_prefix("refs/heads/"))
+        .unwrap_or("HEAD");
+    let upstream = format!("{branch}@{{upstream}}");
+    git_optional_stdout(
+        project_root,
+        &[
+            "rev-parse",
+            "--symbolic-full-name",
+            "--verify",
+            upstream.as_str(),
+        ],
+        &[1, 128],
+        "resolve the task finalization upstream",
+    )
+}
+
+fn capture_agent_git_upstream_destination(
+    project_root: &Path,
+    branch_ref: Option<&str>,
+) -> Result<Option<AgentGitUpstreamDestination>> {
+    let Some(branch_name) = branch_ref.and_then(|branch| branch.strip_prefix("refs/heads/")) else {
+        return Ok(None);
+    };
+    let remote_key = format!("branch.{branch_name}.remote");
+    let merge_key = format!("branch.{branch_name}.merge");
+    let Some(upstream_remote) = git_optional_stdout(
+        project_root,
+        &["config", "--get", remote_key.as_str()],
+        &[1],
+        "resolve the configured upstream remote",
+    )?
+    else {
+        return Ok(None);
+    };
+    let push_remote_key = format!("branch.{branch_name}.pushRemote");
+    let branch_push_remote = git_optional_stdout(
+        project_root,
+        &["config", "--get", push_remote_key.as_str()],
+        &[1],
+        "resolve the configured branch push remote",
+    )?;
+    let default_push_remote = git_optional_stdout(
+        project_root,
+        &["config", "--get", "remote.pushDefault"],
+        &[1],
+        "resolve the configured default push remote",
+    )?;
+    let remote = branch_push_remote
+        .or(default_push_remote)
+        .unwrap_or(upstream_remote);
+    if remote.is_empty() {
+        anyhow::bail!("Automated commit-and-push tasks require a non-empty push remote");
+    }
+    let Some(merge_ref) = git_optional_stdout(
+        project_root,
+        &["config", "--get", merge_key.as_str()],
+        &[1],
+        "resolve the configured upstream branch",
+    )?
+    else {
+        return Ok(None);
+    };
+    if !merge_ref.starts_with("refs/heads/") {
+        anyhow::bail!(
+            "Automated commit-and-push tasks require an upstream branch ref under refs/heads/"
+        );
+    }
+    if remote == "." {
+        anyhow::bail!(
+            "Automated commit-and-push tasks require a named remote with one explicit push URL"
+        );
+    }
+    let urls = git_stdout(
+        project_root,
+        &["remote", "get-url", "--push", "--all", &remote],
+        "resolve the configured upstream push destination",
+    )?;
+    let urls = urls
+        .lines()
+        .filter(|url| !url.is_empty())
+        .collect::<Vec<_>>();
+    let [url] = urls.as_slice() else {
+        anyhow::bail!(
+            "Automated commit-and-push tasks require exactly one configured push URL for remote {remote}"
+        );
+    };
+    let push_url = Some((*url).to_string());
+    Ok(Some(AgentGitUpstreamDestination {
+        remote,
+        merge_ref,
+        push_url,
+    }))
+}
+
+fn run_agent_git_remote_command(
+    command: &mut Command,
+    operation: &str,
+) -> Result<std::process::Output> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    configure_agent_child_command(command);
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("Failed to start Git while trying to {operation}"))?;
+    let started = Instant::now();
+    loop {
+        if child
+            .try_wait()
+            .with_context(|| format!("Failed to poll Git while trying to {operation}"))?
+            .is_some()
+        {
+            return child.wait_with_output().with_context(|| {
+                format!("Failed to collect Git output while trying to {operation}")
+            });
+        }
+        if started.elapsed() >= Duration::from_secs(AGENT_GIT_REMOTE_TIMEOUT_SECONDS) {
+            stop_agent_child_process(&mut child).with_context(|| {
+                format!("Timed-out Git process could not be stopped while trying to {operation}")
+            })?;
+            anyhow::bail!(
+                "Git timed out after {AGENT_GIT_REMOTE_TIMEOUT_SECONDS} seconds while trying to {operation}"
+            );
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn ensure_agent_git_finalization_fence(
+    finalization_lease: Option<&AgentGitFinalizationLease>,
+) -> Result<()> {
+    if let Some(finalization_lease) = finalization_lease {
+        finalization_lease.ensure_owned()?;
+    }
+    Ok(())
+}
+
+fn push_agent_git_commit_to_frozen_destination(
+    project_root: &Path,
+    branch_ref: Option<&str>,
+    expected_upstream_ref: Option<&str>,
+    baseline: &AgentGitWorktreeBaseline,
+    commit_oid: &str,
+    finalization_lease: Option<&AgentGitFinalizationLease>,
+) -> Result<()> {
+    ensure_agent_git_finalization_fence(finalization_lease)?;
+    let expected_destination = AgentGitUpstreamDestination {
+        remote: baseline.upstream_remote.clone().unwrap_or_default(),
+        merge_ref: baseline.upstream_merge_ref.clone().unwrap_or_default(),
+        push_url: baseline.upstream_push_url.clone(),
+    };
+    let push_url = expected_destination
+        .push_url
+        .as_deref()
+        .context("The frozen Git push destination has no explicit URL")?;
+    if expected_destination.remote.is_empty()
+        || expected_destination.merge_ref.is_empty()
+        || resolve_agent_git_upstream(project_root, branch_ref)?.as_deref() != expected_upstream_ref
+        || capture_agent_git_upstream_destination(project_root, branch_ref)?.as_ref()
+            != Some(&expected_destination)
+    {
+        anyhow::bail!(
+            "The Git upstream or push destination changed after CLT froze it; leaving the task PUSH-PENDING"
+        );
+    }
+
+    let refspec = format!("{commit_oid}:{}", expected_destination.merge_ref);
+    let mut command = Command::new("git");
+    command
+        .current_dir(project_root)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args([
+            "-c",
+            "push.followTags=false",
+            "-c",
+            "push.recurseSubmodules=no",
+            "push",
+            "--porcelain",
+            "--no-follow-tags",
+            "--recurse-submodules=no",
+            "--",
+            push_url,
+            refspec.as_str(),
+        ]);
+    ensure_agent_git_finalization_fence(finalization_lease)?;
+    let output = run_agent_git_remote_command(
+        &mut command,
+        &format!(
+            "push sealed commit {commit_oid} to {}",
+            expected_destination.merge_ref
+        ),
+    )?;
+    ensure_agent_git_finalization_fence(finalization_lease)?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to push sealed commit {commit_oid} to {}: {}",
+            expected_destination.merge_ref,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    if resolve_agent_git_upstream(project_root, branch_ref)?.as_deref() != expected_upstream_ref
+        || capture_agent_git_upstream_destination(project_root, branch_ref)?.as_ref()
+            != Some(&expected_destination)
+    {
+        anyhow::bail!(
+            "The Git push destination changed while CLT was publishing; remote proof is required before completion"
+        );
+    }
+    ensure_agent_git_finalization_fence(finalization_lease)?;
+    Ok(())
+}
+
+fn fetch_agent_git_upstream_tip(
+    project_root: &Path,
+    branch_ref: Option<&str>,
+    expected_upstream_ref: Option<&str>,
+    baseline: &AgentGitWorktreeBaseline,
+    finalization_lease: Option<&AgentGitFinalizationLease>,
+) -> Result<Option<String>> {
+    ensure_agent_git_finalization_fence(finalization_lease)?;
+    if resolve_agent_git_upstream(project_root, branch_ref)?.as_deref() != expected_upstream_ref {
+        return Ok(None);
+    }
+    let expected_destination = AgentGitUpstreamDestination {
+        remote: baseline.upstream_remote.clone().unwrap_or_default(),
+        merge_ref: baseline.upstream_merge_ref.clone().unwrap_or_default(),
+        push_url: baseline.upstream_push_url.clone(),
+    };
+    if expected_destination.remote.is_empty()
+        || expected_destination.merge_ref.is_empty()
+        || capture_agent_git_upstream_destination(project_root, branch_ref)?.as_ref()
+            != Some(&expected_destination)
+    {
+        return Ok(None);
+    }
+    if expected_destination.remote == "." {
+        let tip = resolve_git_commit(
+            project_root,
+            &expected_destination.merge_ref,
+            "resolve the local upstream tip",
+        )?;
+        ensure_agent_git_finalization_fence(finalization_lease)?;
+        return Ok(
+            (resolve_agent_git_upstream(project_root, branch_ref)?.as_deref()
+                == expected_upstream_ref
+                && capture_agent_git_upstream_destination(project_root, branch_ref)?.as_ref()
+                    == Some(&expected_destination))
+            .then_some(tip),
+        );
+    }
+    let Some(push_url) = expected_destination.push_url.as_deref() else {
+        return Ok(None);
+    };
+
+    let read_remote_tip = || -> Result<Option<String>> {
+        ensure_agent_git_finalization_fence(finalization_lease)?;
+        let mut command = Command::new("git");
+        command
+            .current_dir(project_root)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .args([
+                "ls-remote",
+                "--refs",
+                push_url,
+                &expected_destination.merge_ref,
+            ]);
+        let output = run_agent_git_remote_command(
+            &mut command,
+            &format!(
+                "query the frozen Git push destination for {}",
+                expected_destination.merge_ref
+            ),
+        )?;
+        ensure_agent_git_finalization_fence(finalization_lease)?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "Failed to query the frozen Git push destination for {}: {}",
+                expected_destination.merge_ref,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let stdout = String::from_utf8(output.stdout)
+            .context("Configured Git remote returned non-UTF-8 output")?;
+        let tips = stdout
+            .lines()
+            .filter_map(|line| line.split_whitespace().next())
+            .collect::<Vec<_>>();
+        Ok(match tips.as_slice() {
+            [] => None,
+            [tip] => Some((*tip).to_string()),
+            _ => None,
+        })
+    };
+
+    let Some(observed_tip) = read_remote_tip()? else {
+        return Ok(None);
+    };
+    ensure_agent_git_finalization_fence(finalization_lease)?;
+    let mut fetch_command = Command::new("git");
+    fetch_command
+        .current_dir(project_root)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args([
+            "fetch",
+            "--no-tags",
+            "--quiet",
+            push_url,
+            &expected_destination.merge_ref,
+        ]);
+    let fetch = run_agent_git_remote_command(
+        &mut fetch_command,
+        &format!(
+            "fetch the frozen Git push destination for {}",
+            expected_destination.merge_ref
+        ),
+    )?;
+    ensure_agent_git_finalization_fence(finalization_lease)?;
+    if !fetch.status.success() {
+        anyhow::bail!(
+            "Failed to fetch the frozen Git push destination for {}: {}",
+            expected_destination.merge_ref,
+            String::from_utf8_lossy(&fetch.stderr).trim()
+        );
+    }
+    let fetched_tip = resolve_git_commit(
+        project_root,
+        "FETCH_HEAD",
+        "resolve the fetched upstream tip",
+    )?;
+    let rechecked_tip = read_remote_tip()?;
+    if resolve_agent_git_upstream(project_root, branch_ref)?.as_deref() != expected_upstream_ref
+        || capture_agent_git_upstream_destination(project_root, branch_ref)?.as_ref()
+            != Some(&expected_destination)
+    {
+        return Ok(None);
+    }
+    ensure_agent_git_finalization_fence(finalization_lease)?;
+    Ok(
+        (Some(fetched_tip.clone()) == rechecked_tip && fetched_tip == observed_tip)
+            .then_some(fetched_tip),
+    )
+}
+
+fn worktree_contains_completed_done_task(project_root: &Path, session_id: &str) -> Result<bool> {
+    let Some((status, task)) =
+        terminal_task_for_codex_session_in_board(&get_tasks_dir(project_root), session_id)?
+    else {
+        return Ok(false);
+    };
+    Ok(status == "done" && task_content_has_completed_note(&task.content))
+}
+
+fn agent_git_upstream_tip_proves_task_commit(
+    project_root: &Path,
+    upstream_tip: &str,
+    local_commit_oid: &str,
+    session_id: &str,
+    task_identity: &str,
+    legacy_identity_checks: bool,
+) -> Result<bool> {
+    Ok(
+        git_commit_is_ancestor(project_root, local_commit_oid, upstream_tip)?
+            && git_ref_completed_task_identity(project_root, upstream_tip, session_id)?.as_deref()
+                == Some(task_identity)
+            && (!legacy_identity_checks
+                || !git_ref_contains_active_task_identity(
+                    project_root,
+                    upstream_tip,
+                    task_identity,
+                )?),
+    )
+}
+
+fn agent_git_manifest_parent_is_current(
+    project_root: &Path,
+    finalization: &agent_store::GitFinalizationRecord,
+) -> Result<bool> {
+    if git_optional_stdout(
+        project_root,
+        &["symbolic-ref", "-q", "HEAD"],
+        &[1],
+        "verify the task-recovery branch",
+    )?
+    .as_deref()
+        != finalization.branch_ref.as_deref()
+    {
+        return Ok(false);
+    }
+    let current_head = resolve_git_commit(project_root, "HEAD", "verify the task-recovery commit")?;
+    let baseline = AgentGitWorktreeBaseline::from_json(&finalization.worktree_baseline)?;
+    if baseline.version >= 2 {
+        return Ok(baseline.manifest_parent_head.as_deref() == Some(current_head.as_str()));
+    }
+    let Some(starting_head) = finalization.starting_head.as_deref() else {
+        return Ok(false);
+    };
+    git_commit_is_ancestor(project_root, starting_head, &current_head)
+}
+
+fn local_agent_git_task_commit_is_retained(
+    project_root: &Path,
+    branch_ref: Option<&str>,
+    commit_oid: &str,
+    session_id: &str,
+    task_identity: &str,
+) -> Result<bool> {
+    let Some(branch_ref) = branch_ref else {
+        return Ok(false);
+    };
+    if git_optional_stdout(
+        project_root,
+        &["symbolic-ref", "-q", "HEAD"],
+        &[1],
+        "verify the frozen push branch",
+    )?
+    .as_deref()
+        != Some(branch_ref)
+        || worktree_completed_task_identity(project_root, session_id)?.as_deref()
+            != Some(task_identity)
+    {
+        return Ok(false);
+    }
+    let branch_tip =
+        resolve_git_commit(project_root, branch_ref, "resolve the frozen push branch")?;
+    if !git_commit_is_ancestor(project_root, commit_oid, &branch_tip)?
+        || git_ref_completed_task_identity(project_root, &branch_tip, session_id)?.as_deref()
+            != Some(task_identity)
+        || git_ref_contains_active_task_identity(project_root, &branch_tip, task_identity)?
+    {
+        return Ok(false);
+    }
+    Ok(
+        resolve_git_commit(project_root, branch_ref, "recheck the frozen push branch")?
+            == branch_tip,
+    )
+}
+
+fn matching_agent_session_tasks(
+    board_dir: &Path,
+    status: &str,
+    session_id: &str,
+    task_identity: &str,
+) -> Result<Vec<TaskEntry>> {
+    Ok(read_task_entries(board_dir, status)?
+        .into_iter()
+        .filter(|entry| {
+            codex_session_id_from_task_content(&entry.content) == Some(session_id)
+                && durable_task_identity(&entry.content).as_deref() == Some(task_identity)
+                && task_content_has_completed_note(&entry.content)
+        })
+        .collect())
+}
+
+fn repair_tracking_agent_git_board(
+    project_root: &Path,
+    session_id: &str,
+    task_identity: &str,
+) -> Result<bool> {
+    let board_dir = get_tasks_dir(project_root);
+    let _mutation_lock = acquire_board_mutation_lock(&board_dir)?;
+    cleanup_clt_atomic_task_temporaries(&board_dir)?;
+    if ["backlog"]
+        .into_iter()
+        .map(|status| matching_agent_session_tasks(&board_dir, status, session_id, task_identity))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .any(|entries| !entries.is_empty())
+    {
+        return Ok(false);
+    }
+
+    let mut done = matching_agent_session_tasks(&board_dir, "done", session_id, task_identity)?;
+    let mut active = Vec::new();
+    for status in ["todo", "doing"] {
+        for entry in matching_agent_session_tasks(&board_dir, status, session_id, task_identity)? {
+            active.push((status, entry));
+        }
+    }
+    if done.is_empty() {
+        let [(status, entry)] = active.as_slice() else {
+            return Ok(false);
+        };
+        let task_index = read_task_entries(&board_dir, status)?
+            .iter()
+            .position(|candidate| candidate.source == entry.source)
+            .map(|index| index + 1)
+            .context("The tracked Git task changed while CLT was repairing its Done move")?;
+        move_agent_git_task_in_board_after_lock(&board_dir, status, "done", task_index)?;
+        return Ok(true);
+    }
+
+    let canonical_content = done[0].content.trim_end().to_string();
+    let crash_duplicates_are_safe_entries = done
+        .iter()
+        .chain(active.iter().map(|(_, entry)| entry))
+        .all(|entry| {
+            matches!(
+                entry.source,
+                TaskSource::MarkdownLine { .. } | TaskSource::Path { is_dir: false, .. }
+            ) && entry.content.trim_end() == canonical_content
+        });
+    if (!active.is_empty() || done.len() > 1) && !crash_duplicates_are_safe_entries {
+        return Ok(false);
+    }
+    while done.len() > 1 {
+        let duplicate = done.pop().expect("Done duplicate exists");
+        remove_agent_git_task_entry_without_reordering(&board_dir, "done", &duplicate)?;
+        done = matching_agent_session_tasks(&board_dir, "done", session_id, task_identity)?;
+    }
+    for status in ["todo", "doing"] {
+        loop {
+            let mut duplicates =
+                matching_agent_session_tasks(&board_dir, status, session_id, task_identity)?;
+            let Some(duplicate) = duplicates.pop() else {
+                break;
+            };
+            remove_agent_git_task_entry_without_reordering(&board_dir, status, &duplicate)?;
+        }
+    }
+    Ok(true)
+}
+
+fn worktree_completed_task_identity(
+    project_root: &Path,
+    session_id: &str,
+) -> Result<Option<String>> {
+    let Some((status, task)) =
+        terminal_task_for_codex_session_in_board(&get_tasks_dir(project_root), session_id)?
+    else {
+        return Ok(None);
+    };
+    if status != "done" || !task_content_has_completed_note(&task.content) {
+        return Ok(None);
+    }
+    Ok(durable_task_identity(&task.content))
+}
+
+fn reconcile_agent_git_finalization(
+    store: &agent_store::TursoAgentStore,
+    project_root: &Path,
+    mut finalization: agent_store::GitFinalizationRecord,
+    owner_run_token: Option<&str>,
+    finalization_lease: Option<&AgentGitFinalizationLease>,
+) -> Result<agent_store::GitFinalizationRecord> {
+    for _ in 0..6 {
+        ensure_agent_git_finalization_fence(finalization_lease)?;
+        let effective_owner = owner_run_token.or(finalization.owner_run_token.as_deref());
+        match finalization.state {
+            GitFinalizationState::Working => {
+                let Some(task_identity) = finalization.task_identity.as_deref() else {
+                    return Ok(finalization);
+                };
+                let baseline =
+                    AgentGitWorktreeBaseline::from_json(&finalization.worktree_baseline)?;
+                if baseline.version >= 2
+                    && (baseline.staged_non_task_patch_ids.is_none()
+                        || baseline.staged_index_tree.is_none()
+                        || baseline.manifest_parent_head.is_none())
+                {
+                    return Ok(finalization);
+                }
+                if !worktree_contains_completed_done_task(
+                    project_root,
+                    &finalization.codex_session_id,
+                )? || !agent_git_manifest_parent_is_current(project_root, &finalization)?
+                {
+                    return Ok(finalization);
+                }
+                ensure_agent_git_finalization_fence(finalization_lease)?;
+                let changed = store.recover_git_finalization_intent_blocking(
+                    finalization.project_id,
+                    &finalization.codex_session_id,
+                    finalization.generation,
+                    task_identity,
+                    effective_owner,
+                    &agent_timestamp(),
+                )?;
+                if !changed {
+                    finalization = store
+                        .git_finalization_blocking(
+                            finalization.project_id,
+                            &finalization.codex_session_id,
+                        )?
+                        .context("Git journal disappeared during completion-intent recovery")?;
+                    continue;
+                }
+            }
+            GitFinalizationState::Tracking => {
+                let Some(task_identity) = finalization.task_identity.as_deref() else {
+                    return Ok(finalization);
+                };
+                if !agent_git_manifest_parent_is_current(project_root, &finalization)? {
+                    return Ok(finalization);
+                }
+                ensure_agent_git_finalization_fence(finalization_lease)?;
+                if !repair_tracking_agent_git_board(
+                    project_root,
+                    &finalization.codex_session_id,
+                    task_identity,
+                )? {
+                    return Ok(finalization);
+                }
+                ensure_agent_git_finalization_fence(finalization_lease)?;
+                if !worktree_contains_completed_done_task(
+                    project_root,
+                    &finalization.codex_session_id,
+                )? {
+                    return Ok(finalization);
+                }
+                ensure_agent_git_finalization_fence(finalization_lease)?;
+                let changed = store.compare_and_set_git_finalization_blocking(
+                    finalization.project_id,
+                    &finalization.codex_session_id,
+                    finalization.generation,
+                    GitFinalizationState::CommitPending,
+                    effective_owner,
+                    None,
+                    None,
+                    &agent_timestamp(),
+                )?;
+                if !changed {
+                    finalization = store
+                        .git_finalization_blocking(
+                            finalization.project_id,
+                            &finalization.codex_session_id,
+                        )?
+                        .context("Git finalization disappeared during task-move reconciliation")?;
+                    continue;
+                }
+            }
+            GitFinalizationState::CommitPending => {
+                let Some(starting_head) = finalization.starting_head.as_deref() else {
+                    return Ok(finalization);
+                };
+                let Some(task_identity) = finalization.task_identity.as_deref() else {
+                    return Ok(finalization);
+                };
+                let baseline =
+                    AgentGitWorktreeBaseline::from_json(&finalization.worktree_baseline)?;
+                let proof_start = if baseline.version >= 2 {
+                    baseline
+                        .manifest_parent_head
+                        .as_deref()
+                        .unwrap_or(starting_head)
+                } else {
+                    starting_head
+                };
+                let Some(commit_oid) = find_agent_git_task_commit_with_policy(
+                    project_root,
+                    proof_start,
+                    finalization.branch_ref.as_deref(),
+                    &finalization.codex_session_id,
+                    task_identity,
+                    baseline.version == 1,
+                )?
+                else {
+                    return Ok(finalization);
+                };
+                if !git_commit_matches_agent_staged_manifest(
+                    project_root,
+                    &commit_oid,
+                    &finalization.codex_session_id,
+                    task_identity,
+                    &finalization.worktree_baseline,
+                    true,
+                )? || !local_agent_git_task_commit_is_retained(
+                    project_root,
+                    finalization.branch_ref.as_deref(),
+                    &commit_oid,
+                    &finalization.codex_session_id,
+                    task_identity,
+                )? {
+                    return Ok(finalization);
+                }
+                ensure_agent_git_finalization_fence(finalization_lease)?;
+                let next_state = match finalization.git_mode {
+                    AgentGitMode::Off => {
+                        anyhow::bail!("Pending Git finalization unexpectedly has Git mode off")
+                    }
+                    AgentGitMode::Commit => GitFinalizationState::Completed,
+                    AgentGitMode::CommitAndPush => GitFinalizationState::PushPending,
+                };
+                let changed = store.compare_and_set_git_finalization_blocking(
+                    finalization.project_id,
+                    &finalization.codex_session_id,
+                    finalization.generation,
+                    next_state,
+                    effective_owner,
+                    Some(&commit_oid),
+                    None,
+                    &agent_timestamp(),
+                )?;
+                if !changed {
+                    finalization = store
+                        .git_finalization_blocking(
+                            finalization.project_id,
+                            &finalization.codex_session_id,
+                        )?
+                        .context("Git finalization disappeared during commit reconciliation")?;
+                    continue;
+                }
+            }
+            GitFinalizationState::PushPending => {
+                let Some(task_identity) = finalization.task_identity.as_deref() else {
+                    return Ok(finalization);
+                };
+                let baseline =
+                    AgentGitWorktreeBaseline::from_json(&finalization.worktree_baseline)?;
+                let Some(local_commit_oid) = finalization.commit_oid.as_deref() else {
+                    return Ok(finalization);
+                };
+                if !git_commit_matches_agent_staged_manifest(
+                    project_root,
+                    local_commit_oid,
+                    &finalization.codex_session_id,
+                    task_identity,
+                    &finalization.worktree_baseline,
+                    true,
+                )? || !local_agent_git_task_commit_is_retained(
+                    project_root,
+                    finalization.branch_ref.as_deref(),
+                    local_commit_oid,
+                    &finalization.codex_session_id,
+                    task_identity,
+                )? {
+                    return Ok(finalization);
+                }
+                let mut upstream_tip = fetch_agent_git_upstream_tip(
+                    project_root,
+                    finalization.branch_ref.as_deref(),
+                    finalization.upstream_ref.as_deref(),
+                    &baseline,
+                    finalization_lease,
+                )?;
+                let already_published = match upstream_tip.as_deref() {
+                    Some(upstream_tip) => agent_git_upstream_tip_proves_task_commit(
+                        project_root,
+                        upstream_tip,
+                        local_commit_oid,
+                        &finalization.codex_session_id,
+                        task_identity,
+                        baseline.version == 1,
+                    )?,
+                    None => false,
+                };
+                if !already_published {
+                    push_agent_git_commit_to_frozen_destination(
+                        project_root,
+                        finalization.branch_ref.as_deref(),
+                        finalization.upstream_ref.as_deref(),
+                        &baseline,
+                        local_commit_oid,
+                        finalization_lease,
+                    )?;
+                    upstream_tip = fetch_agent_git_upstream_tip(
+                        project_root,
+                        finalization.branch_ref.as_deref(),
+                        finalization.upstream_ref.as_deref(),
+                        &baseline,
+                        finalization_lease,
+                    )?;
+                }
+                let Some(upstream_tip) = upstream_tip else {
+                    return Ok(finalization);
+                };
+                if !agent_git_upstream_tip_proves_task_commit(
+                    project_root,
+                    &upstream_tip,
+                    local_commit_oid,
+                    &finalization.codex_session_id,
+                    task_identity,
+                    baseline.version == 1,
+                )? || !local_agent_git_task_commit_is_retained(
+                    project_root,
+                    finalization.branch_ref.as_deref(),
+                    local_commit_oid,
+                    &finalization.codex_session_id,
+                    task_identity,
+                )? {
+                    return Ok(finalization);
+                }
+                ensure_agent_git_finalization_fence(finalization_lease)?;
+                let changed = store.compare_and_set_git_finalization_blocking(
+                    finalization.project_id,
+                    &finalization.codex_session_id,
+                    finalization.generation,
+                    GitFinalizationState::Completed,
+                    effective_owner,
+                    Some(local_commit_oid),
+                    None,
+                    &agent_timestamp(),
+                )?;
+                if !changed {
+                    finalization = store
+                        .git_finalization_blocking(
+                            finalization.project_id,
+                            &finalization.codex_session_id,
+                        )?
+                        .context("Git finalization disappeared during push reconciliation")?;
+                    continue;
+                }
+            }
+            GitFinalizationState::Completed | GitFinalizationState::Cancelled => {
+                return Ok(finalization);
+            }
+        }
+
+        finalization = store
+            .git_finalization_blocking(finalization.project_id, &finalization.codex_session_id)?
+            .context("Git finalization disappeared after a successful reconciliation step")?;
+    }
+
+    anyhow::bail!(
+        "Git finalization for session {} changed too many times during reconciliation",
+        finalization.codex_session_id
+    )
+}
+
+fn reconcile_pending_agent_git_finalizations(
+    state_dir: &Path,
+    project: &agent_store::AgentProject,
+    finalization_lease: Option<&AgentGitFinalizationLease>,
+) -> Result<Vec<agent_store::GitFinalizationRecord>> {
+    let store = open_agent_store_at(state_dir)?;
+    store
+        .list_pending_git_finalizations_blocking(Some(project.id))?
+        .into_iter()
+        .map(|finalization| {
+            reconcile_agent_git_finalization(
+                &store,
+                &project.path,
+                finalization,
+                None,
+                finalization_lease,
+            )
+        })
+        .collect()
+}
+
 #[cfg(unix)]
 fn recover_rejected_agent_process_group_signal(
     child: &mut Child,
@@ -9965,6 +14544,46 @@ mod agent_store {
                 "ALTER TABLE projects ADD COLUMN last_daemon_scan_error TEXT",
             ],
         },
+        AgentMigration {
+            version: 17,
+            statements: &[
+                "CREATE TABLE IF NOT EXISTS git_finalizations (
+                    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    codex_session_id TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    git_mode TEXT NOT NULL,
+                    starting_head TEXT,
+                    branch_ref TEXT,
+                    upstream_ref TEXT,
+                    worktree_baseline TEXT NOT NULL,
+                    task_identity TEXT,
+                    owner_run_token TEXT,
+                    commit_oid TEXT,
+                    generation INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    acknowledged_at TEXT,
+                    acknowledged_run_id INTEGER REFERENCES runs(id) ON DELETE SET NULL,
+                    PRIMARY KEY (project_id, codex_session_id)
+                )",
+                "CREATE UNIQUE INDEX IF NOT EXISTS git_finalizations_pending_project_unique
+                    ON git_finalizations(project_id)
+                    WHERE state IN ('tracking', 'commit_pending', 'push_pending')",
+                "CREATE TABLE IF NOT EXISTS agent_git_launch_states (
+                    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    run_token TEXT NOT NULL,
+                    git_mode TEXT NOT NULL,
+                    starting_head TEXT NOT NULL,
+                    branch_ref TEXT,
+                    upstream_ref TEXT,
+                    worktree_baseline TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (project_id, run_token)
+                )",
+            ],
+        },
     ];
 
     pub(crate) struct TursoAgentStore {
@@ -10033,6 +14652,41 @@ mod agent_store {
         pub(crate) stderr_path: Option<&'a str>,
         pub(crate) summary: Option<&'a str>,
         pub(crate) codex_session_id: Option<&'a str>,
+    }
+
+    pub(crate) struct NewGitFinalization<'a> {
+        pub(crate) project_id: i64,
+        pub(crate) codex_session_id: &'a str,
+        pub(crate) git_mode: AgentGitMode,
+        pub(crate) starting_head: Option<&'a str>,
+        pub(crate) branch_ref: Option<&'a str>,
+        pub(crate) upstream_ref: Option<&'a str>,
+        pub(crate) worktree_baseline: &'a str,
+        pub(crate) task_identity: Option<&'a str>,
+        pub(crate) owner_run_token: Option<&'a str>,
+        pub(crate) created_at: &'a str,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(crate) struct GitFinalizationRecord {
+        pub(crate) project_id: i64,
+        pub(crate) codex_session_id: String,
+        pub(crate) state: GitFinalizationState,
+        pub(crate) git_mode: AgentGitMode,
+        pub(crate) starting_head: Option<String>,
+        pub(crate) branch_ref: Option<String>,
+        pub(crate) upstream_ref: Option<String>,
+        pub(crate) worktree_baseline: String,
+        pub(crate) task_identity: Option<String>,
+        pub(crate) owner_run_token: Option<String>,
+        pub(crate) commit_oid: Option<String>,
+        pub(crate) generation: i64,
+        pub(crate) last_error: Option<String>,
+        pub(crate) created_at: String,
+        pub(crate) updated_at: String,
+        pub(crate) completed_at: Option<String>,
+        pub(crate) acknowledged_at: Option<String>,
+        pub(crate) acknowledged_run_id: Option<i64>,
     }
 
     pub(crate) struct AgentWorkerReservation<'a> {
@@ -10506,6 +15160,31 @@ mod agent_store {
                         format!("Failed to reclaim stale agent lease for project {path}")
                     })?;
             }
+            let pending_git_finalizations = query_count(
+                &transaction,
+                "SELECT COUNT(*) FROM git_finalizations
+                  WHERE project_id = (SELECT id FROM projects WHERE path = ?1)
+                    AND state IN ('working', 'tracking', 'commit_pending', 'push_pending')",
+                [path.as_str()],
+            )
+            .await?;
+            if pending_git_finalizations > 0 {
+                anyhow::bail!(
+                    "Cannot unregister project {path} while {pending_git_finalizations} Git finalization(s) are nonterminal"
+                );
+            }
+            let unconsumed_git_launches = query_count(
+                &transaction,
+                "SELECT COUNT(*) FROM agent_git_launch_states
+                  WHERE project_id = (SELECT id FROM projects WHERE path = ?1)",
+                [path.as_str()],
+            )
+            .await?;
+            if unconsumed_git_launches > 0 {
+                anyhow::bail!(
+                    "Cannot unregister project {path} while {unconsumed_git_launches} Git launch boundary record(s) remain unconsumed"
+                );
+            }
             transaction
                 .execute(
                     "DELETE FROM agent_workers
@@ -10514,6 +15193,16 @@ mod agent_store {
                 )
                 .await
                 .with_context(|| format!("Failed to remove worker history for project {path}"))?;
+            transaction
+                .execute(
+                    "DELETE FROM git_finalizations
+                     WHERE project_id = (SELECT id FROM projects WHERE path = ?1)",
+                    [path.as_str()],
+                )
+                .await
+                .with_context(|| {
+                    format!("Failed to remove Git finalization history for project {path}")
+                })?;
             transaction
                 .execute(
                     "DELETE FROM runs
@@ -10603,6 +15292,1159 @@ mod agent_store {
             }
 
             Ok(projects)
+        }
+
+        pub(crate) fn record_git_launch_state_blocking(
+            &self,
+            project_id: i64,
+            run_token: &str,
+            git_mode: AgentGitMode,
+            start: &AgentGitStartState,
+            created_at: &str,
+        ) -> Result<bool> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(async {
+                    if git_mode == AgentGitMode::Off {
+                        anyhow::bail!("A Git launch state cannot use Git mode off");
+                    }
+                    let mut conn = self.connect().await?;
+                    let transaction = conn
+                        .transaction_with_behavior(TransactionBehavior::Immediate)
+                        .await
+                        .context("Failed to begin recording the prelaunch Git state")?;
+                    if query_count(
+                        &transaction,
+                        "SELECT COUNT(*) FROM agent_git_launch_states
+                          WHERE project_id = ?1 AND run_token <> ?2",
+                        params![project_id, run_token],
+                    )
+                    .await?
+                        != 0
+                    {
+                        anyhow::bail!(
+                            "A prior automated run has an unconsumed Git launch boundary for project {project_id}; refusing to replace it"
+                        );
+                    }
+                    let inserted = transaction
+                        .execute(
+                            "INSERT OR IGNORE INTO agent_git_launch_states (
+                                project_id, run_token, git_mode, starting_head, branch_ref,
+                                upstream_ref, worktree_baseline, created_at
+                             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                            params![
+                                project_id,
+                                run_token,
+                                git_mode.database_value(),
+                                start.starting_head.as_str(),
+                                start.branch_ref.as_deref(),
+                                start.upstream_ref.as_deref(),
+                                start.worktree_baseline.as_str(),
+                                created_at,
+                            ],
+                        )
+                        .await
+                        .context("Failed to persist the prelaunch Git state")?;
+                    if inserted == 0
+                        && query_count(
+                            &transaction,
+                            "SELECT COUNT(*) FROM agent_git_launch_states
+                              WHERE project_id = ?1 AND run_token = ?2
+                                AND git_mode = ?3 AND starting_head = ?4
+                                AND branch_ref IS ?5 AND upstream_ref IS ?6
+                                AND worktree_baseline = ?7",
+                            params![
+                                project_id,
+                                run_token,
+                                git_mode.database_value(),
+                                start.starting_head.as_str(),
+                                start.branch_ref.as_deref(),
+                                start.upstream_ref.as_deref(),
+                                start.worktree_baseline.as_str(),
+                            ],
+                        )
+                        .await?
+                            != 1
+                    {
+                        anyhow::bail!(
+                            "Automated run {run_token} already has a different immutable Git launch boundary"
+                        );
+                    }
+                    transaction
+                        .commit()
+                        .await
+                        .context("Failed to commit the prelaunch Git state")?;
+                    Ok(inserted == 1)
+                })
+        }
+
+        pub(crate) fn has_other_git_launch_state_blocking(
+            &self,
+            project_id: i64,
+            run_token: &str,
+        ) -> Result<bool> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(async {
+                    let conn = self.connect().await?;
+                    Ok(query_count(
+                        &conn,
+                        "SELECT COUNT(*) FROM agent_git_launch_states
+                          WHERE project_id = ?1 AND run_token <> ?2",
+                        params![project_id, run_token],
+                    )
+                    .await?
+                        != 0)
+                })
+        }
+
+        pub(crate) fn git_launch_state_for_project_blocking(
+            &self,
+            project_id: i64,
+        ) -> Result<Option<(String, AgentGitMode, AgentGitStartState)>> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(async {
+                    let conn = self.connect().await?;
+                    let mut rows = conn
+                        .query(
+                            "SELECT run_token, git_mode, starting_head, branch_ref,
+                                    upstream_ref, worktree_baseline
+                               FROM agent_git_launch_states
+                              WHERE project_id = ?1
+                              ORDER BY created_at, run_token",
+                            [project_id],
+                        )
+                        .await
+                        .context("Failed to read project Git launch states")?;
+                    let Some(row) = rows
+                        .next()
+                        .await
+                        .context("Failed to read project Git launch-state row")?
+                    else {
+                        return Ok(None);
+                    };
+                    let launch = (
+                        row_text(&row, 0, "run_token")?,
+                        AgentGitMode::from_database(&row_text(&row, 1, "git_mode")?)?,
+                        AgentGitStartState {
+                            starting_head: row_text(&row, 2, "starting_head")?,
+                            branch_ref: row_optional_text(&row, 3, "branch_ref")?,
+                            upstream_ref: row_optional_text(&row, 4, "upstream_ref")?,
+                            worktree_baseline: row_text(&row, 5, "worktree_baseline")?,
+                        },
+                    );
+                    if rows
+                        .next()
+                        .await
+                        .context("Failed to check for duplicate project Git launch states")?
+                        .is_some()
+                    {
+                        anyhow::bail!(
+                            "Project {project_id} has more than one unconsumed Git launch boundary"
+                        );
+                    }
+                    Ok(Some(launch))
+                })
+        }
+
+        pub(crate) fn reclaim_unchanged_git_launch_state_blocking(
+            &self,
+            project_id: i64,
+            run_token: &str,
+            git_mode: AgentGitMode,
+            start: &AgentGitStartState,
+        ) -> Result<bool> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(async {
+                    let mut conn = self.connect().await?;
+                    let transaction = conn
+                        .transaction_with_behavior(TransactionBehavior::Immediate)
+                        .await
+                        .context("Failed to begin reclaiming an unchanged Git launch state")?;
+                    let terminal_worker = query_count(
+                        &transaction,
+                        "SELECT COUNT(*) FROM agent_workers
+                          WHERE worker_token = ?1 AND project_id = ?2
+                            AND state IN ('completed', 'abandoned', 'superseded')",
+                        params![run_token, project_id],
+                    )
+                    .await?
+                        == 1;
+                    let any_session = query_count(
+                        &transaction,
+                        "SELECT COUNT(*) FROM session_controls
+                          WHERE project_id = ?1 AND run_token = ?2",
+                        params![project_id, run_token],
+                    )
+                    .await?
+                        != 0;
+                    if !terminal_worker || any_session {
+                        transaction.commit().await.context(
+                            "Failed to finish checking an unreclaimable Git launch state",
+                        )?;
+                        return Ok(false);
+                    }
+                    let deleted = transaction
+                        .execute(
+                            "DELETE FROM agent_git_launch_states
+                              WHERE project_id = ?1 AND run_token = ?2
+                                AND git_mode = ?3 AND starting_head = ?4
+                                AND branch_ref IS ?5 AND upstream_ref IS ?6
+                                AND worktree_baseline = ?7",
+                            params![
+                                project_id,
+                                run_token,
+                                git_mode.database_value(),
+                                start.starting_head.as_str(),
+                                start.branch_ref.as_deref(),
+                                start.upstream_ref.as_deref(),
+                                start.worktree_baseline.as_str(),
+                            ],
+                        )
+                        .await
+                        .context("Failed to delete the proven-unchanged Git launch state")?;
+                    transaction
+                        .commit()
+                        .await
+                        .context("Failed to commit Git launch-state reclamation")?;
+                    Ok(deleted == 1)
+                })
+        }
+
+        pub(crate) fn git_launch_state_blocking(
+            &self,
+            project_id: i64,
+            run_token: &str,
+        ) -> Result<Option<(AgentGitMode, AgentGitStartState)>> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(async {
+                    let conn = self.connect().await?;
+                    let mut rows = conn
+                        .query(
+                            "SELECT git_mode, starting_head, branch_ref, upstream_ref,
+                                    worktree_baseline
+                               FROM agent_git_launch_states
+                              WHERE project_id = ?1 AND run_token = ?2",
+                            params![project_id, run_token],
+                        )
+                        .await
+                        .context("Failed to read the prelaunch Git state")?;
+                    let Some(row) = rows
+                        .next()
+                        .await
+                        .context("Failed to read the prelaunch Git state row")?
+                    else {
+                        return Ok(None);
+                    };
+                    Ok(Some((
+                        AgentGitMode::from_database(&row_text(&row, 0, "git_mode")?)?,
+                        AgentGitStartState {
+                            starting_head: row_text(&row, 1, "starting_head")?,
+                            branch_ref: row_optional_text(&row, 2, "branch_ref")?,
+                            upstream_ref: row_optional_text(&row, 3, "upstream_ref")?,
+                            worktree_baseline: row_text(&row, 4, "worktree_baseline")?,
+                        },
+                    )))
+                })
+        }
+
+        #[cfg_attr(unix, allow(dead_code))]
+        pub(crate) fn delete_git_launch_state_blocking(
+            &self,
+            project_id: i64,
+            run_token: &str,
+        ) -> Result<bool> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(async {
+                    let conn = self.connect().await?;
+                    Ok(conn
+                        .execute(
+                            "DELETE FROM agent_git_launch_states
+                              WHERE project_id = ?1 AND run_token = ?2",
+                            params![project_id, run_token],
+                        )
+                        .await
+                        .context("Failed to delete the prelaunch Git state")?
+                        == 1)
+                })
+        }
+
+        pub(crate) fn create_git_finalization_blocking(
+            &self,
+            finalization: NewGitFinalization<'_>,
+        ) -> Result<bool> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(self.create_git_finalization(finalization))
+        }
+
+        async fn create_git_finalization(
+            &self,
+            finalization: NewGitFinalization<'_>,
+        ) -> Result<bool> {
+            if finalization.codex_session_id.is_empty() {
+                anyhow::bail!("Git finalization requires a Codex session ID");
+            }
+            if finalization.git_mode == AgentGitMode::Off {
+                anyhow::bail!("Git finalization cannot be created when Git automation is off");
+            }
+            let mut conn = self.connect().await?;
+            let transaction = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to begin creating Git finalization for project {} and Codex session {}",
+                        finalization.project_id, finalization.codex_session_id
+                    )
+                })?;
+            let inserted = if let Some(owner_run_token) = finalization.owner_run_token {
+                transaction
+                    .execute(
+                        "INSERT OR IGNORE INTO git_finalizations (
+                            project_id, codex_session_id, state, git_mode, starting_head,
+                            branch_ref, upstream_ref, worktree_baseline, task_identity,
+                            owner_run_token, commit_oid, generation,
+                            last_error, created_at, updated_at, completed_at
+                         ) SELECT ?1, ?2, 'working', ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, 0,
+                                  NULL, ?10, ?10, NULL
+                           WHERE EXISTS (
+                               SELECT 1 FROM session_controls
+                                WHERE project_id = ?1 AND codex_session_id = ?2
+                                  AND state = 'running' AND run_token = ?9
+                           )",
+                        params![
+                            finalization.project_id,
+                            finalization.codex_session_id,
+                            finalization.git_mode.database_value(),
+                            finalization.starting_head,
+                            finalization.branch_ref,
+                            finalization.upstream_ref,
+                            finalization.worktree_baseline,
+                            finalization.task_identity,
+                            owner_run_token,
+                            finalization.created_at,
+                        ],
+                    )
+                    .await
+            } else {
+                transaction
+                    .execute(
+                        "INSERT OR IGNORE INTO git_finalizations (
+                            project_id, codex_session_id, state, git_mode, starting_head,
+                            branch_ref, upstream_ref, worktree_baseline, task_identity,
+                            owner_run_token, commit_oid, generation,
+                            last_error, created_at, updated_at, completed_at
+                         ) VALUES (?1, ?2, 'working', ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, 0,
+                                   NULL, ?9, ?9, NULL)",
+                        params![
+                            finalization.project_id,
+                            finalization.codex_session_id,
+                            finalization.git_mode.database_value(),
+                            finalization.starting_head,
+                            finalization.branch_ref,
+                            finalization.upstream_ref,
+                            finalization.worktree_baseline,
+                            finalization.task_identity,
+                            finalization.created_at,
+                        ],
+                    )
+                    .await
+            }
+            .with_context(|| {
+                format!(
+                    "Failed to create Git finalization for project {} and Codex session {}",
+                    finalization.project_id, finalization.codex_session_id
+                )
+            })?;
+            transaction.commit().await.with_context(|| {
+                format!(
+                    "Failed to commit Git finalization creation for project {} and Codex session {}",
+                    finalization.project_id, finalization.codex_session_id
+                )
+            })?;
+            Ok(inserted == 1)
+        }
+
+        pub(crate) fn git_finalization_blocking(
+            &self,
+            project_id: i64,
+            codex_session_id: &str,
+        ) -> Result<Option<GitFinalizationRecord>> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(self.git_finalization(project_id, codex_session_id))
+        }
+
+        async fn git_finalization(
+            &self,
+            project_id: i64,
+            codex_session_id: &str,
+        ) -> Result<Option<GitFinalizationRecord>> {
+            let conn = self.connect().await?;
+            let mut rows = conn
+                .query(
+                    "SELECT project_id, codex_session_id, state, git_mode, starting_head,
+                            branch_ref, upstream_ref, worktree_baseline, task_identity,
+                            owner_run_token, commit_oid, generation, last_error, created_at,
+                            updated_at, completed_at, acknowledged_at, acknowledged_run_id
+                       FROM git_finalizations
+                      WHERE project_id = ?1 AND codex_session_id = ?2",
+                    params![project_id, codex_session_id],
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to read Git finalization for project {project_id} and Codex session {codex_session_id}"
+                    )
+                })?;
+            rows.next()
+                .await
+                .context("Failed to read Git finalization row")?
+                .map(|row| git_finalization_record_from_row(&row))
+                .transpose()
+        }
+
+        pub(crate) fn list_pending_git_finalizations_blocking(
+            &self,
+            project_id: Option<i64>,
+        ) -> Result<Vec<GitFinalizationRecord>> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(self.list_pending_git_finalizations(project_id))
+        }
+
+        async fn list_pending_git_finalizations(
+            &self,
+            project_id: Option<i64>,
+        ) -> Result<Vec<GitFinalizationRecord>> {
+            let conn = self.connect().await?;
+            let mut rows = conn
+                .query(
+                    "SELECT project_id, codex_session_id, state, git_mode, starting_head,
+                            branch_ref, upstream_ref, worktree_baseline, task_identity,
+                            owner_run_token, commit_oid, generation, last_error, created_at,
+                            updated_at, completed_at, acknowledged_at, acknowledged_run_id
+                       FROM git_finalizations
+                      WHERE state IN ('working', 'tracking', 'commit_pending', 'push_pending')
+                        AND (?1 IS NULL OR project_id = ?1)
+                      ORDER BY CAST(updated_at AS INTEGER), project_id, codex_session_id",
+                    params![project_id],
+                )
+                .await
+                .context("Failed to list pending Git finalizations")?;
+            let mut finalizations = Vec::new();
+            while let Some(row) = rows
+                .next()
+                .await
+                .context("Failed to read pending Git finalization row")?
+            {
+                finalizations.push(git_finalization_record_from_row(&row)?);
+            }
+            Ok(finalizations)
+        }
+
+        pub(crate) fn list_unacknowledged_completed_git_finalizations_blocking(
+            &self,
+            project_id: Option<i64>,
+        ) -> Result<Vec<GitFinalizationRecord>> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(self.list_unacknowledged_completed_git_finalizations(project_id))
+        }
+
+        async fn list_unacknowledged_completed_git_finalizations(
+            &self,
+            project_id: Option<i64>,
+        ) -> Result<Vec<GitFinalizationRecord>> {
+            let conn = self.connect().await?;
+            let mut rows = conn
+                .query(
+                    "SELECT project_id, codex_session_id, state, git_mode, starting_head,
+                            branch_ref, upstream_ref, worktree_baseline, task_identity,
+                            owner_run_token, commit_oid, generation, last_error, created_at,
+                            updated_at, completed_at, acknowledged_at, acknowledged_run_id
+                       FROM git_finalizations
+                      WHERE state = 'completed' AND acknowledged_at IS NULL
+                        AND (?1 IS NULL OR project_id = ?1)
+                      ORDER BY CAST(completed_at AS INTEGER), project_id, codex_session_id",
+                    params![project_id],
+                )
+                .await
+                .context("Failed to list unacknowledged completed Git finalizations")?;
+            let mut finalizations = Vec::new();
+            while let Some(row) = rows
+                .next()
+                .await
+                .context("Failed to read an unacknowledged Git finalization row")?
+            {
+                finalizations.push(git_finalization_record_from_row(&row)?);
+            }
+            Ok(finalizations)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn compare_and_set_git_finalization_blocking(
+            &self,
+            project_id: i64,
+            codex_session_id: &str,
+            expected_generation: i64,
+            next_state: GitFinalizationState,
+            owner_run_token: Option<&str>,
+            commit_oid: Option<&str>,
+            last_error: Option<&str>,
+            updated_at: &str,
+        ) -> Result<bool> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(self.compare_and_set_git_finalization(
+                    project_id,
+                    codex_session_id,
+                    expected_generation,
+                    next_state,
+                    None,
+                    None,
+                    false,
+                    owner_run_token,
+                    commit_oid,
+                    last_error,
+                    updated_at,
+                ))
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn compare_and_set_owned_git_finalization_blocking(
+            &self,
+            project_id: i64,
+            codex_session_id: &str,
+            expected_generation: i64,
+            next_state: GitFinalizationState,
+            owner_run_token: &str,
+            commit_oid: Option<&str>,
+            last_error: Option<&str>,
+            updated_at: &str,
+        ) -> Result<bool> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(self.compare_and_set_git_finalization(
+                    project_id,
+                    codex_session_id,
+                    expected_generation,
+                    next_state,
+                    None,
+                    None,
+                    true,
+                    Some(owner_run_token),
+                    commit_oid,
+                    last_error,
+                    updated_at,
+                ))
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn compare_and_set_git_finalization_with_identity_blocking(
+            &self,
+            project_id: i64,
+            codex_session_id: &str,
+            expected_generation: i64,
+            next_state: GitFinalizationState,
+            task_identity: &str,
+            owner_run_token: Option<&str>,
+            updated_at: &str,
+        ) -> Result<bool> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(self.compare_and_set_git_finalization(
+                    project_id,
+                    codex_session_id,
+                    expected_generation,
+                    next_state,
+                    Some(task_identity),
+                    None,
+                    true,
+                    owner_run_token,
+                    None,
+                    None,
+                    updated_at,
+                ))
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn track_git_finalization_with_manifest_blocking(
+            &self,
+            project_id: i64,
+            codex_session_id: &str,
+            expected_generation: i64,
+            task_identity: &str,
+            worktree_baseline: &str,
+            owner_run_token: &str,
+            updated_at: &str,
+        ) -> Result<bool> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(self.compare_and_set_git_finalization(
+                    project_id,
+                    codex_session_id,
+                    expected_generation,
+                    GitFinalizationState::Tracking,
+                    Some(task_identity),
+                    Some(worktree_baseline),
+                    true,
+                    Some(owner_run_token),
+                    None,
+                    None,
+                    updated_at,
+                ))
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn reseal_git_finalization_manifest_blocking(
+            &self,
+            project_id: i64,
+            codex_session_id: &str,
+            expected_generation: i64,
+            task_identity: &str,
+            worktree_baseline: &str,
+            owner_run_token: &str,
+            updated_at: &str,
+        ) -> Result<bool> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(self.compare_and_set_git_finalization(
+                    project_id,
+                    codex_session_id,
+                    expected_generation,
+                    GitFinalizationState::CommitPending,
+                    Some(task_identity),
+                    Some(worktree_baseline),
+                    true,
+                    Some(owner_run_token),
+                    None,
+                    None,
+                    updated_at,
+                ))
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn recover_git_finalization_intent_blocking(
+            &self,
+            project_id: i64,
+            codex_session_id: &str,
+            expected_generation: i64,
+            task_identity: &str,
+            owner_run_token: Option<&str>,
+            updated_at: &str,
+        ) -> Result<bool> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(self.compare_and_set_git_finalization(
+                    project_id,
+                    codex_session_id,
+                    expected_generation,
+                    GitFinalizationState::Tracking,
+                    Some(task_identity),
+                    None,
+                    false,
+                    owner_run_token,
+                    None,
+                    None,
+                    updated_at,
+                ))
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        async fn compare_and_set_git_finalization(
+            &self,
+            project_id: i64,
+            codex_session_id: &str,
+            expected_generation: i64,
+            next_state: GitFinalizationState,
+            task_identity: Option<&str>,
+            worktree_baseline: Option<&str>,
+            require_running_owner: bool,
+            owner_run_token: Option<&str>,
+            commit_oid: Option<&str>,
+            last_error: Option<&str>,
+            updated_at: &str,
+        ) -> Result<bool> {
+            let mut conn = self.connect().await?;
+            let transaction = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to begin updating Git finalization for project {project_id} and Codex session {codex_session_id}"
+                    )
+                })?;
+            let current = {
+                let mut rows = transaction
+                    .query(
+                        "SELECT project_id, codex_session_id, state, git_mode, starting_head,
+                                branch_ref, upstream_ref, worktree_baseline, task_identity,
+                                owner_run_token, commit_oid, generation, last_error, created_at,
+                                updated_at, completed_at, acknowledged_at, acknowledged_run_id
+                           FROM git_finalizations
+                          WHERE project_id = ?1 AND codex_session_id = ?2",
+                        params![project_id, codex_session_id],
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Failed to inspect Git finalization for project {project_id} and Codex session {codex_session_id}"
+                        )
+                    })?;
+                rows.next()
+                    .await
+                    .context("Failed to read Git finalization compare-and-set row")?
+                    .map(|row| git_finalization_record_from_row(&row))
+                    .transpose()?
+            };
+            let Some(current) = current else {
+                transaction
+                    .commit()
+                    .await
+                    .context("Failed to finish compare-and-set for a missing Git finalization")?;
+                return Ok(false);
+            };
+            if current.generation != expected_generation {
+                transaction
+                    .commit()
+                    .await
+                    .context("Failed to finish compare-and-set for a changed Git finalization")?;
+                return Ok(false);
+            }
+            if require_running_owner {
+                let Some(owner_run_token) = owner_run_token else {
+                    anyhow::bail!("Git completion intent requires a running owner token");
+                };
+                if query_count(
+                    &transaction,
+                    "SELECT COUNT(*) FROM session_controls
+                      WHERE project_id = ?1 AND codex_session_id = ?2
+                        AND state = 'running' AND run_token = ?3",
+                    params![project_id, codex_session_id, owner_run_token],
+                )
+                .await?
+                    != 1
+                {
+                    transaction.commit().await.with_context(|| {
+                        format!(
+                            "Failed to finish fenced Git completion intent for project {project_id} and Codex session {codex_session_id}"
+                        )
+                    })?;
+                    return Ok(false);
+                }
+            }
+            if !current.state.can_transition_to(next_state) {
+                anyhow::bail!(
+                    "Invalid Git finalization transition from {} to {}",
+                    current.state.database_value(),
+                    next_state.database_value()
+                );
+            }
+            if next_state == GitFinalizationState::PushPending
+                && current.git_mode != AgentGitMode::CommitAndPush
+            {
+                anyhow::bail!("Only commit-and-push finalizations may enter push_pending");
+            }
+            if let (Some(current_identity), Some(next_identity)) =
+                (current.task_identity.as_deref(), task_identity)
+                && current_identity != next_identity
+            {
+                anyhow::bail!(
+                    "Git finalization task identity cannot change after completion intent is recorded"
+                );
+            }
+            let effective_task_identity = task_identity.or(current.task_identity.as_deref());
+            if next_state.is_finalizing() && effective_task_identity.is_none() {
+                anyhow::bail!(
+                    "Git finalization cannot enter {} without a task identity",
+                    next_state.database_value()
+                );
+            }
+            let effective_commit_oid = commit_oid.or(current.commit_oid.as_deref());
+            if let (Some(current_oid), Some(next_oid)) = (current.commit_oid.as_deref(), commit_oid)
+                && current_oid != next_oid
+            {
+                anyhow::bail!("Git finalization commit OID cannot change once recorded");
+            }
+            if matches!(
+                next_state,
+                GitFinalizationState::PushPending | GitFinalizationState::Completed
+            ) && effective_commit_oid.is_none()
+            {
+                anyhow::bail!(
+                    "Git finalization cannot enter {} without a commit OID",
+                    next_state.database_value()
+                );
+            }
+            if next_state == GitFinalizationState::Completed
+                && ((current.git_mode == AgentGitMode::Commit
+                    && current.state != GitFinalizationState::CommitPending)
+                    || (current.git_mode == AgentGitMode::CommitAndPush
+                        && current.state != GitFinalizationState::PushPending))
+            {
+                anyhow::bail!(
+                    "Git finalization cannot complete before its configured commit or push step"
+                );
+            }
+
+            let completed_at = next_state.is_terminal().then_some(updated_at);
+            let changed = transaction
+                .execute(
+                    "UPDATE git_finalizations
+                        SET state = ?1,
+                            task_identity = COALESCE(task_identity, ?2),
+                            worktree_baseline = COALESCE(?3, worktree_baseline),
+                            owner_run_token = ?4,
+                            commit_oid = CASE WHEN ?5 IS NULL THEN commit_oid ELSE ?5 END,
+                            generation = generation + 1,
+                            last_error = ?6,
+                            updated_at = ?7,
+                            completed_at = ?8
+                      WHERE project_id = ?9 AND codex_session_id = ?10 AND generation = ?11",
+                    params![
+                        next_state.database_value(),
+                        task_identity,
+                        worktree_baseline,
+                        owner_run_token,
+                        commit_oid,
+                        last_error,
+                        updated_at,
+                        completed_at,
+                        project_id,
+                        codex_session_id,
+                        expected_generation,
+                    ],
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to update Git finalization for project {project_id} and Codex session {codex_session_id}"
+                    )
+                })?;
+            if changed == 1 {
+                let next_generation = expected_generation
+                    .checked_add(1)
+                    .context("Git finalization generation overflowed")?;
+                if next_state.is_terminal() {
+                    transaction
+                        .execute(
+                            "DELETE FROM session_controls
+                              WHERE project_id = ?1 AND codex_session_id = ?2
+                                AND state = 'resume_requested' AND child_pid IS NULL
+                                AND interactive_holder IS NULL AND interactive_launch_token IS NULL
+                                AND run_token = ?3 || CAST(?4 AS TEXT)",
+                            params![
+                                project_id,
+                                codex_session_id,
+                                AGENT_GIT_FINALIZATION_RESUME_TOKEN_PREFIX,
+                                expected_generation
+                            ],
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "Failed to clear the terminal Git finalization recovery fence for session {codex_session_id}"
+                            )
+                        })?;
+                } else {
+                    transaction
+                        .execute(
+                        "UPDATE session_controls
+                            SET run_token = ?1 || CAST(?2 AS TEXT), updated_at = ?3
+                          WHERE project_id = ?4 AND codex_session_id = ?5
+                            AND state = 'resume_requested' AND child_pid IS NULL
+                            AND interactive_holder IS NULL AND interactive_launch_token IS NULL
+                            AND run_token = ?1 || CAST(?6 AS TEXT)",
+                        params![
+                            AGENT_GIT_FINALIZATION_RESUME_TOKEN_PREFIX,
+                            next_generation,
+                            updated_at,
+                            project_id,
+                            codex_session_id,
+                            expected_generation
+                        ],
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Failed to advance the Git finalization recovery fence for session {codex_session_id}"
+                        )
+                    })?;
+                }
+            }
+            transaction.commit().await.with_context(|| {
+                format!(
+                    "Failed to commit Git finalization update for project {project_id} and Codex session {codex_session_id}"
+                )
+            })?;
+            Ok(changed == 1)
+        }
+
+        #[cfg(test)]
+        pub(crate) fn delete_terminal_git_finalization_blocking(
+            &self,
+            project_id: i64,
+            codex_session_id: &str,
+        ) -> Result<bool> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(async {
+                    let conn = self.connect().await?;
+                    let removed = conn
+                        .execute(
+                            "DELETE FROM git_finalizations
+                              WHERE project_id = ?1 AND codex_session_id = ?2
+                                AND state IN ('completed', 'cancelled')",
+                            params![project_id, codex_session_id],
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "Failed to delete terminal Git finalization for project {project_id} and Codex session {codex_session_id}"
+                            )
+                        })?;
+                    Ok(removed == 1)
+                })
+        }
+
+        pub(crate) fn acknowledge_completed_git_finalization_session_blocking(
+            &self,
+            project_id: i64,
+            codex_session_id: &str,
+        ) -> Result<bool> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(async {
+                    let mut conn = self.connect().await?;
+                    let acknowledged_at = agent_timestamp();
+                    let transaction = conn
+                        .transaction_with_behavior(TransactionBehavior::Immediate)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "Failed to begin acknowledging completed Git finalization for project {project_id} and Codex session {codex_session_id}"
+                            )
+                        })?;
+                    let completed = {
+                        let mut rows = transaction
+                            .query(
+                                "SELECT completed_at, commit_oid, acknowledged_at,
+                                        acknowledged_run_id
+                                   FROM git_finalizations
+                                  WHERE project_id = ?1 AND codex_session_id = ?2
+                                    AND state = 'completed'",
+                                params![project_id, codex_session_id],
+                            )
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "Failed to inspect completed Git finalization for project {project_id} and Codex session {codex_session_id}"
+                                )
+                            })?;
+                        rows
+                            .next()
+                            .await
+                            .context("Failed to read completed Git finalization acknowledgement")?
+                            .map(|row| {
+                                Ok::<_, anyhow::Error>((
+                                    row_text(&row, 0, "completed_at")?,
+                                    row_optional_text(&row, 1, "commit_oid")?,
+                                    row_optional_text(&row, 2, "acknowledged_at")?,
+                                    row_optional_integer(&row, 3, "acknowledged_run_id")?,
+                                ))
+                            })
+                            .transpose()?
+                    };
+                    let Some((completed_at, commit_oid, prior_acknowledgement, _)) = completed
+                    else {
+                        transaction.commit().await.with_context(|| {
+                            format!(
+                                "Failed to finish acknowledging absent Git finalization for project {project_id} and Codex session {codex_session_id}"
+                            )
+                        })?;
+                        return Ok(false);
+                    };
+
+                    if prior_acknowledgement.is_some() {
+                        transaction
+                            .execute(
+                                "DELETE FROM session_controls
+                                  WHERE project_id = ?1 AND codex_session_id = ?2
+                                    AND state = 'resume_requested' AND child_pid IS NULL
+                                    AND interactive_holder IS NULL
+                                    AND run_token LIKE ?3",
+                                params![
+                                    project_id,
+                                    codex_session_id,
+                                    format!("{AGENT_GIT_FINALIZATION_RESUME_TOKEN_PREFIX}%")
+                                ],
+                            )
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "Failed to clear a late resume request for completed Git finalization {codex_session_id}"
+                                )
+                            })?;
+                        transaction.commit().await.with_context(|| {
+                            format!(
+                                "Failed to commit idempotent Git finalization acknowledgement for {codex_session_id}"
+                            )
+                        })?;
+                        return Ok(true);
+                    }
+
+                    let latest_session_run = {
+                        let mut rows = transaction
+                            .query(
+                                "SELECT id, status, finished_at
+                                   FROM runs
+                                  WHERE project_id = ?1 AND codex_session_id = ?2
+                                  ORDER BY id DESC
+                                  LIMIT 1",
+                                params![project_id, codex_session_id],
+                            )
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "Failed to find an existing successful run for Git finalization {codex_session_id}"
+                                )
+                            })?;
+                        rows
+                            .next()
+                            .await
+                            .context("Failed to read an existing Git finalization run")?
+                            .map(|row| {
+                                Ok::<_, anyhow::Error>((
+                                    row_integer(&row, 0, "id")?,
+                                    row_text(&row, 1, "status")?,
+                                    row_optional_text(&row, 2, "finished_at")?,
+                                ))
+                            })
+                            .transpose()?
+                    };
+                    let short_commit = commit_oid
+                        .as_deref()
+                        .map(|oid| &oid[..oid.len().min(12)])
+                        .unwrap_or("unknown");
+                    let summary = format!(
+                        "CLT recovered the proven Git finalization at commit {short_commit} after an interrupted run acknowledgement."
+                    );
+                    let acknowledged_run_id = match latest_session_run {
+                        Some((run_id, status, finished_at))
+                            if matches!(status.as_str(), "success" | "idle")
+                                && finished_at
+                                    .as_deref()
+                                    .and_then(|value| value.parse::<u64>().ok())
+                                    >= completed_at.parse::<u64>().ok() =>
+                        {
+                            run_id
+                        }
+                        _ => {
+                        transaction
+                            .execute(
+                                "INSERT INTO runs (
+                                    project_id, status, started_at, finished_at, summary,
+                                    codex_session_id
+                                 ) VALUES (?1, 'success', ?2, ?2, ?3, ?4)",
+                                params![
+                                    project_id,
+                                    completed_at.as_str(),
+                                    summary.as_str(),
+                                    codex_session_id,
+                                ],
+                            )
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "Failed to record recovered success for Git finalization {codex_session_id}"
+                                )
+                            })?;
+                        query_count(&transaction, "SELECT last_insert_rowid()", ()).await?
+                        }
+                    };
+
+                    let latest_project_run_id =
+                        query_count(&transaction, "SELECT COALESCE(MAX(id), 0) FROM runs WHERE project_id = ?1", [project_id]).await?;
+                    if latest_project_run_id == acknowledged_run_id {
+                        update_project_after_run(
+                            &transaction,
+                            &AgentRunOutcome {
+                                project_id,
+                                status: "success",
+                                started_at: &completed_at,
+                                finished_at: Some(&completed_at),
+                                exit_code: None,
+                                log_dir: None,
+                                stdout_path: None,
+                                stderr_path: None,
+                                summary: Some(&summary),
+                                codex_session_id: Some(codex_session_id),
+                            },
+                        )
+                        .await?;
+                    }
+
+                    let marked = transaction
+                        .execute(
+                            "UPDATE git_finalizations
+                                SET acknowledged_at = ?1, acknowledged_run_id = ?2
+                              WHERE project_id = ?3 AND codex_session_id = ?4
+                                AND state = 'completed' AND acknowledged_at IS NULL",
+                            params![
+                                acknowledged_at.as_str(),
+                                acknowledged_run_id,
+                                project_id,
+                                codex_session_id,
+                            ],
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "Failed to mark Git finalization {codex_session_id} acknowledged"
+                            )
+                        })?;
+                    if marked != 1 {
+                        anyhow::bail!(
+                            "Git finalization acknowledgement for {codex_session_id} changed inside its exclusive transaction"
+                        );
+                    }
+                    transaction
+                        .execute(
+                            "DELETE FROM session_controls
+                              WHERE project_id = ?1 AND codex_session_id = ?2
+                                AND state = 'resume_requested' AND child_pid IS NULL
+                                AND interactive_holder IS NULL
+                                AND run_token LIKE ?3
+                                AND EXISTS (
+                                    SELECT 1 FROM git_finalizations
+                                     WHERE project_id = ?1 AND codex_session_id = ?2
+                                       AND state = 'completed'
+                                )",
+                            params![
+                                project_id,
+                                codex_session_id,
+                                format!("{AGENT_GIT_FINALIZATION_RESUME_TOKEN_PREFIX}%")
+                            ],
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "Failed to acknowledge completed Git finalization for project {project_id} and Codex session {codex_session_id}"
+                            )
+                        })?;
+                    transaction.commit().await.with_context(|| {
+                        format!(
+                            "Failed to commit completed Git finalization acknowledgement for project {project_id} and Codex session {codex_session_id}"
+                        )
+                    })?;
+                    Ok(true)
+                })
         }
 
         pub(crate) fn record_project_scan_blocking(&self, project_id: i64) -> Result<String> {
@@ -10709,6 +16551,265 @@ mod agent_store {
             Ok(inserted > 0)
         }
 
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn try_acquire_git_finalization_lease_blocking(
+            &self,
+            project_id: i64,
+            holder: &str,
+            acquired_at: &str,
+            expires_at: &str,
+            reclaim_holder: Option<&str>,
+        ) -> Result<bool> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(self.try_acquire_git_finalization_lease(
+                    project_id,
+                    holder,
+                    acquired_at,
+                    expires_at,
+                    reclaim_holder,
+                ))
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        async fn try_acquire_git_finalization_lease(
+            &self,
+            project_id: i64,
+            holder: &str,
+            acquired_at: &str,
+            expires_at: &str,
+            reclaim_holder: Option<&str>,
+        ) -> Result<bool> {
+            let mut conn = self.connect().await?;
+            let transaction = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to begin acquiring the Git finalization lease for project {project_id}"
+                    )
+                })?;
+            transaction
+                .execute(
+                    "UPDATE session_controls
+                        SET run_token = ?1 || (
+                                SELECT CAST(g.generation AS TEXT)
+                                  FROM git_finalizations g
+                                 WHERE g.project_id = session_controls.project_id
+                                   AND g.codex_session_id = session_controls.codex_session_id
+                                   AND g.state IN ('working', 'tracking', 'commit_pending', 'push_pending')
+                            ),
+                            updated_at = ?2
+                      WHERE project_id = ?3 AND state = 'resume_requested'
+                        AND child_pid IS NULL AND interactive_holder IS NULL
+                        AND interactive_launch_token IS NULL
+                        AND run_token LIKE ?1 || '%'
+                        AND EXISTS (
+                            SELECT 1 FROM git_finalizations g
+                             WHERE g.project_id = session_controls.project_id
+                               AND g.codex_session_id = session_controls.codex_session_id
+                               AND g.state IN ('working', 'tracking', 'commit_pending', 'push_pending')
+                        )",
+                    params![
+                        AGENT_GIT_FINALIZATION_RESUME_TOKEN_PREFIX,
+                        acquired_at,
+                        project_id
+                    ],
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to repair stale Git finalization recovery fences for project {project_id}"
+                    )
+                })?;
+            let controls_allow_finalization = "NOT EXISTS (
+                SELECT 1 FROM session_controls sc
+                 WHERE sc.project_id = ?1
+                   AND NOT (
+                       sc.state = 'stopped'
+                       OR (sc.state = 'resume_requested'
+                           AND sc.child_pid IS NULL
+                           AND sc.interactive_holder IS NULL
+                           AND sc.interactive_launch_token IS NULL
+                           AND EXISTS (
+                               SELECT 1 FROM git_finalizations g
+                                WHERE g.project_id = sc.project_id
+                                  AND g.codex_session_id = sc.codex_session_id
+                                  AND g.state IN ('working', 'tracking', 'commit_pending', 'push_pending')
+                                  AND sc.run_token = ?4 || CAST(g.generation AS TEXT)
+                           ))
+                   )
+            )";
+            transaction
+                .execute(
+                    &format!(
+                        "DELETE FROM leases
+                          WHERE project_id = ?1
+                            AND (CAST(expires_at AS INTEGER) <= CAST(?2 AS INTEGER)
+                                 OR (?3 IS NOT NULL AND holder = ?3))
+                            AND NOT EXISTS (
+                                SELECT 1 FROM agent_workers w
+                                 WHERE w.project_id = leases.project_id
+                                   AND w.state IN ('dispatching', 'running', 'finalizing')
+                            )
+                            AND {controls_allow_finalization}"
+                    ),
+                    params![
+                        project_id,
+                        acquired_at,
+                        reclaim_holder,
+                        AGENT_GIT_FINALIZATION_RESUME_TOKEN_PREFIX
+                    ],
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to clear a reclaimable lease before Git finalization for project {project_id}"
+                    )
+                })?;
+            let inserted = transaction
+                .execute(
+                    &format!(
+                        "INSERT OR IGNORE INTO leases (project_id, holder, acquired_at, expires_at)
+                         SELECT ?1, ?2, ?3, ?5
+                          WHERE EXISTS (
+                              SELECT 1 FROM git_finalizations g
+                               WHERE g.project_id = ?1
+                                 AND g.state IN ('working', 'tracking', 'commit_pending', 'push_pending')
+                          )
+                            AND NOT EXISTS (
+                                SELECT 1 FROM agent_workers w
+                                 WHERE w.project_id = ?1
+                                   AND w.state IN ('dispatching', 'running', 'finalizing')
+                            )
+                            AND {controls_allow_finalization}"
+                    ),
+                    params![
+                        project_id,
+                        holder,
+                        acquired_at,
+                        AGENT_GIT_FINALIZATION_RESUME_TOKEN_PREFIX,
+                        expires_at
+                    ],
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to acquire the guarded Git finalization lease for project {project_id}"
+                    )
+                })?;
+            transaction.commit().await.with_context(|| {
+                format!(
+                    "Failed to commit Git finalization lease acquisition for project {project_id}"
+                )
+            })?;
+            Ok(inserted == 1)
+        }
+
+        pub(crate) fn renew_git_finalization_lease_blocking(
+            &self,
+            project_id: i64,
+            holder: &str,
+            expires_at: &str,
+        ) -> Result<bool> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(async {
+                    let conn = self.connect().await?;
+                    let changed = conn
+                        .execute(
+                            "UPDATE leases
+                                SET expires_at = ?1
+                              WHERE project_id = ?2 AND holder = ?3
+                                AND NOT EXISTS (
+                                    SELECT 1 FROM agent_workers w
+                                     WHERE w.project_id = ?2
+                                       AND w.state IN ('dispatching', 'running', 'finalizing')
+                                )
+                                AND NOT EXISTS (
+                                    SELECT 1 FROM session_controls sc
+                                     WHERE sc.project_id = ?2
+                                       AND NOT (
+                                           sc.state = 'stopped'
+                                           OR (sc.state = 'resume_requested'
+                                               AND sc.child_pid IS NULL
+                                               AND sc.interactive_holder IS NULL
+                                               AND sc.interactive_launch_token IS NULL
+                                               AND EXISTS (
+                                                   SELECT 1 FROM git_finalizations g
+                                                    WHERE g.project_id = sc.project_id
+                                                      AND g.codex_session_id = sc.codex_session_id
+                                                      AND g.state IN ('working', 'tracking', 'commit_pending', 'push_pending')
+                                                      AND sc.run_token = ?4 || CAST(g.generation AS TEXT)
+                                               ))
+                                       )
+                                )",
+                            params![
+                                expires_at,
+                                project_id,
+                                holder,
+                                AGENT_GIT_FINALIZATION_RESUME_TOKEN_PREFIX
+                            ],
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "Failed to renew the guarded Git finalization lease for project {project_id}"
+                            )
+                        })?;
+                    Ok(changed == 1)
+                })
+        }
+
+        pub(crate) fn git_finalization_lease_is_owned_blocking(
+            &self,
+            project_id: i64,
+            holder: &str,
+            now: &str,
+        ) -> Result<bool> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(async {
+                    let conn = self.connect().await?;
+                    Ok(query_count(
+                        &conn,
+                        "SELECT COUNT(*) FROM leases l
+                          WHERE l.project_id = ?1 AND l.holder = ?2
+                            AND CAST(l.expires_at AS INTEGER) > CAST(?3 AS INTEGER)
+                            AND NOT EXISTS (
+                                SELECT 1 FROM agent_workers w
+                                 WHERE w.project_id = ?1
+                                   AND w.state IN ('dispatching', 'running', 'finalizing')
+                            )
+                            AND NOT EXISTS (
+                                SELECT 1 FROM session_controls sc
+                                 WHERE sc.project_id = ?1
+                                   AND NOT (
+                                       sc.state = 'stopped'
+                                       OR (sc.state = 'resume_requested'
+                                           AND sc.child_pid IS NULL
+                                           AND sc.interactive_holder IS NULL
+                                           AND sc.interactive_launch_token IS NULL
+                                           AND EXISTS (
+                                               SELECT 1 FROM git_finalizations g
+                                                WHERE g.project_id = sc.project_id
+                                                  AND g.codex_session_id = sc.codex_session_id
+                                                  AND g.state IN ('working', 'tracking', 'commit_pending', 'push_pending')
+                                                  AND sc.run_token = ?4 || CAST(g.generation AS TEXT)
+                                           ))
+                                   )
+                            )",
+                        params![
+                            project_id,
+                            holder,
+                            now,
+                            AGENT_GIT_FINALIZATION_RESUME_TOKEN_PREFIX
+                        ],
+                    )
+                    .await? == 1)
+                })
+        }
+
         pub(crate) fn renew_lease_blocking(
             &self,
             project_id: i64,
@@ -10773,10 +16874,25 @@ mod agent_store {
         ) -> Result<bool> {
             tokio::runtime::Runtime::new()
                 .context("Failed to create async runtime for agent store")?
-                .block_on(self.reserve_worker(reservation))
+                .block_on(self.reserve_worker(reservation, None))
         }
 
-        async fn reserve_worker(&self, reservation: AgentWorkerReservation<'_>) -> Result<bool> {
+        pub(crate) fn reserve_and_claim_worker_blocking(
+            &self,
+            reservation: AgentWorkerReservation<'_>,
+            worker_pid: u32,
+            started_at: &str,
+        ) -> Result<bool> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(self.reserve_worker(reservation, Some((worker_pid, started_at))))
+        }
+
+        async fn reserve_worker(
+            &self,
+            reservation: AgentWorkerReservation<'_>,
+            initial_claim: Option<(u32, &str)>,
+        ) -> Result<bool> {
             let AgentWorkerReservation {
                 project_id,
                 worker_token,
@@ -10881,6 +16997,29 @@ mod agent_store {
                         "Failed to supersede earlier abandoned workers for project {project_id}"
                     )
                 })?;
+
+            if let Some((worker_pid, started_at)) = initial_claim {
+                let claimed = transaction
+                    .execute(
+                        "UPDATE agent_workers
+                            SET state = 'running', worker_pid = ?1, started_at = ?2,
+                                heartbeat_at = ?2, error = NULL
+                          WHERE worker_token = ?3 AND state = 'dispatching'
+                            AND EXISTS (
+                                SELECT 1 FROM leases
+                                 WHERE leases.project_id = agent_workers.project_id
+                                   AND leases.holder = agent_workers.lease_holder
+                            )",
+                        params![i64::from(worker_pid), started_at, worker_token],
+                    )
+                    .await
+                    .with_context(|| {
+                        format!("Failed to atomically claim inline worker {worker_token}")
+                    })?;
+                if claimed != 1 {
+                    return Ok(false);
+                }
+            }
 
             transaction
                 .commit()
@@ -11644,9 +17783,35 @@ mod agent_store {
                     run_token,
                     stdout_path,
                     stderr_path,
+                    None,
                 ))
         }
 
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn mark_session_running_with_git_finalization_blocking(
+            &self,
+            project_id: i64,
+            codex_session_id: &str,
+            child_pid: u32,
+            run_token: &str,
+            stdout_path: &Path,
+            stderr_path: &Path,
+            git_mode: AgentGitMode,
+        ) -> Result<()> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(self.mark_session_running(
+                    project_id,
+                    codex_session_id,
+                    child_pid,
+                    run_token,
+                    stdout_path,
+                    stderr_path,
+                    Some(git_mode),
+                ))
+        }
+
+        #[allow(clippy::too_many_arguments)]
         async fn mark_session_running(
             &self,
             project_id: i64,
@@ -11655,6 +17820,7 @@ mod agent_store {
             run_token: &str,
             stdout_path: &Path,
             stderr_path: &Path,
+            git_mode: Option<AgentGitMode>,
         ) -> Result<()> {
             let mut conn = self.connect().await?;
             let transaction = conn
@@ -11748,6 +17914,107 @@ mod agent_store {
                     "Codex session {codex_session_id} belongs to a different active run generation"
                 );
             }
+            if let Some(git_mode) = git_mode {
+                if git_mode == AgentGitMode::Off {
+                    anyhow::bail!("An atomic Git session registration cannot use Git mode off");
+                }
+                let created_at = agent_timestamp();
+                let inserted = transaction
+                    .execute(
+                        "INSERT OR IGNORE INTO git_finalizations (
+                            project_id, codex_session_id, state, git_mode, starting_head,
+                            branch_ref, upstream_ref, worktree_baseline, task_identity,
+                            owner_run_token, commit_oid, generation, last_error,
+                            created_at, updated_at, completed_at
+                         )
+                         SELECT launch.project_id, ?2, 'working', launch.git_mode,
+                                launch.starting_head, launch.branch_ref, launch.upstream_ref,
+                                launch.worktree_baseline, NULL, launch.run_token, NULL, 0, NULL,
+                                ?5, ?5, NULL
+                           FROM agent_git_launch_states launch
+                          WHERE launch.project_id = ?1 AND launch.run_token = ?3
+                            AND launch.git_mode = ?4",
+                        params![
+                            project_id,
+                            codex_session_id,
+                            run_token,
+                            git_mode.database_value(),
+                            created_at.as_str(),
+                        ],
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Failed to atomically create the Git journal for Codex session {codex_session_id}"
+                        )
+                    })?;
+                let compatible_journal = query_count(
+                    &transaction,
+                    "SELECT COUNT(*)
+                       FROM git_finalizations
+                      WHERE project_id = ?1 AND codex_session_id = ?2
+                        AND state = 'working' AND git_mode = ?3
+                        AND owner_run_token = ?4",
+                    params![
+                        project_id,
+                        codex_session_id,
+                        git_mode.database_value(),
+                        run_token,
+                    ],
+                )
+                .await?
+                    == 1;
+                if !compatible_journal
+                    || (inserted == 0
+                        && query_count(
+                            &transaction,
+                            "SELECT COUNT(*)
+                           FROM git_finalizations finalization
+                           LEFT JOIN agent_git_launch_states launch
+                             ON launch.project_id = finalization.project_id
+                            AND launch.run_token = finalization.owner_run_token
+                          WHERE finalization.project_id = ?1
+                            AND finalization.codex_session_id = ?2
+                            AND finalization.state = 'working'
+                            AND finalization.git_mode = ?3
+                            AND finalization.owner_run_token = ?4
+                            AND (launch.run_token IS NULL OR (
+                                finalization.git_mode = launch.git_mode
+                                AND finalization.starting_head = launch.starting_head
+                                AND finalization.branch_ref IS launch.branch_ref
+                                AND finalization.upstream_ref IS launch.upstream_ref
+                                AND finalization.worktree_baseline = launch.worktree_baseline
+                            ))",
+                            params![
+                                project_id,
+                                codex_session_id,
+                                git_mode.database_value(),
+                                run_token,
+                            ],
+                        )
+                        .await?
+                            != 1)
+                {
+                    anyhow::bail!(
+                        "Automated run {run_token} has no compatible scheduler-owned Git launch state for Codex session {codex_session_id}"
+                    );
+                }
+                if inserted == 1 {
+                    let deleted = transaction
+                        .execute(
+                            "DELETE FROM agent_git_launch_states
+                              WHERE project_id = ?1 AND run_token = ?2",
+                            params![project_id, run_token],
+                        )
+                        .await
+                        .context("Failed to consume the scheduler-owned Git launch state")?;
+                    if deleted != 1 {
+                        anyhow::bail!(
+                            "Automated run {run_token} lost its Git launch state while registering Codex session {codex_session_id}"
+                        );
+                    }
+                }
+            }
             transaction.commit().await.with_context(|| {
                 format!(
                     "Failed to commit Codex session {codex_session_id} registration for project {project_id}"
@@ -11798,6 +18065,38 @@ mod agent_store {
                 )
             })?;
             Ok(())
+        }
+
+        #[cfg(test)]
+        pub(crate) fn set_session_control_recovery_token_blocking(
+            &self,
+            project_id: i64,
+            codex_session_id: &str,
+            run_token: &str,
+        ) -> Result<()> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(async {
+                    let conn = self.connect().await?;
+                    conn.execute(
+                        "INSERT INTO session_controls (
+                            project_id, codex_session_id, state, child_pid, run_token,
+                            interactive_holder, interactive_launch_token, updated_at
+                         ) VALUES (?1, ?2, 'resume_requested', NULL, ?3, NULL, NULL, ?4)
+                         ON CONFLICT(project_id, codex_session_id) DO UPDATE SET
+                            state = 'resume_requested', child_pid = NULL, run_token = excluded.run_token,
+                            interactive_holder = NULL, interactive_launch_token = NULL,
+                            updated_at = excluded.updated_at",
+                        params![project_id, codex_session_id, run_token, agent_timestamp()],
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Failed to set the test recovery token for Codex session {codex_session_id}"
+                        )
+                    })?;
+                    Ok(())
+                })
         }
 
         pub(crate) fn request_session_interrupt_blocking(
@@ -11967,11 +18266,54 @@ mod agent_store {
             tokio::runtime::Runtime::new()
                 .context("Failed to create async runtime for agent store")?
                 .block_on(async {
-                    let conn = self.connect().await?;
+                    let mut conn = self.connect().await?;
+                    let transaction = conn
+                        .transaction_with_behavior(TransactionBehavior::Immediate)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "Failed to begin reserving shared interactive session {codex_session_id}"
+                            )
+                        })?;
+                    let git_boundary_conflict = query_count(
+                        &transaction,
+                        "SELECT COUNT(*)
+                           FROM projects p
+                          WHERE p.id = ?1
+                            AND (
+                                EXISTS (
+                                    SELECT 1 FROM agent_git_launch_states launch
+                                     WHERE launch.project_id = p.id
+                                )
+                                OR EXISTS (
+                                    SELECT 1 FROM git_finalizations finalization
+                                     WHERE finalization.project_id = p.id
+                                       AND finalization.state NOT IN ('completed', 'cancelled')
+                                )
+                                OR (
+                                    p.git_mode <> 'off'
+                                    AND EXISTS (
+                                        SELECT 1 FROM leases
+                                         WHERE leases.project_id = p.id
+                                    )
+                                )
+                            )",
+                        [project_id],
+                    )
+                    .await?
+                        != 0;
+                    if git_boundary_conflict {
+                        transaction.commit().await.with_context(|| {
+                            format!(
+                                "Failed to finish rejecting unsafe shared interactive session {codex_session_id}"
+                            )
+                        })?;
+                        return Ok(false);
+                    }
                     let restore_stopped =
                         is_stopped_shared_interactive_holder(interactive_holder);
                     let changed = if restore_stopped {
-                        conn.execute(
+                        transaction.execute(
                             "UPDATE session_controls
                                 SET state = 'ready_interactive', child_pid = NULL,
                                     interactive_holder = ?1,
@@ -12003,7 +18345,7 @@ mod agent_store {
                         )
                         .await
                     } else {
-                        conn.execute(
+                        transaction.execute(
                             "INSERT INTO session_controls (
                                 project_id, codex_session_id, state, child_pid,
                                 interactive_holder, updated_at
@@ -12037,6 +18379,11 @@ mod agent_store {
                     .with_context(|| {
                         format!(
                             "Failed to reserve Codex session {codex_session_id} for shared interactive use"
+                        )
+                    })?;
+                    transaction.commit().await.with_context(|| {
+                        format!(
+                            "Failed to commit shared interactive session {codex_session_id} reservation"
                         )
                     })?;
                     Ok(changed > 0)
@@ -12758,22 +19105,9 @@ mod agent_store {
                                     "Failed to hand Codex session {codex_session_id} back to exec mode"
                                 )
                             })?,
-                        InteractiveGuardianDisposition::DeleteIdleReservation
-                        | InteractiveGuardianDisposition::DeleteSharedReservation => {
-                            transaction.execute(
-                                "DELETE FROM session_controls
-                                  WHERE project_id = ?1 AND codex_session_id = ?2
-                                    AND state IN ('interactive', 'stop_requested')
-                                    AND interactive_holder = ?3",
-                                params![project_id, codex_session_id, guardian_holder],
-                            )
-                            .await.with_context(|| {
-                                format!(
-                                    "Failed to finish idle interactive Codex session {codex_session_id}"
-                                )
-                            })?
-                        }
-                        InteractiveGuardianDisposition::RestoreStopped
+                        InteractiveGuardianDisposition::PreserveIdleSession
+                        | InteractiveGuardianDisposition::PreserveSharedSession
+                        | InteractiveGuardianDisposition::RestoreStopped
                         | InteractiveGuardianDisposition::RestoreStoppedShared => {
                             transaction.execute(
                                 "UPDATE session_controls
@@ -12792,7 +19126,7 @@ mod agent_store {
                             )
                             .await.with_context(|| {
                                 format!(
-                                    "Failed to restore stopped Codex session {codex_session_id} after interactive use"
+                                    "Failed to preserve Codex session {codex_session_id} after interactive use"
                                 )
                             })?
                         }
@@ -12872,28 +19206,9 @@ mod agent_store {
                                 ],
                             )
                             .await,
-                        InteractiveGuardianDisposition::DeleteIdleReservation
-                        | InteractiveGuardianDisposition::DeleteSharedReservation => {
-                            transaction.execute(
-                                "DELETE FROM session_controls
-                                  WHERE project_id = ?1 AND codex_session_id = ?2
-                                    AND state IN ('interactive', 'stop_requested')
-                                    AND interactive_holder = ?3
-                                    AND interactive_launch_token = ?3
-                                    AND (
-                                        child_pid = ?4
-                                        OR (child_pid IS NULL AND ?4 IS NULL)
-                                    )",
-                                params![
-                                    project_id,
-                                    codex_session_id,
-                                    guardian_holder,
-                                    expected_child_pid.map(i64::from)
-                                ],
-                            )
-                            .await
-                        }
-                        InteractiveGuardianDisposition::RestoreStopped
+                        InteractiveGuardianDisposition::PreserveIdleSession
+                        | InteractiveGuardianDisposition::PreserveSharedSession
+                        | InteractiveGuardianDisposition::RestoreStopped
                         | InteractiveGuardianDisposition::RestoreStoppedShared => {
                             transaction.execute(
                                 "UPDATE session_controls
@@ -13259,6 +19574,112 @@ mod agent_store {
                 })
         }
 
+        pub(crate) fn ensure_pending_git_finalization_resume_requested_blocking(
+            &self,
+            project_id: i64,
+            codex_session_id: &str,
+        ) -> Result<bool> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(async {
+                    let mut conn = self.connect().await?;
+                    let transaction = conn
+                        .transaction_with_behavior(TransactionBehavior::Immediate)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "Failed to begin restoring the exact Git finalization session {codex_session_id}"
+                            )
+                        })?;
+                    let generation = {
+                        let mut rows = transaction
+                            .query(
+                                "SELECT generation FROM git_finalizations
+                                  WHERE project_id = ?1 AND codex_session_id = ?2
+                                    AND state IN ('working', 'tracking', 'commit_pending', 'push_pending')",
+                                params![project_id, codex_session_id],
+                            )
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "Failed to inspect pending Git finalization {codex_session_id}"
+                                )
+                            })?;
+                        rows.next()
+                            .await
+                            .context("Failed to read pending Git finalization generation")?
+                            .map(|row| row_integer(&row, 0, "generation"))
+                            .transpose()?
+                    };
+                    let Some(generation) = generation else {
+                        transaction.commit().await.with_context(|| {
+                            format!(
+                                "Failed to finish restoring absent Git finalization session {codex_session_id}"
+                            )
+                        })?;
+                        return Ok(false);
+                    };
+                    let recovery_token = format!(
+                        "{AGENT_GIT_FINALIZATION_RESUME_TOKEN_PREFIX}{generation}"
+                    );
+                    transaction
+                        .execute(
+                            "UPDATE session_controls
+                                SET run_token = ?1, updated_at = ?2
+                              WHERE project_id = ?3 AND codex_session_id = ?4
+                                AND state = 'resume_requested' AND child_pid IS NULL
+                                AND interactive_holder IS NULL",
+                            params![
+                                recovery_token.as_str(),
+                                agent_timestamp(),
+                                project_id,
+                                codex_session_id,
+                            ],
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "Failed to tag Git finalization recovery session {codex_session_id}"
+                            )
+                        })?;
+                    transaction
+                        .execute(
+                            "INSERT OR IGNORE INTO session_controls (
+                                project_id, codex_session_id, state, child_pid,
+                                run_token, interactive_holder, interactive_launch_token, updated_at
+                             ) VALUES (?1, ?2, 'resume_requested', NULL, ?3, NULL, NULL, ?4)",
+                            params![
+                                project_id,
+                                codex_session_id,
+                                recovery_token.as_str(),
+                                agent_timestamp()
+                            ],
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "Failed to restore Git finalization session {codex_session_id}"
+                            )
+                        })?;
+                    let ready = query_count(
+                        &transaction,
+                        "SELECT COUNT(*) FROM session_controls
+                          WHERE project_id = ?1 AND codex_session_id = ?2
+                            AND state = 'resume_requested' AND child_pid IS NULL
+                            AND interactive_holder IS NULL",
+                        params![project_id, codex_session_id],
+                    )
+                    .await?
+                        == 1;
+                    transaction.commit().await.with_context(|| {
+                        format!(
+                            "Failed to commit restored Git finalization session {codex_session_id}"
+                        )
+                    })?;
+                    Ok(ready)
+                })
+        }
+
         pub(crate) fn clear_orphaned_resume_requested_session_blocking(
             &self,
             project_id: i64,
@@ -13498,6 +19919,42 @@ mod agent_store {
                         )
                     })?;
                     Ok(removed > 0)
+                })
+        }
+
+        pub(crate) fn clear_autonomous_push_resume_request_blocking(
+            &self,
+            project_id: i64,
+            codex_session_id: &str,
+        ) -> Result<bool> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(async {
+                    let conn = self.connect().await?;
+                    let removed = conn
+                        .execute(
+                            "DELETE FROM session_controls
+                              WHERE project_id = ?1 AND codex_session_id = ?2
+                                AND state = 'resume_requested' AND child_pid IS NULL
+                                AND EXISTS (
+                                    SELECT 1 FROM git_finalizations
+                                     WHERE project_id = ?1 AND codex_session_id = ?2
+                                       AND state = 'push_pending'
+                                )
+                                AND NOT EXISTS (
+                                    SELECT 1 FROM agent_workers
+                                     WHERE project_id = ?1
+                                       AND state IN ('dispatching', 'running', 'finalizing')
+                                )",
+                            params![project_id, codex_session_id],
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "Failed to clear autonomous PushPending resume request for Codex session {codex_session_id}"
+                            )
+                        })?;
+                    Ok(removed == 1)
                 })
         }
 
@@ -13896,6 +20353,29 @@ mod agent_store {
             }
             if query_count(
                 &transaction,
+                "SELECT COUNT(*) FROM git_finalizations
+                  WHERE state IN ('working', 'tracking', 'commit_pending', 'push_pending')",
+                (),
+            )
+            .await?
+                > 0
+            {
+                anyhow::bail!("Cannot clean agent history while Git finalization is pending");
+            }
+            if query_count(
+                &transaction,
+                "SELECT COUNT(*) FROM agent_git_launch_states",
+                (),
+            )
+            .await?
+                > 0
+            {
+                anyhow::bail!(
+                    "Cannot clean agent history while an unconsumed Git launch boundary remains"
+                );
+            }
+            if query_count(
+                &transaction,
                 "SELECT COUNT(*) FROM leases
                   WHERE CAST(expires_at AS INTEGER) > CAST(?1 AS INTEGER)",
                 [cleaned_at],
@@ -13924,6 +20404,14 @@ mod agent_store {
                 .execute("DELETE FROM agent_workers", ())
                 .await
                 .context("Failed to delete terminal agent worker records")?;
+            transaction
+                .execute("DELETE FROM git_finalizations", ())
+                .await
+                .context("Failed to delete terminal Git finalization records")?;
+            transaction
+                .execute("DELETE FROM agent_git_launch_states", ())
+                .await
+                .context("Failed to delete stale prelaunch Git states")?;
             let runs_deleted = transaction
                 .execute("DELETE FROM runs", ())
                 .await
@@ -14173,14 +20661,54 @@ mod agent_store {
         }
 
         async fn set_project_git_mode(&self, project_id: i64, mode: AgentGitMode) -> Result<bool> {
-            let conn = self.connect().await?;
-            let changed = conn
+            let mut conn = self.connect().await?;
+            let transaction = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .await
+                .with_context(|| {
+                    format!("Failed to begin setting project {project_id} Git mode")
+                })?;
+            if query_count(
+                &transaction,
+                "SELECT COUNT(*) FROM git_finalizations
+                  WHERE project_id = ?1
+                    AND state IN ('working', 'tracking', 'commit_pending', 'push_pending')",
+                [project_id],
+            )
+            .await?
+                > 0
+                || query_count(
+                    &transaction,
+                    "SELECT COUNT(*) FROM agent_workers
+                      WHERE project_id = ?1
+                        AND state IN ('dispatching', 'running', 'finalizing')",
+                    [project_id],
+                )
+                .await?
+                    > 0
+                || query_count(
+                    &transaction,
+                    "SELECT COUNT(*) FROM leases WHERE project_id = ?1",
+                    [project_id],
+                )
+                .await?
+                    > 0
+            {
+                anyhow::bail!(
+                    "Cannot change project {project_id} Git mode while an agent run or Git journal is active"
+                );
+            }
+            let changed = transaction
                 .execute(
                     "UPDATE projects SET git_mode = ?1, updated_at = ?2 WHERE id = ?3",
                     params![mode.database_value(), agent_timestamp(), project_id],
                 )
                 .await
                 .with_context(|| format!("Failed to set project {} Git mode", project_id))?;
+            transaction
+                .commit()
+                .await
+                .with_context(|| format!("Failed to commit project {project_id} Git mode"))?;
 
             Ok(changed > 0)
         }
@@ -14200,15 +20728,54 @@ mod agent_store {
             project_root: &Path,
             mode: AgentGitMode,
         ) -> Result<bool> {
-            let conn = self.connect().await?;
+            let mut conn = self.connect().await?;
             let path = project_root.display().to_string();
-            let changed = conn
+            let transaction = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .await
+                .with_context(|| format!("Failed to begin setting project {path} Git mode"))?;
+            if query_count(
+                &transaction,
+                "SELECT COUNT(*) FROM git_finalizations
+                  WHERE project_id = (SELECT id FROM projects WHERE path = ?1)
+                    AND state IN ('working', 'tracking', 'commit_pending', 'push_pending')",
+                [path.as_str()],
+            )
+            .await?
+                > 0
+                || query_count(
+                    &transaction,
+                    "SELECT COUNT(*) FROM agent_workers
+                      WHERE project_id = (SELECT id FROM projects WHERE path = ?1)
+                        AND state IN ('dispatching', 'running', 'finalizing')",
+                    [path.as_str()],
+                )
+                .await?
+                    > 0
+                || query_count(
+                    &transaction,
+                    "SELECT COUNT(*) FROM leases
+                      WHERE project_id = (SELECT id FROM projects WHERE path = ?1)",
+                    [path.as_str()],
+                )
+                .await?
+                    > 0
+            {
+                anyhow::bail!(
+                    "Cannot change project {path} Git mode while an agent run or Git journal is active"
+                );
+            }
+            let changed = transaction
                 .execute(
                     "UPDATE projects SET git_mode = ?1, updated_at = ?2 WHERE path = ?3",
                     params![mode.database_value(), agent_timestamp(), path.as_str()],
                 )
                 .await
                 .with_context(|| format!("Failed to set project {} Git mode", path))?;
+            transaction
+                .commit()
+                .await
+                .with_context(|| format!("Failed to commit project {path} Git mode"))?;
 
             Ok(changed > 0)
         }
@@ -14964,6 +21531,29 @@ mod agent_store {
             _ => anyhow::bail!("Agent database column {} was not nullable integer", column),
         }
     }
+
+    fn git_finalization_record_from_row(row: &turso::Row) -> Result<GitFinalizationRecord> {
+        Ok(GitFinalizationRecord {
+            project_id: row_integer(row, 0, "project_id")?,
+            codex_session_id: row_text(row, 1, "codex_session_id")?,
+            state: GitFinalizationState::from_database(&row_text(row, 2, "state")?)?,
+            git_mode: AgentGitMode::from_database(&row_text(row, 3, "git_mode")?)?,
+            starting_head: row_optional_text(row, 4, "starting_head")?,
+            branch_ref: row_optional_text(row, 5, "branch_ref")?,
+            upstream_ref: row_optional_text(row, 6, "upstream_ref")?,
+            worktree_baseline: row_text(row, 7, "worktree_baseline")?,
+            task_identity: row_optional_text(row, 8, "task_identity")?,
+            owner_run_token: row_optional_text(row, 9, "owner_run_token")?,
+            commit_oid: row_optional_text(row, 10, "commit_oid")?,
+            generation: row_integer(row, 11, "generation")?,
+            last_error: row_optional_text(row, 12, "last_error")?,
+            created_at: row_text(row, 13, "created_at")?,
+            updated_at: row_text(row, 14, "updated_at")?,
+            completed_at: row_optional_text(row, 15, "completed_at")?,
+            acknowledged_at: row_optional_text(row, 16, "acknowledged_at")?,
+            acknowledged_run_id: row_optional_integer(row, 17, "acknowledged_run_id")?,
+        })
+    }
 }
 
 fn get_task_root(local: bool) -> Result<std::path::PathBuf> {
@@ -15556,6 +22146,59 @@ fn normalize_task_text(content: &str) -> String {
         .join(" ")
 }
 
+fn durable_task_identity(content: &str) -> Option<String> {
+    let content = task_content_without_recoverable_codex_session(content);
+    let mut canonical_lines = Vec::new();
+    let mut skipping_outcome_section = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        let heading = trimmed.trim_start_matches('#').trim();
+        let normalized_heading = heading.trim_end_matches(':').to_ascii_lowercase();
+        let outcome_heading = matches!(
+            normalized_heading.as_str(),
+            "completion note" | "blocked note" | "unblocked note"
+        );
+        if outcome_heading {
+            skipping_outcome_section = true;
+            continue;
+        }
+        if skipping_outcome_section {
+            if trimmed.starts_with('#') {
+                skipping_outcome_section = false;
+            } else {
+                continue;
+            }
+        }
+
+        let uppercase = trimmed.to_ascii_uppercase();
+        let mut note_start = None;
+        for marker in ["COMPLETED ", "BLOCKED ", "UNBLOCKED "] {
+            for (index, matched) in uppercase.match_indices(marker) {
+                let has_word_boundary = uppercase[..index]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|ch| !ch.is_ascii_alphanumeric() && ch != '_');
+                if has_word_boundary
+                    && starts_with_task_note_date(&uppercase.as_bytes()[index + matched.len()..])
+                {
+                    note_start =
+                        Some(note_start.map_or(index, |current: usize| current.min(index)));
+                }
+            }
+        }
+        let stable = note_start.map_or(trimmed, |index| &trimmed[..index]);
+        let stable = stable
+            .trim_end_matches(|ch: char| ch.is_whitespace() || matches!(ch, '—' | '-' | ':' | ';'))
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !stable.is_empty() {
+            canonical_lines.push(stable);
+        }
+    }
+    (!canonical_lines.is_empty()).then(|| format!("v2\n{}", canonical_lines.join("\n")))
+}
+
 fn split_description_metadata(value: &str) -> (&str, Option<&str>) {
     if let Some(start) = value.rfind(" (")
         && value.ends_with(')')
@@ -15700,8 +22343,134 @@ fn write_lines(path: &Path, lines: &[String]) -> Result<()> {
         format!("{}\n", updated_content)
     };
 
-    fs::write(path, final_content).context("Failed to update file")?;
-    Ok(())
+    #[cfg(unix)]
+    {
+        replace_file_atomically(path, final_content.as_bytes())
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(path, final_content).with_context(|| format!("Failed to write file {:?}", path))
+    }
+}
+
+#[cfg(unix)]
+fn replace_file_atomically(path: &Path, content: &[u8]) -> Result<()> {
+    replace_file_atomically_with_before_publish(path, content, |_| Ok(()))
+}
+
+#[cfg(unix)]
+fn replace_file_atomically_with_before_publish(
+    path: &Path,
+    content: &[u8],
+    before_publish: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
+    let parent = path
+        .parent()
+        .with_context(|| format!("File {:?} has no parent directory", path))?;
+    let existing_metadata = fs::metadata(path)
+        .with_context(|| format!("Failed to read file metadata for {:?}", path))?;
+    if existing_metadata.permissions().readonly() {
+        anyhow::bail!("Refusing to replace read-only board file {:?}", path);
+    }
+    let file_name = path.file_name().and_then(OsStr::to_str).unwrap_or("board");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = parent.join(format!(
+        ".{file_name}.clt-{}-{nonce}.tmp",
+        std::process::id()
+    ));
+    let write_result = (|| -> Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .with_context(|| format!("Failed to create temporary board file {:?}", temporary))?;
+        file.write_all(content)
+            .with_context(|| format!("Failed to write temporary board file {:?}", temporary))?;
+        fs::set_permissions(&temporary, existing_metadata.permissions())
+            .with_context(|| format!("Failed to preserve permissions for board file {:?}", path))?;
+        file.sync_all()
+            .with_context(|| format!("Failed to sync temporary board file {:?}", temporary))?;
+        before_publish(&temporary)?;
+        fs::rename(&temporary, path)
+            .with_context(|| format!("Failed to atomically replace board file {:?}", path))?;
+        #[cfg(unix)]
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .with_context(|| format!("Failed to sync board directory {:?}", parent))?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    write_result
+}
+
+fn is_clt_atomic_task_temporary_name(name: &str) -> bool {
+    let Some(name) = name.strip_prefix('.') else {
+        return false;
+    };
+    let Some((original_name, suffix)) = name.rsplit_once(".clt-") else {
+        return false;
+    };
+    let Some(suffix) = suffix.strip_suffix(".tmp") else {
+        return false;
+    };
+    let Some((pid, nonce)) = suffix.split_once('-') else {
+        return false;
+    };
+    !original_name.is_empty()
+        && !pid.is_empty()
+        && pid.bytes().all(|byte| byte.is_ascii_digit())
+        && !nonce.is_empty()
+        && nonce.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn cleanup_clt_atomic_task_temporaries_in_directory(path: &Path) -> Result<usize> {
+    if !path.is_dir() {
+        return Ok(0);
+    }
+    let mut removed = 0;
+    for entry in fs::read_dir(path)
+        .with_context(|| format!("Failed to inspect task directory {:?}", path))?
+    {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !is_clt_atomic_task_temporary_name(name)
+            || !entry
+                .file_type()
+                .with_context(|| {
+                    format!("Failed to inspect temporary task file {:?}", entry.path())
+                })?
+                .is_file()
+        {
+            continue;
+        }
+        fs::remove_file(entry.path()).with_context(|| {
+            format!(
+                "Failed to remove orphaned task temp file {:?}",
+                entry.path()
+            )
+        })?;
+        removed += 1;
+    }
+    if removed > 0 {
+        sync_task_directory(path)?;
+    }
+    Ok(removed)
+}
+
+fn cleanup_clt_atomic_task_temporaries(board_dir: &Path) -> Result<usize> {
+    let mut removed = cleanup_clt_atomic_task_temporaries_in_directory(board_dir)?;
+    for status in TASK_STATUSES {
+        removed += cleanup_clt_atomic_task_temporaries_in_directory(&board_dir.join(status))?;
+    }
+    Ok(removed)
 }
 
 fn remove_task_entry(board_dir: &Path, status: &str, entry: &TaskEntry) -> Result<()> {
@@ -15735,6 +22504,40 @@ fn remove_task_entry(board_dir: &Path, status: &str, entry: &TaskEntry) -> Resul
         }
     }
 
+    Ok(())
+}
+
+fn remove_agent_git_task_entry_without_reordering(
+    board_dir: &Path,
+    status: &str,
+    entry: &TaskEntry,
+) -> Result<()> {
+    match &entry.source {
+        TaskSource::MarkdownLine { line_index } => {
+            let StatusStore::MarkdownFile(path) = get_status_store(board_dir, status)? else {
+                anyhow::bail!("Task storage changed while removing a managed Git task.");
+            };
+            let content = fs::read_to_string(&path).context("Failed to read file")?;
+            let mut lines = content.lines().map(str::to_string).collect::<Vec<_>>();
+            if *line_index >= lines.len() {
+                anyhow::bail!("Task storage changed while removing a managed Git task.");
+            }
+            lines.remove(*line_index);
+            write_lines(&path, &lines)?;
+        }
+        TaskSource::Path { path, is_dir } => {
+            if *is_dir {
+                fs::remove_dir_all(path)
+                    .with_context(|| format!("Failed to remove task directory {:?}", path))?;
+            } else {
+                fs::remove_file(path)
+                    .with_context(|| format!("Failed to remove task file {:?}", path))?;
+            }
+            if let Some(parent) = path.parent() {
+                sync_task_directory(parent)?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -15784,6 +22587,10 @@ fn insert_content_into_markdown(path: &Path, index: Option<usize>, content: &str
 }
 
 fn insert_content_into_directory(path: &Path, index: Option<usize>, content: &str) -> Result<()> {
+    insert_content_into_directory_with_before_publish(path, index, content, |_| Ok(()))
+}
+
+fn insert_agent_git_content_into_directory(path: &Path, content: &str) -> Result<PathBuf> {
     fs::create_dir_all(path).with_context(|| format!("Failed to create directory {:?}", path))?;
     let preferred_name = format!(
         "{:04}-{}.md",
@@ -15791,8 +22598,32 @@ fn insert_content_into_directory(path: &Path, index: Option<usize>, content: &st
         slugify(&first_sentence(content).unwrap_or_else(|| "task".to_string()))
     );
     let task_path = unique_child_path(path, &preferred_name);
-    fs::write(&task_path, format!("{}\n", content.trim_end()))
-        .with_context(|| format!("Failed to write task file {:?}", task_path))?;
+    write_new_task_file_atomically(
+        &task_path,
+        format!("{}\n", content.trim_end()).as_bytes(),
+        |_| Ok(()),
+    )?;
+    Ok(task_path)
+}
+
+fn insert_content_into_directory_with_before_publish(
+    path: &Path,
+    index: Option<usize>,
+    content: &str,
+    before_publish: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
+    fs::create_dir_all(path).with_context(|| format!("Failed to create directory {:?}", path))?;
+    let preferred_name = format!(
+        "{:04}-{}.md",
+        directory_task_paths(path)?.len() + 1,
+        slugify(&first_sentence(content).unwrap_or_else(|| "task".to_string()))
+    );
+    let task_path = unique_child_path(path, &preferred_name);
+    write_new_task_file_atomically(
+        &task_path,
+        format!("{}\n", content.trim_end()).as_bytes(),
+        before_publish,
+    )?;
 
     if let Some(idx) = index {
         reorder_path_in_directory(path, &task_path, idx)?;
@@ -15800,6 +22631,63 @@ fn insert_content_into_directory(path: &Path, index: Option<usize>, content: &st
         normalize_directory_order(path)?;
     }
 
+    Ok(())
+}
+
+fn write_new_task_file_atomically(
+    path: &Path,
+    content: &[u8],
+    before_publish: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
+    let parent = path
+        .parent()
+        .with_context(|| format!("Task file {:?} has no parent directory", path))?;
+    let file_name = path.file_name().and_then(OsStr::to_str).unwrap_or("task");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = parent.join(format!(
+        ".{file_name}.clt-{}-{nonce}.tmp",
+        std::process::id()
+    ));
+    let write_result = (|| -> Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .with_context(|| format!("Failed to create temporary task file {:?}", temporary))?;
+        file.write_all(content)
+            .with_context(|| format!("Failed to write temporary task file {:?}", temporary))?;
+        file.sync_all()
+            .with_context(|| format!("Failed to sync temporary task file {:?}", temporary))?;
+        before_publish(&temporary)?;
+        if path.exists() {
+            anyhow::bail!("Refusing to replace existing task file {:?}", path);
+        }
+        fs::rename(&temporary, path)
+            .with_context(|| format!("Failed to atomically publish task file {:?}", path))?;
+        #[cfg(unix)]
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .with_context(|| format!("Failed to sync task directory {:?}", parent))?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    write_result
+}
+
+#[cfg(unix)]
+fn sync_task_directory(path: &Path) -> Result<()> {
+    fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .with_context(|| format!("Failed to sync task directory {:?}", path))
+}
+
+#[cfg(not(unix))]
+fn sync_task_directory(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -15988,6 +22876,37 @@ fn move_path_into_directory(
     Ok(dest_path)
 }
 
+fn move_agent_git_path_into_directory_without_reordering(
+    source_path: &Path,
+    dest_dir: &Path,
+) -> Result<PathBuf> {
+    fs::create_dir_all(dest_dir)
+        .with_context(|| format!("Failed to create destination directory {:?}", dest_dir))?;
+    let original_name = source_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("task.md");
+    let preferred_name = format!(
+        "{:04}-{}",
+        directory_task_paths(dest_dir)?.len() + 1,
+        strip_order_prefix(original_name)
+    );
+    let dest_path = unique_child_path(dest_dir, &preferred_name);
+    fs::rename(source_path, &dest_path).with_context(|| {
+        format!(
+            "Failed to atomically move managed Git task {:?} into {:?}",
+            source_path, dest_dir
+        )
+    })?;
+    sync_task_directory(dest_dir)?;
+    if let Some(source_parent) = source_path.parent()
+        && source_parent != dest_dir
+    {
+        sync_task_directory(source_parent)?;
+    }
+    Ok(dest_path)
+}
+
 fn convert_status_to_directory(board_dir: &Path, status: &str) -> Result<PathBuf> {
     let dir_path = board_dir.join(status);
     if dir_path.is_dir() {
@@ -16000,6 +22919,9 @@ fn convert_status_to_directory(board_dir: &Path, status: &str) -> Result<PathBuf
 
     if file_path.exists() {
         let entries = read_markdown_entries(&file_path)?;
+        for entry in &entries {
+            ensure_managed_git_task_mutation_allowed(board_dir, entry, false, None)?;
+        }
         for entry in entries {
             insert_content_into_directory(&dir_path, None, &entry.content)?;
         }
@@ -16029,7 +22951,11 @@ fn convert_archive_to_directory(archive_file: &Path) -> Result<PathBuf> {
     fs::create_dir_all(&archive_dir)
         .with_context(|| format!("Failed to create archive directory {:?}", archive_dir))?;
 
-    for entry in read_markdown_entries(archive_file)? {
+    let entries = read_markdown_entries(archive_file)?;
+    for entry in &entries {
+        ensure_managed_git_task_mutation_allowed(board_dir, entry, false, None)?;
+    }
+    for entry in entries {
         insert_content_into_directory(&archive_dir, None, &entry.content)?;
     }
 
@@ -16060,6 +22986,9 @@ fn expand_status_for_command(board_dir: &Path, status: &'static str) -> Result<E
 
     let file_path = board_dir.join(status_filename(status)?);
     let entries = read_markdown_entries(&file_path)?;
+    for entry in &entries {
+        ensure_managed_git_task_mutation_allowed(board_dir, entry, false, None)?;
+    }
     let task_count = entries.len();
     fs::create_dir_all(&dir_path)
         .with_context(|| format!("Failed to create directory {:?}", dir_path))?;
@@ -16119,20 +23048,524 @@ fn delete_task(root: &Path, status: &str, task_index_str: &str) -> Result<()> {
     delete_task_in_board(&get_tasks_dir(root), status, task_index_str)
 }
 
+fn reseal_provisional_done_task(root: &Path, task_index_str: &str) -> Result<bool> {
+    let Some(context) = automated_agent_child_context()? else {
+        return Ok(false);
+    };
+    let store = open_agent_store()?;
+    let project = store
+        .list_projects_blocking()?
+        .into_iter()
+        .find(|project| project.id == context.project_id)
+        .with_context(|| {
+            format!(
+                "Automated agent project {} is no longer registered",
+                context.project_id
+            )
+        })?;
+    if project.git_mode == AgentGitMode::Off {
+        return Ok(false);
+    }
+    let root = canonicalize_existing_path(root)?;
+    if project.path != root {
+        anyhow::bail!(
+            "Automated agent context project {} targets {}, not {}",
+            context.project_id,
+            project.path.display(),
+            root.display()
+        );
+    }
+    let task_index = parse_one_based_task_index(task_index_str)?;
+    let board_dir = get_tasks_dir(&root);
+    let _mutation_lock = acquire_board_mutation_lock(&board_dir)?;
+    let entry = task_entry_at(&board_dir, "done", task_index)?;
+    let session_id = codex_session_id_from_task_content(&entry.content).context(
+        "Resealing a provisional Done task requires its terminal codex:<session-id> marker",
+    )?;
+    if !task_content_has_completed_note(&entry.content) {
+        anyhow::bail!("Resealing requires the task's dated COMPLETED note");
+    }
+    let finalization = store
+        .git_finalization_blocking(project.id, session_id)?
+        .with_context(|| format!("Task {session_id} has no managed Git finalization"))?;
+    if finalization.state != GitFinalizationState::CommitPending {
+        anyhow::bail!(
+            "Task {session_id} can only be resealed while its Git journal is COMMIT-PENDING, not {}",
+            finalization.state.status_label()
+        );
+    }
+    let task_identity = finalization
+        .task_identity
+        .as_deref()
+        .context("The provisional Done task has no durable identity")?;
+    if durable_task_identity(&entry.content).as_deref() != Some(task_identity) {
+        anyhow::bail!("The provisional Done task no longer matches its durable identity");
+    }
+    let starting_head = finalization
+        .starting_head
+        .as_deref()
+        .context("The provisional Done task has no frozen starting commit")?;
+    let manifest = capture_agent_git_resealed_manifest(
+        AgentGitProofContext {
+            store: &store,
+            project_id: project.id,
+        },
+        &root,
+        &finalization.worktree_baseline,
+        session_id,
+        task_identity,
+        starting_head,
+        finalization.branch_ref.as_deref(),
+    )?;
+    let resealed = store.reseal_git_finalization_manifest_blocking(
+        project.id,
+        session_id,
+        finalization.generation,
+        task_identity,
+        &manifest,
+        &context.run_token,
+        &agent_timestamp(),
+    )?;
+    if !resealed {
+        anyhow::bail!(
+            "Task {session_id} lost its running-session fence while CLT was resealing the corrected manifest"
+        );
+    }
+    Ok(true)
+}
+
 fn delete_task_in_board(board_dir: &Path, status: &str, task_index_str: &str) -> Result<()> {
     let task_index = parse_one_based_task_index(task_index_str)?;
     let _mutation_lock = acquire_board_mutation_lock(board_dir)?;
     let entry = task_entry_at(board_dir, status, task_index)?;
+    ensure_managed_git_task_mutation_allowed(board_dir, &entry, false, None)?;
     remove_task_entry(board_dir, status, &entry)
 }
 
+fn ensure_managed_git_task_mutation_allowed(
+    board_dir: &Path,
+    entry: &TaskEntry,
+    allow_working_preserving_mutation: bool,
+    proposed_working_content: Option<&str>,
+) -> Result<()> {
+    let Some(session_id) = recoverable_codex_session_id_from_task_content(&entry.content) else {
+        return Ok(());
+    };
+    let state_dir = agent_state_dir()?;
+    if !state_dir.join(AGENT_DB_FILE).is_file() {
+        return Ok(());
+    }
+    let canonical_board = fs::canonicalize(board_dir).unwrap_or_else(|_| board_dir.to_path_buf());
+    let store = open_agent_store_at(&state_dir)?;
+    if store.pending_migration_version().is_some() {
+        return Ok(());
+    }
+    let Some(project) = store
+        .list_projects_blocking()?
+        .into_iter()
+        .filter(|project| canonical_board.starts_with(project.path.join("tasks")))
+        .max_by_key(|project| project.path.as_os_str().len())
+    else {
+        return Ok(());
+    };
+    let Some(finalization) = store.git_finalization_blocking(project.id, session_id)? else {
+        return Ok(());
+    };
+    if finalization.state.is_terminal() {
+        return Ok(());
+    }
+    if allow_working_preserving_mutation && finalization.state == GitFinalizationState::Working {
+        if let Some(proposed_content) = proposed_working_content {
+            let bound_identity = finalization.task_identity.as_deref().context(
+                "The Working Git journal has no durable task identity for this content update",
+            )?;
+            ensure_working_task_content_preserves_identity(
+                session_id,
+                bound_identity,
+                proposed_content,
+            )?;
+        }
+        return Ok(());
+    }
+    anyhow::bail!(
+        "Task {session_id} has a managed Git journal in {}; resume that exact agent session instead of changing, moving, archiving, reordering, or deleting its durable task evidence",
+        finalization.state.status_label()
+    )
+}
+
+fn ensure_working_task_content_preserves_identity(
+    session_id: &str,
+    bound_identity: &str,
+    proposed_content: &str,
+) -> Result<()> {
+    if durable_task_identity(proposed_content).as_deref() != Some(bound_identity) {
+        anyhow::bail!(
+            "Task {session_id} has a Working Git journal; content edits may add outcome notes but cannot change its durable task payload"
+        );
+    }
+    Ok(())
+}
+
 fn move_task(root: &Path, from: &str, to: &str, task_index_str: &str) -> Result<()> {
+    if from == "todo"
+        && to == "doing"
+        && let Some(context) = automated_agent_child_context()?
+    {
+        let store = open_agent_store()?;
+        let project = store
+            .list_projects_blocking()?
+            .into_iter()
+            .find(|project| project.id == context.project_id)
+            .with_context(|| {
+                format!(
+                    "Automated agent project {} is no longer registered",
+                    context.project_id
+                )
+            })?;
+        if project.git_mode != AgentGitMode::Off {
+            return move_task_to_doing_with_agent_git_journal(
+                root,
+                task_index_str,
+                &context,
+                &project,
+                &store,
+            );
+        }
+    }
     move_task_in_board(&get_tasks_dir(root), from, to, task_index_str)
+}
+
+fn running_session_for_automated_child(
+    store: &agent_store::TursoAgentStore,
+    context: &AutomatedAgentChildContext,
+) -> Result<String> {
+    for _ in 0..40 {
+        let matches = store
+            .session_controls_for_project_blocking(context.project_id)?
+            .into_iter()
+            .filter(|control| {
+                control.state == AgentSessionControlState::Running
+                    && control.run_token.as_deref() == Some(context.run_token.as_str())
+            })
+            .map(|control| control.codex_session_id)
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [session_id] => return Ok(session_id.clone()),
+            [] => thread::sleep(Duration::from_millis(50)),
+            _ => anyhow::bail!(
+                "Automated run {} owns more than one running Codex session",
+                context.run_token
+            ),
+        }
+    }
+    anyhow::bail!(
+        "CLT could not observe the running Codex session for automated run {}; retry the Todo-to-Doing move",
+        context.run_token
+    )
+}
+
+fn move_task_to_doing_with_agent_git_journal(
+    root: &Path,
+    task_index_str: &str,
+    context: &AutomatedAgentChildContext,
+    project: &agent_store::AgentProject,
+    store: &agent_store::TursoAgentStore,
+) -> Result<()> {
+    let root = canonicalize_existing_path(root)?;
+    if project.path != root {
+        anyhow::bail!(
+            "Automated agent context project {} targets {}, not {}",
+            context.project_id,
+            project.path.display(),
+            root.display()
+        );
+    }
+    let session_id = running_session_for_automated_child(store, context)?;
+    let task_index = parse_one_based_task_index(task_index_str)?;
+    let board_dir = get_tasks_dir(&root);
+    let _mutation_lock = acquire_board_mutation_lock(&board_dir)?;
+    cleanup_clt_atomic_task_temporaries(&board_dir)?;
+    let entry = task_entry_at(&board_dir, "todo", task_index)?;
+    let task_identity = durable_task_identity(&entry.content)
+        .context("Automated Git task has no durable task payload")?;
+    let existing = store
+        .git_finalization_blocking(project.id, &session_id)?
+        .with_context(|| {
+            format!(
+                "Automated run {} has no atomically registered Working Git journal; CLT will not move the proof boundary after launch",
+                context.run_token
+            )
+        })?;
+    if existing.state != GitFinalizationState::Working
+        || existing.owner_run_token.as_deref() != Some(context.run_token.as_str())
+    {
+        anyhow::bail!(
+            "Codex session {session_id} does not own the Working Git journal for automated run {}",
+            context.run_token
+        );
+    }
+    if existing.git_mode != project.git_mode {
+        anyhow::bail!(
+            "Automated run {} froze Git mode {}, but the project now uses {}",
+            context.run_token,
+            existing.git_mode.label(),
+            project.git_mode.label()
+        );
+    }
+    let git = AgentGitStartState {
+        starting_head: existing
+            .starting_head
+            .clone()
+            .context("The atomically registered Working journal has no starting commit")?,
+        branch_ref: existing.branch_ref.clone(),
+        upstream_ref: existing.upstream_ref.clone(),
+        worktree_baseline: existing.worktree_baseline.clone(),
+    };
+    verify_agent_git_start_state_unchanged(&root, project.git_mode, &git)?;
+    require_agent_git_start_task_identity(&root, &git.starting_head, &task_identity)?;
+    if existing
+        .task_identity
+        .as_deref()
+        .is_some_and(|identity| identity != task_identity)
+    {
+        anyhow::bail!("Codex session {session_id} already has an incompatible Git task identity");
+    }
+    if existing.task_identity.is_none()
+        && !store.compare_and_set_git_finalization_with_identity_blocking(
+            project.id,
+            &session_id,
+            existing.generation,
+            GitFinalizationState::Working,
+            &task_identity,
+            Some(&context.run_token),
+            &agent_timestamp(),
+        )?
+    {
+        anyhow::bail!(
+            "Codex session {session_id} lost its running-session fence while binding Todo activation"
+        );
+    }
+    attach_codex_session_to_task_after_lock(&root, "todo", &entry, &session_id, || {})?;
+    move_agent_git_task_in_board_after_lock(&board_dir, "todo", "doing", task_index)?;
+    Ok(())
+}
+
+fn move_task_to_done(root: &Path, from: &str, task_index_str: &str) -> Result<bool> {
+    let Some(context) = automated_agent_child_context()? else {
+        let task_index = parse_one_based_task_index(task_index_str)?;
+        let board_dir = get_tasks_dir(root);
+        let _mutation_lock = acquire_board_mutation_lock(&board_dir)?;
+        let entry = task_entry_at(&board_dir, from, task_index)?;
+        if let Some(session_id) = recoverable_codex_session_id_from_task_content(&entry.content) {
+            let state_dir = agent_state_dir()?;
+            if state_dir.join(AGENT_DB_FILE).is_file() {
+                let root = canonicalize_existing_path(root)?;
+                let store = open_agent_store_at(&state_dir)?;
+                if let Some(project) = store
+                    .list_projects_blocking()?
+                    .into_iter()
+                    .find(|project| project.path == root)
+                    && let Some(finalization) =
+                        store.git_finalization_blocking(project.id, session_id)?
+                    && !finalization.state.is_terminal()
+                {
+                    anyhow::bail!(
+                        "Task {session_id} has a managed Git journal in {}; resume that exact agent session so CLT can prove its commit before Done",
+                        finalization.state.status_label()
+                    );
+                }
+            }
+        }
+        move_task_in_board_after_lock(&board_dir, from, "done", task_index)?;
+        return Ok(false);
+    };
+    move_task_to_done_with_agent_context(root, from, task_index_str, &context)
+}
+
+fn move_task_to_done_with_agent_context(
+    root: &Path,
+    from: &str,
+    task_index_str: &str,
+    context: &AutomatedAgentChildContext,
+) -> Result<bool> {
+    let store = open_agent_store()?;
+    move_task_to_done_with_agent_store(root, from, task_index_str, context, &store)
+}
+
+fn move_task_to_done_with_agent_store(
+    root: &Path,
+    from: &str,
+    task_index_str: &str,
+    context: &AutomatedAgentChildContext,
+    store: &agent_store::TursoAgentStore,
+) -> Result<bool> {
+    let project = store
+        .list_projects_blocking()?
+        .into_iter()
+        .find(|project| project.id == context.project_id)
+        .with_context(|| {
+            format!(
+                "Automated agent project {} is no longer registered",
+                context.project_id
+            )
+        })?;
+    let root = canonicalize_existing_path(root)?;
+    if project.path != root {
+        anyhow::bail!(
+            "Automated agent context project {} targets {}, not {}",
+            context.project_id,
+            project.path.display(),
+            root.display()
+        );
+    }
+    let task_index = parse_one_based_task_index(task_index_str)?;
+    let board_dir = get_tasks_dir(&root);
+    let _mutation_lock = acquire_board_mutation_lock(&board_dir)?;
+    cleanup_clt_atomic_task_temporaries(&board_dir)?;
+    let entry = task_entry_at(&board_dir, from, task_index)?;
+    let session_id = codex_session_id_from_task_content(&entry.content).with_context(|| {
+        "Automated Git completion requires the selected task's terminal codex:<session-id> marker"
+    })?;
+    if !task_content_has_completed_note(&entry.content) {
+        anyhow::bail!(
+            "Automated Git completion requires a dated COMPLETED YYYY-MM-DD: note before moving the task to Done"
+        );
+    }
+    let Some(mut finalization) = store.git_finalization_blocking(project.id, session_id)? else {
+        if project.git_mode == AgentGitMode::Off {
+            move_task_in_board_after_lock(&board_dir, from, "done", task_index)?;
+            return Ok(false);
+        }
+        anyhow::bail!(
+            "Automated Git completion has no start-state journal for Codex session {session_id}; keep the task in Doing and resume the same session"
+        );
+    };
+    if finalization.git_mode == AgentGitMode::Off {
+        anyhow::bail!("Automated Git completion journal unexpectedly has Git mode off");
+    }
+    let Some(task_identity) = finalization.task_identity.clone() else {
+        anyhow::bail!(
+            "Automated Git completion task identity was not bound to Codex session {session_id} before Done was requested"
+        );
+    };
+    let selected_identity = durable_task_identity(&entry.content)
+        .context("Automated Git completion could not identify the selected task payload")?;
+    if selected_identity != task_identity {
+        anyhow::bail!(
+            "Automated Git completion task content no longer matches the task bound to Codex session {session_id}; restore the original task payload and keep only dated outcome-note changes"
+        );
+    }
+    if finalization.state == GitFinalizationState::Working {
+        let current_branch = git_optional_stdout(
+            &root,
+            &["symbolic-ref", "-q", "HEAD"],
+            &[1],
+            "verify the frozen task branch",
+        )?;
+        if current_branch.as_deref() != finalization.branch_ref.as_deref() {
+            anyhow::bail!(
+                "Automated Git task changed branches after entering Doing; return to the frozen branch before `clt done`"
+            );
+        }
+        let starting_head = finalization
+            .starting_head
+            .as_deref()
+            .context("Automated Git task has no frozen starting commit")?;
+        let current_head = resolve_git_commit(&root, "HEAD", "verify the task manifest parent")?;
+        if !git_commit_is_ancestor(&root, starting_head, &current_head)? {
+            anyhow::bail!(
+                "Automated Git task history diverged from its frozen starting commit; CLT will not seal an ambiguous manifest"
+            );
+        }
+        let manifest = capture_agent_git_staged_manifest(
+            AgentGitProofContext {
+                store,
+                project_id: project.id,
+            },
+            &root,
+            &finalization.worktree_baseline,
+            session_id,
+            &task_identity,
+            starting_head,
+            finalization.branch_ref.as_deref(),
+        )?;
+        let tracked = store.track_git_finalization_with_manifest_blocking(
+            project.id,
+            session_id,
+            finalization.generation,
+            &task_identity,
+            &manifest,
+            &context.run_token,
+            &agent_timestamp(),
+        )?;
+        if !tracked {
+            anyhow::bail!(
+                "Automated Git completion lost its running-session fence before recording completion intent"
+            );
+        }
+        finalization = store
+            .git_finalization_blocking(project.id, session_id)?
+            .context("The tracked Git completion intent could not be read back")?;
+    } else if finalization.state == GitFinalizationState::Tracking {
+        let owned = store.compare_and_set_owned_git_finalization_blocking(
+            project.id,
+            session_id,
+            finalization.generation,
+            GitFinalizationState::Tracking,
+            &context.run_token,
+            None,
+            None,
+            &agent_timestamp(),
+        )?;
+        if !owned {
+            anyhow::bail!(
+                "Automated Git completion lost its running-session fence before moving the task"
+            );
+        }
+        finalization = store
+            .git_finalization_blocking(project.id, session_id)?
+            .context("The owned Git completion intent could not be read back")?;
+    }
+    if finalization.codex_session_id != session_id
+        || finalization.state != GitFinalizationState::Tracking
+        || finalization.task_identity.as_deref() != Some(task_identity.as_str())
+    {
+        anyhow::bail!(
+            "Task {} already has an incompatible Git finalization in state {}",
+            session_id,
+            finalization.state.database_value()
+        );
+    }
+
+    move_agent_git_task_in_board_after_lock(&board_dir, from, "done", task_index)?;
+    let updated = store.compare_and_set_owned_git_finalization_blocking(
+        project.id,
+        session_id,
+        finalization.generation,
+        GitFinalizationState::CommitPending,
+        &context.run_token,
+        None,
+        None,
+        &agent_timestamp(),
+    )?;
+    if !updated {
+        anyhow::bail!(
+            "The task moved to provisional Done, but its Git finalization changed concurrently; CLT will reconcile it before scheduling other work"
+        );
+    }
+    Ok(true)
 }
 
 fn move_task_in_board(board_dir: &Path, from: &str, to: &str, task_index_str: &str) -> Result<()> {
     let task_index = parse_one_based_task_index(task_index_str)?;
     let _mutation_lock = acquire_board_mutation_lock(board_dir)?;
+    let entry = task_entry_at(board_dir, from, task_index)?;
+    ensure_managed_git_task_mutation_allowed(
+        board_dir,
+        &entry,
+        matches!(from, "todo" | "doing") && matches!(to, "todo" | "doing"),
+        None,
+    )?;
     move_task_in_board_after_lock(board_dir, from, to, task_index)
 }
 
@@ -16148,6 +23581,49 @@ fn move_task_in_board_with_contention_callback(
     let _mutation_lock =
         acquire_board_mutation_lock_with_contention_callback(board_dir, on_contention)?;
     move_task_in_board_after_lock(board_dir, from, to, task_index)
+}
+
+fn move_agent_git_task_in_board_after_lock(
+    board_dir: &Path,
+    from: &str,
+    to: &str,
+    task_index: usize,
+) -> Result<()> {
+    move_agent_git_task_in_board_with_after_destination(board_dir, from, to, task_index, || Ok(()))
+}
+
+fn move_agent_git_task_in_board_with_after_destination(
+    board_dir: &Path,
+    from: &str,
+    to: &str,
+    task_index: usize,
+    after_destination: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    cleanup_clt_atomic_task_temporaries(board_dir)?;
+    let entry = task_entry_at(board_dir, from, task_index)?;
+    match (&entry.source, get_status_store(board_dir, to)?) {
+        (TaskSource::Path { path, .. }, StatusStore::Directory(dest_dir)) => {
+            move_agent_git_path_into_directory_without_reordering(path, &dest_dir)?;
+            after_destination()?;
+        }
+        (TaskSource::Path { .. }, StatusStore::MarkdownFile(_)) => {
+            anyhow::bail!(
+                "Managed Git tasks cannot move from a folder-backed {from} status into Markdown-backed {to}; expand {to} to folder storage and commit that board layout before scheduling the task"
+            );
+        }
+        (TaskSource::MarkdownLine { .. }, StatusStore::Directory(dest_dir)) => {
+            insert_agent_git_content_into_directory(&dest_dir, &entry.content)?;
+            after_destination()?;
+            remove_agent_git_task_entry_without_reordering(board_dir, from, &entry)?;
+        }
+        (TaskSource::MarkdownLine { .. }, StatusStore::MarkdownFile(dest_file)) => {
+            let dest_index = (to == "done").then_some(0);
+            insert_content_into_markdown(&dest_file, dest_index, &entry.content)?;
+            after_destination()?;
+            remove_agent_git_task_entry_without_reordering(board_dir, from, &entry)?;
+        }
+    }
+    Ok(())
 }
 
 fn move_task_in_board_after_lock(
@@ -16180,6 +23656,7 @@ fn move_task_to_archive_in_board(board_dir: &Path, from: &str, task_index_str: &
     let task_index = parse_one_based_task_index(task_index_str)?;
     let _mutation_lock = acquire_board_mutation_lock(board_dir)?;
     let entry = task_entry_at(board_dir, from, task_index)?;
+    ensure_managed_git_task_mutation_allowed(board_dir, &entry, false, None)?;
 
     match (
         &entry.source,
@@ -16240,6 +23717,7 @@ fn update_task_in_board_after_lock(
         Some(session_id) => task_content_with_codex_session(new_description, session_id),
         None => new_description.trim_end().to_string(),
     };
+    ensure_managed_git_task_mutation_allowed(board_dir, &entry, true, Some(&updated_content))?;
 
     write_task_entry_content(board_dir, status, &entry, &updated_content)
 }
@@ -16393,6 +23871,8 @@ fn reorder_task_in_board(
     to_idx: usize,
 ) -> Result<()> {
     let _mutation_lock = acquire_board_mutation_lock(board_dir)?;
+    let entry = task_entry_at(board_dir, status, from_idx + 1)?;
+    ensure_managed_git_task_mutation_allowed(board_dir, &entry, false, None)?;
     match get_status_store(board_dir, status)? {
         StatusStore::MarkdownFile(path) => reorder_markdown_task(&path, from_idx, to_idx),
         StatusStore::Directory(path) => reorder_directory_task(&path, from_idx, to_idx),
@@ -17435,6 +24915,8 @@ struct TuiAgentProject {
 enum TuiAgentRuntimeState {
     Idle,
     Running,
+    Finalizing,
+    PushPending,
     Interactive,
     Fenced,
     Stale,
@@ -17446,6 +24928,8 @@ impl TuiAgentRuntimeState {
         match self {
             Self::Idle => "IDLE",
             Self::Running => "RUNNING",
+            Self::Finalizing => "FINAL",
+            Self::PushPending => "PUSH",
             Self::Interactive => "INTERACTIVE",
             Self::Fenced => "FENCED",
             Self::Stale => "STALE",
@@ -18817,6 +26301,15 @@ fn load_tui_agent_panel_snapshot_inner(
     };
     let projects = store.list_projects_blocking()?;
     let active_leases = store.list_active_leases_blocking(&agent_timestamp())?;
+    let pending_git_finalizations = if store.pending_migration_version().is_some() {
+        HashMap::new()
+    } else {
+        store
+            .list_pending_git_finalizations_blocking(None)?
+            .into_iter()
+            .map(|finalization| (finalization.project_id, finalization.state))
+            .collect::<HashMap<_, _>>()
+    };
     let suspending_session_projects = store.suspending_session_project_ids_blocking()?;
     let mut interactive_session_projects = HashSet::new();
     for project_id in &suspending_session_projects {
@@ -18852,6 +26345,20 @@ fn load_tui_agent_panel_snapshot_inner(
                 && suspending_session_projects.contains(&project.id)
             {
                 runtime_state = TuiAgentRuntimeState::Fenced;
+            }
+            if matches!(
+                runtime_state,
+                TuiAgentRuntimeState::Idle
+                    | TuiAgentRuntimeState::Fenced
+                    | TuiAgentRuntimeState::Error
+            ) && let Some(finalization_state) =
+                pending_git_finalizations.get(&project.id).copied()
+            {
+                runtime_state = if finalization_state == GitFinalizationState::PushPending {
+                    TuiAgentRuntimeState::PushPending
+                } else {
+                    TuiAgentRuntimeState::Finalizing
+                };
             }
             if runtime_state == TuiAgentRuntimeState::Idle && daemon_scan_problem.is_some() {
                 runtime_state = TuiAgentRuntimeState::Error;
@@ -19714,9 +27221,7 @@ fn cancel_tui_idle_codex_session_interactive(
         Ok(match control {
             None => true,
             Some(control) => {
-                (interactive_holder.starts_with("clt-stopped-interactive-")
-                    || is_stopped_shared_interactive_holder(interactive_holder))
-                    && control.state == AgentSessionControlState::Stopped
+                control.state == AgentSessionControlState::Stopped
                     && control.interactive_holder.is_none()
             }
         })
@@ -21997,7 +29502,7 @@ fn run_tui_codex_session_continue(
 
     Ok(match (resume_result, cancel_result, release_result) {
         (Ok(status), Ok(()), Ok(())) if status.success() => {
-            format!("Returned from Codex session for {label}")
+            format!("Returned from Codex session for {label}; press c to open it again")
         }
         (Ok(status), Ok(()), Ok(())) => format!("Codex session exited with status {status}"),
         (Err(error), Ok(()), Ok(())) => format!("Error: {error}"),
@@ -24280,8 +31785,53 @@ fn init_tasks(root: &Path, folders: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Barrier, Mutex, mpsc};
+    use std::sync::{Barrier, mpsc};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn run_test_git(project_root: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(project_root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: stdout={}; stderr={}",
+            args,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    fn run_test_agent_git(project_root: &Path, args: &[&str]) -> String {
+        let mut command = Command::new("git");
+        command.arg("-C").arg(project_root).args(args);
+        configure_agent_git_identity(&mut command, AgentGitMode::Commit);
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "agent git {:?} failed: stdout={}; stderr={}",
+            args,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    fn initialize_test_git_repository(project_root: &Path) -> String {
+        run_test_git(project_root, &["init"]);
+        run_test_git(project_root, &["config", "user.name", "CLT Test"]);
+        run_test_git(
+            project_root,
+            &["config", "user.email", "clt-test@example.invalid"],
+        );
+        run_test_git(project_root, &["config", "commit.gpgsign", "false"]);
+        run_test_git(project_root, &["add", "--all"]);
+        run_test_git(project_root, &["commit", "-m", "Initial state"]);
+        run_test_git(project_root, &["rev-parse", "HEAD"])
+    }
 
     #[cfg(unix)]
     #[test]
@@ -24364,6 +31914,7 @@ mod tests {
                 AgentTaskSelection::ResumeSession,
                 Some(&std::env::var("CLT_TEST_OWNER_SESSION_ID").unwrap()),
                 &std::env::var("CLT_TEST_OWNER_LEASE_HOLDER").unwrap(),
+                None,
                 &new_agent_shutdown_signal(),
             )
             .unwrap();
@@ -24598,6 +32149,183 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(unix)]
+    fn assert_disconnected_no_session_launch_recovery(mutate_checkout: bool) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_root(if mutate_checkout {
+            "automated-supervisor-pre-session-mutated"
+        } else {
+            "automated-supervisor-pre-session-unchanged"
+        });
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        add_task(&project_root, "committed task", None).unwrap();
+        initialize_test_git_repository(&project_root);
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        assert!(
+            store
+                .set_project_git_mode_for_path_blocking(&project_root, AgentGitMode::Commit)
+                .unwrap()
+        );
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert!(
+            store
+                .try_acquire_lease_blocking(project.id, "scheduler", "99", "999")
+                .unwrap()
+        );
+        let run_token = "inline-crash-before-session";
+        assert!(reserve_test_inline_worker(
+            &store,
+            project.id,
+            run_token,
+            "scheduler",
+            std::process::id(),
+            "100",
+        ));
+        let lease_holder = agent_worker_lease_holder(run_token);
+        let launch_marker = root.join("codex-launched");
+        let fake_codex = root.join("fake-codex");
+        fs::write(
+            &fake_codex,
+            format!(
+                "#!/bin/sh\nprintf launched > '{}'\n",
+                launch_marker.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&fake_codex).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_codex, permissions).unwrap();
+        let stdout_path = root.join("codex.out");
+        let stderr_path = root.join("codex.err");
+        let target = Command::new(&fake_codex);
+        let supervisor_stderr = fs::File::create(&stderr_path).unwrap();
+        let mut supervised = spawn_automated_session_supervisor(
+            &target,
+            AutomatedSupervisorSpec {
+                state_dir: &state_dir,
+                project_id: project.id,
+                run_token,
+                lease_holder: &lease_holder,
+                stdout_path: &stdout_path,
+                stderr_path: &stderr_path,
+            },
+            supervisor_stderr,
+        )
+        .unwrap();
+        let git_start = capture_agent_git_start_state(&project_root, AgentGitMode::Commit).unwrap();
+        assert!(
+            store
+                .record_git_launch_state_blocking(
+                    project.id,
+                    run_token,
+                    AgentGitMode::Commit,
+                    &git_start,
+                    "101",
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .git_launch_state_blocking(project.id, run_token)
+                .unwrap()
+                .is_some()
+        );
+
+        drop(supervised.control);
+        wait_for_automated_supervisor_reaped(&mut supervised.process, &mut supervised.proof)
+            .unwrap();
+
+        assert_eq!(
+            automated_agent_process_group_is_running(supervised.child_pid),
+            Some(false)
+        );
+        assert!(!launch_marker.exists());
+        assert!(
+            store
+                .git_launch_state_blocking(project.id, run_token)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .lease_for_project_blocking(project.id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.list_active_workers_blocking().unwrap().is_empty());
+        let worker = store
+            .list_terminal_workers_blocking()
+            .unwrap()
+            .into_iter()
+            .find(|worker| worker.worker_token == run_token)
+            .unwrap();
+        assert_eq!(worker.state, "abandoned");
+        assert!(
+            worker
+                .error
+                .unwrap()
+                .contains("supervised Codex process group was proven reaped")
+        );
+        if mutate_checkout {
+            fs::write(project_root.join("unexpected.txt"), "changed after crash\n").unwrap();
+            let error = prepare_agent_git_start_state_for_run(
+                &store,
+                &project,
+                AgentTaskSelection::NextTodo,
+                false,
+                false,
+                "replacement-run",
+            )
+            .unwrap_err();
+            assert!(format!("{error:#}").contains("unconsumed launch boundary"));
+            assert!(
+                store
+                    .git_launch_state_blocking(project.id, run_token)
+                    .unwrap()
+                    .is_some()
+            );
+        } else {
+            assert!(
+                prepare_agent_git_start_state_for_run(
+                    &store,
+                    &project,
+                    AgentTaskSelection::NextTodo,
+                    false,
+                    false,
+                    "replacement-run",
+                )
+                .unwrap()
+                .is_some()
+            );
+            assert!(
+                store
+                    .git_launch_state_blocking(project.id, run_token)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disconnected_no_session_reclaims_unchanged_launch_after_worker_abandonment() {
+        assert_disconnected_no_session_launch_recovery(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disconnected_no_session_preserves_launch_after_checkout_mutation() {
+        assert_disconnected_no_session_launch_recovery(true);
+    }
+
     struct FakeAgentRunner {
         result: AgentRunResult,
         ran_projects: Mutex<Vec<PathBuf>>,
@@ -24639,6 +32367,7 @@ mod tests {
             _task_selection: AgentTaskSelection,
             _resume_session_id: Option<&str>,
             _lease_holder: &str,
+            _run_token: Option<&str>,
             _shutdown: &AgentShutdownSignal,
         ) -> Result<AgentRunResult> {
             self.ran_projects.lock().unwrap().push(project.path.clone());
@@ -24689,6 +32418,126 @@ mod tests {
                 created_at,
             })
             .unwrap()
+    }
+
+    fn reserve_test_inline_worker(
+        store: &agent_store::TursoAgentStore,
+        project_id: i64,
+        worker_token: &str,
+        expected_lease_holder: &str,
+        worker_pid: u32,
+        observed_at: &str,
+    ) -> bool {
+        let service_label = format!("{AGENT_INLINE_WORKER_SERVICE_LABEL_PREFIX}{worker_token}");
+        store
+            .reserve_and_claim_worker_blocking(
+                agent_store::AgentWorkerReservation {
+                    project_id,
+                    worker_token,
+                    expected_lease_holder,
+                    max_active_workers: 12,
+                    protocol_version: AGENT_WORKER_PROTOCOL_VERSION,
+                    service_label: &service_label,
+                    binary_path: Path::new("/tmp/test-inline-clt"),
+                    command_arguments: "[]",
+                    path_env: OsStr::new("/usr/bin:/bin"),
+                    codex_path: None,
+                    task_selection: "next_todo",
+                    resume_session_id: None,
+                    created_at: observed_at,
+                },
+                worker_pid,
+                observed_at,
+            )
+            .unwrap()
+    }
+
+    struct InspectInlineOwnershipRunner {
+        state_dir: PathBuf,
+        break_lease_after_observation: bool,
+        observed_run_token: Mutex<Option<String>>,
+    }
+
+    impl AgentRunner for InspectInlineOwnershipRunner {
+        fn run_project(
+            &self,
+            project: &agent_store::AgentProject,
+            _task_selection: AgentTaskSelection,
+            _resume_session_id: Option<&str>,
+            lease_holder: &str,
+            run_token: Option<&str>,
+            _shutdown: &AgentShutdownSignal,
+        ) -> Result<AgentRunResult> {
+            let run_token = run_token.context("inline run did not receive its worker token")?;
+            assert_eq!(lease_holder, agent_worker_lease_holder(run_token));
+            assert!(inline_agent_worker_generation_is_registered(run_token));
+            let store = agent_store::TursoAgentStore::open_blocking(&self.state_dir)?;
+            let worker = store
+                .list_active_workers_blocking()?
+                .into_iter()
+                .find(|worker| worker.worker_token == run_token)
+                .context("inline worker was not durably visible to its runner")?;
+            assert_eq!(worker.state, AGENT_WORKER_STATE_RUNNING);
+            assert_eq!(worker.worker_pid, Some(std::process::id()));
+            assert!(is_inline_agent_worker(&worker));
+            *self.observed_run_token.lock().unwrap() = Some(run_token.to_string());
+            if self.break_lease_after_observation {
+                assert!(store.release_lease_blocking(project.id, lease_holder)?);
+            }
+            Ok(AgentRunResult {
+                status: "idle",
+                exit_code: Some(0),
+                log_dir: self.state_dir.join("runs/inline"),
+                stdout_path: self.state_dir.join("runs/inline/run.out"),
+                stderr_path: self.state_dir.join("runs/inline/run.err"),
+                summary: "inline ownership observed".to_string(),
+                codex_session_id: None,
+                session_run_token: None,
+                control_action: None,
+            })
+        }
+    }
+
+    fn prepare_inline_git_job(root: &Path) -> (PathBuf, AgentRunJob) {
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        add_task(&project_root, "inline Git task", None).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let mut project = store.list_projects_blocking().unwrap().remove(0);
+        assert!(
+            store
+                .set_project_git_mode_blocking(project.id, AgentGitMode::Commit)
+                .unwrap()
+        );
+        project.git_mode = AgentGitMode::Commit;
+        let holder = "foreground-inline-holder".to_string();
+        assert!(
+            store
+                .try_acquire_lease_blocking(
+                    project.id,
+                    &holder,
+                    &agent_timestamp(),
+                    &agent_timestamp_after(60),
+                )
+                .unwrap()
+        );
+        let job = AgentRunJob {
+            state_dir: state_dir.clone(),
+            project,
+            holder,
+            worker_token: None,
+            max_global_jobs: 12,
+            task_selection: AgentTaskSelection::NextTodo,
+            resume_session_id: None,
+            blocked_task_count_before: 0,
+            done_task_contents_before: Vec::new(),
+            blocked_task_snapshots_before: Vec::new(),
+        };
+        (state_dir, job)
     }
 
     fn assert_independent_worker_control_finalizes(action: AgentSessionControlAction) {
@@ -25660,6 +33509,25 @@ mod tests {
     }
 
     #[test]
+    fn working_git_task_updates_preserve_the_stable_payload() {
+        let identity = durable_task_identity("Implement durable finalization").unwrap();
+        ensure_working_task_content_preserves_identity(
+            "session-working",
+            &identity,
+            "Implement durable finalization\n\nCompletion note:\n- COMPLETED 2026-09-02: cargo test passed codex:session-working",
+        )
+        .unwrap();
+
+        let error = ensure_working_task_content_preserves_identity(
+            "session-working",
+            &identity,
+            "Implement a different feature codex:session-working",
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("cannot change its durable task payload"));
+    }
+
+    #[test]
     fn folder_task_stores_codex_session_marker_without_displaying_it() {
         let root = temp_root("folder-codex-session-marker");
         init_tasks(&root, true).unwrap();
@@ -26084,7 +33952,7 @@ mod tests {
             InteractiveGuardianDisposition::from_guardian_holder(
                 "clt-readonly-interactive-worker-42-generation"
             ),
-            Some(InteractiveGuardianDisposition::DeleteSharedReservation)
+            Some(InteractiveGuardianDisposition::PreserveSharedSession)
         );
         assert_eq!(
             InteractiveGuardianDisposition::from_guardian_holder(
@@ -27088,6 +34956,7 @@ mod tests {
                 _task_selection: AgentTaskSelection,
                 resume_session_id: Option<&str>,
                 lease_holder: &str,
+                _run_token: Option<&str>,
                 _shutdown: &AgentShutdownSignal,
             ) -> Result<AgentRunResult> {
                 let session_id = resume_session_id.unwrap();
@@ -27647,7 +35516,145 @@ mod tests {
     }
 
     #[test]
-    fn stale_idle_guardian_recovery_deletes_only_its_reservation_and_lease() {
+    fn completed_task_session_can_be_opened_repeatedly() {
+        let root = temp_root("interactive-completed-task-repeat");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        fs::write(
+            project_root.join("tasks/done.md"),
+            "# Done Tasks\n- finished task codex:session-123\n",
+        )
+        .unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project_id = store.list_projects_blocking().unwrap().remove(0).id;
+
+        let first_requester = InteractiveAgentLease::holder_for_idle_session();
+        assert!(
+            store
+                .try_acquire_lease_blocking(project_id, &first_requester, "100", "9999999999",)
+                .unwrap()
+        );
+        assert!(
+            store
+                .reserve_idle_session_interactive_blocking(
+                    project_id,
+                    "session-123",
+                    &first_requester,
+                    None,
+                )
+                .unwrap()
+        );
+        let first_disposition = InteractiveGuardianDisposition::from_handoff(
+            InteractiveCodexResumeMode::WritableIdle,
+            &first_requester,
+        );
+        assert_eq!(
+            first_disposition,
+            InteractiveGuardianDisposition::PreserveIdleSession
+        );
+        let first_guardian = interactive_guardian_holder(first_disposition);
+        assert!(
+            store
+                .adopt_interactive_guardian_blocking(
+                    project_id,
+                    Some("session-123"),
+                    &first_requester,
+                    &first_guardian,
+                    60,
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .finish_interactive_guardian_blocking(
+                    project_id,
+                    "session-123",
+                    &first_guardian,
+                    first_disposition,
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .session_control_blocking(project_id, "session-123")
+                .unwrap()
+                .unwrap()
+                .state,
+            AgentSessionControlState::Stopped
+        );
+        assert!(
+            codex_session_task_supports_interactive_resume(&project_root, "session-123").unwrap()
+        );
+
+        let second_requester = InteractiveAgentLease::holder_for_stopped_session();
+        assert!(
+            store
+                .try_acquire_lease_blocking(project_id, &second_requester, "100", "9999999999",)
+                .unwrap()
+        );
+        assert!(
+            store
+                .reserve_idle_session_interactive_blocking(
+                    project_id,
+                    "session-123",
+                    &second_requester,
+                    None,
+                )
+                .unwrap()
+        );
+        let second_disposition = InteractiveGuardianDisposition::from_handoff(
+            InteractiveCodexResumeMode::WritableIdle,
+            &second_requester,
+        );
+        assert_eq!(
+            second_disposition,
+            InteractiveGuardianDisposition::RestoreStopped
+        );
+        let second_guardian = interactive_guardian_holder(second_disposition);
+        assert!(
+            store
+                .adopt_interactive_guardian_blocking(
+                    project_id,
+                    Some("session-123"),
+                    &second_requester,
+                    &second_guardian,
+                    60,
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .finish_interactive_guardian_blocking(
+                    project_id,
+                    "session-123",
+                    &second_guardian,
+                    second_disposition,
+                )
+                .unwrap()
+        );
+        let preserved = store
+            .session_control_blocking(project_id, "session-123")
+            .unwrap()
+            .unwrap();
+        assert_eq!(preserved.state, AgentSessionControlState::Stopped);
+        assert!(preserved.interactive_holder.is_none());
+        assert!(
+            store
+                .lease_for_project_blocking(project_id)
+                .unwrap()
+                .is_none()
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stale_idle_guardian_recovery_preserves_the_session_and_releases_the_lease() {
         let root = temp_root("interactive-guardian-no-resume");
         let state_dir = root.join("state/clt");
         let project_root = root.join("project");
@@ -27701,7 +35708,7 @@ mod tests {
                     "session-123",
                     guardian_holder,
                     None,
-                    InteractiveGuardianDisposition::DeleteIdleReservation,
+                    InteractiveGuardianDisposition::PreserveIdleSession,
                 )
                 .unwrap()
         );
@@ -27711,12 +35718,13 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(
-            store
-                .session_controls_for_project_blocking(project_id)
-                .unwrap()
-                .is_empty()
-        );
+        let control = store
+            .session_control_blocking(project_id, "session-123")
+            .unwrap()
+            .unwrap();
+        assert_eq!(control.state, AgentSessionControlState::Stopped);
+        assert!(control.interactive_holder.is_none());
+        assert!(control.interactive_launch_token.is_none());
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -28736,7 +36744,7 @@ mod tests {
         );
 
         let guardian =
-            interactive_guardian_holder(InteractiveGuardianDisposition::DeleteSharedReservation);
+            interactive_guardian_holder(InteractiveGuardianDisposition::PreserveSharedSession);
         assert!(
             store
                 .adopt_interactive_guardian_blocking(
@@ -28797,16 +36805,16 @@ mod tests {
                     project_id,
                     "session-blocked",
                     &guardian,
-                    InteractiveGuardianDisposition::DeleteSharedReservation,
+                    InteractiveGuardianDisposition::PreserveSharedSession,
                 )
                 .unwrap()
         );
-        assert!(
-            store
-                .session_control_blocking(project_id, "session-blocked")
-                .unwrap()
-                .is_none()
-        );
+        let preserved = store
+            .session_control_blocking(project_id, "session-blocked")
+            .unwrap()
+            .unwrap();
+        assert_eq!(preserved.state, AgentSessionControlState::Stopped);
+        assert!(preserved.interactive_holder.is_none());
         assert_eq!(
             store
                 .session_control_blocking(project_id, "session-active")
@@ -28822,6 +36830,141 @@ mod tests {
                 .unwrap()
                 .holder,
             active_holder
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn writable_shared_interactive_reservation_rejects_durable_git_boundaries() {
+        let root = temp_root("writable-shared-interactive-git-boundaries");
+        let state_dir = root.join("state/clt");
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        let requester = InteractiveAgentLease::holder_for_shared_session(false);
+
+        let launch_root = root.join("launch-project");
+        fs::create_dir_all(&launch_root).unwrap();
+        let launch_root = fs::canonicalize(launch_root).unwrap();
+        store
+            .register_project_blocking(&launch_root, "launch-project")
+            .unwrap();
+        let launch_project = store
+            .list_projects_blocking()
+            .unwrap()
+            .into_iter()
+            .find(|project| project.path == launch_root)
+            .unwrap();
+        store
+            .set_session_control_state_blocking(
+                launch_project.id,
+                "session-active-launch",
+                AgentSessionControlState::Running,
+            )
+            .unwrap();
+        assert!(
+            store
+                .record_git_launch_state_blocking(
+                    launch_project.id,
+                    "launch-boundary-token",
+                    AgentGitMode::Commit,
+                    &AgentGitStartState {
+                        starting_head: "1111111111111111111111111111111111111111".to_string(),
+                        branch_ref: Some("refs/heads/master".to_string()),
+                        upstream_ref: None,
+                        worktree_baseline: r#"{"version":1,"tracked_patch_ids":{},"untracked_blob_ids":{},"require_clean":false}"#.to_string(),
+                    },
+                    "100",
+                )
+                .unwrap()
+        );
+        assert!(
+            !store
+                .reserve_shared_session_interactive_blocking(
+                    launch_project.id,
+                    "session-shared-launch",
+                    &requester,
+                    None,
+                )
+                .unwrap()
+        );
+
+        let finalization_root = root.join("finalization-project");
+        fs::create_dir_all(&finalization_root).unwrap();
+        let finalization_root = fs::canonicalize(finalization_root).unwrap();
+        store
+            .register_project_blocking(&finalization_root, "finalization-project")
+            .unwrap();
+        let finalization_project = store
+            .list_projects_blocking()
+            .unwrap()
+            .into_iter()
+            .find(|project| project.path == finalization_root)
+            .unwrap();
+        store
+            .set_session_control_state_blocking(
+                finalization_project.id,
+                "session-active-finalization",
+                AgentSessionControlState::Running,
+            )
+            .unwrap();
+        assert!(
+            store
+                .create_git_finalization_blocking(agent_store::NewGitFinalization {
+                    project_id: finalization_project.id,
+                    codex_session_id: "session-working-finalization",
+                    git_mode: AgentGitMode::Commit,
+                    starting_head: Some("1111111111111111111111111111111111111111"),
+                    branch_ref: Some("refs/heads/master"),
+                    upstream_ref: None,
+                    worktree_baseline: r#"{"version":1,"tracked_patch_ids":{},"untracked_blob_ids":{},"require_clean":false}"#,
+                    task_identity: None,
+                    owner_run_token: None,
+                    created_at: "100",
+                })
+                .unwrap()
+        );
+        assert!(
+            !store
+                .reserve_shared_session_interactive_blocking(
+                    finalization_project.id,
+                    "session-shared-finalization",
+                    &requester,
+                    None,
+                )
+                .unwrap()
+        );
+
+        let lease_root = root.join("lease-project");
+        fs::create_dir_all(&lease_root).unwrap();
+        let lease_root = fs::canonicalize(lease_root).unwrap();
+        store
+            .register_project_blocking(&lease_root, "lease-project")
+            .unwrap();
+        assert!(
+            store
+                .set_project_git_mode_for_path_blocking(&lease_root, AgentGitMode::Commit)
+                .unwrap()
+        );
+        let lease_project = store
+            .list_projects_blocking()
+            .unwrap()
+            .into_iter()
+            .find(|project| project.path == lease_root)
+            .unwrap();
+        assert!(
+            store
+                .try_acquire_lease_blocking(lease_project.id, "git-owner", "100", "999")
+                .unwrap()
+        );
+        assert!(
+            !store
+                .reserve_shared_session_interactive_blocking(
+                    lease_project.id,
+                    "session-shared-lease",
+                    &requester,
+                    None,
+                )
+                .unwrap()
         );
 
         fs::remove_dir_all(root).unwrap();
@@ -30611,7 +38754,7 @@ mod tests {
             InteractiveAgentLease::holder_for_idle_session(),
             InteractiveAgentLease::holder_for_stopped_session(),
             interactive_guardian_holder(InteractiveGuardianDisposition::ResumeExec),
-            interactive_guardian_holder(InteractiveGuardianDisposition::DeleteIdleReservation),
+            interactive_guardian_holder(InteractiveGuardianDisposition::PreserveIdleSession),
             interactive_guardian_holder(InteractiveGuardianDisposition::RestoreStopped),
         ] {
             assert_eq!(agent_lease_holder_pid(&holder), None);
@@ -31309,6 +39452,7 @@ mod tests {
             "model_targets",
             "agent_settings",
             "agent_workers",
+            "git_finalizations",
         ] {
             assert!(
                 store.table_exists_blocking(table).unwrap(),
@@ -31762,7 +39906,7 @@ mod tests {
                 .copied()
                 .unwrap()
         });
-        assert_eq!(migration_count, 16);
+        assert_eq!(migration_count, 17);
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -31951,6 +40095,4088 @@ mod tests {
     }
 
     #[test]
+    fn agent_store_git_finalization_crud_is_idempotent_and_generation_fenced() {
+        let root = temp_root("agent-store-git-finalization");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        store
+            .mark_session_running_blocking(
+                project.id,
+                "session-one",
+                123,
+                "run-one",
+                &root.join("session-one.out"),
+                &root.join("session-one.err"),
+            )
+            .unwrap();
+        store
+            .mark_session_running_blocking(
+                project.id,
+                "session-two",
+                124,
+                "run-two",
+                &root.join("session-two.out"),
+                &root.join("session-two.err"),
+            )
+            .unwrap();
+        let new_finalization = |codex_session_id: &'static str, owner_run_token: &'static str| {
+            agent_store::NewGitFinalization {
+                project_id: project.id,
+                codex_session_id,
+                git_mode: AgentGitMode::Commit,
+                starting_head: Some("1111111111111111111111111111111111111111"),
+                branch_ref: Some("refs/heads/master"),
+                upstream_ref: Some("refs/remotes/origin/master"),
+                worktree_baseline: r#"{"version":1,"tracked_patch_ids":{},"untracked_blob_ids":{},"require_clean":false}"#,
+                task_identity: None,
+                owner_run_token: Some(owner_run_token),
+                created_at: "100",
+            }
+        };
+
+        assert!(
+            !store
+                .create_git_finalization_blocking(new_finalization("session-one", "stale-run",))
+                .unwrap()
+        );
+        assert!(
+            store
+                .create_git_finalization_blocking(new_finalization("session-one", "run-one"))
+                .unwrap()
+        );
+        assert!(
+            !store
+                .create_git_finalization_blocking(new_finalization("session-one", "run-one"))
+                .unwrap()
+        );
+        assert!(
+            store
+                .create_git_finalization_blocking(new_finalization("session-two", "run-two"))
+                .unwrap()
+        );
+
+        let working = store
+            .git_finalization_blocking(project.id, "session-one")
+            .unwrap()
+            .unwrap();
+        assert_eq!(working.state, GitFinalizationState::Working);
+        assert_eq!(working.git_mode, AgentGitMode::Commit);
+        assert_eq!(working.owner_run_token.as_deref(), Some("run-one"));
+        assert_eq!(working.generation, 0);
+        assert_eq!(working.created_at, "100");
+        assert_eq!(working.updated_at, "100");
+        assert!(working.completed_at.is_none());
+        assert!(working.task_identity.is_none());
+        let working_two = store
+            .git_finalization_blocking(project.id, "session-two")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .list_pending_git_finalizations_blocking(Some(project.id))
+                .unwrap(),
+            vec![working.clone(), working_two.clone()]
+        );
+        assert!(
+            store
+                .compare_and_set_git_finalization_with_identity_blocking(
+                    project.id,
+                    "session-one",
+                    0,
+                    GitFinalizationState::Tracking,
+                    "first task",
+                    Some("run-one"),
+                    "101",
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .compare_and_set_git_finalization_with_identity_blocking(
+                    project.id,
+                    "session-two",
+                    0,
+                    GitFinalizationState::Tracking,
+                    "second task",
+                    Some("run-two"),
+                    "101",
+                )
+                .is_err()
+        );
+        let tracking = store
+            .git_finalization_blocking(project.id, "session-one")
+            .unwrap()
+            .unwrap();
+        assert_eq!(tracking.state, GitFinalizationState::Tracking);
+        assert_eq!(tracking.task_identity.as_deref(), Some("first task"));
+        assert_eq!(
+            store
+                .list_pending_git_finalizations_blocking(Some(project.id))
+                .unwrap(),
+            vec![working_two.clone(), tracking]
+        );
+
+        assert!(
+            !store
+                .compare_and_set_git_finalization_blocking(
+                    project.id,
+                    "session-one",
+                    9,
+                    GitFinalizationState::CommitPending,
+                    Some("run-one"),
+                    None,
+                    None,
+                    "101",
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .compare_and_set_git_finalization_blocking(
+                    project.id,
+                    "session-one",
+                    1,
+                    GitFinalizationState::CommitPending,
+                    Some("run-one"),
+                    None,
+                    Some("commit not attempted yet"),
+                    "101",
+                )
+                .unwrap()
+        );
+        assert!(
+            !store
+                .compare_and_set_git_finalization_blocking(
+                    project.id,
+                    "session-one",
+                    1,
+                    GitFinalizationState::CommitPending,
+                    Some("run-one"),
+                    None,
+                    None,
+                    "102",
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .compare_and_set_git_finalization_blocking(
+                    project.id,
+                    "session-one",
+                    2,
+                    GitFinalizationState::CommitPending,
+                    Some("run-one"),
+                    Some("2222222222222222222222222222222222222222"),
+                    None,
+                    "102",
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .compare_and_set_git_finalization_blocking(
+                    project.id,
+                    "session-one",
+                    3,
+                    GitFinalizationState::Completed,
+                    None,
+                    None,
+                    None,
+                    "103",
+                )
+                .unwrap()
+        );
+
+        let completed = store
+            .git_finalization_blocking(project.id, "session-one")
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.state, GitFinalizationState::Completed);
+        assert_eq!(completed.generation, 4);
+        assert_eq!(
+            completed.commit_oid.as_deref(),
+            Some("2222222222222222222222222222222222222222")
+        );
+        assert_eq!(completed.completed_at.as_deref(), Some("103"));
+        assert_eq!(
+            store
+                .list_pending_git_finalizations_blocking(Some(project.id))
+                .unwrap(),
+            vec![working_two]
+        );
+
+        assert!(
+            !store
+                .create_git_finalization_blocking(new_finalization("session-two", "run-two"))
+                .unwrap()
+        );
+        assert!(
+            !store
+                .delete_terminal_git_finalization_blocking(project.id, "session-two")
+                .unwrap()
+        );
+        assert!(
+            store
+                .compare_and_set_git_finalization_blocking(
+                    project.id,
+                    "session-two",
+                    0,
+                    GitFinalizationState::Cancelled,
+                    None,
+                    None,
+                    None,
+                    "104",
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .delete_terminal_git_finalization_blocking(project.id, "session-one")
+                .unwrap()
+        );
+        assert!(
+            store
+                .delete_terminal_git_finalization_blocking(project.id, "session-two")
+                .unwrap()
+        );
+        assert!(
+            store
+                .git_finalization_blocking(project.id, "session-one")
+                .unwrap()
+                .is_none()
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn push_pending_commit_oid_cannot_be_replaced() {
+        let root = temp_root("agent-store-push-pending-immutable-oid");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert!(
+            store
+                .create_git_finalization_blocking(agent_store::NewGitFinalization {
+                    project_id: project.id,
+                    codex_session_id: "session-immutable-push",
+                    git_mode: AgentGitMode::CommitAndPush,
+                    starting_head: Some("1111111111111111111111111111111111111111"),
+                    branch_ref: Some("refs/heads/master"),
+                    upstream_ref: Some("refs/remotes/origin/master"),
+                    worktree_baseline: r#"{"version":1,"tracked_patch_ids":{},"untracked_blob_ids":{},"require_clean":false}"#,
+                    task_identity: Some("immutable push"),
+                    owner_run_token: None,
+                    created_at: "100",
+                })
+                .unwrap()
+        );
+        for (generation, state, commit_oid) in [
+            (0, GitFinalizationState::Tracking, None),
+            (1, GitFinalizationState::CommitPending, None),
+            (
+                2,
+                GitFinalizationState::PushPending,
+                Some("2222222222222222222222222222222222222222"),
+            ),
+        ] {
+            assert!(
+                store
+                    .compare_and_set_git_finalization_blocking(
+                        project.id,
+                        "session-immutable-push",
+                        generation,
+                        state,
+                        None,
+                        commit_oid,
+                        None,
+                        "101",
+                    )
+                    .unwrap()
+            );
+        }
+
+        let error = store
+            .compare_and_set_git_finalization_blocking(
+                project.id,
+                "session-immutable-push",
+                3,
+                GitFinalizationState::PushPending,
+                None,
+                Some("3333333333333333333333333333333333333333"),
+                Some("retry must retain the sealed commit"),
+                "102",
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("commit OID cannot change once recorded"));
+        let pending = store
+            .git_finalization_blocking(project.id, "session-immutable-push")
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.state, GitFinalizationState::PushPending);
+        assert_eq!(pending.generation, 3);
+        assert_eq!(
+            pending.commit_oid.as_deref(),
+            Some("2222222222222222222222222222222222222222")
+        );
+        assert!(pending.last_error.is_none());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn automated_done_is_provisional_until_the_exact_task_commit_is_proven() {
+        let root = temp_root("automated-git-finalization-proof");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        fs::write(
+            project_root.join("tasks/doing.md"),
+            "# Doing Tasks\n- Ship feature — COMPLETED 2026-09-02: cargo test passed codex:session-proof\n",
+        )
+        .unwrap();
+        let starting_head = initialize_test_git_repository(&project_root);
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        assert!(
+            store
+                .set_project_git_mode_for_path_blocking(&project_root, AgentGitMode::Commit,)
+                .unwrap()
+        );
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        store
+            .mark_session_running_blocking(
+                project.id,
+                "session-proof",
+                123,
+                "run-proof",
+                &root.join("proof.out"),
+                &root.join("proof.err"),
+            )
+            .unwrap();
+        let git_start = capture_agent_git_start_state(&project_root, AgentGitMode::Commit).unwrap();
+        ensure_agent_git_working_record(
+            &store,
+            &project,
+            "session-proof",
+            "run-proof",
+            Some(&git_start),
+        )
+        .unwrap();
+        assert!(
+            bind_agent_git_working_task_identity(&store, &project, "session-proof", "run-proof",)
+                .unwrap()
+        );
+        fs::write(project_root.join("feature.txt"), "implemented\n").unwrap();
+        run_test_git(&project_root, &["add", "feature.txt"]);
+
+        move_task_to_done_with_agent_store(
+            &project_root,
+            "doing",
+            "1",
+            &AutomatedAgentChildContext {
+                project_id: project.id,
+                run_token: "run-proof".to_string(),
+            },
+            &store,
+        )
+        .unwrap();
+
+        assert!(read_tasks(&project_root, "doing").unwrap().is_empty());
+        assert_eq!(read_tasks(&project_root, "done").unwrap().len(), 1);
+        let pending = store
+            .git_finalization_blocking(project.id, "session-proof")
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.state, GitFinalizationState::CommitPending);
+        assert_eq!(
+            pending.starting_head.as_deref(),
+            Some(starting_head.as_str())
+        );
+
+        run_test_git(&project_root, &["add", "--all"]);
+        run_test_agent_git(
+            &project_root,
+            &[
+                "commit",
+                "-m",
+                "Ship feature",
+                "-m",
+                "CLT-Task: codex:session-proof",
+            ],
+        );
+        let committed_head = run_test_git(&project_root, &["rev-parse", "HEAD"]);
+        let completed = reconcile_agent_git_finalization(
+            &store,
+            &project_root,
+            pending,
+            Some("run-proof"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(completed.state, GitFinalizationState::Completed);
+        assert_eq!(
+            completed.commit_oid.as_deref(),
+            Some(committed_head.as_str())
+        );
+
+        let acknowledged_again = reconcile_agent_git_finalization(
+            &store,
+            &project_root,
+            completed,
+            Some("run-proof"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(acknowledged_again.state, GitFinalizationState::Completed);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_start_journal_is_not_reconstructed_from_completed_evidence() {
+        let root = temp_root("automated-git-missing-start-journal");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        fs::write(
+            project_root.join("tasks/done.md"),
+            "# Done Tasks\n- Already finished — COMPLETED 2026-09-02: checked codex:session-no-journal\n",
+        )
+        .unwrap();
+        initialize_test_git_repository(&project_root);
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        store
+            .set_project_git_mode_for_path_blocking(&project_root, AgentGitMode::Commit)
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        store
+            .mark_session_running_blocking(
+                project.id,
+                "session-no-journal",
+                123,
+                "run-no-journal",
+                &root.join("missing.out"),
+                &root.join("missing.err"),
+            )
+            .unwrap();
+        let late_snapshot =
+            capture_agent_git_start_state(&project_root, AgentGitMode::Commit).unwrap();
+
+        let error = ensure_agent_git_working_record(
+            &store,
+            &project,
+            "session-no-journal",
+            "run-no-journal",
+            Some(&late_snapshot),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("cannot safely reconstruct"));
+        assert!(
+            store
+                .git_finalization_blocking(project.id, "session-no-journal")
+                .unwrap()
+                .is_none()
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn git_enabled_task_must_exist_in_the_frozen_commit() {
+        let root = temp_root("automated-git-untracked-task");
+        let project_root = root.join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        fs::write(project_root.join("README.md"), "tracked\n").unwrap();
+        initialize_test_git_repository(&project_root);
+        init_tasks(&project_root, false).unwrap();
+        fs::write(
+            project_root.join("tasks/todo.md"),
+            "# Todo Tasks\n- Untracked task\n",
+        )
+        .unwrap();
+        let start = capture_agent_git_start_state(&project_root, AgentGitMode::Commit).unwrap();
+
+        let error = require_agent_git_start_task_identity(
+            &project_root,
+            &start.starting_head,
+            &durable_task_identity("Untracked task").unwrap(),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("committed exactly once"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn prelaunch_git_snapshot_rejects_work_before_task_activation() {
+        let root = temp_root("automated-git-prelaunch-snapshot");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        fs::write(
+            project_root.join("tasks/todo.md"),
+            "# Todo Tasks\n- Start first\n",
+        )
+        .unwrap();
+        initialize_test_git_repository(&project_root);
+        let start = capture_agent_git_start_state(&project_root, AgentGitMode::Commit).unwrap();
+        fs::write(project_root.join("too-early.txt"), "implementation\n").unwrap();
+
+        let error =
+            verify_agent_git_start_state_unchanged(&project_root, AgentGitMode::Commit, &start)
+                .unwrap_err();
+        assert!(format!("{error:#}").contains("changed after CLT froze"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scheduler_owned_git_launch_state_is_required_and_consumed_at_activation() {
+        let root = temp_root("automated-git-server-launch-state");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        fs::write(
+            project_root.join("tasks/todo.md"),
+            "# Todo Tasks\n- Start from durable launch state\n",
+        )
+        .unwrap();
+        initialize_test_git_repository(&project_root);
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        store
+            .set_project_git_mode_for_path_blocking(&project_root, AgentGitMode::Commit)
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        store
+            .mark_session_running_blocking(
+                project.id,
+                "session-launch-state",
+                123,
+                "run-launch-state",
+                &root.join("launch.out"),
+                &root.join("launch.err"),
+            )
+            .unwrap();
+        let context = AutomatedAgentChildContext {
+            project_id: project.id,
+            run_token: "run-launch-state".to_string(),
+        };
+
+        let error = move_task_to_doing_with_agent_git_journal(
+            &project_root,
+            "1",
+            &context,
+            &project,
+            &store,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("no atomically registered Working Git journal"));
+        assert_eq!(read_tasks(&project_root, "todo").unwrap().len(), 1);
+        assert!(read_tasks(&project_root, "doing").unwrap().is_empty());
+        assert!(
+            store
+                .git_finalization_blocking(project.id, "session-launch-state")
+                .unwrap()
+                .is_none()
+        );
+
+        let launch = capture_agent_git_start_state(&project_root, AgentGitMode::Commit).unwrap();
+        store
+            .record_git_launch_state_blocking(
+                project.id,
+                "run-launch-state",
+                AgentGitMode::Commit,
+                &launch,
+                "100",
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .git_launch_state_blocking(project.id, "run-launch-state")
+                .unwrap(),
+            Some((AgentGitMode::Commit, launch.clone()))
+        );
+        store
+            .mark_session_running_with_git_finalization_blocking(
+                project.id,
+                "session-launch-state",
+                123,
+                "run-launch-state",
+                &root.join("launch.out"),
+                &root.join("launch.err"),
+                AgentGitMode::Commit,
+            )
+            .unwrap();
+        let unbound = store
+            .git_finalization_blocking(project.id, "session-launch-state")
+            .unwrap()
+            .unwrap();
+        assert_eq!(unbound.state, GitFinalizationState::Working);
+        assert_eq!(unbound.task_identity, None);
+        assert_eq!(
+            unbound.starting_head.as_deref(),
+            Some(launch.starting_head.as_str())
+        );
+        assert!(
+            store
+                .git_launch_state_blocking(project.id, "run-launch-state")
+                .unwrap()
+                .is_none()
+        );
+
+        move_task_to_doing_with_agent_git_journal(&project_root, "1", &context, &project, &store)
+            .unwrap();
+        assert!(read_tasks(&project_root, "todo").unwrap().is_empty());
+        assert_eq!(read_tasks(&project_root, "doing").unwrap().len(), 1);
+        assert!(
+            store
+                .git_launch_state_blocking(project.id, "run-launch-state")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .git_finalization_blocking(project.id, "session-launch-state")
+                .unwrap()
+                .unwrap()
+                .state,
+            GitFinalizationState::Working
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unconsumed_git_launch_boundary_cannot_be_overwritten_after_release() {
+        let root = temp_root("automated-git-unconsumed-launch");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        fs::write(
+            project_root.join("tasks/todo.md"),
+            "# Todo Tasks\n- Preserve the first launch boundary\n",
+        )
+        .unwrap();
+        initialize_test_git_repository(&project_root);
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        store
+            .set_project_git_mode_for_path_blocking(&project_root, AgentGitMode::Commit)
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        let first = capture_agent_git_start_state(&project_root, AgentGitMode::Commit).unwrap();
+        assert!(
+            store
+                .record_git_launch_state_blocking(
+                    project.id,
+                    "released-run-a",
+                    AgentGitMode::Commit,
+                    &first,
+                    "100",
+                )
+                .unwrap()
+        );
+
+        fs::write(
+            project_root.join("unregistered-work.txt"),
+            "made after release\n",
+        )
+        .unwrap();
+        run_test_git(&project_root, &["add", "unregistered-work.txt"]);
+        run_test_git(&project_root, &["commit", "-m", "Work from ambiguous run"]);
+        let later = capture_agent_git_start_state(&project_root, AgentGitMode::Commit).unwrap();
+        assert_ne!(later.starting_head, first.starting_head);
+
+        let error = prepare_agent_git_start_state_for_run(
+            &store,
+            &project,
+            AgentTaskSelection::NextTodo,
+            false,
+            false,
+            "new-run-b",
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("unconsumed launch boundary"));
+        let record_error = store
+            .record_git_launch_state_blocking(
+                project.id,
+                "new-run-b",
+                AgentGitMode::Commit,
+                &later,
+                "101",
+            )
+            .unwrap_err();
+        assert!(format!("{record_error:#}").contains("refusing to replace"));
+        assert_eq!(
+            store
+                .git_launch_state_blocking(project.id, "released-run-a")
+                .unwrap(),
+            Some((AgentGitMode::Commit, first))
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unchanged_launch_boundary_is_reclaimed_only_after_its_worker_is_dead() {
+        let root = temp_root("automated-git-unchanged-launch-reclaim");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        fs::write(
+            project_root.join("tasks/todo.md"),
+            "# Todo Tasks\n- Retry after a pre-registration crash\n",
+        )
+        .unwrap();
+        initialize_test_git_repository(&project_root);
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        store
+            .set_project_git_mode_for_path_blocking(&project_root, AgentGitMode::Commit)
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert!(
+            store
+                .try_acquire_lease_blocking(project.id, "scheduler", "100", "999")
+                .unwrap()
+        );
+        assert!(reserve_test_worker(
+            &store,
+            project.id,
+            "dead-launch-worker",
+            "scheduler",
+            "101",
+            12,
+        ));
+        assert!(
+            store
+                .claim_worker_blocking("dead-launch-worker", 123, "102")
+                .unwrap()
+        );
+        let launch = capture_agent_git_start_state(&project_root, AgentGitMode::Commit).unwrap();
+        store
+            .record_git_launch_state_blocking(
+                project.id,
+                "dead-launch-worker",
+                AgentGitMode::Commit,
+                &launch,
+                "103",
+            )
+            .unwrap();
+        assert!(
+            store
+                .abandon_worker_blocking(agent_store::AgentWorkerAbandonment {
+                    worker_token: "dead-launch-worker",
+                    expected_state: "running",
+                    expected_worker_pid: Some(123),
+                    expected_heartbeat_at: Some("102"),
+                    finished_at: "104",
+                    error: "simulated crash before session registration",
+                    permitted_successor_holder: None,
+                })
+                .unwrap()
+        );
+
+        let recovered = prepare_agent_git_start_state_for_run(
+            &store,
+            &project,
+            AgentTaskSelection::NextTodo,
+            false,
+            false,
+            "replacement-worker",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(recovered, launch);
+        assert!(
+            store
+                .git_launch_state_blocking(project.id, "dead-launch-worker")
+                .unwrap()
+                .is_none()
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn terminal_worker_launch_reclaim_waits_for_every_exact_session_row() {
+        let root = temp_root("automated-git-launch-session-fence");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        fs::write(
+            project_root.join("tasks/todo.md"),
+            "# Todo Tasks\n- Preserve a session-bound launch\n",
+        )
+        .unwrap();
+        initialize_test_git_repository(&project_root);
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        store
+            .set_project_git_mode_for_path_blocking(&project_root, AgentGitMode::Commit)
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert!(
+            store
+                .try_acquire_lease_blocking(project.id, "scheduler", "100", "999")
+                .unwrap()
+        );
+        assert!(reserve_test_worker(
+            &store,
+            project.id,
+            "session-bound-launch-worker",
+            "scheduler",
+            "101",
+            12,
+        ));
+        assert!(
+            store
+                .claim_worker_blocking("session-bound-launch-worker", 123, "102")
+                .unwrap()
+        );
+        let launch = capture_agent_git_start_state(&project_root, AgentGitMode::Commit).unwrap();
+        assert!(
+            store
+                .record_git_launch_state_blocking(
+                    project.id,
+                    "session-bound-launch-worker",
+                    AgentGitMode::Commit,
+                    &launch,
+                    "103",
+                )
+                .unwrap()
+        );
+        store
+            .set_session_control_recovery_token_blocking(
+                project.id,
+                "session-survives-reap",
+                "session-bound-launch-worker",
+            )
+            .unwrap();
+        assert!(
+            store
+                .abandon_worker_blocking(agent_store::AgentWorkerAbandonment {
+                    worker_token: "session-bound-launch-worker",
+                    expected_state: "running",
+                    expected_worker_pid: Some(123),
+                    expected_heartbeat_at: Some("102"),
+                    finished_at: "104",
+                    error: "simulated reap with a durable session row",
+                    permitted_successor_holder: None,
+                })
+                .unwrap()
+        );
+
+        assert!(
+            !store
+                .reclaim_unchanged_git_launch_state_blocking(
+                    project.id,
+                    "session-bound-launch-worker",
+                    AgentGitMode::Commit,
+                    &launch,
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .git_launch_state_blocking(project.id, "session-bound-launch-worker")
+                .unwrap()
+                .is_some()
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn atomic_git_session_registration_rolls_back_without_a_launch_boundary() {
+        let root = temp_root("automated-git-session-registration-rollback");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+
+        let error = store
+            .mark_session_running_with_git_finalization_blocking(
+                project.id,
+                "session-without-launch",
+                123,
+                "run-without-launch",
+                &root.join("missing.out"),
+                &root.join("missing.err"),
+                AgentGitMode::Commit,
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("no compatible scheduler-owned Git launch state"));
+        assert!(
+            store
+                .session_control_blocking(project.id, "session-without-launch")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .git_finalization_blocking(project.id, "session-without-launch")
+                .unwrap()
+                .is_none()
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn git_start_capture_rejects_detached_head() {
+        let root = temp_root("automated-git-detached-head");
+        init_tasks(&root, false).unwrap();
+        initialize_test_git_repository(&root);
+        run_test_git(&root, &["checkout", "--detach"]);
+
+        let error = capture_agent_git_start_state(&root, AgentGitMode::Commit).unwrap_err();
+        assert!(format!("{error:#}").contains("attached branch"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn git_start_preflight_rejects_unsafe_mixed_board_storage() {
+        let first = temp_root("automated-git-mixed-doing-done");
+        init_tasks(&first, false).unwrap();
+        fs::remove_file(first.join("tasks/doing.md")).unwrap();
+        fs::create_dir(first.join("tasks/doing")).unwrap();
+        let error = require_agent_git_board_storage_compatible(&first).unwrap_err();
+        assert!(format!("{error:#}").contains("folder-backed Done"));
+
+        let second = temp_root("automated-git-mixed-todo-doing");
+        init_tasks(&second, true).unwrap();
+        fs::remove_dir(second.join("tasks/doing")).unwrap();
+        fs::write(second.join("tasks/doing.md"), "# Doing Tasks\n").unwrap();
+        let error = require_agent_git_board_storage_compatible(&second).unwrap_err();
+        assert!(format!("{error:#}").contains("folder-backed Doing"));
+
+        fs::remove_dir_all(first).unwrap();
+        fs::remove_dir_all(second).unwrap();
+    }
+
+    #[test]
+    fn git_start_preflight_rejects_an_uncommitted_todo_before_launch() {
+        let root = temp_root("automated-git-uncommitted-todo");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        initialize_test_git_repository(&project_root);
+        fs::write(
+            project_root.join("tasks/todo.md"),
+            "# Todo Tasks\n- This task exists only in the worktree\n",
+        )
+        .unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        store
+            .set_project_git_mode_for_path_blocking(&project_root, AgentGitMode::Commit)
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+
+        let error = prepare_agent_git_start_state_for_run(
+            &store,
+            &project,
+            AgentTaskSelection::NextTodo,
+            false,
+            false,
+            "uncommitted-run",
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("not committed exactly once"));
+        assert!(
+            store
+                .git_launch_state_blocking(project.id, "uncommitted-run")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .list_pending_git_finalizations_blocking(Some(project.id))
+                .unwrap()
+                .is_empty()
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_git_sync_fast_forwards_before_the_launch_snapshot() {
+        let root = temp_root("automated-git-startup-sync");
+        let project_root = root.join("project");
+        let peer_root = root.join("peer");
+        let remote_root = root.join("remote.git");
+        init_tasks(&project_root, false).unwrap();
+        initialize_test_git_repository(&project_root);
+        fs::create_dir_all(&remote_root).unwrap();
+        run_test_git(&remote_root, &["init", "--bare"]);
+        run_test_git(
+            &project_root,
+            &["remote", "add", "origin", remote_root.to_str().unwrap()],
+        );
+        run_test_git(&project_root, &["push", "-u", "origin", "HEAD"]);
+        run_test_git(
+            &root,
+            &[
+                "clone",
+                remote_root.to_str().unwrap(),
+                peer_root.to_str().unwrap(),
+            ],
+        );
+        run_test_git(&peer_root, &["config", "user.name", "CLT Peer"]);
+        run_test_git(
+            &peer_root,
+            &["config", "user.email", "clt-peer@example.invalid"],
+        );
+        fs::write(peer_root.join("upstream.txt"), "upstream\n").unwrap();
+        run_test_git(&peer_root, &["add", "upstream.txt"]);
+        run_test_git(&peer_root, &["commit", "-m", "Advance upstream"]);
+        run_test_git(&peer_root, &["push"]);
+        let expected_head = run_test_git(&peer_root, &["rev-parse", "HEAD"]);
+        fs::write(project_root.join("untracked-local.txt"), "preserve me\n").unwrap();
+
+        synchronize_agent_git_checkout_before_launch(&project_root).unwrap();
+
+        assert_eq!(
+            run_test_git(&project_root, &["rev-parse", "HEAD"]),
+            expected_head
+        );
+        assert_eq!(
+            fs::read_to_string(project_root.join("untracked-local.txt")).unwrap(),
+            "preserve me\n"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_git_sync_rechecks_board_storage_after_fast_forward() {
+        let root = temp_root("automated-git-startup-storage-change");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        let peer_root = root.join("peer");
+        let remote_root = root.join("remote.git");
+        init_tasks(&project_root, false).unwrap();
+        fs::write(
+            project_root.join("tasks/todo.md"),
+            "# Todo Tasks\n- Refuse an unsafe upstream board layout\n",
+        )
+        .unwrap();
+        initialize_test_git_repository(&project_root);
+        fs::create_dir_all(&remote_root).unwrap();
+        run_test_git(&remote_root, &["init", "--bare"]);
+        run_test_git(
+            &project_root,
+            &["remote", "add", "origin", remote_root.to_str().unwrap()],
+        );
+        run_test_git(&project_root, &["push", "-u", "origin", "HEAD"]);
+        run_test_git(
+            &root,
+            &[
+                "clone",
+                remote_root.to_str().unwrap(),
+                peer_root.to_str().unwrap(),
+            ],
+        );
+        run_test_git(&peer_root, &["config", "user.name", "CLT Peer"]);
+        run_test_git(
+            &peer_root,
+            &["config", "user.email", "clt-peer@example.invalid"],
+        );
+        run_test_git(&peer_root, &["rm", "tasks/doing.md"]);
+        fs::create_dir(peer_root.join("tasks/doing")).unwrap();
+        fs::write(peer_root.join("tasks/doing/.gitkeep"), "").unwrap();
+        run_test_git(&peer_root, &["add", "tasks/doing/.gitkeep"]);
+        run_test_git(
+            &peer_root,
+            &["commit", "-m", "Make only Doing folder-backed"],
+        );
+        run_test_git(&peer_root, &["push"]);
+        let upstream_head = run_test_git(&peer_root, &["rev-parse", "HEAD"]);
+
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        store
+            .set_project_git_mode_for_path_blocking(&project_root, AgentGitMode::Commit)
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        let error = prepare_agent_git_start_state_for_run(
+            &store,
+            &project,
+            AgentTaskSelection::NextTodo,
+            false,
+            false,
+            "storage-change-run",
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("folder-backed Done"));
+        assert_eq!(
+            run_test_git(&project_root, &["rev-parse", "HEAD"]),
+            upstream_head
+        );
+        assert!(
+            store
+                .git_launch_state_blocking(project.id, "storage-change-run")
+                .unwrap()
+                .is_none()
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_git_sync_rejects_divergence_without_rewriting_local_history() {
+        let root = temp_root("automated-git-startup-sync-diverged");
+        let project_root = root.join("project");
+        let peer_root = root.join("peer");
+        let remote_root = root.join("remote.git");
+        init_tasks(&project_root, false).unwrap();
+        initialize_test_git_repository(&project_root);
+        fs::create_dir_all(&remote_root).unwrap();
+        run_test_git(&remote_root, &["init", "--bare"]);
+        run_test_git(
+            &project_root,
+            &["remote", "add", "origin", remote_root.to_str().unwrap()],
+        );
+        run_test_git(&project_root, &["push", "-u", "origin", "HEAD"]);
+        run_test_git(
+            &root,
+            &[
+                "clone",
+                remote_root.to_str().unwrap(),
+                peer_root.to_str().unwrap(),
+            ],
+        );
+        run_test_git(&peer_root, &["config", "user.name", "CLT Peer"]);
+        run_test_git(
+            &peer_root,
+            &["config", "user.email", "clt-peer@example.invalid"],
+        );
+        fs::write(peer_root.join("upstream.txt"), "upstream\n").unwrap();
+        run_test_git(&peer_root, &["add", "upstream.txt"]);
+        run_test_git(&peer_root, &["commit", "-m", "Advance upstream"]);
+        run_test_git(&peer_root, &["push"]);
+        fs::write(project_root.join("local.txt"), "local\n").unwrap();
+        run_test_git(&project_root, &["add", "local.txt"]);
+        run_test_git(&project_root, &["commit", "-m", "Advance locally"]);
+        let local_head = run_test_git(&project_root, &["rev-parse", "HEAD"]);
+
+        let error = synchronize_agent_git_checkout_before_launch(&project_root).unwrap_err();
+
+        assert!(format!("{error:#}").contains("Failed to fast-forward"));
+        assert_eq!(
+            run_test_git(&project_root, &["rev-parse", "HEAD"]),
+            local_head
+        );
+        assert_eq!(
+            fs::read_to_string(project_root.join("local.txt")).unwrap(),
+            "local\n"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn working_git_link_race_fixture(
+        name: &str,
+        task: &str,
+        session_id: &str,
+        run_token: &str,
+    ) -> (
+        PathBuf,
+        PathBuf,
+        agent_store::TursoAgentStore,
+        agent_store::GitFinalizationRecord,
+    ) {
+        let root = temp_root(name);
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        fs::write(
+            project_root.join("tasks/todo.md"),
+            format!("# Todo Tasks\n- {task}\n"),
+        )
+        .unwrap();
+        initialize_test_git_repository(&project_root);
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        store
+            .mark_session_running_blocking(
+                project.id,
+                session_id,
+                123,
+                run_token,
+                &root.join("race.out"),
+                &root.join("race.err"),
+            )
+            .unwrap();
+        let start = capture_agent_git_start_state(&project_root, AgentGitMode::Commit).unwrap();
+        let task_identity = durable_task_identity(task).unwrap();
+        assert!(
+            store
+                .create_git_finalization_blocking(agent_store::NewGitFinalization {
+                    project_id: project.id,
+                    codex_session_id: session_id,
+                    git_mode: AgentGitMode::Commit,
+                    starting_head: Some(&start.starting_head),
+                    branch_ref: start.branch_ref.as_deref(),
+                    upstream_ref: start.upstream_ref.as_deref(),
+                    worktree_baseline: &start.worktree_baseline,
+                    task_identity: Some(&task_identity),
+                    owner_run_token: Some(run_token),
+                    created_at: "100",
+                })
+                .unwrap()
+        );
+        let finalization = store
+            .git_finalization_blocking(project.id, session_id)
+            .unwrap()
+            .unwrap();
+        (root, project_root, store, finalization)
+    }
+
+    #[test]
+    fn working_cancellation_wins_before_link_repair_without_mutating_the_board() {
+        let task = "Cancel before repairing the link";
+        let session_id = "session-cancel-first";
+        let run_token = "run-cancel-first";
+        let (root, project_root, store, finalization) = working_git_link_race_fixture(
+            "automated-git-working-cancel-first",
+            task,
+            session_id,
+            run_token,
+        );
+        let state_dir = root.join("state/clt");
+        let (cancel_holding_tx, cancel_holding_rx) = mpsc::channel();
+        let (release_cancel_tx, release_cancel_rx) = mpsc::channel();
+        let cancel_state_dir = state_dir.clone();
+        let cancel_project_root = project_root.clone();
+        let cancel_finalization = finalization.clone();
+        let cancel_thread = thread::spawn(move || {
+            let store = agent_store::TursoAgentStore::open_blocking(&cancel_state_dir).unwrap();
+            cancel_unlinked_working_git_finalization_with_lock_callbacks(
+                &store,
+                &cancel_project_root,
+                &cancel_finalization,
+                run_token,
+                || {},
+                move || {
+                    cancel_holding_tx.send(()).unwrap();
+                    release_cancel_rx
+                        .recv_timeout(Duration::from_secs(2))
+                        .expect("cancellation was not released");
+                },
+                || {},
+            )
+            .unwrap()
+        });
+        cancel_holding_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("cancellation did not acquire the board lock");
+
+        let (repair_contended_tx, repair_contended_rx) = mpsc::channel();
+        let repair_state_dir = state_dir.clone();
+        let repair_project_root = project_root.clone();
+        let repair_finalization = finalization.clone();
+        let repair_thread = thread::spawn(move || {
+            let store = agent_store::TursoAgentStore::open_blocking(&repair_state_dir).unwrap();
+            repair_working_git_task_link_with_lock_callbacks(
+                &store,
+                &repair_project_root,
+                &repair_finalization,
+                || {},
+                || {},
+                move || repair_contended_tx.send(()).unwrap(),
+            )
+            .unwrap()
+        });
+        repair_contended_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("repair did not wait for cancellation's board lock");
+        release_cancel_tx.send(()).unwrap();
+
+        assert!(cancel_thread.join().unwrap());
+        assert!(!repair_thread.join().unwrap());
+        assert_eq!(
+            read_tasks(&project_root, "todo").unwrap(),
+            vec![format!("- {task}")]
+        );
+        assert!(read_tasks(&project_root, "doing").unwrap().is_empty());
+        let current = store
+            .git_finalization_blocking(finalization.project_id, session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.state, GitFinalizationState::Cancelled);
+        assert_eq!(current.generation, finalization.generation + 1);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn working_link_repair_wins_before_idle_cancellation() {
+        let task = "Repair before cancelling the journal";
+        let session_id = "session-repair-first";
+        let run_token = "run-repair-first";
+        let (root, project_root, store, finalization) = working_git_link_race_fixture(
+            "automated-git-working-repair-first",
+            task,
+            session_id,
+            run_token,
+        );
+        let state_dir = root.join("state/clt");
+        let (repair_holding_tx, repair_holding_rx) = mpsc::channel();
+        let (release_repair_tx, release_repair_rx) = mpsc::channel();
+        let repair_state_dir = state_dir.clone();
+        let repair_project_root = project_root.clone();
+        let repair_finalization = finalization.clone();
+        let repair_thread = thread::spawn(move || {
+            let store = agent_store::TursoAgentStore::open_blocking(&repair_state_dir).unwrap();
+            repair_working_git_task_link_with_lock_callbacks(
+                &store,
+                &repair_project_root,
+                &repair_finalization,
+                || {},
+                move || {
+                    repair_holding_tx.send(()).unwrap();
+                    release_repair_rx
+                        .recv_timeout(Duration::from_secs(2))
+                        .expect("repair was not released");
+                },
+                || {},
+            )
+            .unwrap()
+        });
+        repair_holding_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("repair did not acquire the board lock");
+
+        let (cancel_contended_tx, cancel_contended_rx) = mpsc::channel();
+        let cancel_state_dir = state_dir.clone();
+        let cancel_project_root = project_root.clone();
+        let cancel_finalization = finalization.clone();
+        let cancel_thread = thread::spawn(move || {
+            let store = agent_store::TursoAgentStore::open_blocking(&cancel_state_dir).unwrap();
+            cancel_unlinked_working_git_finalization_with_lock_callbacks(
+                &store,
+                &cancel_project_root,
+                &cancel_finalization,
+                run_token,
+                || {},
+                || {},
+                move || cancel_contended_tx.send(()).unwrap(),
+            )
+            .unwrap()
+        });
+        cancel_contended_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("cancellation did not wait for repair's board lock");
+        release_repair_tx.send(()).unwrap();
+
+        assert!(repair_thread.join().unwrap());
+        assert!(!cancel_thread.join().unwrap());
+        assert!(read_tasks(&project_root, "todo").unwrap().is_empty());
+        let doing = read_task_entries(&get_tasks_dir(&project_root), "doing").unwrap();
+        assert_eq!(doing.len(), 1);
+        assert_eq!(doing[0].content, format!("{task} codex:{session_id}"));
+        assert_eq!(
+            store
+                .git_finalization_blocking(finalization.project_id, session_id)
+                .unwrap()
+                .unwrap(),
+            finalization
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn working_link_repair_refuses_a_different_branch() {
+        let root = temp_root("automated-git-working-repair-branch");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        fs::write(
+            project_root.join("tasks/todo.md"),
+            "# Todo Tasks\n- Repair only on frozen branch\n",
+        )
+        .unwrap();
+        initialize_test_git_repository(&project_root);
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        store
+            .set_project_git_mode_for_path_blocking(&project_root, AgentGitMode::Commit)
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        store
+            .mark_session_running_blocking(
+                project.id,
+                "session-working-repair",
+                123,
+                "run-working-repair",
+                &root.join("working.out"),
+                &root.join("working.err"),
+            )
+            .unwrap();
+        let start = capture_agent_git_start_state(&project_root, AgentGitMode::Commit).unwrap();
+        let task_identity = durable_task_identity("Repair only on frozen branch").unwrap();
+        assert!(
+            store
+                .create_git_finalization_blocking(agent_store::NewGitFinalization {
+                    project_id: project.id,
+                    codex_session_id: "session-working-repair",
+                    git_mode: AgentGitMode::Commit,
+                    starting_head: Some(&start.starting_head),
+                    branch_ref: start.branch_ref.as_deref(),
+                    upstream_ref: start.upstream_ref.as_deref(),
+                    worktree_baseline: &start.worktree_baseline,
+                    task_identity: Some(&task_identity),
+                    owner_run_token: Some("run-working-repair"),
+                    created_at: "100",
+                })
+                .unwrap()
+        );
+        let finalization = store
+            .git_finalization_blocking(project.id, "session-working-repair")
+            .unwrap()
+            .unwrap();
+        run_test_git(&project_root, &["checkout", "-b", "wrong-repair-branch"]);
+
+        assert!(!repair_working_git_task_link(&store, &project_root, &finalization).unwrap());
+        let todo = read_tasks(&project_root, "todo").unwrap();
+        assert_eq!(todo, vec!["- Repair only on frozen branch"]);
+        assert!(read_tasks(&project_root, "doing").unwrap().is_empty());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn working_link_repair_rechecks_history_after_waiting_for_the_board_lock() {
+        let root = temp_root("automated-git-working-repair-history-race");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        fs::write(
+            project_root.join("tasks/todo.md"),
+            "# Todo Tasks\n- Recheck repair history\n",
+        )
+        .unwrap();
+        initialize_test_git_repository(&project_root);
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        store
+            .mark_session_running_blocking(
+                project.id,
+                "session-repair-race",
+                123,
+                "run-repair-race",
+                &root.join("race.out"),
+                &root.join("race.err"),
+            )
+            .unwrap();
+        let start = capture_agent_git_start_state(&project_root, AgentGitMode::Commit).unwrap();
+        let task_identity = durable_task_identity("Recheck repair history").unwrap();
+        assert!(
+            store
+                .create_git_finalization_blocking(agent_store::NewGitFinalization {
+                    project_id: project.id,
+                    codex_session_id: "session-repair-race",
+                    git_mode: AgentGitMode::Commit,
+                    starting_head: Some(&start.starting_head),
+                    branch_ref: start.branch_ref.as_deref(),
+                    upstream_ref: start.upstream_ref.as_deref(),
+                    worktree_baseline: &start.worktree_baseline,
+                    task_identity: Some(&task_identity),
+                    owner_run_token: Some("run-repair-race"),
+                    created_at: "100",
+                })
+                .unwrap()
+        );
+        let finalization = store
+            .git_finalization_blocking(project.id, "session-repair-race")
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            !repair_working_git_task_link_with_before_lock(
+                &store,
+                &project_root,
+                &finalization,
+                || {
+                    fs::write(project_root.join("racing-commit.txt"), "unproven\n").unwrap();
+                    run_test_git(&project_root, &["add", "racing-commit.txt"]);
+                    run_test_git(&project_root, &["commit", "-m", "Unproven racing commit"]);
+                },
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            read_tasks(&project_root, "todo").unwrap(),
+            vec!["- Recheck repair history"]
+        );
+        assert!(read_tasks(&project_root, "doing").unwrap().is_empty());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn working_link_repair_finishes_marker_and_duplicate_activation_crashes() {
+        let root = temp_root("automated-git-working-activation-repair");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        fs::write(
+            project_root.join("tasks/todo.md"),
+            "# Todo Tasks\n- Repair activation crash\n",
+        )
+        .unwrap();
+        initialize_test_git_repository(&project_root);
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        store
+            .mark_session_running_blocking(
+                project.id,
+                "session-activation-repair",
+                123,
+                "run-activation-repair",
+                &root.join("activation.out"),
+                &root.join("activation.err"),
+            )
+            .unwrap();
+        let start = capture_agent_git_start_state(&project_root, AgentGitMode::Commit).unwrap();
+        let task_identity = durable_task_identity("Repair activation crash").unwrap();
+        assert!(
+            store
+                .create_git_finalization_blocking(agent_store::NewGitFinalization {
+                    project_id: project.id,
+                    codex_session_id: "session-activation-repair",
+                    git_mode: AgentGitMode::Commit,
+                    starting_head: Some(&start.starting_head),
+                    branch_ref: start.branch_ref.as_deref(),
+                    upstream_ref: start.upstream_ref.as_deref(),
+                    worktree_baseline: &start.worktree_baseline,
+                    task_identity: Some(&task_identity),
+                    owner_run_token: Some("run-activation-repair"),
+                    created_at: "100",
+                })
+                .unwrap()
+        );
+        let linked = "Repair activation crash codex:session-activation-repair";
+        fs::write(
+            project_root.join("tasks/todo.md"),
+            format!("# Todo Tasks\n- {linked}\n"),
+        )
+        .unwrap();
+        let finalization = store
+            .git_finalization_blocking(project.id, "session-activation-repair")
+            .unwrap()
+            .unwrap();
+
+        assert!(repair_working_git_task_link(&store, &project_root, &finalization).unwrap());
+        assert!(read_tasks(&project_root, "todo").unwrap().is_empty());
+        let doing = read_task_entries(&get_tasks_dir(&project_root), "doing").unwrap();
+        assert_eq!(doing.len(), 1);
+        assert_eq!(doing[0].content, linked);
+
+        fs::write(
+            project_root.join("tasks/todo.md"),
+            format!("# Todo Tasks\n- {linked}\n"),
+        )
+        .unwrap();
+        assert!(repair_working_git_task_link(&store, &project_root, &finalization).unwrap());
+        assert!(read_tasks(&project_root, "todo").unwrap().is_empty());
+        let doing = read_task_entries(&get_tasks_dir(&project_root), "doing").unwrap();
+        assert_eq!(doing.len(), 1);
+        assert_eq!(doing[0].content, linked);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sealed_git_finalization_rejects_a_same_path_rewrite() {
+        let root = temp_root("automated-git-finalization-same-path-rewrite");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        fs::write(
+            project_root.join("tasks/doing.md"),
+            "# Doing Tasks\n- Seal exact bytes — COMPLETED 2026-09-02: checked codex:session-exact-bytes\n",
+        )
+        .unwrap();
+        initialize_test_git_repository(&project_root);
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        store
+            .set_project_git_mode_for_path_blocking(&project_root, AgentGitMode::Commit)
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        store
+            .mark_session_running_blocking(
+                project.id,
+                "session-exact-bytes",
+                123,
+                "run-exact-bytes",
+                &root.join("exact.out"),
+                &root.join("exact.err"),
+            )
+            .unwrap();
+        let git_start = capture_agent_git_start_state(&project_root, AgentGitMode::Commit).unwrap();
+        ensure_agent_git_working_record(
+            &store,
+            &project,
+            "session-exact-bytes",
+            "run-exact-bytes",
+            Some(&git_start),
+        )
+        .unwrap();
+        bind_agent_git_working_task_identity(
+            &store,
+            &project,
+            "session-exact-bytes",
+            "run-exact-bytes",
+        )
+        .unwrap();
+        fs::write(project_root.join("feature.txt"), "sealed\n").unwrap();
+        run_test_git(&project_root, &["add", "feature.txt"]);
+        move_task_to_done_with_agent_store(
+            &project_root,
+            "doing",
+            "1",
+            &AutomatedAgentChildContext {
+                project_id: project.id,
+                run_token: "run-exact-bytes".to_string(),
+            },
+            &store,
+        )
+        .unwrap();
+
+        fs::write(project_root.join("feature.txt"), "rewritten after seal\n").unwrap();
+        run_test_git(&project_root, &["add", "--all"]);
+        run_test_agent_git(
+            &project_root,
+            &[
+                "commit",
+                "-m",
+                "Rewrite sealed bytes",
+                "-m",
+                "CLT-Task: codex:session-exact-bytes",
+            ],
+        );
+        let pending = store
+            .git_finalization_blocking(project.id, "session-exact-bytes")
+            .unwrap()
+            .unwrap();
+        let unchanged = reconcile_agent_git_finalization(
+            &store,
+            &project_root,
+            pending,
+            Some("run-exact-bytes"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(unchanged.state, GitFinalizationState::CommitPending);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn provisional_done_can_reseal_a_hook_mutation_before_commit() {
+        let root = temp_root("automated-git-finalization-reseal");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        fs::write(
+            project_root.join("tasks/doing.md"),
+            "# Doing Tasks\n- Reseal hook output — COMPLETED 2026-09-02: checked codex:session-reseal\n",
+        )
+        .unwrap();
+        initialize_test_git_repository(&project_root);
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        store
+            .set_project_git_mode_for_path_blocking(&project_root, AgentGitMode::Commit)
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        store
+            .mark_session_running_blocking(
+                project.id,
+                "session-reseal",
+                123,
+                "run-reseal",
+                &root.join("reseal.out"),
+                &root.join("reseal.err"),
+            )
+            .unwrap();
+        let git_start = capture_agent_git_start_state(&project_root, AgentGitMode::Commit).unwrap();
+        ensure_agent_git_working_record(
+            &store,
+            &project,
+            "session-reseal",
+            "run-reseal",
+            Some(&git_start),
+        )
+        .unwrap();
+        bind_agent_git_working_task_identity(&store, &project, "session-reseal", "run-reseal")
+            .unwrap();
+        fs::write(project_root.join("formatted.txt"), "before hook\n").unwrap();
+        run_test_git(&project_root, &["add", "formatted.txt"]);
+        move_task_to_done_with_agent_store(
+            &project_root,
+            "doing",
+            "1",
+            &AutomatedAgentChildContext {
+                project_id: project.id,
+                run_token: "run-reseal".to_string(),
+            },
+            &store,
+        )
+        .unwrap();
+
+        fs::write(project_root.join("formatted.txt"), "after hook\n").unwrap();
+        run_test_git(&project_root, &["add", "--all"]);
+        let pending = store
+            .git_finalization_blocking(project.id, "session-reseal")
+            .unwrap()
+            .unwrap();
+        let task_identity = pending.task_identity.as_deref().unwrap();
+        let resealed_manifest = capture_agent_git_resealed_manifest(
+            AgentGitProofContext {
+                store: &store,
+                project_id: project.id,
+            },
+            &project_root,
+            &pending.worktree_baseline,
+            "session-reseal",
+            task_identity,
+            pending.starting_head.as_deref().unwrap(),
+            pending.branch_ref.as_deref(),
+        )
+        .unwrap();
+        assert!(
+            store
+                .reseal_git_finalization_manifest_blocking(
+                    project.id,
+                    "session-reseal",
+                    pending.generation,
+                    task_identity,
+                    &resealed_manifest,
+                    "run-reseal",
+                    "200",
+                )
+                .unwrap()
+        );
+        run_test_agent_git(
+            &project_root,
+            &[
+                "commit",
+                "-m",
+                "Reseal hook output",
+                "-m",
+                "CLT-Task: codex:session-reseal",
+            ],
+        );
+        let resealed = store
+            .git_finalization_blocking(project.id, "session-reseal")
+            .unwrap()
+            .unwrap();
+        let completed = reconcile_agent_git_finalization(
+            &store,
+            &project_root,
+            resealed,
+            Some("run-reseal"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(completed.state, GitFinalizationState::Completed);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn git_finalization_rejects_raw_changes_to_another_board_scope() {
+        let root = temp_root("automated-git-finalization-raw-board-scope");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        fs::write(
+            project_root.join("tasks/doing.md"),
+            "# Doing Tasks\n- Protect board scope — COMPLETED 2026-09-02: checked codex:session-board-scope\n",
+        )
+        .unwrap();
+        initialize_test_git_repository(&project_root);
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        store
+            .set_project_git_mode_for_path_blocking(&project_root, AgentGitMode::Commit)
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        store
+            .mark_session_running_blocking(
+                project.id,
+                "session-board-scope",
+                123,
+                "run-board-scope",
+                &root.join("scope.out"),
+                &root.join("scope.err"),
+            )
+            .unwrap();
+        let git_start = capture_agent_git_start_state(&project_root, AgentGitMode::Commit).unwrap();
+        ensure_agent_git_working_record(
+            &store,
+            &project,
+            "session-board-scope",
+            "run-board-scope",
+            Some(&git_start),
+        )
+        .unwrap();
+        bind_agent_git_working_task_identity(
+            &store,
+            &project,
+            "session-board-scope",
+            "run-board-scope",
+        )
+        .unwrap();
+        fs::write(project_root.join("feature.txt"), "implemented\n").unwrap();
+        fs::write(
+            project_root.join("tasks/todo.md"),
+            "# Unrelated header rewrite\n",
+        )
+        .unwrap();
+        run_test_git(&project_root, &["add", "feature.txt", "tasks/todo.md"]);
+        let error = move_task_to_done_with_agent_store(
+            &project_root,
+            "doing",
+            "1",
+            &AutomatedAgentChildContext {
+                project_id: project.id,
+                run_token: "run-board-scope".to_string(),
+            },
+            &store,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("raw changes outside the selected task"));
+        assert_eq!(read_tasks(&project_root, "doing").unwrap().len(), 1);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tracking_repair_deduplicates_an_interrupted_markdown_move() {
+        let root = temp_root("automated-git-finalization-move-repair");
+        init_tasks(&root, false).unwrap();
+        let content = "Repair move — COMPLETED 2026-09-02: checked codex:session-move-repair";
+        fs::write(
+            root.join("tasks/doing.md"),
+            format!("# Doing Tasks\n- {content}\n"),
+        )
+        .unwrap();
+        fs::write(
+            root.join("tasks/done.md"),
+            format!("# Done Tasks\n- {content}\n"),
+        )
+        .unwrap();
+
+        assert!(
+            repair_tracking_agent_git_board(
+                &root,
+                "session-move-repair",
+                &durable_task_identity(content).unwrap(),
+            )
+            .unwrap()
+        );
+        assert!(read_tasks(&root, "doing").unwrap().is_empty());
+        let done = read_task_entries(&root.join("tasks"), "done").unwrap();
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].content, content);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tracking_repair_deduplicates_identical_markdown_and_plain_file_entries() {
+        let root = temp_root("automated-git-finalization-mixed-move-repair");
+        init_tasks(&root, false).unwrap();
+        let content =
+            "Repair mixed move — COMPLETED 2026-09-02: checked codex:session-mixed-repair";
+        fs::write(
+            root.join("tasks/doing.md"),
+            format!("# Doing Tasks\n- {content}\n"),
+        )
+        .unwrap();
+        fs::remove_file(root.join("tasks/done.md")).unwrap();
+        fs::create_dir_all(root.join("tasks/done")).unwrap();
+        fs::write(
+            root.join("tasks/done/0001-repair-mixed-move.md"),
+            format!("{content}\n"),
+        )
+        .unwrap();
+
+        assert!(
+            repair_tracking_agent_git_board(
+                &root,
+                "session-mixed-repair",
+                &durable_task_identity(content).unwrap(),
+            )
+            .unwrap()
+        );
+        assert!(read_tasks(&root, "doing").unwrap().is_empty());
+        let done = read_task_entries(&root.join("tasks"), "done").unwrap();
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].content.trim_end(), content);
+        assert!(matches!(
+            done[0].source,
+            TaskSource::Path { is_dir: false, .. }
+        ));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn managed_directory_move_crash_never_reorders_or_hides_unrelated_tasks() {
+        let root = temp_root("automated-git-directory-move-crash");
+        init_tasks(&root, false).unwrap();
+        let content =
+            "Publish atomically — COMPLETED 2026-09-02: checked codex:session-directory-crash";
+        fs::write(
+            root.join("tasks/doing.md"),
+            format!("# Doing Tasks\n- {content}\n"),
+        )
+        .unwrap();
+        fs::remove_file(root.join("tasks/done.md")).unwrap();
+        fs::create_dir(root.join("tasks/done")).unwrap();
+        let unrelated = root.join("tasks/done/0007-unrelated.md");
+        fs::write(&unrelated, "Unrelated completed task\n").unwrap();
+
+        let error = move_agent_git_task_in_board_with_after_destination(
+            &root.join("tasks"),
+            "doing",
+            "done",
+            1,
+            || anyhow::bail!("simulated crash after destination publication"),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("simulated crash"));
+        assert!(unrelated.is_file());
+        assert_eq!(read_tasks(&root, "doing").unwrap().len(), 1);
+        assert_eq!(read_tasks(&root, "done").unwrap().len(), 2);
+        assert!(
+            fs::read_dir(root.join("tasks/done"))
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".clt-reorder-"))
+        );
+
+        assert!(
+            repair_tracking_agent_git_board(
+                &root,
+                "session-directory-crash",
+                &durable_task_identity(content).unwrap(),
+            )
+            .unwrap()
+        );
+        assert!(read_tasks(&root, "doing").unwrap().is_empty());
+        assert_eq!(read_tasks(&root, "done").unwrap().len(), 2);
+        assert!(unrelated.is_file());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_git_recovery_sweeps_only_exact_orphaned_atomic_temp_files() {
+        let root = temp_root("automated-git-orphaned-board-temps");
+        init_tasks(&root, false).unwrap();
+        let board_dir = root.join("tasks");
+        let todo_file = board_dir.join("todo.md");
+        let original_todo = fs::read_to_string(&todo_file).unwrap();
+        let markdown_crash = std::panic::catch_unwind(|| {
+            replace_file_atomically_with_before_publish(
+                &todo_file,
+                b"# Todo Tasks\n- unpublished\n",
+                |_| panic!("simulated power loss before Markdown rename"),
+            )
+            .unwrap();
+        });
+        assert!(markdown_crash.is_err());
+        assert!(
+            fs::read_dir(&board_dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| is_clt_atomic_task_temporary_name(
+                    &entry.file_name().to_string_lossy()
+                ))
+        );
+
+        fs::remove_file(board_dir.join("done.md")).unwrap();
+        fs::create_dir(board_dir.join("done")).unwrap();
+        let target = board_dir.join("done/0001-unpublished.md");
+        let directory_crash = std::panic::catch_unwind(|| {
+            write_new_task_file_atomically(&target, b"unpublished\n", |_| {
+                panic!("simulated power loss before task-file rename")
+            })
+            .unwrap();
+        });
+        assert!(directory_crash.is_err());
+        fs::write(board_dir.join("done/.keep-me"), "user file\n").unwrap();
+
+        assert_eq!(cleanup_clt_atomic_task_temporaries(&board_dir).unwrap(), 2);
+        assert_eq!(fs::read_to_string(&todo_file).unwrap(), original_todo);
+        assert!(!target.exists());
+        assert!(board_dir.join("done/.keep-me").is_file());
+        let done_dir = board_dir.join("done");
+        for directory in [&board_dir, &done_dir] {
+            assert!(
+                fs::read_dir(directory)
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .all(|entry| !is_clt_atomic_task_temporary_name(
+                        &entry.file_name().to_string_lossy()
+                    ))
+            );
+        }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn push_mode_uses_the_frozen_push_remote_and_one_exact_refspec() {
+        let root = temp_root("automated-git-exact-push-finalization");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        let origin_root = root.join("origin.git");
+        let publish_root = root.join("publish.git");
+        init_tasks(&project_root, false).unwrap();
+        fs::write(
+            project_root.join("tasks/doing.md"),
+            "# Doing Tasks\n- Publish feature — COMPLETED 2026-09-02: cargo test passed codex:session-push\n",
+        )
+        .unwrap();
+        let initial_head = initialize_test_git_repository(&project_root);
+        fs::create_dir_all(&origin_root).unwrap();
+        fs::create_dir_all(&publish_root).unwrap();
+        run_test_git(&origin_root, &["init", "--bare"]);
+        run_test_git(&publish_root, &["init", "--bare"]);
+        run_test_git(
+            &project_root,
+            &["remote", "add", "origin", origin_root.to_str().unwrap()],
+        );
+        run_test_git(&project_root, &["push", "-u", "origin", "HEAD"]);
+        run_test_git(
+            &project_root,
+            &["remote", "add", "publish", publish_root.to_str().unwrap()],
+        );
+        let branch = run_test_git(&project_root, &["branch", "--show-current"]);
+        let branch_ref = format!("refs/heads/{branch}");
+        run_test_git(&project_root, &["branch", "side"]);
+        run_test_git(
+            &project_root,
+            &["push", "publish", &format!("HEAD:{branch_ref}")],
+        );
+        run_test_git(&project_root, &["push", "publish", "side:refs/heads/side"]);
+        run_test_git(
+            &project_root,
+            &["config", &format!("branch.{branch}.pushRemote"), "publish"],
+        );
+        run_test_git(
+            &project_root,
+            &["config", "remote.publish.push", "refs/heads/*:refs/heads/*"],
+        );
+
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        assert!(
+            store
+                .set_project_git_mode_for_path_blocking(&project_root, AgentGitMode::CommitAndPush,)
+                .unwrap()
+        );
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        store
+            .mark_session_running_blocking(
+                project.id,
+                "session-push",
+                123,
+                "run-push",
+                &root.join("push.out"),
+                &root.join("push.err"),
+            )
+            .unwrap();
+        let git_start =
+            capture_agent_git_start_state(&project_root, AgentGitMode::CommitAndPush).unwrap();
+        ensure_agent_git_working_record(
+            &store,
+            &project,
+            "session-push",
+            "run-push",
+            Some(&git_start),
+        )
+        .unwrap();
+        assert!(
+            bind_agent_git_working_task_identity(&store, &project, "session-push", "run-push",)
+                .unwrap()
+        );
+        fs::write(project_root.join("publish.txt"), "implemented\n").unwrap();
+        run_test_git(&project_root, &["add", "publish.txt"]);
+        move_task_to_done_with_agent_store(
+            &project_root,
+            "doing",
+            "1",
+            &AutomatedAgentChildContext {
+                project_id: project.id,
+                run_token: "run-push".to_string(),
+            },
+            &store,
+        )
+        .unwrap();
+
+        run_test_git(&project_root, &["add", "--all"]);
+        run_test_agent_git(
+            &project_root,
+            &[
+                "commit",
+                "-m",
+                "Publish feature",
+                "-m",
+                "CLT-Task: codex:session-push",
+            ],
+        );
+        let task_commit = run_test_git(&project_root, &["rev-parse", "HEAD"]);
+        run_test_git(&project_root, &["branch", "-f", "side", &task_commit]);
+        let pending = store
+            .git_finalization_blocking(project.id, "session-push")
+            .unwrap()
+            .unwrap();
+        let completed = reconcile_agent_git_finalization(
+            &store,
+            &project_root,
+            pending,
+            Some("run-push"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(completed.state, GitFinalizationState::Completed);
+        assert_eq!(completed.commit_oid.as_deref(), Some(task_commit.as_str()));
+        assert_eq!(
+            run_test_git(&publish_root, &["rev-parse", &branch_ref]),
+            task_commit
+        );
+        assert_eq!(
+            run_test_git(&publish_root, &["rev-parse", "refs/heads/side"]),
+            initial_head
+        );
+        assert_eq!(
+            run_test_git(&origin_root, &["rev-parse", &branch_ref]),
+            initial_head
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sealed_commit_push_runs_the_repository_pre_push_hook() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_root("automated-git-pre-push-hook");
+        let project_root = root.join("project");
+        let remote_root = root.join("remote.git");
+        let hook_marker = root.join("pre-push-ran");
+        init_tasks(&project_root, false).unwrap();
+        let initial_head = initialize_test_git_repository(&project_root);
+        fs::create_dir_all(&remote_root).unwrap();
+        run_test_git(&remote_root, &["init", "--bare"]);
+        run_test_git(
+            &project_root,
+            &["remote", "add", "origin", remote_root.to_str().unwrap()],
+        );
+        run_test_git(&project_root, &["push", "-u", "origin", "HEAD"]);
+
+        let start =
+            capture_agent_git_start_state(&project_root, AgentGitMode::CommitAndPush).unwrap();
+        let baseline = AgentGitWorktreeBaseline::from_json(&start.worktree_baseline).unwrap();
+        fs::write(project_root.join("hooked.txt"), "must pass policy\n").unwrap();
+        run_test_git(&project_root, &["add", "hooked.txt"]);
+        run_test_git(&project_root, &["commit", "-m", "Exercise pre-push hook"]);
+        let commit_oid = run_test_git(&project_root, &["rev-parse", "HEAD"]);
+
+        let hook = project_root.join(".git/hooks/pre-push");
+        fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\nprintf invoked > '{}'\nexit 1\n",
+                hook_marker.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions).unwrap();
+
+        let error = push_agent_git_commit_to_frozen_destination(
+            &project_root,
+            start.branch_ref.as_deref(),
+            start.upstream_ref.as_deref(),
+            &baseline,
+            &commit_oid,
+            None,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("Failed to push sealed commit"));
+        assert!(hook_marker.is_file());
+        let branch_ref = start.branch_ref.unwrap();
+        assert_eq!(
+            run_test_git(&remote_root, &["rev-parse", &branch_ref]),
+            initial_head
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn push_mode_keeps_a_non_fast_forward_publication_pending() {
+        let root = temp_root("automated-git-non-fast-forward-push");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        let peer_root = root.join("peer");
+        let remote_root = root.join("remote.git");
+        init_tasks(&project_root, false).unwrap();
+        fs::write(
+            project_root.join("tasks/doing.md"),
+            "# Doing Tasks\n- Preserve rejected publication — COMPLETED 2026-09-02: checked codex:session-push-reject\n",
+        )
+        .unwrap();
+        initialize_test_git_repository(&project_root);
+        fs::create_dir_all(&remote_root).unwrap();
+        run_test_git(&remote_root, &["init", "--bare"]);
+        run_test_git(
+            &project_root,
+            &["remote", "add", "origin", remote_root.to_str().unwrap()],
+        );
+        run_test_git(&project_root, &["push", "-u", "origin", "HEAD"]);
+
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        store
+            .set_project_git_mode_for_path_blocking(&project_root, AgentGitMode::CommitAndPush)
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        store
+            .mark_session_running_blocking(
+                project.id,
+                "session-push-reject",
+                123,
+                "run-push-reject",
+                &root.join("reject.out"),
+                &root.join("reject.err"),
+            )
+            .unwrap();
+        let git_start =
+            capture_agent_git_start_state(&project_root, AgentGitMode::CommitAndPush).unwrap();
+        ensure_agent_git_working_record(
+            &store,
+            &project,
+            "session-push-reject",
+            "run-push-reject",
+            Some(&git_start),
+        )
+        .unwrap();
+        bind_agent_git_working_task_identity(
+            &store,
+            &project,
+            "session-push-reject",
+            "run-push-reject",
+        )
+        .unwrap();
+
+        run_test_git(
+            &root,
+            &[
+                "clone",
+                remote_root.to_str().unwrap(),
+                peer_root.to_str().unwrap(),
+            ],
+        );
+        run_test_git(&peer_root, &["config", "user.name", "CLT Peer"]);
+        run_test_git(
+            &peer_root,
+            &["config", "user.email", "clt-peer@example.invalid"],
+        );
+        fs::write(peer_root.join("remote-only.txt"), "remote advance\n").unwrap();
+        run_test_git(&peer_root, &["add", "remote-only.txt"]);
+        run_test_git(&peer_root, &["commit", "-m", "Advance remote"]);
+        run_test_git(&peer_root, &["push"]);
+        let remote_tip = run_test_git(&peer_root, &["rev-parse", "HEAD"]);
+
+        fs::write(project_root.join("local-only.txt"), "local task\n").unwrap();
+        run_test_git(&project_root, &["add", "local-only.txt"]);
+        move_task_to_done_with_agent_store(
+            &project_root,
+            "doing",
+            "1",
+            &AutomatedAgentChildContext {
+                project_id: project.id,
+                run_token: "run-push-reject".to_string(),
+            },
+            &store,
+        )
+        .unwrap();
+        run_test_git(&project_root, &["add", "--all"]);
+        run_test_agent_git(
+            &project_root,
+            &[
+                "commit",
+                "-m",
+                "Preserve rejected publication",
+                "-m",
+                "CLT-Task: codex:session-push-reject",
+            ],
+        );
+        let pending = store
+            .git_finalization_blocking(project.id, "session-push-reject")
+            .unwrap()
+            .unwrap();
+        let error = reconcile_agent_git_finalization(
+            &store,
+            &project_root,
+            pending,
+            Some("run-push-reject"),
+            None,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("Failed to push sealed commit"));
+        assert_eq!(
+            store
+                .git_finalization_blocking(project.id, "session-push-reject")
+                .unwrap()
+                .unwrap()
+                .state,
+            GitFinalizationState::PushPending
+        );
+        let branch_ref = run_test_git(&project_root, &["symbolic-ref", "HEAD"]);
+        assert_eq!(
+            run_test_git(&remote_root, &["rev-parse", &branch_ref]),
+            remote_tip
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn task_commit_proof_rejects_a_duplicate_session_marker() {
+        let root = temp_root("git-finalization-duplicate-marker");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        let starting_head = initialize_test_git_repository(&project_root);
+        fs::write(
+            project_root.join("tasks/done.md"),
+            "# Done Tasks\n- Finished — COMPLETED 2026-09-02: checked codex:session-duplicate\n",
+        )
+        .unwrap();
+        fs::write(
+            project_root.join("tasks/doing.md"),
+            "# Doing Tasks\n- Duplicate marker codex:session-duplicate\n",
+        )
+        .unwrap();
+        run_test_git(&project_root, &["add", "--all"]);
+        run_test_agent_git(
+            &project_root,
+            &[
+                "commit",
+                "-m",
+                "Duplicate marker fixture",
+                "-m",
+                "CLT-Task: codex:session-duplicate",
+            ],
+        );
+        let branch_ref = run_test_git(&project_root, &["symbolic-ref", "HEAD"]);
+
+        assert!(
+            !git_ref_contains_completed_task(&project_root, &branch_ref, "session-duplicate")
+                .unwrap()
+        );
+        assert_eq!(
+            find_agent_git_task_commit(
+                &project_root,
+                &starting_head,
+                Some(&branch_ref),
+                "session-duplicate",
+                &durable_task_identity("Finished").unwrap(),
+            )
+            .unwrap(),
+            None
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn task_commit_proof_rejects_a_partially_staged_board_move() {
+        let root = temp_root("git-finalization-partial-board");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        fs::write(
+            project_root.join("tasks/todo.md"),
+            "# Todo Tasks\n- Move me\n",
+        )
+        .unwrap();
+        let starting_head = initialize_test_git_repository(&project_root);
+        fs::write(
+            project_root.join("tasks/done.md"),
+            "# Done Tasks\n- Move me — COMPLETED 2026-09-02: checked codex:session-partial\n",
+        )
+        .unwrap();
+        run_test_git(&project_root, &["add", "tasks/done.md"]);
+        run_test_agent_git(
+            &project_root,
+            &[
+                "commit",
+                "-m",
+                "Stage only Done",
+                "-m",
+                "CLT-Task: codex:session-partial",
+            ],
+        );
+        let branch_ref = run_test_git(&project_root, &["symbolic-ref", "HEAD"]);
+
+        assert_eq!(
+            find_agent_git_task_commit(
+                &project_root,
+                &starting_head,
+                Some(&branch_ref),
+                "session-partial",
+                &durable_task_identity("Move me").unwrap(),
+            )
+            .unwrap(),
+            None
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn git_finalization_rejects_a_board_only_commit_with_source_left_uncommitted() {
+        let root = temp_root("git-finalization-leftover-source");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        fs::write(
+            project_root.join("tasks/doing.md"),
+            "# Doing Tasks\n- Implement source — COMPLETED 2026-09-02: checked codex:session-source\n",
+        )
+        .unwrap();
+        fs::write(project_root.join("source.txt"), "before\n").unwrap();
+        initialize_test_git_repository(&project_root);
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        store
+            .set_project_git_mode_for_path_blocking(&project_root, AgentGitMode::Commit)
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        store
+            .mark_session_running_blocking(
+                project.id,
+                "session-source",
+                123,
+                "run-source",
+                &root.join("source.out"),
+                &root.join("source.err"),
+            )
+            .unwrap();
+        let git_start = capture_agent_git_start_state(&project_root, AgentGitMode::Commit).unwrap();
+        ensure_agent_git_working_record(
+            &store,
+            &project,
+            "session-source",
+            "run-source",
+            Some(&git_start),
+        )
+        .unwrap();
+        bind_agent_git_working_task_identity(&store, &project, "session-source", "run-source")
+            .unwrap();
+        fs::write(project_root.join("source.txt"), "after\n").unwrap();
+        let error = move_task_to_done_with_agent_store(
+            &project_root,
+            "doing",
+            "1",
+            &AutomatedAgentChildContext {
+                project_id: project.id,
+                run_token: "run-source".to_string(),
+            },
+            &store,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("remaining unstaged"));
+
+        let pending = store
+            .git_finalization_blocking(project.id, "session-source")
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.state, GitFinalizationState::Working);
+        assert_eq!(read_tasks(&project_root, "doing").unwrap().len(), 1);
+        assert_eq!(
+            fs::read_to_string(project_root.join("source.txt")).unwrap(),
+            "after\n"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn task_commit_proof_rejects_an_extra_untrailed_agent_commit() {
+        let root = temp_root("git-finalization-extra-agent-commit");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        fs::write(
+            project_root.join("tasks/todo.md"),
+            "# Todo Tasks\n- One commit task\n",
+        )
+        .unwrap();
+        let starting_head = initialize_test_git_repository(&project_root);
+        fs::write(project_root.join("implementation.txt"), "implemented\n").unwrap();
+        run_test_git(&project_root, &["add", "implementation.txt"]);
+        run_test_agent_git(&project_root, &["commit", "-m", "Implement first"]);
+        fs::write(project_root.join("tasks/todo.md"), "# Todo Tasks\n").unwrap();
+        fs::write(
+            project_root.join("tasks/done.md"),
+            "# Done Tasks\n- One commit task — COMPLETED 2026-09-02: checked codex:session-one-commit\n",
+        )
+        .unwrap();
+        run_test_git(&project_root, &["add", "--all", "--", "tasks"]);
+        run_test_agent_git(
+            &project_root,
+            &[
+                "commit",
+                "-m",
+                "Finish task",
+                "-m",
+                "CLT-Task: codex:session-one-commit",
+            ],
+        );
+        let branch_ref = run_test_git(&project_root, &["symbolic-ref", "HEAD"]);
+
+        assert_eq!(
+            find_agent_git_task_commit(
+                &project_root,
+                &starting_head,
+                Some(&branch_ref),
+                "session-one-commit",
+                &durable_task_identity("One commit task").unwrap(),
+            )
+            .unwrap(),
+            None
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn premanifest_audit_rejects_an_agent_commit_with_an_overridden_author() {
+        let root = temp_root("git-finalization-overridden-author");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        let starting_head = initialize_test_git_repository(&project_root);
+        fs::write(project_root.join("implementation.txt"), "premature\n").unwrap();
+        run_test_git(&project_root, &["add", "implementation.txt"]);
+        run_test_agent_git(
+            &project_root,
+            &[
+                "commit",
+                "--author=Different Author <different@example.invalid>",
+                "-m",
+                "Premature implementation",
+            ],
+        );
+        let manifest_parent = run_test_git(&project_root, &["rev-parse", "HEAD"]);
+        let store = agent_store::TursoAgentStore::open_blocking(&root.join("state/clt")).unwrap();
+
+        assert!(
+            !agent_git_range_is_safe_before_manifest(
+                AgentGitProofContext {
+                    store: &store,
+                    project_id: 1,
+                },
+                &project_root,
+                &starting_head,
+                &manifest_parent,
+                "session-current",
+            )
+            .unwrap()
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn premanifest_audit_rejects_a_commit_with_no_agent_identity_or_journal() {
+        let root = temp_root("git-finalization-unproven-non-agent");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        let starting_head = initialize_test_git_repository(&project_root);
+        fs::write(project_root.join("premature.txt"), "premature\n").unwrap();
+        run_test_git(&project_root, &["add", "premature.txt"]);
+        run_test_git(&project_root, &["commit", "-m", "Unproven premature work"]);
+        let manifest_parent = run_test_git(&project_root, &["rev-parse", "HEAD"]);
+        let store = agent_store::TursoAgentStore::open_blocking(&root.join("state/clt")).unwrap();
+
+        assert!(
+            !agent_git_range_is_safe_before_manifest(
+                AgentGitProofContext {
+                    store: &store,
+                    project_id: 1,
+                },
+                &project_root,
+                &starting_head,
+                &manifest_parent,
+                "session-current",
+            )
+            .unwrap()
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn premanifest_audit_accepts_another_sessions_exact_completed_commit() {
+        let root = temp_root("git-finalization-proven-other-task");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        let peer_root = root.join("peer");
+        let remote_root = root.join("remote.git");
+        init_tasks(&project_root, false).unwrap();
+        fs::write(
+            project_root.join("tasks/todo.md"),
+            "# Todo Tasks\n- Task A — BLOCKED 2026-09-02: waiting codex:session-a\n- Task B — COMPLETED 2026-09-02: checked\n",
+        )
+        .unwrap();
+        fs::write(project_root.join("tasks/doing.md"), "# Doing Tasks\n").unwrap();
+        let starting_head = initialize_test_git_repository(&project_root);
+        fs::create_dir_all(&remote_root).unwrap();
+        run_test_git(&remote_root, &["init", "--bare"]);
+        run_test_git(
+            &project_root,
+            &["remote", "add", "origin", remote_root.to_str().unwrap()],
+        );
+        run_test_git(&project_root, &["push", "-u", "origin", "HEAD"]);
+        run_test_git(
+            &root,
+            &[
+                "clone",
+                remote_root.to_str().unwrap(),
+                peer_root.to_str().unwrap(),
+            ],
+        );
+        run_test_git(&peer_root, &["config", "user.name", "CLT Peer"]);
+        run_test_git(
+            &peer_root,
+            &["config", "user.email", "clt-peer@example.invalid"],
+        );
+        fs::write(peer_root.join("upstream.txt"), "upstream\n").unwrap();
+        run_test_git(&peer_root, &["add", "upstream.txt"]);
+        run_test_git(&peer_root, &["commit", "-m", "Advance upstream"]);
+        run_test_git(&peer_root, &["push"]);
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        store
+            .set_project_git_mode_for_path_blocking(&project_root, AgentGitMode::Commit)
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        store
+            .mark_session_running_blocking(
+                project.id,
+                "session-a",
+                122,
+                "run-a",
+                &root.join("a.out"),
+                &root.join("a.err"),
+            )
+            .unwrap();
+        let task_a_start =
+            capture_agent_git_start_state(&project_root, AgentGitMode::Commit).unwrap();
+        ensure_agent_git_working_record(
+            &store,
+            &project,
+            "session-a",
+            "run-a",
+            Some(&task_a_start),
+        )
+        .unwrap();
+        assert!(
+            bind_agent_git_working_task_identity(&store, &project, "session-a", "run-a").unwrap()
+        );
+        store
+            .set_session_control_state_blocking(
+                project.id,
+                "session-a",
+                AgentSessionControlState::ResumeRequested,
+            )
+            .unwrap();
+        let git_start = prepare_agent_git_start_state_for_run(
+            &store,
+            &project,
+            AgentTaskSelection::NextTodo,
+            false,
+            false,
+            "run-b",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(git_start.starting_head, starting_head);
+        assert_eq!(
+            run_test_git(&project_root, &["rev-parse", "HEAD"]),
+            starting_head
+        );
+        move_task(&project_root, "todo", "doing", "2").unwrap();
+        let task_b = read_task_entries(&get_tasks_dir(&project_root), "doing")
+            .unwrap()
+            .remove(0);
+        attach_codex_session_to_task_after_lock(
+            &project_root,
+            "doing",
+            &task_b,
+            "session-b",
+            || {},
+        )
+        .unwrap();
+        store
+            .mark_session_running_blocking(
+                project.id,
+                "session-b",
+                123,
+                "run-b",
+                &root.join("b.out"),
+                &root.join("b.err"),
+            )
+            .unwrap();
+        ensure_agent_git_working_record(&store, &project, "session-b", "run-b", Some(&git_start))
+            .unwrap();
+        assert!(
+            bind_agent_git_working_task_identity(&store, &project, "session-b", "run-b").unwrap()
+        );
+        fs::write(project_root.join("task-b.txt"), "implemented\n").unwrap();
+        run_test_git(&project_root, &["add", "--all"]);
+        move_task_to_done_with_agent_store(
+            &project_root,
+            "doing",
+            "1",
+            &AutomatedAgentChildContext {
+                project_id: project.id,
+                run_token: "run-b".to_string(),
+            },
+            &store,
+        )
+        .unwrap();
+        run_test_git(&project_root, &["add", "--all"]);
+        run_test_agent_git(
+            &project_root,
+            &[
+                "commit",
+                "-m",
+                "Finish task B",
+                "-m",
+                "CLT-Task: codex:session-b",
+            ],
+        );
+        let task_b_commit = run_test_git(&project_root, &["rev-parse", "HEAD"]);
+        let pending = store
+            .git_finalization_blocking(project.id, "session-b")
+            .unwrap()
+            .unwrap();
+        let completed =
+            reconcile_agent_git_finalization(&store, &project_root, pending, Some("run-b"), None)
+                .unwrap();
+        assert_eq!(completed.state, GitFinalizationState::Completed);
+
+        assert!(
+            agent_git_range_is_safe_before_manifest(
+                AgentGitProofContext {
+                    store: &store,
+                    project_id: project.id,
+                },
+                &project_root,
+                &starting_head,
+                &task_b_commit,
+                "session-a",
+            )
+            .unwrap()
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn premanifest_audit_rejects_a_merge_with_extra_resolution_content() {
+        let root = temp_root("git-finalization-mutated-merge");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        let starting_head = initialize_test_git_repository(&project_root);
+        let primary_branch = run_test_git(&project_root, &["branch", "--show-current"]);
+        run_test_git(&project_root, &["checkout", "-b", "upstream-fixture"]);
+        fs::write(project_root.join("upstream.txt"), "upstream\n").unwrap();
+        run_test_git(&project_root, &["add", "upstream.txt"]);
+        run_test_git(&project_root, &["commit", "-m", "Upstream change"]);
+        run_test_git(&project_root, &["checkout", &primary_branch]);
+        fs::write(project_root.join("local.txt"), "local\n").unwrap();
+        run_test_git(&project_root, &["add", "local.txt"]);
+        run_test_git(&project_root, &["commit", "-m", "Local change"]);
+        run_test_git(&project_root, &["merge", "--no-commit", "upstream-fixture"]);
+        fs::write(project_root.join("smuggled.txt"), "implementation\n").unwrap();
+        run_test_git(&project_root, &["add", "smuggled.txt"]);
+        run_test_agent_git(&project_root, &["commit", "-m", "Synchronization merge"]);
+        let manifest_parent = run_test_git(&project_root, &["rev-parse", "HEAD"]);
+        let store = agent_store::TursoAgentStore::open_blocking(&root.join("state/clt")).unwrap();
+
+        assert!(
+            !agent_git_range_is_safe_before_manifest(
+                AgentGitProofContext {
+                    store: &store,
+                    project_id: 1,
+                },
+                &project_root,
+                &starting_head,
+                &manifest_parent,
+                "session-current",
+            )
+            .unwrap()
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn premanifest_audit_rejects_a_clean_merge_with_an_unproven_side_commit() {
+        let root = temp_root("git-finalization-clean-sync-merge");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        let starting_head = initialize_test_git_repository(&project_root);
+        let primary_branch = run_test_git(&project_root, &["branch", "--show-current"]);
+        run_test_git(&project_root, &["checkout", "-b", "upstream-fixture"]);
+        fs::write(project_root.join("upstream.txt"), "upstream\n").unwrap();
+        run_test_git(&project_root, &["add", "upstream.txt"]);
+        run_test_git(&project_root, &["commit", "-m", "Upstream change"]);
+        run_test_git(&project_root, &["checkout", &primary_branch]);
+        run_test_git(
+            &project_root,
+            &[
+                "merge",
+                "--no-ff",
+                "upstream-fixture",
+                "-m",
+                "Synchronization merge",
+            ],
+        );
+        let manifest_parent = run_test_git(&project_root, &["rev-parse", "HEAD"]);
+        let store = agent_store::TursoAgentStore::open_blocking(&root.join("state/clt")).unwrap();
+
+        assert!(
+            !agent_git_range_is_safe_before_manifest(
+                AgentGitProofContext {
+                    store: &store,
+                    project_id: 1,
+                },
+                &project_root,
+                &starting_head,
+                &manifest_parent,
+                "session-current",
+            )
+            .unwrap()
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn task_commit_proof_rejects_a_divergent_starting_head() {
+        let root = temp_root("git-finalization-divergent-head");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        let starting_head = initialize_test_git_repository(&project_root);
+        fs::write(
+            project_root.join("tasks/done.md"),
+            "# Done Tasks\n- Divergent task — COMPLETED 2026-09-02: checked codex:session-divergent\n",
+        )
+        .unwrap();
+        run_test_git(&project_root, &["add", "tasks/done.md"]);
+        let tree = run_test_git(&project_root, &["write-tree"]);
+        let divergent = run_test_agent_git(
+            &project_root,
+            &[
+                "commit-tree",
+                &tree,
+                "-m",
+                "Divergent task",
+                "-m",
+                "CLT-Task: codex:session-divergent",
+            ],
+        );
+        let branch_ref = run_test_git(&project_root, &["symbolic-ref", "HEAD"]);
+        run_test_git(&project_root, &["update-ref", &branch_ref, &divergent]);
+
+        assert_eq!(
+            find_agent_git_task_commit(
+                &project_root,
+                &starting_head,
+                Some(&branch_ref),
+                "session-divergent",
+                &durable_task_identity("Divergent task").unwrap(),
+            )
+            .unwrap(),
+            None
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn task_commit_proof_rejects_a_distinct_agent_task_in_the_same_range() {
+        let root = temp_root("git-finalization-distinct-agent-task");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        fs::write(
+            project_root.join("tasks/todo.md"),
+            "# Todo Tasks\n- Task A\n- Task B\n",
+        )
+        .unwrap();
+        let starting_head = initialize_test_git_repository(&project_root);
+        fs::write(
+            project_root.join("tasks/todo.md"),
+            "# Todo Tasks\n- Task A\n",
+        )
+        .unwrap();
+        fs::write(
+            project_root.join("tasks/done.md"),
+            "# Done Tasks\n- Task B — COMPLETED 2026-09-02: checked codex:session-b\n",
+        )
+        .unwrap();
+        run_test_git(&project_root, &["add", "--all", "--", "tasks"]);
+        run_test_agent_git(
+            &project_root,
+            &[
+                "commit",
+                "-m",
+                "Finish task B",
+                "-m",
+                "CLT-Task: codex:session-b",
+            ],
+        );
+        fs::write(project_root.join("tasks/todo.md"), "# Todo Tasks\n").unwrap();
+        fs::write(
+            project_root.join("tasks/done.md"),
+            "# Done Tasks\n- Task A — COMPLETED 2026-09-02: checked codex:session-a\n- Task B — COMPLETED 2026-09-02: checked codex:session-b\n",
+        )
+        .unwrap();
+        run_test_git(&project_root, &["add", "--all", "--", "tasks"]);
+        run_test_agent_git(
+            &project_root,
+            &[
+                "commit",
+                "-m",
+                "Finish task A",
+                "-m",
+                "CLT-Task: codex:session-a",
+            ],
+        );
+        let branch_ref = run_test_git(&project_root, &["symbolic-ref", "HEAD"]);
+
+        assert_eq!(
+            find_agent_git_task_commit(
+                &project_root,
+                &starting_head,
+                Some(&branch_ref),
+                "session-a",
+                &durable_task_identity("Task A").unwrap(),
+            )
+            .unwrap(),
+            None
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn task_commit_proof_rejects_two_commits_with_the_same_task_trailer() {
+        let root = temp_root("git-finalization-two-task-trailers");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        fs::write(
+            project_root.join("tasks/todo.md"),
+            "# Todo Tasks\n- Trailer task\n",
+        )
+        .unwrap();
+        let starting_head = initialize_test_git_repository(&project_root);
+        fs::write(project_root.join("implementation.txt"), "implemented\n").unwrap();
+        run_test_git(&project_root, &["add", "implementation.txt"]);
+        run_test_agent_git(
+            &project_root,
+            &[
+                "commit",
+                "-m",
+                "First task commit",
+                "-m",
+                "CLT-Task: codex:session-two-trailers",
+            ],
+        );
+        fs::write(project_root.join("tasks/todo.md"), "# Todo Tasks\n").unwrap();
+        fs::write(
+            project_root.join("tasks/done.md"),
+            "# Done Tasks\n- Trailer task — COMPLETED 2026-09-02: checked codex:session-two-trailers\n",
+        )
+        .unwrap();
+        run_test_git(&project_root, &["add", "--all", "--", "tasks"]);
+        run_test_agent_git(
+            &project_root,
+            &[
+                "commit",
+                "-m",
+                "Second task commit",
+                "-m",
+                "CLT-Task: codex:session-two-trailers",
+            ],
+        );
+        let branch_ref = run_test_git(&project_root, &["symbolic-ref", "HEAD"]);
+
+        assert_eq!(
+            find_agent_git_task_commit(
+                &project_root,
+                &starting_head,
+                Some(&branch_ref),
+                "session-two-trailers",
+                &durable_task_identity("Trailer task").unwrap(),
+            )
+            .unwrap(),
+            None
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn committed_task_parser_matches_folder_and_nested_board_grammar() {
+        let root = temp_root("git-finalization-folder-parser");
+        let project_root = root.join("project");
+        fs::create_dir_all(project_root.join("tasks/doing/0001-parent/todo")).unwrap();
+        fs::create_dir_all(project_root.join("tasks/doing/0002-real/assets/done")).unwrap();
+        fs::write(
+            project_root.join("tasks/doing/0001-parent/task.md"),
+            "Parent task\n",
+        )
+        .unwrap();
+        fs::write(
+            project_root.join("tasks/doing/0001-parent/todo/0001-child.md"),
+            "Nested child\n",
+        )
+        .unwrap();
+        fs::write(
+            project_root.join("tasks/doing/0002-real/task.md"),
+            "Real task codex:session-real\n",
+        )
+        .unwrap();
+        fs::write(
+            project_root.join("tasks/doing/0002-real/assets/done/fake.md"),
+            "Fake attachment codex:session-fake\n",
+        )
+        .unwrap();
+        fs::write(
+            project_root.join("tasks/doing/README.md"),
+            "Direct README task\n",
+        )
+        .unwrap();
+        initialize_test_git_repository(&project_root);
+        let entries = git_ref_task_entries(&project_root, "HEAD").unwrap();
+        let contents = entries
+            .iter()
+            .map(|entry| entry.content.trim().to_string())
+            .collect::<Vec<_>>();
+
+        assert!(contents.contains(&"Parent task".to_string()));
+        assert!(contents.contains(&"Nested child".to_string()));
+        assert!(contents.contains(&"Real task codex:session-real".to_string()));
+        assert!(contents.contains(&"Direct README task".to_string()));
+        assert!(
+            !contents
+                .iter()
+                .any(|content| content.contains("Fake attachment"))
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .find(|entry| entry.content.contains("Nested child"))
+                .map(|entry| entry.status.as_str()),
+            Some("todo")
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn git_finalizer_does_not_steal_an_expired_lease_from_a_running_session() {
+        let root = temp_root("git-finalizer-live-control-lease");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert!(
+            store
+                .create_git_finalization_blocking(agent_store::NewGitFinalization {
+                    project_id: project.id,
+                    codex_session_id: "session-live-control",
+                    git_mode: AgentGitMode::Commit,
+                    starting_head: Some("1111111111111111111111111111111111111111"),
+                    branch_ref: Some("refs/heads/master"),
+                    upstream_ref: None,
+                    worktree_baseline: r#"{"version":1,"tracked_patch_ids":{},"untracked_blob_ids":{},"require_clean":false}"#,
+                    task_identity: None,
+                    owner_run_token: None,
+                    created_at: "100",
+                })
+                .unwrap()
+        );
+        store
+            .mark_session_running_blocking(
+                project.id,
+                "session-live-control",
+                std::process::id(),
+                "run-live-control",
+                &root.join("live.out"),
+                &root.join("live.err"),
+            )
+            .unwrap();
+        assert!(
+            store
+                .try_acquire_lease_blocking(project.id, "live-session-holder", "100", "101")
+                .unwrap()
+        );
+
+        assert!(
+            !store
+                .try_acquire_git_finalization_lease_blocking(
+                    project.id,
+                    "git-finalizer-contender",
+                    "200",
+                    "500",
+                    None,
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .lease_for_project_blocking(project.id)
+                .unwrap()
+                .unwrap()
+                .holder,
+            "live-session-holder"
+        );
+        assert_eq!(
+            store
+                .session_control_blocking(project.id, "session-live-control")
+                .unwrap()
+                .unwrap()
+                .state,
+            AgentSessionControlState::Running
+        );
+        assert!(
+            store
+                .release_lease_blocking(project.id, "live-session-holder")
+                .unwrap()
+        );
+        store
+            .set_session_control_recovery_token_blocking(
+                project.id,
+                "session-live-control",
+                "ordinary-resume-token",
+            )
+            .unwrap();
+        assert!(
+            !store
+                .try_acquire_git_finalization_lease_blocking(
+                    project.id,
+                    "git-finalizer-contender",
+                    "200",
+                    "500",
+                    None,
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .session_control_blocking(project.id, "session-live-control")
+                .unwrap()
+                .unwrap()
+                .run_token
+                .as_deref(),
+            Some("ordinary-resume-token")
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn git_finalizer_gate_accepts_each_pending_sessions_exact_recovery_generation() {
+        let root = temp_root("git-finalizer-multiple-recovery-controls");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        for (session, task_identity) in [
+            ("session-working", None),
+            ("session-finalizing", Some("finalizing task")),
+        ] {
+            assert!(
+                store
+                    .create_git_finalization_blocking(agent_store::NewGitFinalization {
+                        project_id: project.id,
+                        codex_session_id: session,
+                        git_mode: AgentGitMode::Commit,
+                        starting_head: Some("1111111111111111111111111111111111111111"),
+                        branch_ref: Some("refs/heads/master"),
+                        upstream_ref: None,
+                        worktree_baseline: r#"{"version":1,"tracked_patch_ids":{},"untracked_blob_ids":{},"require_clean":false}"#,
+                        task_identity,
+                        owner_run_token: None,
+                        created_at: "100",
+                    })
+                    .unwrap()
+            );
+        }
+        assert!(
+            store
+                .compare_and_set_git_finalization_blocking(
+                    project.id,
+                    "session-finalizing",
+                    0,
+                    GitFinalizationState::Tracking,
+                    None,
+                    None,
+                    None,
+                    "101",
+                )
+                .unwrap()
+        );
+        store
+            .set_session_control_recovery_token_blocking(
+                project.id,
+                "session-working",
+                "clt-git-finalization:999",
+            )
+            .unwrap();
+        assert!(
+            store
+                .ensure_pending_git_finalization_resume_requested_blocking(
+                    project.id,
+                    "session-finalizing",
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .session_control_blocking(project.id, "session-working")
+                .unwrap()
+                .unwrap()
+                .run_token
+                .as_deref(),
+            Some("clt-git-finalization:999")
+        );
+        assert_eq!(
+            store
+                .session_control_blocking(project.id, "session-finalizing")
+                .unwrap()
+                .unwrap()
+                .run_token
+                .as_deref(),
+            Some("clt-git-finalization:1")
+        );
+        assert!(
+            store
+                .try_acquire_git_finalization_lease_blocking(
+                    project.id,
+                    "multi-session-finalizer",
+                    &agent_timestamp(),
+                    &agent_timestamp_after(60),
+                    None,
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .session_control_blocking(project.id, "session-working")
+                .unwrap()
+                .unwrap()
+                .run_token
+                .as_deref(),
+            Some("clt-git-finalization:0")
+        );
+        assert!(
+            store
+                .compare_and_set_git_finalization_blocking(
+                    project.id,
+                    "session-finalizing",
+                    1,
+                    GitFinalizationState::CommitPending,
+                    None,
+                    None,
+                    None,
+                    "102",
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .session_control_blocking(project.id, "session-finalizing")
+                .unwrap()
+                .unwrap()
+                .run_token
+                .as_deref(),
+            Some("clt-git-finalization:2")
+        );
+        assert!(
+            store
+                .git_finalization_lease_is_owned_blocking(
+                    project.id,
+                    "multi-session-finalizer",
+                    &agent_timestamp(),
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .compare_and_set_git_finalization_blocking(
+                    project.id,
+                    "session-finalizing",
+                    2,
+                    GitFinalizationState::Completed,
+                    None,
+                    Some("2222222222222222222222222222222222222222"),
+                    None,
+                    "103",
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .session_control_blocking(project.id, "session-finalizing")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .git_finalization_lease_is_owned_blocking(
+                    project.id,
+                    "multi-session-finalizer",
+                    &agent_timestamp(),
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .release_lease_blocking(project.id, "multi-session-finalizer")
+                .unwrap()
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn git_finalizer_heartbeat_renews_and_exact_holder_loss_fences_it() {
+        let root = temp_root("git-finalizer-heartbeat-fence");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert!(
+            store
+                .create_git_finalization_blocking(agent_store::NewGitFinalization {
+                    project_id: project.id,
+                    codex_session_id: "session-heartbeat",
+                    git_mode: AgentGitMode::Commit,
+                    starting_head: Some("1111111111111111111111111111111111111111"),
+                    branch_ref: Some("refs/heads/master"),
+                    upstream_ref: None,
+                    worktree_baseline: r#"{"version":1,"tracked_patch_ids":{},"untracked_blob_ids":{},"require_clean":false}"#,
+                    task_identity: None,
+                    owner_run_token: None,
+                    created_at: "100",
+                })
+                .unwrap()
+        );
+        drop(store);
+
+        let lease = try_acquire_agent_git_finalization_lease_with_timeout(
+            &state_dir,
+            &project,
+            false,
+            Duration::from_secs(2),
+        )
+        .unwrap()
+        .unwrap();
+        thread::sleep(Duration::from_secs(3));
+        lease.ensure_owned().unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        assert!(
+            !store
+                .try_acquire_git_finalization_lease_blocking(
+                    project.id,
+                    "competing-finalizer",
+                    &agent_timestamp(),
+                    &agent_timestamp_after(1),
+                    None,
+                )
+                .unwrap()
+        );
+        let exact_holder = lease.holder.clone();
+        assert!(
+            store
+                .release_lease_blocking(project.id, &exact_holder)
+                .unwrap()
+        );
+        let fence_error = lease.ensure_owned().unwrap_err();
+        assert!(format!("{fence_error:#}").contains("lost its exact project lease"));
+        drop(lease);
+
+        assert!(
+            store
+                .try_acquire_git_finalization_lease_blocking(
+                    project.id,
+                    "replacement-finalizer",
+                    &agent_timestamp(),
+                    &agent_timestamp_after(1),
+                    None,
+                )
+                .unwrap()
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scheduler_prioritizes_pending_git_finalization_over_new_todo_work() {
+        let root = temp_root("scheduler-git-finalization-priority");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        fs::write(
+            project_root.join("tasks/todo.md"),
+            "# Todo Tasks\n- Later task\n",
+        )
+        .unwrap();
+        fs::write(
+            project_root.join("tasks/done.md"),
+            "# Done Tasks\n- Provisional — COMPLETED 2026-09-02: checked codex:session-pending\n",
+        )
+        .unwrap();
+        let starting_head = initialize_test_git_repository(&project_root);
+        let branch_ref = run_test_git(&project_root, &["symbolic-ref", "HEAD"]);
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        assert!(
+            store
+                .set_project_git_mode_for_path_blocking(&project_root, AgentGitMode::Commit,)
+                .unwrap()
+        );
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert!(
+            store
+                .create_git_finalization_blocking(agent_store::NewGitFinalization {
+                    project_id: project.id,
+                    codex_session_id: "session-pending",
+                    git_mode: AgentGitMode::Commit,
+                    starting_head: Some(&starting_head),
+                    branch_ref: Some(&branch_ref),
+                    upstream_ref: None,
+                    worktree_baseline: r#"{"version":1,"tracked_patch_ids":{},"untracked_blob_ids":{},"require_clean":false}"#,
+                    task_identity: None,
+                    owner_run_token: None,
+                    created_at: "100",
+                })
+                .unwrap()
+        );
+        assert!(
+            store
+                .recover_git_finalization_intent_blocking(
+                    project.id,
+                    "session-pending",
+                    0,
+                    "provisional",
+                    None,
+                    "101",
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .compare_and_set_git_finalization_blocking(
+                    project.id,
+                    "session-pending",
+                    1,
+                    GitFinalizationState::CommitPending,
+                    None,
+                    None,
+                    None,
+                    "102",
+                )
+                .unwrap()
+        );
+        store
+            .set_session_control_state_blocking(
+                project.id,
+                "session-pending",
+                AgentSessionControlState::ResumeRequested,
+            )
+            .unwrap();
+        drop(store);
+
+        let start =
+            run_agent_scheduler_pass_with_max_global_jobs(&state_dir, true, &[], 1, None).unwrap();
+        assert_eq!(start.jobs.len(), 1);
+        assert_eq!(
+            start.jobs[0].task_selection,
+            AgentTaskSelection::ResumeSession
+        );
+        assert_eq!(
+            start.jobs[0].resume_session_id.as_deref(),
+            Some("session-pending")
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scheduler_keeps_push_pending_autonomous_and_does_not_resume_codex() {
+        let root = temp_root("scheduler-autonomous-push-pending");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        fs::write(
+            project_root.join("tasks/todo.md"),
+            "# Todo Tasks\n- Do not start while publication is pending\n",
+        )
+        .unwrap();
+        initialize_test_git_repository(&project_root);
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert!(
+            store
+                .create_git_finalization_blocking(agent_store::NewGitFinalization {
+                    project_id: project.id,
+                    codex_session_id: "session-autonomous-push",
+                    git_mode: AgentGitMode::CommitAndPush,
+                    starting_head: Some("1111111111111111111111111111111111111111"),
+                    branch_ref: Some("refs/heads/master"),
+                    upstream_ref: Some("refs/remotes/origin/master"),
+                    worktree_baseline: r#"{"version":1,"tracked_patch_ids":{},"untracked_blob_ids":{},"require_clean":false}"#,
+                    task_identity: Some("autonomous push"),
+                    owner_run_token: None,
+                    created_at: "100",
+                })
+                .unwrap()
+        );
+        for (generation, state, commit_oid) in [
+            (0, GitFinalizationState::Tracking, None),
+            (1, GitFinalizationState::CommitPending, None),
+            (
+                2,
+                GitFinalizationState::PushPending,
+                Some("2222222222222222222222222222222222222222"),
+            ),
+        ] {
+            assert!(
+                store
+                    .compare_and_set_git_finalization_blocking(
+                        project.id,
+                        "session-autonomous-push",
+                        generation,
+                        state,
+                        None,
+                        commit_oid,
+                        None,
+                        "101",
+                    )
+                    .unwrap()
+            );
+        }
+        store
+            .set_session_control_state_blocking(
+                project.id,
+                "session-autonomous-push",
+                AgentSessionControlState::ResumeRequested,
+            )
+            .unwrap();
+        assert!(
+            store
+                .try_acquire_lease_blocking(
+                    project.id,
+                    "concurrent-finalizer",
+                    &agent_timestamp(),
+                    &agent_timestamp_after(60),
+                )
+                .unwrap()
+        );
+        drop(store);
+
+        let fenced =
+            run_agent_scheduler_pass_with_max_global_jobs(&state_dir, true, &[], 1, None).unwrap();
+        assert!(fenced.jobs.is_empty());
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        let untouched = store
+            .git_finalization_blocking(project.id, "session-autonomous-push")
+            .unwrap()
+            .unwrap();
+        assert_eq!(untouched.generation, 3);
+        assert!(untouched.last_error.is_none());
+        assert!(
+            store
+                .release_lease_blocking(project.id, "concurrent-finalizer")
+                .unwrap()
+        );
+        drop(store);
+
+        let pass =
+            run_agent_scheduler_pass_with_max_global_jobs(&state_dir, true, &[], 1, None).unwrap();
+        assert!(pass.jobs.is_empty());
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        assert!(
+            store
+                .session_control_blocking(project.id, "session-autonomous-push")
+                .unwrap()
+                .is_none()
+        );
+        let failed = store
+            .git_finalization_blocking(project.id, "session-autonomous-push")
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.state, GitFinalizationState::PushPending);
+        assert_eq!(failed.generation, 4);
+        assert!(failed.last_error.is_some());
+        drop(store);
+
+        let backed_off =
+            run_agent_scheduler_pass_with_max_global_jobs(&state_dir, true, &[], 1, None).unwrap();
+        assert!(backed_off.jobs.is_empty());
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        let still_pending = store
+            .git_finalization_blocking(project.id, "session-autonomous-push")
+            .unwrap()
+            .unwrap();
+        assert_eq!(still_pending.state, GitFinalizationState::PushPending);
+        assert_eq!(still_pending.generation, failed.generation);
+        assert_eq!(still_pending.last_error, failed.last_error);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_job_preserves_pending_git_finalization_then_accepts_the_proven_commit() {
+        let root = temp_root("agent-job-git-finalization-lifecycle");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        fs::write(
+            project_root.join("tasks/doing.md"),
+            "# Doing Tasks\n- Durable finish — COMPLETED 2026-09-02: cargo test passed codex:session-lifecycle\n",
+        )
+        .unwrap();
+        initialize_test_git_repository(&project_root);
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        assert!(
+            store
+                .set_project_git_mode_for_path_blocking(&project_root, AgentGitMode::Commit,)
+                .unwrap()
+        );
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        store
+            .mark_session_running_blocking(
+                project.id,
+                "session-lifecycle",
+                123,
+                "run-before-commit",
+                &root.join("before.out"),
+                &root.join("before.err"),
+            )
+            .unwrap();
+        let git_start = capture_agent_git_start_state(&project_root, AgentGitMode::Commit).unwrap();
+        ensure_agent_git_working_record(
+            &store,
+            &project,
+            "session-lifecycle",
+            "run-before-commit",
+            Some(&git_start),
+        )
+        .unwrap();
+        assert!(
+            bind_agent_git_working_task_identity(
+                &store,
+                &project,
+                "session-lifecycle",
+                "run-before-commit",
+            )
+            .unwrap()
+        );
+        fs::write(project_root.join("durable.txt"), "implemented\n").unwrap();
+        run_test_git(&project_root, &["add", "durable.txt"]);
+        move_task_to_done_with_agent_store(
+            &project_root,
+            "doing",
+            "1",
+            &AutomatedAgentChildContext {
+                project_id: project.id,
+                run_token: "run-before-commit".to_string(),
+            },
+            &store,
+        )
+        .unwrap();
+
+        let first_holder = "git-finalization-first-holder";
+        assert!(
+            store
+                .try_acquire_lease_blocking(project.id, first_holder, "100", "9999999999")
+                .unwrap()
+        );
+        let mut timed_out_runner = FakeAgentRunner::new(&state_dir, "timeout");
+        timed_out_runner.result.codex_session_id = Some("session-lifecycle".to_string());
+        timed_out_runner.result.session_run_token = Some("run-before-commit".to_string());
+        timed_out_runner.result.exit_code = None;
+        let pending_completion = run_agent_job(
+            AgentRunJob {
+                state_dir: state_dir.clone(),
+                project: project.clone(),
+                holder: first_holder.to_string(),
+                worker_token: None,
+                max_global_jobs: 12,
+                task_selection: AgentTaskSelection::NextTodo,
+                resume_session_id: None,
+                blocked_task_count_before: 0,
+                done_task_contents_before: Vec::new(),
+                blocked_task_snapshots_before: Vec::new(),
+            },
+            &timed_out_runner,
+            &new_agent_shutdown_signal(),
+        )
+        .unwrap();
+
+        assert_eq!(pending_completion.status, "failure");
+        assert!(pending_completion.summary.contains("FINALIZING"));
+        assert_eq!(
+            store
+                .session_control_blocking(project.id, "session-lifecycle")
+                .unwrap()
+                .unwrap()
+                .state,
+            AgentSessionControlState::Running
+        );
+        assert_eq!(
+            store
+                .git_finalization_blocking(project.id, "session-lifecycle")
+                .unwrap()
+                .unwrap()
+                .state,
+            GitFinalizationState::CommitPending
+        );
+
+        run_test_git(&project_root, &["add", "--all"]);
+        run_test_agent_git(
+            &project_root,
+            &[
+                "commit",
+                "-m",
+                "Durable finish",
+                "-m",
+                "CLT-Task: codex:session-lifecycle",
+            ],
+        );
+        store
+            .mark_session_running_blocking(
+                project.id,
+                "session-lifecycle",
+                124,
+                "run-after-commit",
+                &root.join("after.out"),
+                &root.join("after.err"),
+            )
+            .unwrap();
+        let second_holder = "git-finalization-second-holder";
+        assert!(
+            store
+                .try_acquire_lease_blocking(project.id, second_holder, "200", "9999999999")
+                .unwrap()
+        );
+        let mut resumed_runner = FakeAgentRunner::new(&state_dir, "timeout");
+        resumed_runner.result.codex_session_id = Some("session-lifecycle".to_string());
+        resumed_runner.result.session_run_token = Some("run-after-commit".to_string());
+        resumed_runner.result.exit_code = None;
+        let completed = run_agent_job(
+            AgentRunJob {
+                state_dir: state_dir.clone(),
+                project: project.clone(),
+                holder: second_holder.to_string(),
+                worker_token: None,
+                max_global_jobs: 12,
+                task_selection: AgentTaskSelection::ResumeSession,
+                resume_session_id: Some("session-lifecycle".to_string()),
+                blocked_task_count_before: 0,
+                done_task_contents_before: completed_task_contents(&project_root).unwrap(),
+                blocked_task_snapshots_before: Vec::new(),
+            },
+            &resumed_runner,
+            &new_agent_shutdown_signal(),
+        )
+        .unwrap();
+
+        assert_eq!(completed.status, "success");
+        assert!(completed.summary.contains("proved"));
+        assert!(
+            store
+                .session_control_blocking(project.id, "session-lifecycle")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .git_finalization_blocking(project.id, "session-lifecycle")
+                .unwrap()
+                .unwrap()
+                .state,
+            GitFinalizationState::Completed
+        );
+        assert_eq!(
+            store
+                .latest_run_for_project_blocking(project.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "success"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scheduler_rolls_forward_a_proven_commit_without_resuming_codex() {
+        let root = temp_root("scheduler-git-finalization-roll-forward");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        fs::write(
+            project_root.join("tasks/todo.md"),
+            "# Todo Tasks\n- Later task\n",
+        )
+        .unwrap();
+        let starting_head = initialize_test_git_repository(&project_root);
+        let branch_ref = run_test_git(&project_root, &["symbolic-ref", "HEAD"]);
+        fs::write(
+            project_root.join("tasks/done.md"),
+            "# Done Tasks\n- Already committed — COMPLETED 2026-09-02: checked codex:session-roll-forward\n",
+        )
+        .unwrap();
+        run_test_git(&project_root, &["add", "--all"]);
+        run_test_agent_git(
+            &project_root,
+            &[
+                "commit",
+                "-m",
+                "Already committed",
+                "-m",
+                "CLT-Task: codex:session-roll-forward",
+            ],
+        );
+
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        assert!(
+            store
+                .set_project_git_mode_for_path_blocking(&project_root, AgentGitMode::Commit,)
+                .unwrap()
+        );
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert!(
+            store
+                .create_git_finalization_blocking(agent_store::NewGitFinalization {
+                    project_id: project.id,
+                    codex_session_id: "session-roll-forward",
+                    git_mode: AgentGitMode::Commit,
+                    starting_head: Some(&starting_head),
+                    branch_ref: Some(&branch_ref),
+                    upstream_ref: None,
+                    worktree_baseline: r#"{"version":1,"tracked_patch_ids":{},"untracked_blob_ids":{},"require_clean":false}"#,
+                    task_identity: None,
+                    owner_run_token: None,
+                    created_at: "100",
+                })
+                .unwrap()
+        );
+        assert!(
+            store
+                .recover_git_finalization_intent_blocking(
+                    project.id,
+                    "session-roll-forward",
+                    0,
+                    &durable_task_identity("Already committed").unwrap(),
+                    None,
+                    "101",
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .compare_and_set_git_finalization_blocking(
+                    project.id,
+                    "session-roll-forward",
+                    1,
+                    GitFinalizationState::CommitPending,
+                    None,
+                    None,
+                    None,
+                    "102",
+                )
+                .unwrap()
+        );
+        store
+            .set_session_control_state_blocking(
+                project.id,
+                "session-roll-forward",
+                AgentSessionControlState::ResumeRequested,
+            )
+            .unwrap();
+        drop(store);
+
+        let mut start =
+            run_agent_scheduler_pass_with_max_global_jobs(&state_dir, true, &[], 1, None).unwrap();
+        assert_eq!(start.jobs.len(), 1);
+        assert_eq!(start.jobs[0].task_selection, AgentTaskSelection::NextTodo);
+
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        assert_eq!(
+            store
+                .git_finalization_blocking(project.id, "session-roll-forward")
+                .unwrap()
+                .unwrap()
+                .state,
+            GitFinalizationState::Completed
+        );
+        assert!(
+            store
+                .session_control_blocking(project.id, "session-roll-forward")
+                .unwrap()
+                .is_none()
+        );
+        let job = start.jobs.pop().unwrap();
+        assert!(
+            store
+                .release_lease_blocking(project.id, &job.holder)
+                .unwrap()
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn agent_store_register_is_idempotent_and_lists_projects() {
         let root = temp_root("agent-register");
         let state_dir = root.join("state/clt");
@@ -32013,6 +44239,144 @@ mod tests {
         assert!(store.unregister_project_blocking(&project_root).unwrap());
         assert!(!store.unregister_project_blocking(&project_root).unwrap());
         assert!(store.list_projects_blocking().unwrap().is_empty());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_store_unregister_and_clean_preserve_an_unconsumed_git_launch_boundary() {
+        let root = temp_root("agent-unregister-unconsumed-git-launch");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        initialize_test_git_repository(&project_root);
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        let launch = capture_agent_git_start_state(&project_root, AgentGitMode::Commit).unwrap();
+        store
+            .record_git_launch_state_blocking(
+                project.id,
+                "orphaned-release",
+                AgentGitMode::Commit,
+                &launch,
+                "100",
+            )
+            .unwrap();
+
+        let unregister_error = store
+            .unregister_project_blocking(&project_root)
+            .unwrap_err();
+        assert!(format!("{unregister_error:#}").contains("launch boundary"));
+        let clean_error = store.clean_agent_history_blocking("200").unwrap_err();
+        assert!(format!("{clean_error:#}").contains("launch boundary"));
+        assert_eq!(store.list_projects_blocking().unwrap().len(), 1);
+        assert_eq!(
+            store
+                .git_launch_state_blocking(project.id, "orphaned-release")
+                .unwrap(),
+            Some((AgentGitMode::Commit, launch))
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_store_unregister_preserves_push_pending_finalization() {
+        let root = temp_root("agent-unregister-push-pending");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        store
+            .mark_session_running_blocking(
+                project.id,
+                "session-pending-unregister",
+                123,
+                "run-pending-unregister",
+                &root.join("pending.out"),
+                &root.join("pending.err"),
+            )
+            .unwrap();
+        assert!(
+            store
+                .create_git_finalization_blocking(agent_store::NewGitFinalization {
+                    project_id: project.id,
+                    codex_session_id: "session-pending-unregister",
+                    git_mode: AgentGitMode::CommitAndPush,
+                    starting_head: Some("1111111111111111111111111111111111111111"),
+                    branch_ref: Some("refs/heads/master"),
+                    upstream_ref: Some("refs/remotes/origin/master"),
+                    worktree_baseline: r#"{"version":1,"tracked_patch_ids":{},"untracked_blob_ids":{},"require_clean":false}"#,
+                    task_identity: Some("pending task"),
+                    owner_run_token: Some("run-pending-unregister"),
+                    created_at: "100",
+                })
+                .unwrap()
+        );
+        assert!(
+            store
+                .compare_and_set_git_finalization_blocking(
+                    project.id,
+                    "session-pending-unregister",
+                    0,
+                    GitFinalizationState::Tracking,
+                    Some("run-pending-unregister"),
+                    None,
+                    None,
+                    "101",
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .compare_and_set_git_finalization_blocking(
+                    project.id,
+                    "session-pending-unregister",
+                    1,
+                    GitFinalizationState::CommitPending,
+                    Some("run-pending-unregister"),
+                    None,
+                    None,
+                    "102",
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .compare_and_set_git_finalization_blocking(
+                    project.id,
+                    "session-pending-unregister",
+                    2,
+                    GitFinalizationState::PushPending,
+                    Some("run-pending-unregister"),
+                    Some("2222222222222222222222222222222222222222"),
+                    None,
+                    "103",
+                )
+                .unwrap()
+        );
+
+        let error = store
+            .unregister_project_blocking(&project_root)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("nonterminal"));
+        assert_eq!(
+            store
+                .git_finalization_blocking(project.id, "session-pending-unregister")
+                .unwrap()
+                .unwrap()
+                .state,
+            GitFinalizationState::PushPending
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -34366,6 +46730,80 @@ mod tests {
     }
 
     #[test]
+    fn foreground_git_run_uses_one_durable_inline_generation() {
+        let root = temp_root("foreground-inline-generation");
+        let (state_dir, job) = prepare_inline_git_job(&root);
+        let runner = InspectInlineOwnershipRunner {
+            state_dir: state_dir.clone(),
+            break_lease_after_observation: false,
+            observed_run_token: Mutex::new(None),
+        };
+
+        let completion = run_agent_job(job, &runner, &new_agent_shutdown_signal()).unwrap();
+        assert_eq!(completion.status, "idle");
+        let worker_token = runner.observed_run_token.lock().unwrap().clone().unwrap();
+        assert!(!inline_agent_worker_generation_is_registered(&worker_token));
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        assert!(store.list_active_workers_blocking().unwrap().is_empty());
+        let worker = store
+            .list_terminal_workers_blocking()
+            .unwrap()
+            .into_iter()
+            .find(|worker| worker.worker_token == worker_token)
+            .unwrap();
+        assert_eq!(worker.state, "completed");
+        assert_eq!(worker.run_id, Some(completion.run_id));
+        assert!(
+            store
+                .lease_for_project_blocking(worker.project_id)
+                .unwrap()
+                .is_none()
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn foreground_git_run_error_abandons_its_exact_inline_generation() {
+        let root = temp_root("foreground-inline-error");
+        let (state_dir, job) = prepare_inline_git_job(&root);
+        let runner = InspectInlineOwnershipRunner {
+            state_dir: state_dir.clone(),
+            break_lease_after_observation: true,
+            observed_run_token: Mutex::new(None),
+        };
+
+        let error = run_agent_job(job, &runner, &new_agent_shutdown_signal())
+            .err()
+            .expect("broken inline lease must fail the run");
+        assert!(
+            error
+                .to_string()
+                .contains("lost its durable ownership fence")
+        );
+        let worker_token = runner.observed_run_token.lock().unwrap().clone().unwrap();
+        assert!(!inline_agent_worker_generation_is_registered(&worker_token));
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        assert!(store.list_active_workers_blocking().unwrap().is_empty());
+        let worker = store
+            .list_terminal_workers_blocking()
+            .unwrap()
+            .into_iter()
+            .find(|worker| worker.worker_token == worker_token)
+            .unwrap();
+        assert_eq!(worker.state, "abandoned");
+        assert!(
+            worker
+                .error
+                .unwrap()
+                .contains("lost its durable ownership fence")
+        );
+        assert_eq!(store.run_count_blocking().unwrap(), 1);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn independent_worker_dispatch_survives_scheduler_state_and_consumes_capacity() {
         let root = temp_root("independent-worker-dispatch");
         let state_dir = root.join("state/clt");
@@ -34647,6 +47085,84 @@ mod tests {
                 .unwrap()
                 .expires_at,
             "300"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn inline_worker_reservation_and_claim_commit_as_one_lease_transfer() {
+        let root = temp_root("inline-worker-atomic-claim");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert!(
+            store
+                .try_acquire_lease_blocking(project.id, "scheduler", "100", "200")
+                .unwrap()
+        );
+        let reservation = |expected_lease_holder| agent_store::AgentWorkerReservation {
+            project_id: project.id,
+            worker_token: "inline-token",
+            expected_lease_holder,
+            max_active_workers: 12,
+            protocol_version: AGENT_WORKER_PROTOCOL_VERSION,
+            service_label: "clt-inline-worker-inline-token",
+            binary_path: Path::new("/tmp/clt-inline-generation"),
+            command_arguments: "[]",
+            path_env: OsStr::new("/usr/bin:/bin"),
+            codex_path: None,
+            task_selection: "next_todo",
+            resume_session_id: None,
+            created_at: "101",
+        };
+
+        assert!(
+            !store
+                .reserve_and_claim_worker_blocking(
+                    reservation("wrong-holder"),
+                    std::process::id(),
+                    "102",
+                )
+                .unwrap()
+        );
+        assert!(store.list_active_workers_blocking().unwrap().is_empty());
+        assert_eq!(
+            store
+                .lease_for_project_blocking(project.id)
+                .unwrap()
+                .unwrap()
+                .holder,
+            "scheduler"
+        );
+
+        assert!(
+            store
+                .reserve_and_claim_worker_blocking(
+                    reservation("scheduler"),
+                    std::process::id(),
+                    "102",
+                )
+                .unwrap()
+        );
+        let worker = store.list_active_workers_blocking().unwrap().remove(0);
+        assert_eq!(worker.state, AGENT_WORKER_STATE_RUNNING);
+        assert_eq!(worker.worker_pid, Some(std::process::id()));
+        assert_eq!(worker.started_at.as_deref(), Some("102"));
+        assert_eq!(worker.heartbeat_at.as_deref(), Some("102"));
+        assert_eq!(
+            store
+                .lease_for_project_blocking(project.id)
+                .unwrap()
+                .unwrap()
+                .holder,
+            agent_worker_lease_holder("inline-token")
         );
 
         fs::remove_dir_all(root).unwrap();
@@ -35235,6 +47751,161 @@ mod tests {
     }
 
     #[test]
+    fn inline_worker_liveness_uses_the_registered_generation_not_a_reused_pid() {
+        let root = temp_root("inline-worker-generation-liveness");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert!(
+            store
+                .try_acquire_lease_blocking(project.id, "scheduler", "99", "999")
+                .unwrap()
+        );
+        let generation = InlineAgentWorkerGeneration::register("inline-live-token");
+        assert!(reserve_test_inline_worker(
+            &store,
+            project.id,
+            "inline-live-token",
+            "scheduler",
+            std::process::id(),
+            "100",
+        ));
+
+        let drain_count = Cell::new(0);
+        let workers = reconcile_independent_agent_workers_with(
+            &state_dir,
+            &store,
+            160,
+            |_| panic!("a running inline generation must not be dispatched"),
+            |_| {
+                drain_count.set(drain_count.get() + 1);
+                Ok(true)
+            },
+        )
+        .unwrap();
+        assert_eq!(workers.len(), 1);
+        assert_eq!(drain_count.get(), 0);
+
+        drop(generation);
+        let workers = reconcile_independent_agent_workers_with(
+            &state_dir,
+            &store,
+            161,
+            |_| panic!("an inline generation must not be dispatched"),
+            |_| {
+                drain_count.set(drain_count.get() + 1);
+                Ok(true)
+            },
+        )
+        .unwrap();
+        assert!(workers.is_empty());
+        assert_eq!(drain_count.get(), 1);
+        assert_eq!(store.run_count_blocking().unwrap(), 1);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn inline_worker_recovery_waits_for_exact_launch_reap_fence() {
+        let root = temp_root("inline-worker-launch-reap-fence");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert!(
+            store
+                .try_acquire_lease_blocking(project.id, "scheduler", "99", "999")
+                .unwrap()
+        );
+        assert!(reserve_test_inline_worker(
+            &store,
+            project.id,
+            "inline-reap-token",
+            "scheduler",
+            u32::MAX,
+            "100",
+        ));
+        let git_start = AgentGitStartState {
+            starting_head: "abc123".to_string(),
+            branch_ref: Some("refs/heads/main".to_string()),
+            upstream_ref: None,
+            worktree_baseline: "[]".to_string(),
+        };
+        assert!(
+            store
+                .record_git_launch_state_blocking(
+                    project.id,
+                    "inline-reap-token",
+                    AgentGitMode::Commit,
+                    &git_start,
+                    "101",
+                )
+                .unwrap()
+        );
+
+        let drain_count = Cell::new(0);
+        let workers = reconcile_independent_agent_workers_with(
+            &state_dir,
+            &store,
+            160,
+            |_| panic!("an inline worker must not be dispatched"),
+            |_| {
+                drain_count.set(drain_count.get() + 1);
+                Ok(true)
+            },
+        )
+        .unwrap();
+        assert_eq!(workers.len(), 1);
+        assert_eq!(drain_count.get(), 0);
+        assert_eq!(store.run_count_blocking().unwrap(), 0);
+
+        assert!(
+            store
+                .abandon_worker_blocking(agent_store::AgentWorkerAbandonment {
+                    worker_token: "inline-reap-token",
+                    expected_state: AGENT_WORKER_STATE_RUNNING,
+                    expected_worker_pid: Some(u32::MAX),
+                    expected_heartbeat_at: Some("100"),
+                    finished_at: "161",
+                    error: "simulated supervisor finalization after reap",
+                    permitted_successor_holder: None,
+                })
+                .unwrap()
+        );
+        assert!(
+            store
+                .reclaim_unchanged_git_launch_state_blocking(
+                    project.id,
+                    "inline-reap-token",
+                    AgentGitMode::Commit,
+                    &git_start,
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .git_launch_state_blocking(project.id, "inline-reap-token")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(drain_count.get(), 0);
+        assert_eq!(store.run_count_blocking().unwrap(), 1);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn worker_finalization_requires_the_exact_current_lease_holder() {
         let root = temp_root("agent-worker-finalization-fence");
         let state_dir = root.join("state/clt");
@@ -35587,6 +48258,7 @@ mod tests {
 
     #[test]
     fn incompatible_schema_migration_is_deferred_for_pinned_workers() {
+        let future_migration_version = 18;
         let root = temp_root("agent-worker-migration-barrier");
         let state_dir = root.join("state/clt");
         let project_root = root.join("project");
@@ -35617,7 +48289,7 @@ mod tests {
         );
         assert!(
             store
-                .worker_schema_migration_deferred_blocking(AGENT_WORKER_SHARED_SCHEMA_VERSION + 1)
+                .worker_schema_migration_deferred_blocking(future_migration_version)
                 .unwrap()
         );
         store
@@ -35632,13 +48304,13 @@ mod tests {
             .unwrap();
         let compatibility_store = agent_store::TursoAgentStore::open_blocking_with_test_migration(
             &state_dir,
-            AGENT_WORKER_SHARED_SCHEMA_VERSION + 1,
+            future_migration_version,
             "CREATE TABLE deferred_worker_migration_probe (id INTEGER PRIMARY KEY)",
         )
         .unwrap();
         assert_eq!(
             compatibility_store.pending_migration_version(),
-            Some(AGENT_WORKER_SHARED_SCHEMA_VERSION + 1)
+            Some(future_migration_version)
         );
         assert!(
             !compatibility_store
@@ -35670,12 +48342,12 @@ mod tests {
         );
         assert!(
             !store
-                .worker_schema_migration_deferred_blocking(AGENT_WORKER_SHARED_SCHEMA_VERSION + 1)
+                .worker_schema_migration_deferred_blocking(future_migration_version)
                 .unwrap()
         );
         let migrated_store = agent_store::TursoAgentStore::open_blocking_with_test_migration(
             &state_dir,
-            AGENT_WORKER_SHARED_SCHEMA_VERSION + 1,
+            future_migration_version,
             "CREATE TABLE deferred_worker_migration_probe (id INTEGER PRIMARY KEY)",
         )
         .unwrap();
@@ -36071,6 +48743,8 @@ mod tests {
         assert!(commit_prompt.contains("Pre-existing unstaged changes do not prevent a commit"));
         assert!(commit_prompt.contains("Do not require the worktree to be clean"));
         assert!(commit_prompt.contains("Do not commit when there are no tasks left"));
+        assert!(commit_prompt.contains("CLT completed the scheduler-owned startup preparation"));
+        assert!(commit_prompt.contains("Do not pull, fetch or otherwise synchronize"));
         assert!(!commit_prompt.contains("Git push:"));
 
         project.git_mode = AgentGitMode::CommitAndPush;
@@ -36078,10 +48752,11 @@ mod tests {
             build_agent_codex_prompt(&project, AgentTaskSelection::NextTodo, true, true);
         assert!(push_prompt.contains("Git commit:"));
         assert!(push_prompt.contains("Git push:"));
-        assert!(
-            push_prompt.contains("pull first with the locally configured merge/rebase strategy")
-        );
-        assert!(!push_prompt.contains("pull-with-rebase"));
+        assert!(!push_prompt.contains("git pull --no-rebase --autostash"));
+        assert!(push_prompt.contains("Do not run `git push`"));
+        assert!(push_prompt.contains("CLT proves the sealed local commit"));
+        assert!(push_prompt.contains("single intended push URL"));
+        assert!(push_prompt.contains("remains PUSH-PENDING"));
         assert!(push_prompt.contains("Never force-push"));
 
         let recovery_prompt =
@@ -36920,6 +49595,7 @@ exit 0
             AgentTaskSelection::ResumeSession,
             Some("session-123"),
             "wrong-holder",
+            None,
             &new_agent_shutdown_signal(),
         );
         assert!(wrong_holder_result.is_err());
@@ -36938,6 +49614,7 @@ exit 0
                 AgentTaskSelection::ResumeSession,
                 Some("session-123"),
                 lease_holder,
+                None,
                 &new_agent_shutdown_signal(),
             )
             .unwrap();
@@ -37022,6 +49699,7 @@ exit 0
                 AgentTaskSelection::NextTodo,
                 None,
                 "test-holder",
+                None,
                 &shutdown,
             )
             .unwrap();
@@ -37043,6 +49721,152 @@ exit 0
         assert!(stderr.contains(&format!("arg={}\n", project_root.display())));
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn assert_connected_no_session_launch_recovery(mutate_checkout: bool) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_root(if mutate_checkout {
+            "git-runner-no-session-mutated"
+        } else {
+            "git-runner-no-session-unchanged"
+        });
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        add_task(&project_root, "committed task", None).unwrap();
+        initialize_test_git_repository(&project_root);
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let mut project = store.list_projects_blocking().unwrap().remove(0);
+        assert!(
+            store
+                .set_project_git_mode_blocking(project.id, AgentGitMode::Commit)
+                .unwrap()
+        );
+        project.git_mode = AgentGitMode::Commit;
+        let scheduler_holder = "git-no-session-scheduler";
+        assert!(
+            store
+                .try_acquire_lease_blocking(
+                    project.id,
+                    scheduler_holder,
+                    &agent_timestamp(),
+                    &agent_timestamp_after(60),
+                )
+                .unwrap()
+        );
+        let fake_codex = root.join("fake-codex");
+        fs::write(&fake_codex, "#!/bin/sh\nprintf 'NO_TASKS_LEFT\\n'\n").unwrap();
+        let mut permissions = fs::metadata(&fake_codex).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_codex, permissions).unwrap();
+        let runner =
+            CodexAgentRunner::with_command(state_dir.clone(), Duration::from_secs(5), fake_codex);
+        let run_token = "git-no-session-token";
+        assert!(reserve_test_inline_worker(
+            &store,
+            project.id,
+            run_token,
+            scheduler_holder,
+            std::process::id(),
+            &agent_timestamp(),
+        ));
+        let lease_holder = agent_worker_lease_holder(run_token);
+
+        let result = runner
+            .run_project(
+                &project,
+                AgentTaskSelection::NextTodo,
+                None,
+                &lease_holder,
+                Some(run_token),
+                &new_agent_shutdown_signal(),
+            )
+            .unwrap();
+
+        assert_eq!(result.status, "idle");
+        assert!(result.codex_session_id.is_none());
+        assert!(
+            store
+                .git_launch_state_blocking(project.id, run_token)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .finalize_worker_blocking(agent_store::AgentWorkerFinalization {
+                    worker_token: run_token,
+                    expected_worker_pid: Some(std::process::id()),
+                    expected_lease_holder: &lease_holder,
+                    status: result.status,
+                    finished_at: &agent_timestamp(),
+                    exit_code: result.exit_code,
+                    log_dir: Some(result.log_dir.to_string_lossy().as_ref()),
+                    stdout_path: Some(result.stdout_path.to_string_lossy().as_ref()),
+                    stderr_path: Some(result.stderr_path.to_string_lossy().as_ref()),
+                    summary: Some(&result.summary),
+                    codex_session_id: None,
+                    error: None,
+                })
+                .unwrap()
+                .is_some()
+        );
+        if mutate_checkout {
+            fs::write(project_root.join("unexpected.txt"), "changed after reap\n").unwrap();
+            let error = prepare_agent_git_start_state_for_run(
+                &store,
+                &project,
+                AgentTaskSelection::NextTodo,
+                false,
+                false,
+                "replacement-run",
+            )
+            .unwrap_err();
+            assert!(format!("{error:#}").contains("unconsumed launch boundary"));
+            assert!(
+                store
+                    .git_launch_state_blocking(project.id, run_token)
+                    .unwrap()
+                    .is_some()
+            );
+        } else {
+            assert!(
+                prepare_agent_git_start_state_for_run(
+                    &store,
+                    &project,
+                    AgentTaskSelection::NextTodo,
+                    false,
+                    false,
+                    "replacement-run",
+                )
+                .unwrap()
+                .is_some()
+            );
+            assert!(
+                store
+                    .git_launch_state_blocking(project.id, run_token)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn connected_no_session_reclaims_unchanged_launch_after_worker_finalization() {
+        assert_connected_no_session_launch_recovery(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn connected_no_session_preserves_launch_after_checkout_mutation() {
+        assert_connected_no_session_launch_recovery(true);
     }
 
     #[cfg(unix)]
@@ -37100,6 +49924,7 @@ exit 0
                     AgentTaskSelection::ResumeDoing,
                     None,
                     "wrong-holder",
+                    None,
                     &new_agent_shutdown_signal(),
                 )
                 .is_err()
@@ -37118,6 +49943,7 @@ exit 0
                 AgentTaskSelection::ResumeDoing,
                 None,
                 lease_holder,
+                None,
                 &new_agent_shutdown_signal(),
             )
             .unwrap();
@@ -37179,6 +50005,7 @@ exit 0
                 AgentTaskSelection::NextTodo,
                 None,
                 lease_holder,
+                None,
                 &new_agent_shutdown_signal(),
             )
             .unwrap();
@@ -37242,6 +50069,7 @@ exit 0
                 AgentTaskSelection::NextTodo,
                 None,
                 "test-holder",
+                None,
                 &new_agent_shutdown_signal(),
             )
             .unwrap();
@@ -37329,6 +50157,7 @@ exit 0
                 AgentTaskSelection::NextTodo,
                 None,
                 "test-holder",
+                None,
                 &new_agent_shutdown_signal(),
             )
             .unwrap();
@@ -37403,6 +50232,7 @@ exit 0
                 AgentTaskSelection::NextTodo,
                 None,
                 "test-holder",
+                None,
                 &shutdown,
             )
             .unwrap();

@@ -136,7 +136,7 @@ Expected behavior:
 
 ### `clt agent unregister [path]`
 
-Removes a project from the registry. It should not delete project tasks or logs.
+Removes a project from the registry. It should not delete project tasks or logs, and it must refuse while a nonterminal Git finalization or unconsumed pre-registration launch boundary remains.
 
 ### `clt agent projects`
 
@@ -198,12 +198,13 @@ Each project run should execute a prompt equivalent to the current shell script:
 1. Inspect the task board using `clt`.
 2. Pick the next available ready/todo task.
 3. If no task exists, print `NO_TASKS_LEFT`.
-4. Move exactly one task to `doing`.
+4. Move exactly one task to `doing`. With Git automation enabled, the task must already exist in `HEAD`; the scheduler has already synchronized and frozen the checkout before releasing Codex. The command rechecks that launch state and binds it to a durable `WORKING` journal before this board mutation. Codex must not pull, synchronize, or switch branches itself.
 5. Complete that task.
 6. Run relevant checks/tests.
 7. Update the task board.
-8. Mark the task done if completed.
-9. Stop after one task.
+8. Mark the task done if completed. In a Git-enabled automated run this starts a provisional, persisted `FINALIZING` transaction rather than immediately making the task terminal.
+9. Create one normal task commit whose full tree exactly matches the sealed implementation, completion note, and projected board transition, with one exact `CLT-Task: codex:<session-id>` trailer. Never push from Codex, including in commit-and-push mode.
+10. Stop after one task. CLT proves the local commit and, when configured, publishes it itself. Local-finalization interruption resumes the same session; `PUSH-PENDING` publication does not.
 
 The Rust implementation should invoke Codex with:
 
@@ -221,6 +222,28 @@ cannot pause waiting for an approval response. Only enable the agent for trusted
 repositories or run it inside an externally isolated container or VM.
 
 The prompt should live in Rust as a template or in a bundled text file. It should be easy to update without touching scheduler logic.
+
+## Durable Git Finalization Contract
+
+For a fresh project run in `commit` or `commit-and-push` mode, checkout selection and required branch/upstream configuration must be complete before scheduling; detached HEAD is rejected. Before spawning or releasing Codex, the scheduler requires the Git index to match `HEAD` and performs the safe fast-forward-only startup sync unless an older `WORKING` journal still depends on the current history. In that case it deliberately preserves the current commit so the older task remains provable. It captures the resulting `HEAD`, attached branch, unstaged/untracked baseline, and upstream configuration and persists that server-owned launch record. Any spawned child remains behind its launch gate until the remaining session fences are registered. If synchronization, capture, persistence, or registration fails, Codex must not execute the agent prompt.
+
+The launch record initially exists before a Codex session can be registered. This unconsumed pre-registration boundary is immutable: neither the same run nor a replacement worker may overwrite or recapture it from a later checkout. If Codex exits before announcing a session, its supervisor first reaps the exact child and terminalizes that worker generation without erasing the boundary. CLT reclaims it automatically only when the exact worker is terminal, no session-control row owns its run token, and the checkout and Git mode match the frozen snapshot. Any uncertainty or changed checkout fails closed and prevents later project work. Unregister and clean also refuse to erase this evidence.
+
+The selected Todo task must already have the same durable identity in the frozen starting commit. This makes task creation and task execution separate commit boundaries: a user or prior workflow commits the task definition once, then the automated run makes the single implementation-and-completion commit.
+
+The Todo-to-Doing command verifies the server-owned launch state has not changed and binds it to the session's durable `WORKING` journal before moving the task. Once released, Codex may inspect Git, implement the task, and create the sealed commit. It never pushes and must not run a startup pull, fetch/synchronize, merge, rebase, switch branches, reset history, or reconfigure the destination; those are CLT-owned operations, not agent work.
+
+Managed folder-backed moves preserve representation and order. When the source task is a path, Todo-to-Doing and Doing-to-Done rename that same file or directory into a directory-backed destination without conversion or renumbering. Prelaunch rejects Todo-directory to Doing-Markdown and Doing-directory to Done-Markdown layouts. If a crash leaves identical session-linked source and destination copies, recovery removes the duplicate and completes the intended state without disturbing unrelated tasks; mismatched or ambiguous copies remain fenced.
+
+When implementation and checks are complete, Codex runs all known file-mutating formatters and hook checks, records the completion note, and stages the implementation plus the active Doing task and its terminal session marker. `clt done` verifies the baseline, task identity, branch, history, and staged task scope. In a private temporary index it projects only that task into Done and records the resulting full repository tree as the immutable commit manifest. The worktree's Done entry is provisional; its physical location is not success.
+
+Codex then stages the real board transition and creates exactly one ordinary, one-parent commit. CLT accepts it only when the complete committed tree equals the seal and the task identity, manifest parent, CLT Agent author/committer identity, and one exact `CLT-Task: codex:<session-id>` trailer all agree. A second board-only commit, an equivalent same-path rewrite, or an earlier unproven CLT Agent commit does not satisfy the contract. If a hook changes files or fails after sealing, Codex stages the complete corrected payload and runs `clt done done <index>` to reseal the provisional entry before retrying that same one-commit operation.
+
+Commit-and-push resolves Git's effective push remote at launch using `branch.<name>.pushRemote`, then `remote.pushDefault`, then the upstream remote, and freezes the chosen remote, its one concrete push URL, and the upstream `refs/heads/...` merge ref. After proving the local commit, CLT—not Codex—pushes that immutable exact OID to the URL/ref with an explicit non-force refspec, so implicit routing, default refspecs, and later configuration changes cannot redirect publication. Normal pre-push hooks and configured signed-push policy still apply. `PUSH-PENDING` becomes terminal only after CLT independently queries and fetches that frozen destination and proves containment. A successful push exit or stale local remote-tracking ref is insufficient.
+
+The journal makes recovery a roll-forward state machine. `FINALIZING` local work resumes the exact session, checks for an already-created commit, and performs only the first unproven local step. `PUSH-PENDING` is different: the scheduler retries CLT's bounded publication without launching or resuming Codex and blocks later work in that project until settlement. Scheduler-owned reconciliation uses a transactionally acquired, renewable exact-holder lease; live workers or controls prevent acquisition, and ownership is rechecked around every mutation and remote side effect. Shared writable interactive sessions are refused while Git launch or finalization proof is active. A durably blocked `WORKING` journal may yield to another Todo while blocked-recovery backoff is active; CLT preserves its journal and reachable history and skips startup synchronization for the later task. It never creates a replacement completion commit merely because acknowledgement was interrupted. If completed-task evidence exists but the frozen start journal has disappeared, CLT fails closed rather than guessing the original branch, parent, baseline, or ownership boundary.
+
+Dirty unstaged work is supported through the captured baseline. The shared Git index is intentionally a cooperative boundary: CLT refuses pre-existing staged changes at fresh launch and later verifies the exact seal, but Git provides no actor ownership for a clean-file change staged concurrently. Humans, interactive sessions, and parallel tools sharing that checkout must leave the index untouched while automated finalization owns it.
 
 ## Scheduling Rules
 
@@ -249,6 +272,11 @@ The scheduler should:
 - Back off an unresolved blocked-task recovery so the monitor does not create a tight Codex retry loop, while allowing ready Todo work to proceed during that recovery-specific backoff.
 - Do not treat unmarked `doing` tasks as abandoned work without a stale or expired agent lease.
 - Ignore backlog-only projects until a task is promoted to `todo`.
+- Keep fresh Git-enabled Codex execution gated until scheduler-owned startup synchronization and durable launch-state persistence both succeed.
+- Resume unresolved `FINALIZING` work in its exact Codex session and roll forward from the first unproven local-commit step.
+- Retry `PUSH-PENDING` entirely inside CLT without starting Codex, and do not run a later project task until publication settles.
+- Resume a ready `WORKING` journal exactly. If its linked task is durably blocked and blocked-recovery backoff is active, preserve the journal and history but allow another ready Todo; skip startup sync so the older boundary remains reachable.
+- Treat a provisional Done entry, process exit, HEAD movement, or successful push exit alone as insufficient proof. Match the exact sealed tree, parent, task marker, and `CLT-Task` trailer, and in push mode prove exact-OID containment at the frozen remote destination.
 - Treat `NO_TASKS_LEFT` as a clean idle result.
 - Stop or mark failure on timeout.
 
