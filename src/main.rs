@@ -24885,7 +24885,7 @@ struct TuiStartState {
 }
 
 fn tui_task_board_instructions() -> &'static str {
-    "Arrows navigate boards and tasks, Enter opens subtasks, e edits, n or + creates a subtask under the selected task, and Space creates a task. Press r to reorganize; use Shift+Arrows to move tasks. Tab opens Agent Projects, M opens Models, and h/? opens Help. Codex: s stops/resumes, i interrupts for interaction, c opens completed or blocked sessions, and l shows logs."
+    "Arrows navigate boards and tasks, Enter opens subtasks, e edits, n or + creates a subtask under the selected task, and Space creates a task. Press r to reorganize; use Shift+Arrows to move tasks. Tab opens Agent Projects, M opens Models, and h/? opens Help. Codex: s stops/resumes, i interrupts for interaction, c opens linked idle Doing, completed, or blocked sessions, and l shows logs."
 }
 
 fn tui_start_state(active_board: bool) -> TuiStartState {
@@ -26894,7 +26894,7 @@ fn preferred_recorded_agent_output_path(run: &agent_store::AgentRunRecord) -> Op
 }
 
 fn task_supports_interactive_codex_resume(status: &str, task: &TaskEntry) -> bool {
-    status == "done" || matches!(status, "todo" | "doing") && task_entry_is_blocked(task)
+    matches!(status, "done" | "doing") || status == "todo" && task_entry_is_blocked(task)
 }
 
 fn codex_session_task_supports_interactive_resume(
@@ -29439,7 +29439,7 @@ fn run_tui_codex_session_continue(
             let release_result = interactive_lease.map_or(Ok(()), InteractiveAgentLease::release);
             return match (task_is_resumable, cancel_result, release_result) {
                 (Ok(false), Ok(true), Ok(())) => anyhow::bail!(
-                    "This task changed before its Codex session could open; c is only available from Done or currently blocked tasks"
+                    "This task changed before its Codex session could open; c is only available from Done, Doing, or currently blocked Todo tasks"
                 ),
                 (Err(error), Ok(true), Ok(())) => Err(error)
                     .context("Unable to revalidate the Codex task before interactive resume"),
@@ -30095,7 +30095,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                  [g]            - Cycle selected project's Git mode: off/commit/push\n\
                                  [s]            - Stop/resume linked task or displayed Agent Output session\n\
                                  [i]            - Take over linked/displayed live session, then auto-restart exec\n\
-                                 [c]            - Open Done/blocked task or displayed idle/latest session\n\
+                                 [c]            - Open linked idle Doing, Done/blocked, or displayed session\n\
                                  [l]            - Toggle active/selected project's live/current agent output\n\
                                  [a]            - Move selected task to archive\n\
                                  [A]            - Toggle archive view\n\
@@ -31156,7 +31156,7 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                             &task,
                                         ) {
                                             feedback_buffer =
-                                                "Codex sessions can be resumed from Done or blocked tasks."
+                                                "Codex sessions can be resumed from linked Doing, Done, or blocked Todo tasks."
                                                     .to_string();
                                             continue;
                                         }
@@ -36547,7 +36547,7 @@ mod tests {
     }
 
     #[test]
-    fn interactive_codex_resume_accepts_done_and_currently_blocked_tasks() {
+    fn interactive_codex_resume_accepts_doing_done_and_currently_blocked_todo_tasks() {
         let done = task_entry_from_text(
             TaskSource::MarkdownLine { line_index: 1 },
             "finished task",
@@ -36570,6 +36570,7 @@ mod tests {
         assert!(task_supports_interactive_codex_resume("done", &done));
         assert!(task_supports_interactive_codex_resume("todo", &blocked));
         assert!(task_supports_interactive_codex_resume("doing", &blocked));
+        assert!(task_supports_interactive_codex_resume("doing", &unblocked));
         assert!(!task_supports_interactive_codex_resume("todo", &unblocked));
         assert!(!task_supports_interactive_codex_resume("backlog", &blocked));
     }
@@ -36586,6 +36587,14 @@ mod tests {
         assert!(codex_session_task_supports_interactive_resume(&root, "session-123").unwrap());
 
         fs::write(root.join("tasks/done.md"), "# Done Tasks\n").unwrap();
+        fs::write(
+            root.join("tasks/doing.md"),
+            "# Doing Tasks\n- interrupted task codex:session-123\n",
+        )
+        .unwrap();
+        assert!(codex_session_task_supports_interactive_resume(&root, "session-123").unwrap());
+
+        fs::write(root.join("tasks/doing.md"), "# Doing Tasks\n").unwrap();
         fs::write(
             root.join("tasks/todo.md"),
             "# Todo Tasks\n- now unblocked codex:session-123\n",
@@ -38183,7 +38192,7 @@ mod tests {
         assert!(instructions.contains("e edits"));
         assert!(instructions.contains("Codex: s stops/resumes"));
         assert!(instructions.contains("i interrupts for interaction"));
-        assert!(instructions.contains("c opens completed or blocked sessions"));
+        assert!(instructions.contains("c opens linked idle Doing, completed, or blocked sessions"));
         assert!(instructions.contains("l shows logs"));
         assert!(instructions.contains("Press r to reorganize"));
         assert!(instructions.contains("Tab opens Agent Projects"));
