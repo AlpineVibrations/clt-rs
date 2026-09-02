@@ -664,10 +664,6 @@ impl InteractiveGuardianDisposition {
         }
     }
 
-    fn resumes_exec(self) -> bool {
-        self == Self::ResumeExec
-    }
-
     fn holds_project_lease(self) -> bool {
         !matches!(
             self,
@@ -706,18 +702,17 @@ impl InteractiveGuardianDisposition {
     }
 
     fn guardian_process_is_proven_dead(holder: &str) -> bool {
-        let Some(disposition) = Self::from_guardian_holder(holder) else {
-            return false;
-        };
-        let Some(pid) = holder
+        Self::guardian_process_id(holder)
+            .is_some_and(|pid| local_process_is_running(pid) == Some(false))
+    }
+
+    fn guardian_process_id(holder: &str) -> Option<u32> {
+        let disposition = Self::from_guardian_holder(holder)?;
+        holder
             .strip_prefix(disposition.guardian_holder_prefix())
             .and_then(|suffix| suffix.strip_prefix('-'))
             .and_then(|suffix| suffix.split('-').next())
             .and_then(|pid| pid.parse::<u32>().ok())
-        else {
-            return false;
-        };
-        local_process_is_running(pid) == Some(false)
     }
 }
 
@@ -2957,65 +2952,56 @@ fn run_automated_session_supervisor(
         return report_automated_supervisor_reaped(status);
     }
 
-    let store = match open_agent_store_at(spec.state_dir) {
-        Ok(store) => store,
-        Err(error) => {
-            let status = stop_supervised_automated_child_until_reaped(
-                &mut child,
-                "its session-control store could not be opened",
-            );
-            eprintln!("Failed to open automated supervisor session control: {error:#}");
-            return report_automated_supervisor_reaped(status);
-        }
-    };
-    let mut last_poll_warning: Option<Instant> = None;
-    let status = loop {
-        match interactive_child_exited_without_reaping(&child) {
-            Ok(true) => {
-                break stop_supervised_automated_child_until_reaped(
-                    &mut child,
-                    "the Codex group leader exited",
-                );
+    // The runner owns session-control polling while it is connected and sends a
+    // stop byte through the supervisor lifeline when a control is requested.
+    // Keeping the supervisor out of the multiprocess agent database prevents a
+    // storage-engine panic here from orphaning the Codex process it alone can
+    // reap. If the runner crashes, EOF on the same lifeline remains an
+    // independent, database-free shutdown signal.
+    let monitor_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        loop {
+            #[cfg(test)]
+            if spec.run_token.starts_with("panic-supervisor-after-launch-") {
+                panic!("injected automated supervisor monitor panic");
             }
-            Ok(false) => {}
-            Err(error) => {
-                eprintln!("Automated supervisor could not poll its Codex child: {error:#}");
-                break stop_supervised_automated_child_until_reaped(
-                    &mut child,
-                    "polling the Codex child failed",
-                );
-            }
-        }
 
-        match supervised_session_control(&store, spec.project_id, child_pid, spec.run_token) {
-            Ok(Some(control)) => {
-                if control.state.requested_action().is_some() {
+            match interactive_child_exited_without_reaping(&child) {
+                Ok(true) => {
                     break stop_supervised_automated_child_until_reaped(
                         &mut child,
-                        "a task-session control was requested",
+                        "the Codex group leader exited",
+                    );
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    eprintln!("Automated supervisor could not poll its Codex child: {error:#}");
+                    break stop_supervised_automated_child_until_reaped(
+                        &mut child,
+                        "polling the Codex child failed",
                     );
                 }
             }
-            Ok(None) => {}
-            Err(error) => {
-                let should_warn = last_poll_warning
-                    .is_none_or(|warning| warning.elapsed() >= Duration::from_secs(5));
-                if should_warn {
-                    eprintln!(
-                        "Automated supervisor is retrying its session-control poll: {error:#}"
-                    );
-                    last_poll_warning = Some(Instant::now());
-                }
-            }
-        }
 
-        if parent_state.load(Ordering::SeqCst) != AUTOMATED_SUPERVISOR_CONNECTED {
-            break stop_supervised_automated_child_until_reaped(
-                &mut child,
-                "its runner requested shutdown or disconnected",
-            );
+            if parent_state.load(Ordering::SeqCst) != AUTOMATED_SUPERVISOR_CONNECTED {
+                break stop_supervised_automated_child_until_reaped(
+                    &mut child,
+                    "its runner requested shutdown or disconnected",
+                );
+            }
+            thread::sleep(Duration::from_millis(100));
         }
-        thread::sleep(Duration::from_millis(100));
+    }));
+    let status = match monitor_result {
+        Ok(status) => status,
+        Err(_) => {
+            eprintln!(
+                "Automated supervisor monitor panicked; stopping its owned Codex process group"
+            );
+            stop_supervised_automated_child_until_reaped(
+                &mut child,
+                "its supervisor monitor panicked",
+            )
+        }
     };
 
     let parent_disconnected =
@@ -3603,6 +3589,8 @@ fn resume_codex_session_interactively(
     mode: InteractiveCodexResumeMode,
 ) -> Result<ExitStatus> {
     let executable = std::env::current_exe().context("Failed to resolve the CLT executable")?;
+    let state_dir = ensure_agent_state_dir()?;
+    let store = open_agent_store_at(&state_dir)?;
     let mut command = Command::new(&executable);
     command
         .arg("--local")
@@ -3636,18 +3624,23 @@ fn resume_codex_session_interactively(
     })?;
     drop(command);
     #[cfg(unix)]
-    let mut lifeline: Box<dyn Write> = Box::new(guardian_lifeline);
+    let lifeline: Box<dyn Write> = Box::new(guardian_lifeline);
     #[cfg(not(unix))]
-    let Some(mut lifeline) = guardian.stdin.take() else {
+    let Some(lifeline) = guardian.stdin.take() else {
         let _ = guardian.kill();
         let _ = guardian.wait();
         anyhow::bail!("Interactive Codex guardian did not open its lifeline");
     };
+    let mut lifeline = Some(lifeline);
     let start_result = lifeline
+        .as_mut()
+        .expect("interactive guardian lifeline is present before launch")
         .write_all(&[1])
         .context("Failed to start the interactive Codex guardian")
         .and_then(|_| {
             lifeline
+                .as_mut()
+                .expect("interactive guardian lifeline is present while launching")
                 .flush()
                 .context("Failed to flush the interactive Codex guardian lifeline")
         });
@@ -3656,9 +3649,33 @@ fn resume_codex_session_interactively(
         let _ = guardian.wait();
         return Err(error);
     }
-    let status_result = guardian
-        .wait()
-        .context("Failed to wait for the interactive Codex guardian");
+    let guardian_pid = guardian.id();
+    let status_result = loop {
+        match guardian.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => {}
+            Err(error) => {
+                break Err(error).context("Failed to wait for the interactive Codex guardian");
+            }
+        }
+
+        if lifeline.is_some()
+            && store
+                .session_control_blocking(project_id, session_id)
+                .is_ok_and(|control| {
+                    control.is_some_and(|control| {
+                        interactive_guardian_stop_requested(&control, guardian_pid)
+                    })
+                })
+        {
+            // Closing the database-free lifeline asks the child-owning guardian
+            // to stop and reap its exact Codex process group. The parent TUI is
+            // the only process that owns this writer, so another TUI can request
+            // a safe stop without ever signaling a numeric PID itself.
+            drop(lifeline.take());
+        }
+        thread::sleep(Duration::from_millis(100));
+    };
     drop(lifeline);
     let foreground_result = restore_parent_terminal_after_interactive_guardian();
     match status_result {
@@ -3676,6 +3693,16 @@ fn resume_codex_session_interactively(
             }
         }
     }
+}
+
+fn interactive_guardian_stop_requested(
+    control: &agent_store::AgentSessionControlRecord,
+    guardian_pid: u32,
+) -> bool {
+    control.state == AgentSessionControlState::StopRequested
+        && control.interactive_holder.as_deref().is_some_and(|holder| {
+            InteractiveGuardianDisposition::guardian_process_id(holder) == Some(guardian_pid)
+        })
 }
 
 #[cfg(unix)]
@@ -4611,7 +4638,7 @@ fn run_agent_interactive_session_worker(
         Ok(_) => None,
         Err(error) => Some(error),
     };
-    finish_interactive_guardian_after_reap(
+    let resume_exec = finish_interactive_guardian_after_reap(
         &store,
         project_id,
         session_id,
@@ -4619,7 +4646,7 @@ fn run_agent_interactive_session_worker(
         lease_timeout,
         disposition,
     )?;
-    if disposition.resumes_exec() {
+    if resume_exec {
         spawn_agent_session_resume_worker(&project.path, project_id, session_id)?;
     }
     interaction_failure.map_or(Ok(()), Err)
@@ -4632,7 +4659,7 @@ fn finish_interactive_guardian_after_reap(
     guardian_holder: &str,
     lease_timeout: Duration,
     disposition: InteractiveGuardianDisposition,
-) -> Result<()> {
+) -> Result<bool> {
     let renewal_interval = agent_lease_renew_interval(lease_timeout);
     let mut last_renewal = Instant::now();
     let mut last_warning: Option<Instant> = None;
@@ -4644,32 +4671,41 @@ fn finish_interactive_guardian_after_reap(
             guardian_holder,
             disposition,
         ) {
-            Ok(true) => return Ok(()),
-            Ok(false) => match store.session_control_blocking(project_id, session_id) {
+            Ok(changed) => match store.session_control_blocking(project_id, session_id) {
                 Ok(control) => {
-                    let already_finalized = match disposition {
+                    let finalized = match disposition {
                         InteractiveGuardianDisposition::ResumeExec => {
-                            control.is_some_and(|control| {
-                                matches!(
-                                    control.state,
+                            control.as_ref().and_then(|control| {
+                                if control.interactive_holder.as_deref() == Some(guardian_holder) {
+                                    return None;
+                                }
+                                match control.state {
                                     AgentSessionControlState::ResumeRequested
-                                        | AgentSessionControlState::Running
-                                ) && control.interactive_holder.as_deref() != Some(guardian_holder)
+                                    | AgentSessionControlState::Running => Some(true),
+                                    AgentSessionControlState::Stopped => Some(false),
+                                    _ => None,
+                                }
                             })
                         }
                         InteractiveGuardianDisposition::DeleteIdleReservation
                         | InteractiveGuardianDisposition::DeleteSharedReservation => {
-                            control.is_none()
+                            control.is_none().then_some(false)
                         }
                         InteractiveGuardianDisposition::RestoreStopped
                         | InteractiveGuardianDisposition::RestoreStoppedShared => control
                             .is_some_and(|control| {
                                 control.state == AgentSessionControlState::Stopped
                                     && control.interactive_holder.is_none()
-                            }),
+                            })
+                            .then_some(false),
                     };
-                    if already_finalized {
-                        return Ok(());
+                    if let Some(resume_exec) = finalized {
+                        return Ok(resume_exec);
+                    }
+                    if changed {
+                        anyhow::bail!(
+                            "Interactive guardian finalized its child but left an unexpected session state"
+                        );
                     }
                     anyhow::bail!(
                         "Interactive guardian state changed before its reaped child could be finalized"
@@ -7116,8 +7152,10 @@ fn reconcile_stale_agent_session_controls(
                 continue;
             }
         }
-        if control.state == AgentSessionControlState::Interactive
-            && let Some(holder) = control.interactive_holder.as_deref()
+        if matches!(
+            control.state,
+            AgentSessionControlState::Interactive | AgentSessionControlState::StopRequested
+        ) && let Some(holder) = control.interactive_holder.as_deref()
             && let Some(disposition) = InteractiveGuardianDisposition::from_guardian_holder(holder)
             && control.interactive_launch_token.as_deref() == Some(holder)
         {
@@ -7159,8 +7197,11 @@ fn reconcile_stale_agent_session_controls(
                             .map(|_| ())
                     })?;
                 }
-                continue;
             }
+            // A recognized interactive guardian owns the only race-free Child
+            // handle. Even after `s` records stop_requested, automated stale-run
+            // recovery must not reinterpret this row or signal its PID.
+            continue;
         }
         let recorded_child_is_gone = control.child_pid.is_some_and(|child_pid| {
             automated_agent_process_group_is_running(child_pid) == Some(false)
@@ -12085,6 +12126,43 @@ mod agent_store {
                 })
         }
 
+        pub(crate) fn request_interactive_session_stop_blocking(
+            &self,
+            project_id: i64,
+            codex_session_id: &str,
+            expected_child_pid: u32,
+            expected_interactive_holder: &str,
+        ) -> Result<bool> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(async {
+                    let conn = self.connect().await?;
+                    let changed = conn
+                        .execute(
+                            "UPDATE session_controls
+                                SET state = 'stop_requested', updated_at = ?1
+                              WHERE project_id = ?2 AND codex_session_id = ?3
+                                AND state = 'interactive' AND child_pid = ?4
+                                AND interactive_holder = ?5
+                                AND interactive_launch_token = ?5",
+                            params![
+                                agent_timestamp(),
+                                project_id,
+                                codex_session_id,
+                                i64::from(expected_child_pid),
+                                expected_interactive_holder
+                            ],
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "Failed to request stop for interactive Codex session {codex_session_id}"
+                            )
+                        })?;
+                    Ok(changed > 0)
+                })
+        }
+
         pub(crate) fn request_stopped_session_resume_blocking(
             &self,
             project_id: i64,
@@ -12657,11 +12735,15 @@ mod agent_store {
                         InteractiveGuardianDisposition::ResumeExec => transaction
                             .execute(
                                 "UPDATE session_controls
-                                    SET state = 'resume_requested', child_pid = NULL,
+                                    SET state = CASE
+                                            WHEN state = 'stop_requested' THEN 'stopped'
+                                            ELSE 'resume_requested'
+                                        END,
+                                        child_pid = NULL,
                                         interactive_holder = NULL,
                                         interactive_launch_token = NULL, updated_at = ?1
                                   WHERE project_id = ?2 AND codex_session_id = ?3
-                                    AND state = 'interactive'
+                                    AND state IN ('interactive', 'stop_requested')
                                     AND interactive_holder = ?4",
                                 params![
                                     agent_timestamp(),
@@ -12681,7 +12763,7 @@ mod agent_store {
                             transaction.execute(
                                 "DELETE FROM session_controls
                                   WHERE project_id = ?1 AND codex_session_id = ?2
-                                    AND state = 'interactive'
+                                    AND state IN ('interactive', 'stop_requested')
                                     AND interactive_holder = ?3",
                                 params![project_id, codex_session_id, guardian_holder],
                             )
@@ -12699,7 +12781,7 @@ mod agent_store {
                                         interactive_holder = NULL,
                                         interactive_launch_token = NULL, updated_at = ?1
                                   WHERE project_id = ?2 AND codex_session_id = ?3
-                                    AND state = 'interactive'
+                                    AND state IN ('interactive', 'stop_requested')
                                     AND interactive_holder = ?4",
                                 params![
                                     agent_timestamp(),
@@ -12766,11 +12848,15 @@ mod agent_store {
                         InteractiveGuardianDisposition::ResumeExec => transaction
                             .execute(
                                 "UPDATE session_controls
-                                    SET state = 'resume_requested', child_pid = NULL,
+                                    SET state = CASE
+                                            WHEN state = 'stop_requested' THEN 'stopped'
+                                            ELSE 'resume_requested'
+                                        END,
+                                        child_pid = NULL,
                                         interactive_holder = NULL,
                                         interactive_launch_token = NULL, updated_at = ?1
                                   WHERE project_id = ?2 AND codex_session_id = ?3
-                                    AND state = 'interactive'
+                                    AND state IN ('interactive', 'stop_requested')
                                     AND interactive_holder = ?4
                                     AND interactive_launch_token = ?4
                                     AND (
@@ -12791,7 +12877,7 @@ mod agent_store {
                             transaction.execute(
                                 "DELETE FROM session_controls
                                   WHERE project_id = ?1 AND codex_session_id = ?2
-                                    AND state = 'interactive'
+                                    AND state IN ('interactive', 'stop_requested')
                                     AND interactive_holder = ?3
                                     AND interactive_launch_token = ?3
                                     AND (
@@ -12815,7 +12901,7 @@ mod agent_store {
                                         interactive_holder = NULL,
                                         interactive_launch_token = NULL, updated_at = ?1
                                   WHERE project_id = ?2 AND codex_session_id = ?3
-                                    AND state = 'interactive'
+                                    AND state IN ('interactive', 'stop_requested')
                                     AND interactive_holder = ?4
                                     AND interactive_launch_token = ?4
                                     AND (
@@ -13110,6 +13196,32 @@ mod agent_store {
                         });
                     }
                     Ok(controls)
+                })
+        }
+
+        pub(crate) fn suspending_session_project_ids_blocking(&self) -> Result<HashSet<i64>> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(async {
+                    let conn = self.connect().await?;
+                    let mut rows = conn
+                        .query(
+                            "SELECT DISTINCT project_id
+                               FROM session_controls
+                              WHERE state != 'stopped'",
+                            (),
+                        )
+                        .await
+                        .context("Failed to list projects suspended by Codex session controls")?;
+                    let mut project_ids = HashSet::new();
+                    while let Some(row) = rows
+                        .next()
+                        .await
+                        .context("Failed to read suspended Codex session project")?
+                    {
+                        project_ids.insert(row_integer(&row, 0, "project_id")?);
+                    }
+                    Ok(project_ids)
                 })
         }
 
@@ -17323,6 +17435,8 @@ struct TuiAgentProject {
 enum TuiAgentRuntimeState {
     Idle,
     Running,
+    Interactive,
+    Fenced,
     Stale,
     Error,
 }
@@ -17332,6 +17446,8 @@ impl TuiAgentRuntimeState {
         match self {
             Self::Idle => "IDLE",
             Self::Running => "RUNNING",
+            Self::Interactive => "INTERACTIVE",
+            Self::Fenced => "FENCED",
             Self::Stale => "STALE",
             Self::Error => "ERROR",
         }
@@ -18701,6 +18817,25 @@ fn load_tui_agent_panel_snapshot_inner(
     };
     let projects = store.list_projects_blocking()?;
     let active_leases = store.list_active_leases_blocking(&agent_timestamp())?;
+    let suspending_session_projects = store.suspending_session_project_ids_blocking()?;
+    let mut interactive_session_projects = HashSet::new();
+    for project_id in &suspending_session_projects {
+        if store
+            .session_controls_for_project_blocking(*project_id)?
+            .into_iter()
+            .any(|control| {
+                matches!(
+                    control.state,
+                    AgentSessionControlState::Interactive | AgentSessionControlState::StopRequested
+                ) && control.interactive_holder.as_deref().is_some_and(|holder| {
+                    InteractiveGuardianDisposition::from_guardian_holder(holder).is_some()
+                        && !InteractiveGuardianDisposition::guardian_process_is_proven_dead(holder)
+                })
+            })
+        {
+            interactive_session_projects.insert(*project_id);
+        }
+    }
 
     let projects = projects
         .into_iter()
@@ -18708,6 +18843,16 @@ fn load_tui_agent_panel_snapshot_inner(
             let scan = scan_agent_project(&project.path);
             let daemon_scan_problem = tui_agent_daemon_scan_problem(&project);
             let mut runtime_state = tui_agent_runtime_state(project.id, &active_leases);
+            if runtime_state == TuiAgentRuntimeState::Idle
+                && interactive_session_projects.contains(&project.id)
+            {
+                runtime_state = TuiAgentRuntimeState::Interactive;
+            }
+            if runtime_state == TuiAgentRuntimeState::Idle
+                && suspending_session_projects.contains(&project.id)
+            {
+                runtime_state = TuiAgentRuntimeState::Fenced;
+            }
             if runtime_state == TuiAgentRuntimeState::Idle && daemon_scan_problem.is_some() {
                 runtime_state = TuiAgentRuntimeState::Error;
             }
@@ -19171,7 +19316,7 @@ fn tui_agent_log_refresh_interval() -> Duration {
 }
 
 fn tui_agent_panel_instructions() -> &'static str {
-    "Up/Down selects, Enter opens/adds, Space toggles ON/OFF, Delete removes with confirmation, g cycles Git off/commit/push, m cycles the selected target, M opens Models, f toggles fast, t cycles thinking, l shows output. With output open: s stops/resumes, i takes over a live session, and c continues an idle session. Tab returns to Kanban."
+    "Up/Down selects, Enter opens/adds, Space toggles ON/OFF, Delete removes with confirmation, g cycles Git off/commit/push, m cycles the selected target, M opens Models, f toggles fast, t cycles thinking, l shows output. s directly stops the selected active, interactive, or fenced session; with output open it controls that exact session. With output open: i takes over a live session and c continues an idle session. Tab returns to Kanban."
 }
 
 fn parse_agent_codex_session_id(line: &str) -> Option<String> {
@@ -19334,9 +19479,32 @@ fn toggle_tui_codex_session_stop_at(
                 )
             }
         }
+        AgentSessionControlState::Interactive => {
+            let child_pid = control
+                .child_pid
+                .context("The interactive Codex session is still registering; try again")?;
+            let interactive_holder = control.interactive_holder.as_deref().context(
+                "The interactive Codex session has no guardian identity; leave it fenced",
+            )?;
+            if store.request_interactive_session_stop_blocking(
+                project_id,
+                session_id,
+                child_pid,
+                interactive_holder,
+            )? {
+                Ok(
+                    "Stopping this interactive Codex session safely; CLT will reap it and release its reservation."
+                        .to_string(),
+                )
+            } else {
+                Ok(
+                    "The interactive Codex session changed before it could be stopped; try again."
+                        .to_string(),
+                )
+            }
+        }
         AgentSessionControlState::InterruptRequested
-        | AgentSessionControlState::ReadyInteractive
-        | AgentSessionControlState::Interactive => {
+        | AgentSessionControlState::ReadyInteractive => {
             Ok("This Codex session is being used for an interactive handoff.".to_string())
         }
         AgentSessionControlState::ResumeRequested => {
@@ -19690,7 +19858,11 @@ fn selected_tui_task_log_view_at(
         session_id.clone(),
     ));
 
-    let live_path = if selected.runtime_state.is_running() {
+    let live_path = if selected.runtime_state.is_running()
+        || matches!(
+            selected.runtime_state,
+            TuiAgentRuntimeState::Interactive | TuiAgentRuntimeState::Fenced
+        ) {
         active_agent_log_for_codex_session(selected, state_dir, &session_id)?
     } else {
         None
@@ -19721,10 +19893,6 @@ fn active_agent_log_for_codex_session(
     state_dir: &Path,
     session_id: &str,
 ) -> Result<Option<PathBuf>> {
-    if !selected.runtime_state.is_running() {
-        return Ok(None);
-    }
-
     let store = open_agent_store_at(state_dir)?;
     if let Some(control) = store.session_control_blocking(selected.project.id, session_id)? {
         if matches!(
@@ -19738,6 +19906,10 @@ fn active_agent_log_for_codex_session(
                 .map(PathBuf::from)
                 .filter(|path| path.is_file()));
         }
+        return Ok(None);
+    }
+
+    if !selected.runtime_state.is_running() {
         return Ok(None);
     }
 
@@ -19825,7 +19997,30 @@ fn selected_tui_agent_log_view_at(
         return Ok(None);
     };
 
-    let live_path = if selected.runtime_state.is_running() {
+    let fenced_session = if matches!(
+        selected.runtime_state,
+        TuiAgentRuntimeState::Interactive | TuiAgentRuntimeState::Fenced
+    ) {
+        let store = open_agent_store_at(state_dir)?;
+        store
+            .session_controls_for_project_blocking(selected.project.id)?
+            .into_iter()
+            .rev()
+            .find_map(|control| {
+                if control.state == AgentSessionControlState::Stopped {
+                    return None;
+                }
+                control
+                    .stderr_path
+                    .or(control.stdout_path)
+                    .map(PathBuf::from)
+                    .filter(|path| path.is_file())
+                    .map(|path| (path, control.codex_session_id))
+            })
+    } else {
+        None
+    };
+    let live_path = if fenced_session.is_none() && selected.runtime_state.is_running() {
         latest_agent_log_path(
             &agent_project_run_log_dir(state_dir, &selected.project)?,
             "err",
@@ -19834,22 +20029,29 @@ fn selected_tui_agent_log_view_at(
         None
     };
 
-    let (path, is_live, session_target) = match live_path {
-        Some(path) => {
-            let session_target = agent_codex_session_id_from_log(&path)?
-                .map(|session_id| TuiCodexSessionTarget::new(&selected.project, session_id));
-            (Some(path), true, session_target)
-        }
-        None => {
-            let store = open_agent_store_at(state_dir)?;
-            let run = store.latest_run_for_project_blocking(selected.project.id)?;
-            let session_target = run
-                .as_ref()
-                .and_then(|run| run.codex_session_id.clone())
-                .map(|session_id| TuiCodexSessionTarget::new(&selected.project, session_id));
-            let path = run.as_ref().and_then(preferred_recorded_agent_output_path);
-            (path, false, session_target)
-        }
+    let (path, is_live, session_target) = match fenced_session {
+        Some((path, session_id)) => (
+            Some(path),
+            true,
+            Some(TuiCodexSessionTarget::new(&selected.project, session_id)),
+        ),
+        None => match live_path {
+            Some(path) => {
+                let session_target = agent_codex_session_id_from_log(&path)?
+                    .map(|session_id| TuiCodexSessionTarget::new(&selected.project, session_id));
+                (Some(path), true, session_target)
+            }
+            None => {
+                let store = open_agent_store_at(state_dir)?;
+                let run = store.latest_run_for_project_blocking(selected.project.id)?;
+                let session_target = run
+                    .as_ref()
+                    .and_then(|run| run.codex_session_id.clone())
+                    .map(|session_id| TuiCodexSessionTarget::new(&selected.project, session_id));
+                let path = run.as_ref().and_then(preferred_recorded_agent_output_path);
+                (path, false, session_target)
+            }
+        },
     };
 
     path.map(|path| {
@@ -21502,6 +21704,56 @@ fn viewed_tui_codex_session_target(
     )
 }
 
+fn selected_tui_agent_session_target(panel: &TuiAgentPanel) -> Result<TuiCodexSessionTarget> {
+    let state_dir = ensure_agent_state_dir()?;
+    selected_tui_agent_session_target_at(panel, &state_dir)
+}
+
+fn selected_tui_agent_session_target_at(
+    panel: &TuiAgentPanel,
+    state_dir: &Path,
+) -> Result<TuiCodexSessionTarget> {
+    let selected = panel
+        .selected_project()
+        .context("Select a registered agent project before controlling its session")?;
+    let controls = open_agent_store_at(state_dir)?
+        .session_controls_for_project_blocking(selected.project.id)?
+        .into_iter()
+        .filter(|control| control.state != AgentSessionControlState::Stopped)
+        .collect::<Vec<_>>();
+    let interactive = controls
+        .iter()
+        .filter(|control| {
+            matches!(
+                control.state,
+                AgentSessionControlState::Interactive | AgentSessionControlState::StopRequested
+            ) && control
+                .interactive_holder
+                .as_deref()
+                .and_then(InteractiveGuardianDisposition::from_guardian_holder)
+                .is_some()
+        })
+        .collect::<Vec<_>>();
+    let control = if interactive.len() == 1 {
+        interactive[0]
+    } else if controls.len() == 1 {
+        &controls[0]
+    } else if controls.is_empty() {
+        anyhow::bail!(
+            "The selected project has no active or fenced Codex session to stop; open recorded output with l to control an older session"
+        );
+    } else {
+        anyhow::bail!(
+            "The selected project has multiple controllable Codex sessions; open the intended output with l before pressing s"
+        );
+    };
+
+    Ok(TuiCodexSessionTarget::new(
+        &selected.project,
+        control.codex_session_id.clone(),
+    ))
+}
+
 fn run_tui_codex_session_interrupt(
     terminal: &mut TuiTerminal,
     terminal_session: &mut TerminalSession,
@@ -22904,9 +23156,12 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                         }
                                     }
                                     KeyCode::Char('s') => {
-                                        let target = match viewed_tui_codex_session_target(
-                                            agent_log_view.as_ref(),
-                                        ) {
+                                        let target_result = if agent_log_view.is_some() {
+                                            viewed_tui_codex_session_target(agent_log_view.as_ref())
+                                        } else {
+                                            selected_tui_agent_session_target(&agent_panel)
+                                        };
+                                        let target = match target_result {
                                             Ok(target) => target,
                                             Err(error) => {
                                                 feedback_buffer = error.to_string();
@@ -24285,6 +24540,62 @@ mod tests {
     #[test]
     fn crashed_automated_owner_interrupt_is_handed_to_interactive_holder() {
         assert_crashed_automated_owner_control_is_reaped(AgentSessionControlAction::Interrupt);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automated_supervisor_monitor_panic_still_reaps_its_codex_group() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_root("automated-supervisor-monitor-panic");
+        fs::create_dir_all(&root).unwrap();
+        let stdout_path = root.join("codex.out");
+        let stderr_path = root.join("codex.err");
+        let fake_codex = root.join("fake-codex");
+        fs::write(
+            &fake_codex,
+            "#!/bin/sh\ntrap '' TERM HUP\nwhile :; do sleep 1; done\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&fake_codex).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_codex, permissions).unwrap();
+
+        let target = Command::new(&fake_codex);
+        let supervisor_stderr = fs::File::create(&stderr_path).unwrap();
+        let mut supervised = spawn_automated_session_supervisor(
+            &target,
+            AutomatedSupervisorSpec {
+                state_dir: &root,
+                project_id: 1,
+                run_token: "panic-supervisor-after-launch-test",
+                lease_holder: "test-holder",
+                stdout_path: &stdout_path,
+                stderr_path: &stderr_path,
+            },
+            supervisor_stderr,
+        )
+        .unwrap();
+        supervised.control.write_all(b"x").unwrap();
+        supervised.control.flush().unwrap();
+        drop(supervised.control);
+
+        let status =
+            wait_for_automated_supervisor_reaped(&mut supervised.process, &mut supervised.proof)
+                .unwrap();
+
+        assert!(!status.success());
+        assert_eq!(
+            automated_agent_process_group_is_running(supervised.child_pid),
+            Some(false)
+        );
+        assert!(
+            fs::read_to_string(&stderr_path)
+                .unwrap()
+                .contains("monitor panicked; stopping its owned Codex process group")
+        );
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     struct FakeAgentRunner {
@@ -25834,7 +26145,8 @@ mod tests {
         store
             .register_project_blocking(&project_root, "project")
             .unwrap();
-        let project_id = store.list_projects_blocking().unwrap().remove(0).id;
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        let project_id = project.id;
 
         let lease = InteractiveAgentLease::try_acquire_at(&state_dir, project_id, 60)
             .unwrap()
@@ -27240,6 +27552,101 @@ mod tests {
     }
 
     #[test]
+    fn stopping_interactive_takeover_keeps_the_exact_session_stopped() {
+        let root = temp_root("interactive-guardian-explicit-stop");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project_id = store.list_projects_blocking().unwrap().remove(0).id;
+        let requester = InteractiveAgentLease::holder_for_current_process();
+        assert!(
+            store
+                .try_acquire_lease_blocking(project_id, &requester, "100", "9999999999")
+                .unwrap()
+        );
+        store
+            .set_session_control_state_blocking(
+                project_id,
+                "session-123",
+                AgentSessionControlState::Stopped,
+            )
+            .unwrap();
+        assert!(
+            store
+                .begin_stopped_session_interactive_blocking(
+                    project_id,
+                    "session-123",
+                    &requester,
+                    None,
+                )
+                .unwrap()
+        );
+        let guardian = interactive_guardian_holder(InteractiveGuardianDisposition::ResumeExec);
+        assert!(
+            store
+                .adopt_interactive_guardian_blocking(
+                    project_id,
+                    Some("session-123"),
+                    &requester,
+                    &guardian,
+                    60,
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .register_interactive_guardian_child_blocking(
+                    project_id,
+                    "session-123",
+                    &guardian,
+                    std::process::id(),
+                    60,
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .request_interactive_session_stop_blocking(
+                    project_id,
+                    "session-123",
+                    std::process::id(),
+                    &guardian,
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .finish_interactive_guardian_blocking(
+                    project_id,
+                    "session-123",
+                    &guardian,
+                    InteractiveGuardianDisposition::ResumeExec,
+                )
+                .unwrap()
+        );
+        let stopped = store
+            .session_control_blocking(project_id, "session-123")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stopped.state, AgentSessionControlState::Stopped);
+        assert!(stopped.child_pid.is_none());
+        assert!(stopped.interactive_holder.is_none());
+        assert!(
+            store
+                .lease_for_project_blocking(project_id)
+                .unwrap()
+                .is_none()
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn stale_idle_guardian_recovery_deletes_only_its_reservation_and_lease() {
         let root = temp_root("interactive-guardian-no-resume");
         let state_dir = root.join("state/clt");
@@ -28292,7 +28699,8 @@ mod tests {
         store
             .register_project_blocking(&project_root, "project")
             .unwrap();
-        let project_id = store.list_projects_blocking().unwrap().remove(0).id;
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        let project_id = project.id;
         let active_holder = "clt-worker-active";
         assert!(
             store
@@ -28350,6 +28758,38 @@ mod tests {
                     60,
                 )
                 .unwrap()
+        );
+        let message =
+            toggle_tui_codex_session_stop_at(&state_dir, project_id, "session-blocked").unwrap();
+        assert!(message.starts_with("Stopping this interactive Codex session safely"));
+        let stopping = store
+            .session_control_blocking(project_id, "session-blocked")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stopping.state, AgentSessionControlState::StopRequested);
+        assert!(interactive_guardian_stop_requested(
+            &stopping,
+            std::process::id()
+        ));
+        let mut panel = TuiAgentPanel {
+            projects: vec![TuiAgentProject {
+                project,
+                scan: AgentProjectScan::empty(),
+                runtime_state: TuiAgentRuntimeState::Interactive,
+                daemon_scan_problem: None,
+            }],
+            current_project_registration: None,
+            daemon_status: "running".to_string(),
+            state: ListState::default(),
+            scroll_offset: 0,
+            last_error: None,
+        };
+        panel.state.select(Some(0));
+        assert_eq!(
+            selected_tui_agent_session_target_at(&panel, &state_dir)
+                .unwrap()
+                .session_id,
+            "session-blocked"
         );
         assert!(
             store
@@ -28583,6 +29023,81 @@ mod tests {
         append_agent_log_line(&stderr_path, "still working").unwrap();
         log_view.refresh().unwrap();
         assert!(log_view.content.contains("still working"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fenced_agent_log_view_keeps_the_orphaned_session_controllable() {
+        let root = temp_root("agent-fenced-output");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "fenced-project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        let stdout_path = root.join("fenced.out");
+        let stderr_path = root.join("fenced.err");
+        fs::write(&stdout_path, "").unwrap();
+        fs::write(
+            &stderr_path,
+            "session id: session-fenced\nwork survived its supervisor\n",
+        )
+        .unwrap();
+        store
+            .mark_session_running_blocking(
+                project.id,
+                "session-fenced",
+                4242,
+                "orphaned-run-token",
+                &stdout_path,
+                &stderr_path,
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.suspending_session_project_ids_blocking().unwrap(),
+            HashSet::from([project.id])
+        );
+        let mut panel = TuiAgentPanel {
+            projects: vec![TuiAgentProject {
+                project,
+                scan: AgentProjectScan::empty(),
+                runtime_state: TuiAgentRuntimeState::Fenced,
+                daemon_scan_problem: None,
+            }],
+            current_project_registration: None,
+            daemon_status: "running".to_string(),
+            state: ListState::default(),
+            scroll_offset: 0,
+            last_error: None,
+        };
+        panel.state.select(Some(0));
+
+        let log_view = selected_tui_agent_log_view_at(&panel, &state_dir)
+            .unwrap()
+            .unwrap();
+        assert!(log_view.is_live);
+        assert!(log_view.content.contains("work survived its supervisor"));
+        let target = viewed_tui_codex_session_target(Some(&log_view)).unwrap();
+        assert_eq!(target.session_id, "session-fenced");
+        assert!(tui_agent_log_title(&log_view).contains("s/i/c controls"));
+
+        let message =
+            toggle_tui_codex_session_stop_at(&state_dir, target.project_id, &target.session_id)
+                .unwrap();
+        assert!(message.starts_with("Stopping this Codex task session"));
+        assert_eq!(
+            store
+                .session_control_blocking(target.project_id, &target.session_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            AgentSessionControlState::StopRequested
+        );
 
         fs::remove_dir_all(root).unwrap();
     }

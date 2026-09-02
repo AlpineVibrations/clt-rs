@@ -1,0 +1,5 @@
+Allow the TUI to gracefully stop live interactive Codex handoffs and release completed-session fences (BUG, AGENT, TUI, HIGH)
+
+Completion note:
+
+COMPLETED 2026-09-01: Added an `INTERACTIVE` Agent Projects state and made `s` directly control the selected project's single active, interactive, or fenced session without requiring an output link. Interactive stops now use an exact-holder database CAS and the original TUI's private lifeline so the child-owning guardian gracefully stops and reaps its Codex process group; completed/shared reservations are removed, while interrupted active sessions remain resumable as stopped. Updated TUI guidance and README recovery documentation, installed the release build, restarted launchd, and verified FISHDOME advanced to TR-01. Checks: `cargo test --locked` (325 passed), `cargo clippy --locked --all-targets -- -D warnings`, `cargo fmt --all -- --check`, `git diff --check`, release/installed SHA-256 match, and live FISHDOME board/session/lease verification.
