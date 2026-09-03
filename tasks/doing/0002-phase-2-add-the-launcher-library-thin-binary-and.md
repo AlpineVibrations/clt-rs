@@ -16,4 +16,6 @@ BLOCKED 2026-09-03: Implementation and all gates pass, but `clt done doing 2` ca
 
 BLOCKED 2026-09-03: Reverified the durable launcher split and all locked quality gates. Phase 0's older WORKING journal remains unresolved, and CLT's per-path worktree baseline cannot preserve its `src/main.rs` patch after Phase 2 relocates that code to `src/lib.rs`; Phase 0 must be finalized first or CLT must support baseline path relocation before this task can be sealed safely.
 
+BLOCKED 2026-09-03: Interactive recovery confirmed that both Phase 0 and Phase 2 remain in WORKING finalization state and no Phase 2 task commit exists. The verified implementation is preserved, but external journal recovery is still required because no scoped staging layout can retain Phase 0's frozen `src/main.rs` patch after the required move to `src/lib.rs`.
+
 codex:01a064fb-ac78-7ac0-ba28-963a09cac536
