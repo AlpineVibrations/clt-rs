@@ -60,6 +60,7 @@ Use this section while developing the next release.
 
 ### Fixed
 
+- Rebuild the active-worker project index and retry worker reservation when a SQLite-restored legacy index quotes worker states as identifiers and Turso reports `no such column: dispatching`.
 - Moving an idle, session-linked managed Git task to Done now explicitly accepts external completion: CLT safely cancels its stale `WORKING` journal and queued resume state under a short project fence, while continuing to protect live sessions and sealed commit/push proof.
 - Fixed managed Git sealing so a Todo or other task-board edit added during an agent run can remain unstaged and survive outside the exact task commit, while staged unrelated board changes and non-task baseline drift are still rejected.
 

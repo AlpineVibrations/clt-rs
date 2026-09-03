@@ -5835,11 +5835,11 @@ fn run_agent_daemon_database_operation_with_recovery<T>(
                 let original_error = format!("{err:#}");
                 rebuild_active_worker_index().with_context(|| {
                     format!(
-                        "Failed to rebuild {AGENT_WORKERS_ACTIVE_PROJECT_INDEX} after scheduler error: {original_error}"
+                        "Failed to rebuild {AGENT_WORKERS_ACTIVE_PROJECT_INDEX} after agent database error: {original_error}"
                     )
                 })?;
                 eprintln!(
-                    "Scheduler pass recovery: rebuilt index={AGENT_WORKERS_ACTIVE_PROJECT_INDEX}; retrying"
+                    "Agent database recovery: rebuilt index={AGENT_WORKERS_ACTIVE_PROJECT_INDEX}; retrying"
                 );
             }
             Err(err)
@@ -5862,8 +5862,15 @@ fn run_agent_daemon_database_operation_with_recovery<T>(
 
 fn agent_error_indicates_damaged_active_worker_index(err: &anyhow::Error) -> bool {
     let rendered = format!("{err:#}");
-    rendered.contains("IdxDelete: no matching index entry found for key")
-        && rendered.contains("worker")
+    (rendered.contains("IdxDelete: no matching index entry found for key")
+        && rendered.contains("worker"))
+        // SQLite accepts double-quoted string literals in a partial-index predicate,
+        // but Turso later reads them as identifiers when maintaining that index.
+        // Databases restored through SQLite can therefore carry a legacy definition
+        // that fails on the first worker write instead of during the scheduler scan.
+        || ["dispatching", "running", "finalizing"]
+            .iter()
+            .any(|state| rendered.contains(&format!("Parse error: no such column: {state}")))
 }
 
 fn agent_error_is_database_locked(err: &anyhow::Error) -> bool {
@@ -7123,23 +7130,32 @@ fn dispatch_independent_agent_worker_with(
     let command_arguments = serde_json::to_string(&command_arguments)
         .context("Failed to serialize independent worker launch arguments")?;
     let created_at = agent_timestamp();
-    let reservation_result = with_agent_store_at(state_dir, |store| {
-        store.reserve_worker_blocking(agent_store::AgentWorkerReservation {
-            project_id: job.project.id,
-            worker_token: &spec.worker_token,
-            expected_lease_holder: &job.holder,
-            max_active_workers: job.max_global_jobs,
-            protocol_version: AGENT_WORKER_PROTOCOL_VERSION,
-            service_label: &spec.service_label,
-            binary_path: &spec.executable,
-            command_arguments: &command_arguments,
-            path_env: &spec.service_env.path,
-            codex_path: spec.service_env.codex_path_override.as_deref(),
-            task_selection: spec.task_selection.label(),
-            resume_session_id: spec.resume_session_id.as_deref(),
-            created_at: &created_at,
-        })
-    });
+    let reservation_result = run_agent_daemon_database_operation_with_recovery(
+        || {
+            with_agent_store_at(state_dir, |store| {
+                store.reserve_worker_blocking(agent_store::AgentWorkerReservation {
+                    project_id: job.project.id,
+                    worker_token: &spec.worker_token,
+                    expected_lease_holder: &job.holder,
+                    max_active_workers: job.max_global_jobs,
+                    protocol_version: AGENT_WORKER_PROTOCOL_VERSION,
+                    service_label: &spec.service_label,
+                    binary_path: &spec.executable,
+                    command_arguments: &command_arguments,
+                    path_env: &spec.service_env.path,
+                    codex_path: spec.service_env.codex_path_override.as_deref(),
+                    task_selection: spec.task_selection.label(),
+                    resume_session_id: spec.resume_session_id.as_deref(),
+                    created_at: &created_at,
+                })
+            })
+        },
+        || {
+            with_agent_store_at(state_dir, |store| {
+                store.rebuild_active_worker_project_index_blocking()
+            })
+        },
+    );
     let reserved = match reservation_result {
         Ok(reserved) => reserved,
         Err(error) => {
@@ -39570,6 +39586,33 @@ mod tests {
                 if operation_calls.get() == 1 {
                     anyhow::bail!(
                         "Failed to abandon worker token: IdxDelete: no matching index entry found for key"
+                    );
+                }
+                Ok("recovered")
+            },
+            || {
+                rebuild_calls.set(rebuild_calls.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result, "recovered");
+        assert_eq!(operation_calls.get(), 2);
+        assert_eq!(rebuild_calls.get(), 1);
+    }
+
+    #[test]
+    fn agent_daemon_rebuilds_an_active_worker_index_with_quoted_state_names() {
+        let operation_calls = Cell::new(0);
+        let rebuild_calls = Cell::new(0);
+
+        let result = run_agent_daemon_database_operation_with_recovery(
+            || {
+                operation_calls.set(operation_calls.get() + 1);
+                if operation_calls.get() == 1 {
+                    anyhow::bail!(
+                        "Failed to reserve worker token: Parse error: no such column: dispatching"
                     );
                 }
                 Ok("recovered")
