@@ -1,0 +1,17 @@
+Phase 2: Add the launcher library, thin binary, and CLI module (REFACTOR, ARCHITECTURE).
+
+Reference: [CLT Refactor Design/Build Plan](../../refactor-plan.md#phase-2-launcher-library-and-cli-module)
+
+Dependency: Phase 1.
+
+Build outcome: `src/main.rs` delegates to the sole public Rust entry point, `clt_rs::run()`, while Clap definitions and dispatch live in an internal CLI module.
+
+Acceptance: Visible and hidden command parsing, help, stdout/stderr, and process exit behavior remain unchanged; all gates pass.
+
+Completion note:
+
+COMPLETED 2026-09-03: Added the public `clt_rs::run()` launcher, reduced `src/main.rs` to a thin binary, and moved Clap definitions plus command dispatch into the internal `cli` module. Checks: `cargo fmt --all -- --check`; `cargo clippy --locked --all-targets --all-features -- -D warnings`; `cargo test --locked --all-targets --all-features` (396 library tests and 7 CLI integration tests passed).
+
+BLOCKED 2026-09-03: Implementation and all gates pass, but `clt done doing 2` cannot seal because the frozen baseline records Phase 0's unrelated unstaged patch at `src/main.rs`, while this required file split preserves that patch at `src/lib.rs`. Finalization needs external CLT journal recovery after Phase 0 is resolved, or supported baseline path-relocation handling; committing Phase 0's changes in this task would violate the scoped-commit contract.
+
+codex:01a064fb-ac78-7ac0-ba28-963a09cac536
