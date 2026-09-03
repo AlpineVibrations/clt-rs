@@ -14,4 +14,6 @@ COMPLETED 2026-09-03: Added the internal `platform` module for launchd/systemd s
 
 BLOCKED 2026-09-03: Implementation and all gates pass, but the frozen baseline has Phase 2–4's `src/lib.rs` as an untracked file and Phase 5 necessarily changes it to declare `platform` and remove the extracted code. Git cannot stage only Phase 5's delta or a buildable task commit without also absorbing older task payloads, so external CLT journal recovery must resolve the earlier WORKING histories before this task can be sealed safely.
 
+BLOCKED 2026-09-03: Reverified the platform extraction and all locked gates while the Phase 0 and Phase 2–4 journals remain WORKING. Phase 5 still cannot stage its `src/lib.rs` delta without consuming the earlier sessions' untracked baseline; resolve those journals or add supported baseline ownership transfer before sealing this task.
+
 codex:01a06525-5bff-7672-bd08-fb6cb3dfb97b
