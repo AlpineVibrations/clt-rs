@@ -1,5 +1,137 @@
 use super::*;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct AgentSchedulingDecisionRequest {
+    pub(super) has_resume_session: bool,
+    pub(super) resume_interrupted_task: bool,
+    pub(super) has_blocked_task: bool,
+    pub(super) blocked_recovery_backoff_active: bool,
+    pub(super) has_pending_task: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct AgentSchedulingDecision {
+    pub(super) task_selection: Option<AgentTaskSelection>,
+}
+
+pub(super) fn decide_agent_scheduling_stage(
+    request: AgentSchedulingDecisionRequest,
+) -> AgentSchedulingDecision {
+    let task_selection = if request.has_resume_session {
+        Some(AgentTaskSelection::ResumeSession)
+    } else if request.resume_interrupted_task {
+        Some(AgentTaskSelection::ResumeDoing)
+    } else if request.has_blocked_task && !request.blocked_recovery_backoff_active {
+        Some(AgentTaskSelection::RecoverBlocked)
+    } else if request.has_pending_task {
+        Some(AgentTaskSelection::NextTodo)
+    } else if request.has_blocked_task {
+        Some(AgentTaskSelection::RecoverBlocked)
+    } else {
+        None
+    };
+    AgentSchedulingDecision { task_selection }
+}
+
+pub(super) struct AgentJobAcquisitionRequest<'a> {
+    pub(super) state_dir: &'a Path,
+    pub(super) project: &'a agent::AgentProject,
+    pub(super) scan: &'a AgentProjectScan,
+    pub(super) holder: &'a str,
+    pub(super) lease_timeout: Duration,
+    pub(super) reclaim_current_process_leases: bool,
+    pub(super) max_global_jobs: usize,
+    pub(super) task_selection: AgentTaskSelection,
+    pub(super) resume_session_id: Option<String>,
+}
+
+pub(super) enum AgentJobAcquisitionResult {
+    Acquired {
+        job: Box<AgentRunJob>,
+        acquired_at: String,
+        expires_at: String,
+    },
+    ActiveLease(Option<agent::AgentLeaseRecord>),
+    SessionSuspended,
+}
+
+pub(super) fn acquire_agent_job_stage(
+    request: AgentJobAcquisitionRequest<'_>,
+) -> Result<AgentJobAcquisitionResult> {
+    let AgentJobAcquisitionRequest {
+        state_dir,
+        project,
+        scan,
+        holder,
+        lease_timeout,
+        reclaim_current_process_leases,
+        max_global_jobs,
+        task_selection,
+        resume_session_id,
+    } = request;
+    let mut acquired_at = agent_timestamp();
+    let mut expires_at = agent_timestamp_after(lease_timeout.as_secs());
+    let mut acquired = with_agent_store_at(state_dir, |store| {
+        store.try_acquire_lease_blocking(project.id, holder, &acquired_at, &expires_at)
+    })?;
+    if !acquired {
+        let lease = agent_lease_for_project(state_dir, project.id)?;
+        if let Some(lease) = lease.as_ref()
+            && try_reclaim_inactive_agent_lease(
+                state_dir,
+                project,
+                Some(scan),
+                lease,
+                reclaim_current_process_leases,
+            )?
+        {
+            acquired_at = agent_timestamp();
+            expires_at = agent_timestamp_after(lease_timeout.as_secs());
+            acquired = with_agent_store_at(state_dir, |store| {
+                store.try_acquire_lease_blocking(project.id, holder, &acquired_at, &expires_at)
+            })?;
+        }
+
+        if !acquired {
+            return Ok(AgentJobAcquisitionResult::ActiveLease(
+                agent_lease_for_project(state_dir, project.id)?,
+            ));
+        }
+    }
+
+    if resume_session_id.is_none() {
+        let controls = with_agent_store_at(state_dir, |store| {
+            store.session_controls_for_project_blocking(project.id)
+        })?;
+        if session_controls_suspend_project(&controls) {
+            with_agent_store_at(state_dir, |store| {
+                store.release_lease_blocking(project.id, holder).map(|_| ())
+            })?;
+            return Ok(AgentJobAcquisitionResult::SessionSuspended);
+        }
+    }
+
+    let done_task_contents_before = completed_task_contents(&project.path).unwrap_or_default();
+    let blocked_task_snapshots_before = blocked_task_snapshots(&project.path).unwrap_or_default();
+    let job = AgentRunJob {
+        state_dir: state_dir.to_path_buf(),
+        project: project.clone(),
+        holder: holder.to_string(),
+        worker_token: None,
+        max_global_jobs,
+        task_selection,
+        resume_session_id,
+        blocked_task_count_before: scan.blocked_task_count(),
+        done_task_contents_before,
+        blocked_task_snapshots_before,
+    };
+    Ok(AgentJobAcquisitionResult::Acquired {
+        job: Box::new(job),
+        acquired_at,
+        expires_at,
+    })
+}
+
 pub(super) fn run_agent_daemon() -> Result<()> {
     let state_dir = ensure_agent_state_dir()?;
     let poll_interval = agent_poll_interval()?;
@@ -842,19 +974,14 @@ pub(super) fn run_agent_scheduler_pass_with_max_global_jobs(
                 || existing_lease.as_ref().is_some_and(|lease| {
                     agent_lease_is_reclaimable(lease, reclaim_current_process_leases, now)
                 }));
-        let task_selection = if resume_session_id.is_some() {
-            Some(AgentTaskSelection::ResumeSession)
-        } else if resume_interrupted_task {
-            Some(AgentTaskSelection::ResumeDoing)
-        } else if scan.has_blocked_task() && !blocked_recovery_backoff_active {
-            Some(AgentTaskSelection::RecoverBlocked)
-        } else if scan.has_pending_task() {
-            Some(AgentTaskSelection::NextTodo)
-        } else if scan.has_blocked_task() {
-            Some(AgentTaskSelection::RecoverBlocked)
-        } else {
-            None
-        };
+        let task_selection = decide_agent_scheduling_stage(AgentSchedulingDecisionRequest {
+            has_resume_session: resume_session_id.is_some(),
+            resume_interrupted_task,
+            has_blocked_task: scan.has_blocked_task(),
+            blocked_recovery_backoff_active,
+            has_pending_task: scan.has_pending_task(),
+        })
+        .task_selection;
 
         let Some(task_selection) = task_selection else {
             println!(
@@ -919,57 +1046,40 @@ pub(super) fn run_agent_scheduler_pass_with_max_global_jobs(
             continue;
         }
 
-        let mut acquired_at = agent_timestamp();
-        let mut expires_at = agent_timestamp_after(lease_timeout.as_secs());
-        let mut acquired = with_agent_store_at(state_dir, |store| {
-            store.try_acquire_lease_blocking(project.id, &holder, &acquired_at, &expires_at)
+        let acquisition = acquire_agent_job_stage(AgentJobAcquisitionRequest {
+            state_dir,
+            project: &project,
+            scan: &scan,
+            holder: &holder,
+            lease_timeout,
+            reclaim_current_process_leases,
+            max_global_jobs,
+            task_selection,
+            resume_session_id,
         })?;
-        if !acquired {
-            let lease = agent_lease_for_project(state_dir, project.id)?;
-            if let Some(lease) = lease.as_ref()
-                && try_reclaim_inactive_agent_lease(
-                    state_dir,
-                    &project,
-                    Some(&scan),
-                    lease,
-                    reclaim_current_process_leases,
-                )?
-            {
-                let reacquired_at = agent_timestamp();
-                let reexpires_at = agent_timestamp_after(lease_timeout.as_secs());
-                acquired_at = reacquired_at;
-                expires_at = reexpires_at;
-                acquired = with_agent_store_at(state_dir, |store| {
-                    store.try_acquire_lease_blocking(project.id, &holder, &acquired_at, &expires_at)
-                })?;
+        let AgentJobAcquisitionResult::Acquired {
+            job,
+            acquired_at,
+            expires_at,
+        } = acquisition
+        else {
+            match acquisition {
+                AgentJobAcquisitionResult::ActiveLease(lease) => {
+                    pass.skipped_active_lease += 1;
+                    print_active_lease_skip(&project, &scan, lease.as_ref());
+                }
+                AgentJobAcquisitionResult::SessionSuspended => {
+                    println!(
+                        "Project {}: action=skip reason=session_state_changed_before_start path={}",
+                        project.name,
+                        project.path.display()
+                    );
+                }
+                AgentJobAcquisitionResult::Acquired { .. } => unreachable!(),
             }
+            continue;
+        };
 
-            if !acquired {
-                pass.skipped_active_lease += 1;
-                let lease = agent_lease_for_project(state_dir, project.id)?;
-                print_active_lease_skip(&project, &scan, lease.as_ref());
-                continue;
-            }
-        }
-
-        if resume_session_id.is_none() {
-            let controls = with_agent_store_at(state_dir, |store| {
-                store.session_controls_for_project_blocking(project.id)
-            })?;
-            if session_controls_suspend_project(&controls) {
-                with_agent_store_at(state_dir, |store| {
-                    store
-                        .release_lease_blocking(project.id, &holder)
-                        .map(|_| ())
-                })?;
-                println!(
-                    "Project {}: action=skip reason=session_state_changed_before_start path={}",
-                    project.name,
-                    project.path.display()
-                );
-                continue;
-            }
-        }
         println!(
             "Project {}: action=running work={} todo={} ready_todo={} blocked_todo={} doing={} blocked_doing={} scan_status={} lease_holder={} lease_acquired_at={} lease_expires_at={} path={}",
             project.name,
@@ -985,23 +1095,8 @@ pub(super) fn run_agent_scheduler_pass_with_max_global_jobs(
             format_agent_timestamp(&expires_at),
             project.path.display()
         );
-
-        let done_task_contents_before = completed_task_contents(&project.path).unwrap_or_default();
-        let blocked_task_snapshots_before =
-            blocked_task_snapshots(&project.path).unwrap_or_default();
         pass.runs_started += 1;
-        jobs.push(AgentRunJob {
-            state_dir: state_dir.to_path_buf(),
-            project,
-            holder: holder.clone(),
-            worker_token: None,
-            max_global_jobs,
-            task_selection,
-            resume_session_id,
-            blocked_task_count_before: scan.blocked_task_count(),
-            done_task_contents_before,
-            blocked_task_snapshots_before,
-        });
+        jobs.push(*job);
     }
 
     Ok(AgentSchedulerStart { pass, jobs })

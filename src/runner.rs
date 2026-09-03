@@ -87,15 +87,356 @@ pub(super) fn unproven_agent_child_termination(
 }
 
 pub(super) trait AgentRunner: Send + Sync {
-    fn run_project(
-        &self,
-        project: &agent::AgentProject,
-        task_selection: AgentTaskSelection,
-        resume_session_id: Option<&str>,
-        lease_holder: &str,
-        run_token: Option<&str>,
-        shutdown: &AgentShutdownSignal,
-    ) -> Result<AgentRunResult>;
+    fn run_project(&self, request: AgentRunRequest<'_>) -> Result<AgentRunResult>;
+}
+
+pub(super) struct AgentRunRequest<'a> {
+    pub(super) project: &'a agent::AgentProject,
+    pub(super) task_selection: AgentTaskSelection,
+    pub(super) resume_session_id: Option<&'a str>,
+    pub(super) lease_holder: &'a str,
+    pub(super) run_token: Option<&'a str>,
+    pub(super) shutdown: &'a AgentShutdownSignal,
+}
+
+pub(super) struct AgentSupervisionOutcomeRequest {
+    pub(super) wait_result: AgentProcessWait,
+    pub(super) requested_control: Option<AgentSessionControlAction>,
+    pub(super) reported_no_tasks: bool,
+    pub(super) timeout: Duration,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct AgentSupervisionOutcome {
+    pub(super) status: &'static str,
+    pub(super) exit_code: Option<i64>,
+    pub(super) summary: String,
+    pub(super) stderr_note: Option<String>,
+}
+
+pub(super) struct AgentRunnerLaunchRequest<'a> {
+    pub(super) runner: &'a CodexAgentRunner,
+    pub(super) store: &'a agent::TursoAgentStore,
+    pub(super) project: &'a agent::AgentProject,
+    pub(super) task_selection: AgentTaskSelection,
+    pub(super) resume_session_id: Option<&'a str>,
+    pub(super) lease_holder: &'a str,
+    pub(super) run_file_stem: &'a str,
+    pub(super) git_start_state: Option<&'a AgentGitStartState>,
+}
+
+pub(super) struct AgentRunnerLaunchedProcess {
+    pub(super) child: Child,
+    pub(super) child_pid: u32,
+    pub(super) log_dir: PathBuf,
+    pub(super) stdout_path: PathBuf,
+    pub(super) stderr_path: PathBuf,
+    pub(super) configured_session_id: Option<String>,
+    #[cfg(unix)]
+    pub(super) supervisor_control: Option<std::process::ChildStdin>,
+    #[cfg(unix)]
+    pub(super) supervisor_proof: BufReader<std::process::ChildStdout>,
+}
+
+pub(super) enum AgentRunnerLaunchResult {
+    Launched(AgentRunnerLaunchedProcess),
+    Failed(AgentRunResult),
+}
+
+pub(super) fn classify_agent_supervision_stage(
+    request: AgentSupervisionOutcomeRequest,
+) -> AgentSupervisionOutcome {
+    let AgentSupervisionOutcomeRequest {
+        wait_result,
+        requested_control,
+        reported_no_tasks,
+        timeout,
+    } = request;
+    if let Some(action) = requested_control {
+        let exit_code = match wait_result {
+            AgentProcessWait::Exited(status) => status.code().map(i64::from),
+            AgentProcessWait::TimedOut(status) | AgentProcessWait::Interrupted(status) => {
+                status.and_then(|status| status.code().map(i64::from))
+            }
+        };
+        return match action {
+            AgentSessionControlAction::Stop => AgentSupervisionOutcome {
+                status: "stopped",
+                exit_code,
+                summary: "Codex task session stopped and remains resumable.".to_string(),
+                stderr_note: Some("Codex stopped by task-session control.".to_string()),
+            },
+            AgentSessionControlAction::Interrupt => AgentSupervisionOutcome {
+                status: "handoff",
+                exit_code,
+                summary: "Codex task session is ready for interactive handoff.".to_string(),
+                stderr_note: Some(
+                    "Codex interrupted for an interactive session handoff.".to_string(),
+                ),
+            },
+        };
+    }
+
+    match wait_result {
+        AgentProcessWait::Exited(exit_status) => {
+            let exit_code = exit_status.code().map(i64::from);
+            if reported_no_tasks {
+                AgentSupervisionOutcome {
+                    status: "idle",
+                    exit_code,
+                    summary: "Codex reported no available tasks.".to_string(),
+                    stderr_note: None,
+                }
+            } else if exit_status.success() {
+                AgentSupervisionOutcome {
+                    status: "success",
+                    exit_code,
+                    summary: "Codex run completed successfully.".to_string(),
+                    stderr_note: None,
+                }
+            } else {
+                AgentSupervisionOutcome {
+                    status: "failure",
+                    exit_code,
+                    summary: format!("Codex exited with status {exit_status}."),
+                    stderr_note: None,
+                }
+            }
+        }
+        AgentProcessWait::TimedOut(exit_status) => {
+            let summary = format!("Codex timed out after {} seconds.", timeout.as_secs());
+            AgentSupervisionOutcome {
+                status: "timeout",
+                exit_code: exit_status.and_then(|status| status.code().map(i64::from)),
+                stderr_note: Some(summary.clone()),
+                summary,
+            }
+        }
+        AgentProcessWait::Interrupted(exit_status) => AgentSupervisionOutcome {
+            status: "interrupted",
+            exit_code: exit_status.and_then(|status| status.code().map(i64::from)),
+            summary: "Codex stopped because the agent is shutting down.".to_string(),
+            stderr_note: Some("Codex stopped because the agent is shutting down.".to_string()),
+        },
+    }
+}
+
+pub(super) fn launch_agent_runner_stage(
+    request: AgentRunnerLaunchRequest<'_>,
+) -> Result<AgentRunnerLaunchResult> {
+    let AgentRunnerLaunchRequest {
+        runner,
+        store,
+        project,
+        task_selection,
+        resume_session_id,
+        lease_holder,
+        run_file_stem,
+        git_start_state,
+    } = request;
+    let log_dir = agent_project_run_log_dir(&runner.state_dir, project)?;
+    fs::create_dir_all(&log_dir)
+        .with_context(|| format!("Failed to create agent run log directory {:?}", log_dir))?;
+    let stdout_path = log_dir.join(format!("{run_file_stem}.out"));
+    let stderr_path = log_dir.join(format!("{run_file_stem}.err"));
+    let stdout_file = fs::File::create(&stdout_path)
+        .with_context(|| format!("Failed to create stdout log {:?}", stdout_path))?;
+    fs::File::create(&stderr_path)
+        .with_context(|| format!("Failed to create stderr log {:?}", stderr_path))?;
+    let stderr_file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&stderr_path)
+        .with_context(|| format!("Failed to reopen stderr log {:?}", stderr_path))?;
+
+    let mut command = Command::new(&runner.command);
+    command
+        .arg("--sandbox")
+        .arg("danger-full-access")
+        .arg("--ask-for-approval")
+        .arg("never")
+        .arg("--enable")
+        .arg("goals");
+    let model_target = if let Some(model_id) = project.codex_model.as_ref() {
+        agent::AgentModelDefaults {
+            provider_id: Some(
+                project
+                    .codex_provider
+                    .clone()
+                    .unwrap_or_else(|| "openai".to_string()),
+            ),
+            model_id: Some(model_id.clone()),
+        }
+    } else {
+        store.resolve_model_target_blocking(project)?
+    };
+    if let (Some(provider), Some(model)) = (
+        model_target.provider_id.as_deref(),
+        model_target.model_id.as_deref(),
+    ) {
+        command
+            .arg("--config")
+            .arg(format!("model_provider={provider:?}"));
+        command.arg("--model").arg(model);
+    }
+    let model_reasoning_effort = if project.codex_reasoning_effort.is_none() {
+        match (
+            model_target.provider_id.as_deref(),
+            model_target.model_id.as_deref(),
+        ) {
+            (Some(provider), Some(model)) => {
+                store.model_target_reasoning_blocking(provider, model)?
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    if let Some(reasoning_effort) = project
+        .codex_reasoning_effort
+        .as_deref()
+        .or(model_reasoning_effort.as_deref())
+    {
+        command
+            .arg("--config")
+            .arg(format!("model_reasoning_effort=\"{reasoning_effort}\""));
+    }
+    if project.codex_fast_enabled {
+        command
+            .arg("--enable")
+            .arg("fast_mode")
+            .arg("--config")
+            .arg("service_tier=\"fast\"");
+    } else {
+        command.arg("--disable").arg("fast_mode");
+    }
+    let configured_session_id = configure_automated_codex_subcommand(
+        &mut command,
+        project,
+        task_selection,
+        resume_session_id,
+    )?;
+    #[cfg(not(unix))]
+    if let Some(session_id) = configured_session_id.as_deref() {
+        anyhow::bail!(
+            "Automated Codex session resume {session_id} is unsupported on this platform because CLT cannot register it before launch"
+        );
+    }
+    command.current_dir(&project.path);
+    configure_agent_git_identity(&mut command, project.git_mode);
+    configure_automated_agent_child_context(
+        &mut command,
+        &runner.state_dir,
+        project.id,
+        run_file_stem,
+    );
+
+    let persist_git_launch_state = || -> Result<bool> {
+        let Some(git_start_state) = git_start_state else {
+            return Ok(false);
+        };
+        verify_agent_git_start_state_unchanged(&project.path, project.git_mode, git_start_state)?;
+        store.record_git_launch_state_blocking(
+            project.id,
+            run_file_stem,
+            project.git_mode,
+            git_start_state,
+            &agent_timestamp(),
+        )
+    };
+
+    #[cfg(unix)]
+    let spawn_result: Result<AgentRunnerLaunchedProcess> = (|| {
+        drop(stdout_file);
+        let AutomatedSupervisorChild {
+            mut process,
+            control,
+            child_pid,
+            mut proof,
+        } = spawn_automated_session_supervisor(
+            &command,
+            AutomatedSupervisorSpec {
+                state_dir: &runner.state_dir,
+                project_id: project.id,
+                run_token: run_file_stem,
+                lease_holder,
+                stdout_path: &stdout_path,
+                stderr_path: &stderr_path,
+            },
+            stderr_file,
+        )?;
+        if let Err(error) = persist_git_launch_state() {
+            drop(control);
+            wait_for_automated_supervisor_reaped(&mut process, &mut proof).with_context(|| {
+                format!(
+                    "Persisting the prelaunch Git state failed ({error:#}), and the automated supervisor did not prove Codex stopped"
+                )
+            })?;
+            return Err(error)
+                .context("Failed to persist the prelaunch Git state behind the Codex launch gate");
+        }
+        Ok(AgentRunnerLaunchedProcess {
+            child: process,
+            child_pid,
+            log_dir: log_dir.clone(),
+            stdout_path: stdout_path.clone(),
+            stderr_path: stderr_path.clone(),
+            configured_session_id: configured_session_id.clone(),
+            supervisor_control: Some(control),
+            supervisor_proof: proof,
+        })
+    })();
+    #[cfg(not(unix))]
+    let spawn_result: Result<AgentRunnerLaunchedProcess> = (|| {
+        let git_launch_state_was_created = persist_git_launch_state()?;
+        command
+            .stdout(Stdio::from(stdout_file))
+            .stderr(Stdio::from(stderr_file));
+        configure_agent_child_command(&mut command);
+        match command.spawn() {
+            Ok(child) => Ok(AgentRunnerLaunchedProcess {
+                child_pid: child.id(),
+                child,
+                log_dir: log_dir.clone(),
+                stdout_path: stdout_path.clone(),
+                stderr_path: stderr_path.clone(),
+                configured_session_id: configured_session_id.clone(),
+            }),
+            Err(error) => {
+                if git_launch_state_was_created
+                    && !store.delete_git_launch_state_blocking(project.id, run_file_stem)?
+                {
+                    anyhow::bail!(
+                        "The Codex process failed to spawn and its exact Git launch boundary could not be deleted"
+                    );
+                }
+                Err(error.into())
+            }
+        }
+    })();
+
+    match spawn_result {
+        Ok(process) => Ok(AgentRunnerLaunchResult::Launched(process)),
+        Err(error) => {
+            let summary = format!(
+                "Failed to start Codex command {} in {}: {error}",
+                runner.command.display(),
+                project.path.display()
+            );
+            append_agent_log_line(&stderr_path, &summary)?;
+            Ok(AgentRunnerLaunchResult::Failed(AgentRunResult {
+                status: "failure",
+                exit_code: None,
+                log_dir,
+                stdout_path,
+                stderr_path,
+                summary,
+                codex_session_id: configured_session_id,
+                session_run_token: None,
+                control_action: None,
+            }))
+        }
+    }
 }
 
 pub(super) struct CodexAgentRunner {
@@ -1228,16 +1569,26 @@ pub(super) fn skill_frontmatter_name(contents: &str) -> Option<&str> {
 }
 
 impl AgentRunner for CodexAgentRunner {
-    fn run_project(
+    fn run_project(&self, request: AgentRunRequest<'_>) -> Result<AgentRunResult> {
+        Self::run_codex_project_stage(self, request)
+    }
+}
+
+impl CodexAgentRunner {
+    pub(super) fn run_codex_project_stage(
         &self,
-        project: &agent::AgentProject,
-        task_selection: AgentTaskSelection,
-        resume_session_id: Option<&str>,
-        lease_holder: &str,
-        run_token: Option<&str>,
-        shutdown: &AgentShutdownSignal,
+        request: AgentRunRequest<'_>,
     ) -> Result<AgentRunResult> {
-        let store = open_agent_store_at(&self.state_dir)?;
+        let AgentRunRequest {
+            project,
+            task_selection,
+            resume_session_id,
+            lease_holder,
+            run_token,
+            shutdown,
+        } = request;
+        let runner = self;
+        let store = open_agent_store_at(&runner.state_dir)?;
         let known_session_id = match resume_session_id {
             Some(session_id) => Some(session_id.to_string()),
             None => automated_codex_session_to_resume(&project.path, task_selection)?,
@@ -1248,10 +1599,10 @@ impl AgentRunner for CodexAgentRunner {
         let project = &effective_project;
         let effective_worker_token = run_token
             .map(str::to_string)
-            .or_else(|| self.worker_token.clone());
+            .or_else(|| runner.worker_token.clone());
         if run_token.is_some()
-            && self.worker_token.is_some()
-            && run_token != self.worker_token.as_deref()
+            && runner.worker_token.is_some()
+            && run_token != runner.worker_token.as_deref()
         {
             anyhow::bail!("Agent runner received conflicting durable worker tokens");
         }
@@ -1276,220 +1627,29 @@ impl AgentRunner for CodexAgentRunner {
             task_contents_for_status(&project.path, TaskStatus::Doing).unwrap_or_default();
         let blocked_task_snapshots_before =
             blocked_task_snapshots(&project.path).unwrap_or_default();
-        let log_dir = agent_project_run_log_dir(&self.state_dir, project)?;
-        fs::create_dir_all(&log_dir)
-            .with_context(|| format!("Failed to create agent run log directory {:?}", log_dir))?;
-
-        let stdout_path = log_dir.join(format!("{run_file_stem}.out"));
-        let stderr_path = log_dir.join(format!("{run_file_stem}.err"));
-        let stdout_file = fs::File::create(&stdout_path)
-            .with_context(|| format!("Failed to create stdout log {:?}", stdout_path))?;
-        fs::File::create(&stderr_path)
-            .with_context(|| format!("Failed to create stderr log {:?}", stderr_path))?;
-        let stderr_file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&stderr_path)
-            .with_context(|| format!("Failed to reopen stderr log {:?}", stderr_path))?;
-
-        let mut command = Command::new(&self.command);
-        command
-            .arg("--sandbox")
-            .arg("danger-full-access")
-            .arg("--ask-for-approval")
-            .arg("never")
-            .arg("--enable")
-            .arg("goals");
-        let model_target = if let Some(model_id) = project.codex_model.as_ref() {
-            agent::AgentModelDefaults {
-                provider_id: Some(
-                    project
-                        .codex_provider
-                        .clone()
-                        .unwrap_or_else(|| "openai".to_string()),
-                ),
-                model_id: Some(model_id.clone()),
-            }
-        } else {
-            store.resolve_model_target_blocking(project)?
-        };
-        if let (Some(provider), Some(model)) = (
-            model_target.provider_id.as_deref(),
-            model_target.model_id.as_deref(),
-        ) {
-            command
-                .arg("--config")
-                .arg(format!("model_provider={provider:?}"));
-            command.arg("--model").arg(model);
-        }
-        let model_reasoning_effort = if project.codex_reasoning_effort.is_none() {
-            match (
-                model_target.provider_id.as_deref(),
-                model_target.model_id.as_deref(),
-            ) {
-                (Some(provider), Some(model)) => {
-                    store.model_target_reasoning_blocking(provider, model)?
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
-        if let Some(reasoning_effort) = project
-            .codex_reasoning_effort
-            .as_deref()
-            .or(model_reasoning_effort.as_deref())
-        {
-            command
-                .arg("--config")
-                .arg(format!("model_reasoning_effort=\"{reasoning_effort}\""));
-        }
-        if project.codex_fast_enabled {
-            command
-                .arg("--enable")
-                .arg("fast_mode")
-                .arg("--config")
-                .arg("service_tier=\"fast\"");
-        } else {
-            command.arg("--disable").arg("fast_mode");
-        }
-        let configured_session_id = configure_automated_codex_subcommand(
-            &mut command,
+        let launched = match launch_agent_runner_stage(AgentRunnerLaunchRequest {
+            runner,
+            store: &store,
             project,
             task_selection,
             resume_session_id,
-        )?;
-        #[cfg(not(unix))]
-        if let Some(session_id) = configured_session_id.as_deref() {
-            anyhow::bail!(
-                "Automated Codex session resume {session_id} is unsupported on this platform because CLT cannot register it before launch"
-            );
-        }
-        command.current_dir(&project.path);
-        configure_agent_git_identity(&mut command, project.git_mode);
-        configure_automated_agent_child_context(
-            &mut command,
-            &self.state_dir,
-            project.id,
-            &run_file_stem,
-        );
-
-        let persist_git_launch_state = || -> Result<bool> {
-            let Some(git_start_state) = git_start_state.as_ref() else {
-                return Ok(false);
-            };
-            verify_agent_git_start_state_unchanged(
-                &project.path,
-                project.git_mode,
-                git_start_state,
-            )?;
-            store.record_git_launch_state_blocking(
-                project.id,
-                &run_file_stem,
-                project.git_mode,
-                git_start_state,
-                &agent_timestamp(),
-            )
+            lease_holder,
+            run_file_stem: &run_file_stem,
+            git_start_state: git_start_state.as_ref(),
+        })? {
+            AgentRunnerLaunchResult::Launched(process) => process,
+            AgentRunnerLaunchResult::Failed(result) => return Ok(result),
         };
-
+        let mut child = launched.child;
+        let child_pid = launched.child_pid;
+        let log_dir = launched.log_dir;
+        let stdout_path = launched.stdout_path;
+        let stderr_path = launched.stderr_path;
+        let configured_session_id = launched.configured_session_id;
         #[cfg(unix)]
-        let spawn_result: Result<_> = (|| {
-            drop(stdout_file);
-            let supervised = spawn_automated_session_supervisor(
-                &command,
-                AutomatedSupervisorSpec {
-                    state_dir: &self.state_dir,
-                    project_id: project.id,
-                    run_token: &run_file_stem,
-                    lease_holder,
-                    stdout_path: &stdout_path,
-                    stderr_path: &stderr_path,
-                },
-                stderr_file,
-            )?;
-            let AutomatedSupervisorChild {
-                mut process,
-                control,
-                child_pid,
-                mut proof,
-            } = supervised;
-            let git_launch_state_was_created = match persist_git_launch_state() {
-                Ok(created) => created,
-                Err(error) => {
-                    drop(control);
-                    wait_for_automated_supervisor_reaped(&mut process, &mut proof).with_context(
-                        || {
-                            format!(
-                                "Persisting the prelaunch Git state failed ({error:#}), and the automated supervisor did not prove Codex stopped"
-                            )
-                        },
-                    )?;
-                    return Err(error).context(
-                        "Failed to persist the prelaunch Git state behind the Codex launch gate",
-                    );
-                }
-            };
-            Ok((
-                process,
-                child_pid,
-                Some(control),
-                Some(proof),
-                git_launch_state_was_created,
-            ))
-        })();
-        #[cfg(not(unix))]
-        let spawn_result: Result<_> = (|| {
-            let git_launch_state_was_created = persist_git_launch_state()?;
-            command
-                .stdout(Stdio::from(stdout_file))
-                .stderr(Stdio::from(stderr_file));
-            configure_agent_child_command(&mut command);
-            match command.spawn() {
-                Ok(child) => {
-                    let child_pid = child.id();
-                    Ok((child, child_pid, None, None, git_launch_state_was_created))
-                }
-                Err(error) => {
-                    if git_launch_state_was_created
-                        && !store.delete_git_launch_state_blocking(project.id, &run_file_stem)?
-                    {
-                        anyhow::bail!(
-                            "The Codex process failed to spawn and its exact Git launch boundary could not be deleted"
-                        );
-                    }
-                    Err(error.into())
-                }
-            }
-        })();
-
-        let (
-            mut child,
-            child_pid,
-            mut supervisor_control,
-            mut supervisor_proof,
-            _git_launch_state_was_created,
-        ) = match spawn_result {
-            Ok(child) => child,
-            Err(err) => {
-                let summary = format!(
-                    "Failed to start Codex command {} in {}: {err}",
-                    self.command.display(),
-                    project.path.display()
-                );
-                append_agent_log_line(&stderr_path, &summary)?;
-                return Ok(AgentRunResult {
-                    status: "failure",
-                    exit_code: None,
-                    log_dir,
-                    stdout_path,
-                    stderr_path,
-                    summary,
-                    codex_session_id: configured_session_id,
-                    session_run_token: None,
-                    control_action: None,
-                });
-            }
-        };
+        let mut supervisor_control = launched.supervisor_control;
+        #[cfg(unix)]
+        let mut supervisor_proof = launched.supervisor_proof;
         let mut last_heartbeat_stderr_bytes = 0;
         let mut observed_session_id = configured_session_id;
         let mut session_linked = false;
@@ -1508,7 +1668,7 @@ impl AgentRunner for CodexAgentRunner {
                     stdout_path: &stdout_path,
                     stderr_path: &stderr_path,
                     lease_holder,
-                    lease_timeout_seconds: self.lease_timeout.as_secs(),
+                    lease_timeout_seconds: runner.lease_timeout.as_secs(),
                     claim_requested_resume: task_selection == AgentTaskSelection::ResumeSession
                         && resume_session_id == Some(session_id),
                 },
@@ -1526,9 +1686,7 @@ impl AgentRunner for CodexAgentRunner {
                     supervisor_control.take();
                     wait_for_automated_supervisor_reaped(
                         &mut child,
-                        supervisor_proof
-                            .as_mut()
-                            .expect("Unix automated supervisor has a proof pipe"),
+                        &mut supervisor_proof,
                     )
                     .with_context(|| {
                         format!(
@@ -1570,9 +1728,7 @@ impl AgentRunner for CodexAgentRunner {
             supervisor_control.take();
             wait_for_automated_supervisor_reaped(
                 &mut child,
-                supervisor_proof
-                    .as_mut()
-                    .expect("Unix automated supervisor has a proof pipe"),
+                &mut supervisor_proof,
             )
             .with_context(|| {
                 format!(
@@ -1586,25 +1742,23 @@ impl AgentRunner for CodexAgentRunner {
             AutomatedSupervisorWaitHandles {
                 process: &mut child,
                 control: &mut supervisor_control,
-                proof: supervisor_proof
-                    .as_mut()
-                    .expect("Unix automated supervisor has a proof pipe"),
+                proof: &mut supervisor_proof,
             },
-            self.timeout,
-            self.heartbeat_interval,
+            runner.timeout,
+            runner.heartbeat_interval,
             |elapsed| {
                 print_agent_run_heartbeat(
                     project,
                     elapsed,
-                    self.timeout,
+                    runner.timeout,
                     &stdout_path,
                     &stderr_path,
                     &mut last_heartbeat_stderr_bytes,
                 )
             },
             || {
-                if last_lease_renewal.elapsed() >= self.lease_renew_interval {
-                    let expires_at = agent_timestamp_after(self.lease_timeout.as_secs());
+                if last_lease_renewal.elapsed() >= runner.lease_renew_interval {
+                    let expires_at = agent_timestamp_after(runner.lease_timeout.as_secs());
                     let renewed = if let Some(worker_token) = effective_worker_token.as_deref() {
                         store.renew_worker_blocking(
                             worker_token,
@@ -1721,13 +1875,13 @@ impl AgentRunner for CodexAgentRunner {
         #[cfg(not(unix))]
         let wait_result = wait_for_child_with_timeout_and_heartbeat(
             &mut child,
-            self.timeout,
-            self.heartbeat_interval,
+            runner.timeout,
+            runner.heartbeat_interval,
             |elapsed| {
                 print_agent_run_heartbeat(
                     project,
                     elapsed,
-                    self.timeout,
+                    runner.timeout,
                     &stdout_path,
                     &stderr_path,
                     &mut last_heartbeat_stderr_bytes,
@@ -1762,94 +1916,52 @@ impl AgentRunner for CodexAgentRunner {
             requested_control_cell.set(Some(action));
         }
         let requested_control = requested_control_cell.get();
-        let (status, exit_code, summary) = if let Some(action) = requested_control {
-            let exit_code = match wait_result {
-                AgentProcessWait::Exited(status) => status.code().map(i64::from),
-                AgentProcessWait::TimedOut(status) | AgentProcessWait::Interrupted(status) => {
-                    status.and_then(|status| status.code().map(i64::from))
-                }
-            };
-            match action {
-                AgentSessionControlAction::Stop => {
-                    append_agent_log_line(&stderr_path, "Codex stopped by task-session control.")?;
-                    (
-                        "stopped",
-                        exit_code,
-                        "Codex task session stopped and remains resumable.".to_string(),
-                    )
-                }
-                AgentSessionControlAction::Interrupt => {
-                    append_agent_log_line(
-                        &stderr_path,
-                        "Codex interrupted for an interactive session handoff.",
-                    )?;
-                    (
-                        "handoff",
-                        exit_code,
-                        "Codex task session is ready for interactive handoff.".to_string(),
-                    )
-                }
-            }
-        } else {
-            match wait_result {
-                AgentProcessWait::Exited(exit_status) => {
-                    let exit_code = exit_status.code().map(i64::from);
-                    if stdout.contains(AGENT_NO_TASKS_LEFT_MARKER) {
-                        (
-                            "idle",
-                            exit_code,
-                            "Codex reported no available tasks.".to_string(),
-                        )
-                    } else if exit_status.success() {
-                        (
-                            "success",
-                            exit_code,
-                            "Codex run completed successfully.".to_string(),
-                        )
-                    } else {
-                        (
-                            "failure",
-                            exit_code,
-                            format!("Codex exited with status {exit_status}."),
-                        )
-                    }
-                }
-                AgentProcessWait::TimedOut(exit_status) => {
-                    append_agent_log_line(
-                        &stderr_path,
-                        &format!("Codex timed out after {} seconds.", self.timeout.as_secs()),
-                    )?;
-                    (
-                        "timeout",
-                        exit_status.and_then(|status| status.code().map(i64::from)),
-                        format!("Codex timed out after {} seconds.", self.timeout.as_secs()),
-                    )
-                }
-                AgentProcessWait::Interrupted(exit_status) => {
-                    append_agent_log_line(
-                        &stderr_path,
-                        "Codex stopped because the agent is shutting down.",
-                    )?;
-                    (
-                        "interrupted",
-                        exit_status.and_then(|status| status.code().map(i64::from)),
-                        "Codex stopped because the agent is shutting down.".to_string(),
-                    )
-                }
-            }
-        };
+        let supervision = classify_agent_supervision_stage(AgentSupervisionOutcomeRequest {
+            wait_result,
+            requested_control,
+            reported_no_tasks: stdout.contains(AGENT_NO_TASKS_LEFT_MARKER),
+            timeout: runner.timeout,
+        });
+        if let Some(note) = supervision.stderr_note.as_deref() {
+            append_agent_log_line(&stderr_path, note)?;
+        }
 
         Ok(AgentRunResult {
-            status,
-            exit_code,
+            status: supervision.status,
+            exit_code: supervision.exit_code,
             log_dir,
             stdout_path,
             stderr_path,
-            summary,
+            summary: supervision.summary,
             codex_session_id,
             session_run_token: session_registered.then_some(run_file_stem),
             control_action: requested_control,
         })
+    }
+}
+
+#[cfg(test)]
+impl CodexAgentRunner {
+    pub(super) fn run_project(
+        &self,
+        project: &agent::AgentProject,
+        task_selection: AgentTaskSelection,
+        resume_session_id: Option<&str>,
+        lease_holder: &str,
+        run_token: Option<&str>,
+        shutdown: &AgentShutdownSignal,
+    ) -> Result<AgentRunResult> {
+        <Self as AgentRunner>::run_project(
+            self,
+            AgentRunRequest {
+                project,
+                task_selection,
+                resume_session_id,
+                lease_holder,
+                run_token,
+                shutdown,
+            },
+        )
     }
 }
 

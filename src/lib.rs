@@ -687,19 +687,76 @@ mod tests {
     }
 
     impl AgentRunner for FakeAgentRunner {
-        fn run_project(
-            &self,
-            project: &agent::AgentProject,
-            _task_selection: AgentTaskSelection,
-            _resume_session_id: Option<&str>,
-            _lease_holder: &str,
-            _run_token: Option<&str>,
-            _shutdown: &AgentShutdownSignal,
-        ) -> Result<AgentRunResult> {
-            self.ran_projects.lock().unwrap().push(project.path.clone());
+        fn run_project(&self, request: AgentRunRequest<'_>) -> Result<AgentRunResult> {
+            self.ran_projects
+                .lock()
+                .unwrap()
+                .push(request.project.path.clone());
             thread::sleep(self.delay);
             Ok(self.result.clone())
         }
+    }
+
+    #[test]
+    fn agent_scheduling_decision_stage_is_pure_and_prioritized() {
+        let decide = |has_resume_session,
+                      resume_interrupted_task,
+                      has_blocked_task,
+                      blocked_recovery_backoff_active,
+                      has_pending_task| {
+            decide_agent_scheduling_stage(AgentSchedulingDecisionRequest {
+                has_resume_session,
+                resume_interrupted_task,
+                has_blocked_task,
+                blocked_recovery_backoff_active,
+                has_pending_task,
+            })
+            .task_selection
+        };
+
+        assert_eq!(
+            decide(true, true, true, false, true),
+            Some(AgentTaskSelection::ResumeSession)
+        );
+        assert_eq!(
+            decide(false, true, true, false, true),
+            Some(AgentTaskSelection::ResumeDoing)
+        );
+        assert_eq!(
+            decide(false, false, true, false, true),
+            Some(AgentTaskSelection::RecoverBlocked)
+        );
+        assert_eq!(
+            decide(false, false, true, true, true),
+            Some(AgentTaskSelection::NextTodo)
+        );
+        assert_eq!(decide(false, false, false, false, false), None);
+    }
+
+    #[test]
+    fn agent_supervision_outcome_stage_classifies_without_side_effects() {
+        let success = Command::new("true").status().unwrap();
+        let idle = classify_agent_supervision_stage(AgentSupervisionOutcomeRequest {
+            wait_result: AgentProcessWait::Exited(success),
+            requested_control: None,
+            reported_no_tasks: true,
+            timeout: Duration::from_secs(9),
+        });
+        assert_eq!(idle.status, "idle");
+        assert_eq!(idle.summary, "Codex reported no available tasks.");
+        assert_eq!(idle.stderr_note, None);
+
+        let timeout = classify_agent_supervision_stage(AgentSupervisionOutcomeRequest {
+            wait_result: AgentProcessWait::TimedOut(None),
+            requested_control: None,
+            reported_no_tasks: false,
+            timeout: Duration::from_secs(9),
+        });
+        assert_eq!(timeout.status, "timeout");
+        assert_eq!(
+            timeout.stderr_note.as_deref(),
+            Some("Codex timed out after 9 seconds.")
+        );
     }
 
     fn temp_root(name: &str) -> std::path::PathBuf {
@@ -785,17 +842,11 @@ mod tests {
     }
 
     impl AgentRunner for InspectInlineOwnershipRunner {
-        fn run_project(
-            &self,
-            project: &agent::AgentProject,
-            _task_selection: AgentTaskSelection,
-            _resume_session_id: Option<&str>,
-            lease_holder: &str,
-            run_token: Option<&str>,
-            _shutdown: &AgentShutdownSignal,
-        ) -> Result<AgentRunResult> {
-            let run_token = run_token.context("inline run did not receive its worker token")?;
-            assert_eq!(lease_holder, agent_worker_lease_holder(run_token));
+        fn run_project(&self, request: AgentRunRequest<'_>) -> Result<AgentRunResult> {
+            let run_token = request
+                .run_token
+                .context("inline run did not receive its worker token")?;
+            assert_eq!(request.lease_holder, agent_worker_lease_holder(run_token));
             assert!(inline_agent_worker_generation_is_registered(run_token));
             let store = agent::TursoAgentStore::open_blocking(&self.state_dir)?;
             let worker = store
@@ -808,7 +859,7 @@ mod tests {
             assert!(is_inline_agent_worker(&worker));
             *self.observed_run_token.lock().unwrap() = Some(run_token.to_string());
             if self.break_lease_after_observation {
-                assert!(store.release_lease_blocking(project.id, lease_holder)?);
+                assert!(store.release_lease_blocking(request.project.id, request.lease_holder)?);
             }
             Ok(AgentRunResult {
                 status: "idle",
@@ -3311,26 +3362,18 @@ mod tests {
         }
 
         impl AgentRunner for UnprovenTerminationRunner {
-            fn run_project(
-                &self,
-                project: &agent::AgentProject,
-                _task_selection: AgentTaskSelection,
-                resume_session_id: Option<&str>,
-                lease_holder: &str,
-                _run_token: Option<&str>,
-                _shutdown: &AgentShutdownSignal,
-            ) -> Result<AgentRunResult> {
-                let session_id = resume_session_id.unwrap();
+            fn run_project(&self, request: AgentRunRequest<'_>) -> Result<AgentRunResult> {
+                let session_id = request.resume_session_id.unwrap();
                 let store = agent::TursoAgentStore::open_blocking(&self.state_dir)?;
                 assert!(store.register_known_session_with_child_blocking(
                     agent::AgentKnownSessionRegistration {
-                        project_id: project.id,
+                        project_id: request.project.id,
                         codex_session_id: session_id,
                         child_pid: std::process::id(),
                         run_token: "registered-unproven-generation",
                         stdout_path: &self.state_dir.join("unproven.out"),
                         stderr_path: &self.state_dir.join("unproven.err"),
-                        lease_holder,
+                        lease_holder: request.lease_holder,
                         lease_timeout_seconds: 60,
                         claim_requested_resume: true,
                     },
@@ -6810,6 +6853,170 @@ mod tests {
             tui_models_return_pane(TuiPane::AgentProjects),
             TuiPane::AgentProjects
         );
+    }
+
+    #[test]
+    fn tui_reducer_owns_pane_transitions_and_returns_effects() {
+        let root = temp_root("tui-reducer-panes");
+        let mut app = TuiApp::new(&root, true);
+
+        let effects =
+            update_tui_pane(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)).unwrap();
+        assert_eq!(app.current_pane, TuiPane::AgentProjects);
+        assert_eq!(
+            effects,
+            vec![TuiEffect::RefreshAgentPanel, TuiEffect::SyncAgentLog]
+        );
+
+        let effects =
+            update_tui_pane(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)).unwrap();
+        assert_eq!(app.current_pane, TuiPane::Tasks);
+        assert_eq!(effects, vec![TuiEffect::SyncTaskLog]);
+
+        let effects = update_tui_pane(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('M'), KeyModifiers::SHIFT),
+        )
+        .unwrap();
+        assert_eq!(app.current_pane, TuiPane::Models);
+        assert_eq!(app.models_return_pane, TuiPane::Tasks);
+        assert_eq!(effects, vec![TuiEffect::RefreshModels]);
+
+        let effects =
+            update_tui_pane(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert_eq!(app.current_pane, TuiPane::Tasks);
+        assert!(effects.is_empty());
+
+        let space = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE);
+        assert_eq!(
+            update_tui_pane(&mut app, space).unwrap(),
+            vec![TuiEffect::PaneKey(space)]
+        );
+    }
+
+    #[test]
+    fn tui_task_reducer_navigates_cached_entries_without_storage_access() {
+        let root = temp_root("tui-reducer-tasks");
+        let mut app = TuiApp::new(&root, true);
+        let entry = |summary: &str| TaskEntry {
+            source: TaskSource::MarkdownLine { line_index: 0 },
+            summary: summary.to_string(),
+            content: summary.to_string(),
+            metadata: None,
+            has_subtasks: false,
+        };
+        app.task_snapshot.board_entries[TODO_BOARD_INDEX] = vec![entry("first"), entry("second")];
+        app.task_snapshot.board_entries[1] = vec![entry("doing")];
+        app.board_states[TODO_BOARD_INDEX].select(Some(0));
+
+        let effects =
+            update_tui_pane(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)).unwrap();
+        assert_eq!(app.board_states[TODO_BOARD_INDEX].selected(), Some(1));
+        assert_eq!(effects, vec![TuiEffect::SyncTaskLog]);
+
+        update_tui_pane(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)).unwrap();
+        assert_eq!(app.board_states[TODO_BOARD_INDEX].selected(), Some(0));
+
+        update_tui_pane(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)).unwrap();
+        assert_eq!(app.selected_board, 1);
+        assert_eq!(app.board_states[1].selected(), Some(0));
+    }
+
+    #[test]
+    fn tui_render_uses_cached_state_without_mutating_the_app() {
+        let root = temp_root("tui-pure-render");
+        let mut app = TuiApp::new(&root, true);
+        app.task_snapshot.board_title = "Cached Board".to_string();
+        app.task_snapshot.board_entries[TODO_BOARD_INDEX] = vec![TaskEntry {
+            source: TaskSource::MarkdownLine { line_index: 0 },
+            summary: "cached task".to_string(),
+            content: "cached task".to_string(),
+            metadata: None,
+            has_subtasks: false,
+        }];
+        app.board_states[TODO_BOARD_INDEX].select(Some(0));
+        app.current_time = "12:34".to_string();
+        let selected_before = app.board_states[TODO_BOARD_INDEX].selected();
+        let scroll_before = app.board_scroll_offsets;
+
+        let backend = ratatui::backend::TestBackend::new(100, 28);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render_tui(frame, &app)).unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("cached task"));
+        assert_eq!(
+            app.board_states[TODO_BOARD_INDEX].selected(),
+            selected_before
+        );
+        assert_eq!(app.board_scroll_offsets, scroll_before);
+    }
+
+    #[test]
+    fn tui_render_entry_point_contains_no_effectful_operations() {
+        let source = include_str!("tui.rs");
+        let render = source
+            .split_once("pub(super) fn render_tui(")
+            .unwrap()
+            .1
+            .split_once("pub(super) fn execute_tui_key_effect(")
+            .unwrap()
+            .0;
+
+        for forbidden in [
+            "fs::",
+            "read_task_entries",
+            "read_archived_task_entries",
+            "open_agent_store",
+            "TursoAgentStore",
+            "agent_service_",
+            "Command::",
+            "std::process",
+            "std::env",
+        ] {
+            assert!(
+                !render.contains(forbidden),
+                "render_tui must not perform effects: found {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn tui_update_handlers_are_pure_and_effect_execution_is_separate() {
+        let source = include_str!("tui.rs");
+        let updates = source
+            .split_once("pub(super) fn update_tui_pane(")
+            .unwrap()
+            .1
+            .split_once("pub(super) fn execute_tui_effect(")
+            .unwrap()
+            .0;
+
+        for forbidden in [
+            "fs::",
+            "read_task_entries",
+            "read_archived_task_entries",
+            "open_agent_store",
+            "TursoAgentStore",
+            "agent_service_",
+            "Command::",
+            "std::process",
+            "std::env",
+            "Instant::now",
+        ] {
+            assert!(
+                !updates.contains(forbidden),
+                "TUI update handlers must return effects instead of executing them: found {forbidden}"
+            );
+        }
+        assert!(source.contains("pub(super) fn execute_tui_effect("));
+        assert!(source.contains("pub(super) fn execute_tui_key_effect("));
     }
 
     #[test]
@@ -16340,15 +16547,27 @@ mod tests {
                 .is_some()
         );
 
-        let workers = reconcile_independent_agent_workers_with(
-            &state_dir,
-            &store,
-            161,
-            |_| panic!("a timed-out dispatch must not be relaunched"),
-            |_| Ok(true),
+        let mut process_is_running =
+            |_: u32| panic!("a dispatching worker has no process to inspect");
+        let mut launch =
+            |_: &AgentWorkerLaunchSpec| panic!("a timed-out dispatch must not be relaunched");
+        let mut drain = |_: &agent::AgentWorkerRecord| Ok(true);
+        let mut timestamp = || "161".to_string();
+        let reconciliation = reconcile_agent_worker_effects_stage(
+            AgentWorkerReconciliationRequest {
+                state_dir: &state_dir,
+                store: &store,
+                now_seconds: 161,
+            },
+            AgentWorkerReconciliationEffects {
+                process_is_running: &mut process_is_running,
+                launch_dispatching: &mut launch,
+                drain_worker: &mut drain,
+                timestamp: &mut timestamp,
+            },
         )
         .unwrap();
-        assert!(workers.is_empty());
+        assert!(reconciliation.active_workers.is_empty());
         assert!(
             store
                 .lease_for_project_blocking(project.id)

@@ -1,5 +1,56 @@
 use super::*;
 
+pub(super) struct AgentWorkerReconciliationRequest<'a> {
+    pub(super) state_dir: &'a Path,
+    pub(super) store: &'a agent::TursoAgentStore,
+    pub(super) now_seconds: u64,
+}
+
+pub(super) struct AgentWorkerReconciliationEffects<'a> {
+    pub(super) process_is_running: &'a mut dyn FnMut(u32) -> Option<bool>,
+    pub(super) launch_dispatching: &'a mut dyn FnMut(&AgentWorkerLaunchSpec) -> Result<()>,
+    pub(super) drain_worker: &'a mut dyn FnMut(&agent::AgentWorkerRecord) -> Result<bool>,
+    pub(super) timestamp: &'a mut dyn FnMut() -> String,
+}
+
+pub(super) struct AgentWorkerReconciliationResult {
+    pub(super) active_workers: Vec<agent::AgentWorkerRecord>,
+}
+
+pub(super) struct AgentSessionLinkRequest<'a> {
+    pub(super) job: &'a AgentRunJob,
+    pub(super) session_id: &'a str,
+    pub(super) run_status: &'a str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum AgentSessionLinkResult {
+    AlreadyLinked,
+    ExactResumePreserved,
+    Attached,
+    NoEligibleTask,
+}
+
+pub(super) struct AgentResultRecordingRequest<'a> {
+    pub(super) job: &'a AgentRunJob,
+    pub(super) finalization_lease_holder: &'a str,
+    pub(super) lease_transferred: bool,
+    pub(super) status: &'static str,
+    pub(super) started_at: &'a str,
+    pub(super) finished_at: &'a str,
+    pub(super) exit_code: Option<i64>,
+    pub(super) log_dir: Option<&'a str>,
+    pub(super) stdout_path: Option<&'a str>,
+    pub(super) stderr_path: Option<&'a str>,
+    pub(super) summary: &'a str,
+    pub(super) codex_session_id: Option<&'a str>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct AgentResultRecordingResult {
+    pub(super) run_id: i64,
+}
+
 pub(super) fn next_agent_worker_token(project_id: i64) -> String {
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -97,6 +148,33 @@ pub(super) fn reconcile_independent_agent_workers_with(
     mut launch_dispatching: impl FnMut(&AgentWorkerLaunchSpec) -> Result<()>,
     mut drain_worker: impl FnMut(&agent::AgentWorkerRecord) -> Result<bool>,
 ) -> Result<Vec<agent::AgentWorkerRecord>> {
+    let mut process_is_running = local_process_is_running;
+    let mut timestamp = agent_timestamp;
+    Ok(reconcile_agent_worker_effects_stage(
+        AgentWorkerReconciliationRequest {
+            state_dir,
+            store,
+            now_seconds: now,
+        },
+        AgentWorkerReconciliationEffects {
+            process_is_running: &mut process_is_running,
+            launch_dispatching: &mut launch_dispatching,
+            drain_worker: &mut drain_worker,
+            timestamp: &mut timestamp,
+        },
+    )?
+    .active_workers)
+}
+
+pub(super) fn reconcile_agent_worker_effects_stage(
+    request: AgentWorkerReconciliationRequest<'_>,
+    mut effects: AgentWorkerReconciliationEffects<'_>,
+) -> Result<AgentWorkerReconciliationResult> {
+    let AgentWorkerReconciliationRequest {
+        state_dir,
+        store,
+        now_seconds: now,
+    } = request;
     let workers = store.list_active_workers_blocking()?;
     for worker in workers {
         if worker.protocol_version > AGENT_WORKER_PROTOCOL_VERSION {
@@ -114,7 +192,7 @@ pub(super) fn reconcile_independent_agent_workers_with(
         let owns_lease = lease
             .as_ref()
             .is_some_and(|lease| lease.holder == worker.lease_holder);
-        let process_state = worker.worker_pid.and_then(local_process_is_running);
+        let process_state = worker.worker_pid.and_then(&mut effects.process_is_running);
         let inline_worker = is_inline_agent_worker(&worker);
         let inline_launch_pending = inline_worker
             && store
@@ -217,7 +295,7 @@ pub(super) fn reconcile_independent_agent_workers_with(
         };
 
         if let Some(reason) = abandonment_reason {
-            let drained = match drain_worker(&worker) {
+            let drained = match (effects.drain_worker)(&worker) {
                 Ok(drained) => drained,
                 Err(error) => {
                     eprintln!(
@@ -241,7 +319,7 @@ pub(super) fn reconcile_independent_agent_workers_with(
                 expected_state: &worker.state,
                 expected_worker_pid: worker.worker_pid,
                 expected_heartbeat_at: worker.heartbeat_at.as_deref(),
-                finished_at: &agent_timestamp(),
+                finished_at: &(effects.timestamp)(),
                 error: &reason,
                 permitted_successor_holder,
             })?;
@@ -262,13 +340,13 @@ pub(super) fn reconcile_independent_agent_workers_with(
                 Ok(selection) => selection,
                 Err(error) => {
                     let reason = format!("Invalid durable worker task selection: {error:#}");
-                    if drain_worker(&worker)? {
+                    if (effects.drain_worker)(&worker)? {
                         let _ = store.abandon_worker_blocking(agent::AgentWorkerAbandonment {
                             worker_token: &worker.worker_token,
                             expected_state: &worker.state,
                             expected_worker_pid: worker.worker_pid,
                             expected_heartbeat_at: worker.heartbeat_at.as_deref(),
-                            finished_at: &agent_timestamp(),
+                            finished_at: &(effects.timestamp)(),
                             error: &reason,
                             permitted_successor_holder: None,
                         })?;
@@ -301,7 +379,7 @@ pub(super) fn reconcile_independent_agent_workers_with(
                     path: worker.path_env.clone(),
                 },
             };
-            if let Err(error) = launch_dispatching(&spec) {
+            if let Err(error) = (effects.launch_dispatching)(&spec) {
                 eprintln!(
                     "Project {}: action=worker_dispatch_retry worker_token={} reason=\"{error:#}\" path={}",
                     worker.project_name,
@@ -312,7 +390,9 @@ pub(super) fn reconcile_independent_agent_workers_with(
         }
     }
 
-    store.list_active_workers_blocking()
+    Ok(AgentWorkerReconciliationResult {
+        active_workers: store.list_active_workers_blocking()?,
+    })
 }
 
 #[cfg(not(test))]
@@ -847,14 +927,14 @@ pub(super) fn run_agent_job_inner(
         .transpose()?
         .unwrap_or(false);
     let started_at = agent_timestamp();
-    let run_result = runner.run_project(
-        &job.project,
-        job.task_selection,
-        job.resume_session_id.as_deref(),
-        &job.holder,
-        job.worker_token.as_deref(),
+    let run_result = runner.run_project(AgentRunRequest {
+        project: &job.project,
+        task_selection: job.task_selection,
+        resume_session_id: job.resume_session_id.as_deref(),
+        lease_holder: &job.holder,
+        run_token: job.worker_token.as_deref(),
         shutdown,
-    );
+    });
     renew_agent_job_worker_fence(&job)?;
     let finished_at = agent_timestamp();
 
@@ -881,7 +961,11 @@ pub(super) fn run_agent_job_inner(
             }
 
             if let Some(session_id) = result.codex_session_id.as_deref()
-                && let Err(error) = attach_codex_session_after_run(&job, session_id, result.status)
+                && let Err(error) = link_agent_session_after_run_stage(AgentSessionLinkRequest {
+                    job: &job,
+                    session_id,
+                    run_status: result.status,
+                })
             {
                 result.status = "failure";
                 result.summary = format!(
@@ -1216,21 +1300,66 @@ pub(super) fn run_agent_job_inner(
         summary = format!("{summary} Failed to finalize Codex session control: {error:#}");
     }
 
+    let recording_result = record_agent_result_stage(AgentResultRecordingRequest {
+        job: &job,
+        finalization_lease_holder: &finalization_lease_holder,
+        lease_transferred,
+        status,
+        started_at: &started_at,
+        finished_at: &finished_at,
+        exit_code,
+        log_dir: log_dir.as_deref(),
+        stdout_path: stdout_path.as_deref(),
+        stderr_path: stderr_path.as_deref(),
+        summary: &summary,
+        codex_session_id: codex_session_id.as_deref(),
+    });
+    let run_id = recording_result?.run_id;
+    session_lifecycle_result?;
+
+    Ok(AgentRunCompletion {
+        run_id,
+        project_name: job.project.name,
+        project_path: job.project.path,
+        status,
+        summary,
+        stdout_path,
+        stderr_path,
+    })
+}
+
+pub(super) fn record_agent_result_stage(
+    request: AgentResultRecordingRequest<'_>,
+) -> Result<AgentResultRecordingResult> {
+    let AgentResultRecordingRequest {
+        job,
+        finalization_lease_holder,
+        lease_transferred,
+        status,
+        started_at,
+        finished_at,
+        exit_code,
+        log_dir,
+        stdout_path,
+        stderr_path,
+        summary,
+        codex_session_id,
+    } = request;
     let run_record_result = if let Some(worker_token) = job.worker_token.as_deref() {
         with_agent_store_at(&job.state_dir, |store| {
             store
                 .finalize_worker_blocking(agent::AgentWorkerFinalization {
                     worker_token,
                     expected_worker_pid: Some(std::process::id()),
-                    expected_lease_holder: &finalization_lease_holder,
+                    expected_lease_holder: finalization_lease_holder,
                     status,
-                    finished_at: &finished_at,
+                    finished_at,
                     exit_code,
-                    log_dir: log_dir.as_deref(),
-                    stdout_path: stdout_path.as_deref(),
-                    stderr_path: stderr_path.as_deref(),
-                    summary: Some(&summary),
-                    codex_session_id: codex_session_id.as_deref(),
+                    log_dir,
+                    stdout_path,
+                    stderr_path,
+                    summary: Some(summary),
+                    codex_session_id,
                     error: None,
                 })
                 .and_then(|run_id| {
@@ -1244,14 +1373,14 @@ pub(super) fn run_agent_job_inner(
             store.record_run_outcome_blocking(agent::AgentRunOutcome {
                 project_id: job.project.id,
                 status,
-                started_at: &started_at,
-                finished_at: Some(&finished_at),
+                started_at,
+                finished_at: Some(finished_at),
                 exit_code,
-                log_dir: log_dir.as_deref(),
-                stdout_path: stdout_path.as_deref(),
-                stderr_path: stderr_path.as_deref(),
-                summary: Some(&summary),
-                codex_session_id: codex_session_id.as_deref(),
+                log_dir,
+                stdout_path,
+                stderr_path,
+                summary: Some(summary),
+                codex_session_id,
             })
         })
     };
@@ -1265,18 +1394,8 @@ pub(super) fn run_agent_job_inner(
         })
     };
     let run_id = run_record_result?;
-    session_lifecycle_result?;
     release_result?;
-
-    Ok(AgentRunCompletion {
-        run_id,
-        project_name: job.project.name,
-        project_path: job.project.path,
-        status,
-        summary,
-        stdout_path,
-        stderr_path,
-    })
+    Ok(AgentResultRecordingResult { run_id })
 }
 
 pub(super) fn renew_agent_job_worker_fence(job: &AgentRunJob) -> Result<()> {
@@ -1301,20 +1420,37 @@ pub(super) fn renew_agent_job_worker_fence(job: &AgentRunJob) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn attach_codex_session_after_run(
     job: &AgentRunJob,
     session_id: &str,
     run_status: &str,
 ) -> Result<()> {
+    link_agent_session_after_run_stage(AgentSessionLinkRequest {
+        job,
+        session_id,
+        run_status,
+    })
+    .map(|_| ())
+}
+
+pub(super) fn link_agent_session_after_run_stage(
+    request: AgentSessionLinkRequest<'_>,
+) -> Result<AgentSessionLinkResult> {
+    let AgentSessionLinkRequest {
+        job,
+        session_id,
+        run_status,
+    } = request;
     let _mutation_lock = acquire_board_mutation_lock(&get_tasks_dir(&job.project.path))?;
     if terminal_task_for_codex_session_in_board(&get_tasks_dir(&job.project.path), session_id)?
         .is_some()
     {
-        return Ok(());
+        return Ok(AgentSessionLinkResult::AlreadyLinked);
     }
     if job.task_selection == AgentTaskSelection::ResumeSession {
         if task_status_for_codex_session(&job.project.path, session_id)?.is_some() {
-            return Ok(());
+            return Ok(AgentSessionLinkResult::ExactResumePreserved);
         }
         anyhow::bail!(
             "The task marker for exact Codex session {session_id} disappeared before handback"
@@ -1341,13 +1477,14 @@ pub(super) fn attach_codex_session_after_run(
             session_id,
             || {},
         )?;
+        Ok(AgentSessionLinkResult::Attached)
     } else if matches!(run_status, "success" | "blocked" | "stopped" | "handoff") {
         anyhow::bail!(
             "Could not identify exactly one completed or blocked task for Codex session {session_id}"
         );
+    } else {
+        Ok(AgentSessionLinkResult::NoEligibleTask)
     }
-
-    Ok(())
 }
 
 pub(super) fn task_contents_for_status(
