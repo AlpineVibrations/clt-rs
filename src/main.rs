@@ -91,6 +91,8 @@ const TURSO_SHARED_WAL_MAGIC: &[u8; 8] = b"TSHMWAL\0";
 const TURSO_SHARED_WAL_VERSION: u32 = 1;
 const AGENT_DEFAULT_RUN_TIMEOUT_SECONDS: u64 = 45 * 60;
 const AGENT_GIT_REMOTE_TIMEOUT_SECONDS: u64 = 30;
+const AGENT_EXTERNAL_COMPLETION_LEASE_SECONDS: u64 = 60;
+const AGENT_EXTERNAL_COMPLETION_REASON: &str = "Managed Git proof was cancelled because a user explicitly moved the task to Done as an external completion";
 // A commit-and-push reconciliation can perform two three-step remote proofs
 // around one push. Its dedicated renewable lease stays beyond that bounded
 // single-pass worst case without inheriting the ordinary one-hour worker TTL.
@@ -312,6 +314,13 @@ pub(crate) enum GitFinalizationState {
     PushPending,
     Completed,
     Cancelled,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TaskDoneOutcome {
+    Normal,
+    Provisional,
+    ExternalCompletion(String),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -1273,7 +1282,13 @@ fn main() -> Result<()> {
             to,
         }) => {
             if to == "done" {
-                move_task_to_done(&root, &from, &task_index)?;
+                if let TaskDoneOutcome::ExternalCompletion(session_id) =
+                    move_task_to_done(&root, &from, &task_index)?
+                {
+                    println!(
+                        "Task {task_index} from {from} marked as externally completed; cancelled idle managed Git journal for Codex session {session_id}."
+                    );
+                }
             } else {
                 move_task(&root, &from, &to, &task_index)?;
             }
@@ -1289,14 +1304,21 @@ fn main() -> Result<()> {
                     println!("Task is already done.");
                 }
             } else {
-                let provisional = move_task_to_done(&root, &status, &task_index)?;
-                if provisional {
-                    println!(
-                        "Task {} from {} moved provisionally; Git finalization is pending.",
-                        task_index, status
-                    );
-                } else {
-                    println!("Task {} from {} marked as done.", task_index, status);
+                match move_task_to_done(&root, &status, &task_index)? {
+                    TaskDoneOutcome::Normal => {
+                        println!("Task {} from {} marked as done.", task_index, status);
+                    }
+                    TaskDoneOutcome::Provisional => {
+                        println!(
+                            "Task {} from {} moved provisionally; Git finalization is pending.",
+                            task_index, status
+                        );
+                    }
+                    TaskDoneOutcome::ExternalCompletion(session_id) => {
+                        println!(
+                            "Task {task_index} from {status} marked as externally completed; cancelled idle managed Git journal for Codex session {session_id}."
+                        );
+                    }
                 }
             }
         }
@@ -6515,9 +6537,11 @@ fn run_agent_scheduler_pass_with_max_global_jobs(
             );
             continue;
         }
+        let has_resumable_doing_task =
+            scan.doing_count > 0 && project_has_resumable_doing_task(state_dir, &project)?;
         let resume_abandoned_worker =
-            scan.doing_count > 0 && abandoned_project_ids.contains(&project.id);
-        let resume_interrupted_task = scan.doing_count > 0
+            has_resumable_doing_task && abandoned_project_ids.contains(&project.id);
+        let resume_interrupted_task = has_resumable_doing_task
             && (resume_abandoned_worker
                 || existing_lease.as_ref().is_some_and(|lease| {
                     agent_lease_is_reclaimable(lease, reclaim_current_process_leases, now)
@@ -8558,6 +8582,36 @@ fn task_status_for_codex_session(
     session_id: &str,
 ) -> Result<Option<&'static str>> {
     task_status_for_codex_session_in_board(&get_tasks_dir(project_root), session_id)
+}
+
+fn project_has_resumable_doing_task(
+    state_dir: &Path,
+    project: &agent_store::AgentProject,
+) -> Result<bool> {
+    let doing = read_task_entries(&get_tasks_dir(&project.path), "doing")?;
+    with_agent_store_at(state_dir, |store| {
+        for task in doing {
+            let externally_completed =
+                recoverable_codex_session_id_from_task_content(&task.content)
+                    .map(|session_id| {
+                        store
+                            .git_finalization_blocking(project.id, session_id)
+                            .map(|journal| {
+                                journal.is_some_and(|journal| {
+                                    journal.state == GitFinalizationState::Cancelled
+                                        && journal.last_error.as_deref()
+                                            == Some(AGENT_EXTERNAL_COMPLETION_REASON)
+                                })
+                            })
+                    })
+                    .transpose()?
+                    .unwrap_or(false);
+            if !externally_completed {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    })
 }
 
 fn resumable_codex_session_for_project(
@@ -16038,6 +16092,197 @@ mod agent_store {
         }
 
         #[allow(clippy::too_many_arguments)]
+        pub(crate) fn accept_external_git_completion_blocking(
+            &self,
+            project_id: i64,
+            codex_session_id: &str,
+            expected_generation: i64,
+            task_identity: &str,
+            lease_holder: &str,
+            acquired_at: &str,
+            expires_at: &str,
+        ) -> Result<bool> {
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime for agent store")?
+                .block_on(self.accept_external_git_completion(
+                    project_id,
+                    codex_session_id,
+                    expected_generation,
+                    task_identity,
+                    lease_holder,
+                    acquired_at,
+                    expires_at,
+                ))
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        async fn accept_external_git_completion(
+            &self,
+            project_id: i64,
+            codex_session_id: &str,
+            expected_generation: i64,
+            task_identity: &str,
+            lease_holder: &str,
+            acquired_at: &str,
+            expires_at: &str,
+        ) -> Result<bool> {
+            let mut conn = self.connect().await?;
+            let transaction = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to begin accepting external completion for Codex session {codex_session_id}"
+                    )
+                })?;
+
+            if query_count(
+                &transaction,
+                "SELECT COUNT(*) FROM agent_workers
+                  WHERE project_id = ?1
+                    AND state IN ('dispatching', 'running', 'finalizing')",
+                [project_id],
+            )
+            .await?
+                > 0
+            {
+                anyhow::bail!(
+                    "Task {codex_session_id} still has an active agent worker; stop it before moving the task to Done as an external completion"
+                );
+            }
+
+            if query_count(
+                &transaction,
+                "SELECT COUNT(*) FROM session_controls
+                  WHERE project_id = ?1 AND codex_session_id = ?2
+                    AND NOT (
+                        state IN ('stopped', 'resume_requested')
+                        AND child_pid IS NULL
+                        AND interactive_holder IS NULL
+                        AND interactive_launch_token IS NULL
+                    )",
+                params![project_id, codex_session_id],
+            )
+            .await?
+                > 0
+            {
+                anyhow::bail!(
+                    "Codex session {codex_session_id} is still active; stop it before moving the task to Done as an external completion"
+                );
+            }
+
+            transaction
+                .execute(
+                    "DELETE FROM leases
+                      WHERE project_id = ?1
+                        AND CAST(expires_at AS INTEGER) <= CAST(?2 AS INTEGER)",
+                    params![project_id, acquired_at],
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to clear an expired project lease before accepting external completion for {codex_session_id}"
+                    )
+                })?;
+            if query_count(
+                &transaction,
+                "SELECT COUNT(*) FROM leases WHERE project_id = ?1",
+                [project_id],
+            )
+            .await?
+                > 0
+            {
+                anyhow::bail!(
+                    "Task {codex_session_id} still has an active project lease; stop its agent session before moving the task to Done as an external completion"
+                );
+            }
+            let lease_inserted = transaction
+                .execute(
+                    "INSERT OR IGNORE INTO leases (project_id, holder, acquired_at, expires_at)
+                     SELECT ?1, ?2, ?3, ?4
+                      WHERE EXISTS (
+                          SELECT 1 FROM git_finalizations
+                           WHERE project_id = ?1 AND codex_session_id = ?5
+                             AND state = 'working' AND generation = ?6
+                             AND task_identity = ?7
+                      )",
+                    params![
+                        project_id,
+                        lease_holder,
+                        acquired_at,
+                        expires_at,
+                        codex_session_id,
+                        expected_generation,
+                        task_identity,
+                    ],
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to fence the project while accepting external completion for {codex_session_id}"
+                    )
+                })?;
+            if lease_inserted != 1 {
+                transaction.commit().await.with_context(|| {
+                    format!(
+                        "Failed to finish a rejected external completion for {codex_session_id}"
+                    )
+                })?;
+                return Ok(false);
+            }
+
+            let changed = transaction
+                .execute(
+                    "UPDATE git_finalizations
+                        SET state = 'cancelled', owner_run_token = NULL,
+                            generation = generation + 1, last_error = ?1,
+                            updated_at = ?2, completed_at = ?2
+                      WHERE project_id = ?3 AND codex_session_id = ?4
+                        AND state = 'working' AND generation = ?5
+                        AND task_identity = ?6",
+                    params![
+                        AGENT_EXTERNAL_COMPLETION_REASON,
+                        acquired_at,
+                        project_id,
+                        codex_session_id,
+                        expected_generation,
+                        task_identity,
+                    ],
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to cancel the managed Git journal for externally completed task {codex_session_id}"
+                    )
+                })?;
+            if changed != 1 {
+                return Ok(false);
+            }
+
+            transaction
+                .execute(
+                    "DELETE FROM session_controls
+                      WHERE project_id = ?1 AND codex_session_id = ?2
+                        AND state IN ('stopped', 'resume_requested')
+                        AND child_pid IS NULL
+                        AND interactive_holder IS NULL
+                        AND interactive_launch_token IS NULL",
+                    params![project_id, codex_session_id],
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to clear the idle resume state for externally completed task {codex_session_id}"
+                    )
+                })?;
+
+            transaction.commit().await.with_context(|| {
+                format!("Failed to commit external completion for Codex session {codex_session_id}")
+            })?;
+            Ok(true)
+        }
+
+        #[allow(clippy::too_many_arguments)]
         pub(crate) fn compare_and_set_git_finalization_blocking(
             &self,
             project_id: i64,
@@ -23482,7 +23727,7 @@ fn move_task(root: &Path, from: &str, to: &str, task_index_str: &str) -> Result<
             );
         }
     }
-    move_task_in_board(&get_tasks_dir(root), from, to, task_index_str)
+    move_task_in_board(&get_tasks_dir(root), from, to, task_index_str).map(|_| ())
 }
 
 fn running_session_for_automated_child(
@@ -23600,36 +23845,22 @@ fn move_task_to_doing_with_agent_git_journal(
     Ok(())
 }
 
-fn move_task_to_done(root: &Path, from: &str, task_index_str: &str) -> Result<bool> {
+fn move_task_to_done(root: &Path, from: &str, task_index_str: &str) -> Result<TaskDoneOutcome> {
     let Some(context) = automated_agent_child_context()? else {
-        let task_index = parse_one_based_task_index(task_index_str)?;
-        let board_dir = get_tasks_dir(root);
-        let _mutation_lock = acquire_board_mutation_lock(&board_dir)?;
-        let entry = task_entry_at(&board_dir, from, task_index)?;
-        if let Some(session_id) = recoverable_codex_session_id_from_task_content(&entry.content) {
-            let state_dir = agent_state_dir()?;
-            if state_dir.join(AGENT_DB_FILE).is_file() {
-                let root = canonicalize_existing_path(root)?;
-                let store = open_agent_store_at(&state_dir)?;
-                if let Some(project) = store
-                    .list_projects_blocking()?
-                    .into_iter()
-                    .find(|project| project.path == root)
-                    && let Some(finalization) =
-                        store.git_finalization_blocking(project.id, session_id)?
-                    && !finalization.state.is_terminal()
-                {
-                    anyhow::bail!(
-                        "Task {session_id} has a managed Git journal in {}; resume that exact agent session so CLT can prove its commit before Done",
-                        finalization.state.status_label()
-                    );
-                }
-            }
-        }
-        move_task_in_board_after_lock(&board_dir, from, "done", task_index)?;
-        return Ok(false);
+        return Ok(
+            match move_task_in_board(&get_tasks_dir(root), from, "done", task_index_str)? {
+                Some(session_id) => TaskDoneOutcome::ExternalCompletion(session_id),
+                None => TaskDoneOutcome::Normal,
+            },
+        );
     };
-    move_task_to_done_with_agent_context(root, from, task_index_str, &context)
+    Ok(
+        if move_task_to_done_with_agent_context(root, from, task_index_str, &context)? {
+            TaskDoneOutcome::Provisional
+        } else {
+            TaskDoneOutcome::Normal
+        },
+    )
 }
 
 fn move_task_to_done_with_agent_context(
@@ -23806,17 +24037,163 @@ fn move_task_to_done_with_agent_store(
     Ok(true)
 }
 
-fn move_task_in_board(board_dir: &Path, from: &str, to: &str, task_index_str: &str) -> Result<()> {
+fn external_completion_lease_holder() -> String {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("clt-external-completion-{}-{nonce}", std::process::id())
+}
+
+fn agent_project_for_board(
+    store: &agent_store::TursoAgentStore,
+    board_dir: &Path,
+) -> Result<Option<agent_store::AgentProject>> {
+    let canonical_board = fs::canonicalize(board_dir).unwrap_or_else(|_| board_dir.to_path_buf());
+    Ok(store
+        .list_projects_blocking()?
+        .into_iter()
+        .filter(|project| canonical_board.starts_with(project.path.join("tasks")))
+        .max_by_key(|project| project.path.as_os_str().len()))
+}
+
+fn move_user_task_to_done_with_store_after_lock(
+    board_dir: &Path,
+    from: &str,
+    task_index: usize,
+    entry: &TaskEntry,
+    store: &agent_store::TursoAgentStore,
+) -> Result<Option<String>> {
+    let Some(session_id) = recoverable_codex_session_id_from_task_content(&entry.content) else {
+        move_task_in_board_after_lock(board_dir, from, "done", task_index)?;
+        return Ok(None);
+    };
+    let Some(project) = agent_project_for_board(store, board_dir)? else {
+        move_task_in_board_after_lock(board_dir, from, "done", task_index)?;
+        return Ok(None);
+    };
+    let Some(finalization) = store.git_finalization_blocking(project.id, session_id)? else {
+        move_task_in_board_after_lock(board_dir, from, "done", task_index)?;
+        return Ok(None);
+    };
+    if finalization.state.is_terminal() {
+        move_task_in_board_after_lock(board_dir, from, "done", task_index)?;
+        return Ok(None);
+    }
+    if finalization.state != GitFinalizationState::Working {
+        anyhow::bail!(
+            "Task {session_id} has a managed Git journal in {}; its commit proof is already sealed and cannot be replaced by an external completion",
+            finalization.state.status_label()
+        );
+    }
+    let bound_identity = finalization
+        .task_identity
+        .as_deref()
+        .context("The Working Git journal has no durable task identity")?;
+    if durable_task_identity(&entry.content).as_deref() != Some(bound_identity) {
+        anyhow::bail!(
+            "Task {session_id} no longer matches its Working Git journal; restore its durable task payload before accepting external completion"
+        );
+    }
+
+    let acquired_at = agent_timestamp();
+    let expires_at = agent_timestamp_after(AGENT_EXTERNAL_COMPLETION_LEASE_SECONDS);
+    let lease_holder = external_completion_lease_holder();
+    if !store.accept_external_git_completion_blocking(
+        project.id,
+        session_id,
+        finalization.generation,
+        bound_identity,
+        &lease_holder,
+        &acquired_at,
+        &expires_at,
+    )? {
+        let current = store.git_finalization_blocking(project.id, session_id)?;
+        let state = current
+            .as_ref()
+            .map(|journal| journal.state.status_label())
+            .unwrap_or("MISSING");
+        anyhow::bail!(
+            "Task {session_id} changed while CLT was accepting external completion (journal: {state}); retry the Done move"
+        );
+    }
+
+    let move_result = move_task_in_board_after_lock(board_dir, from, "done", task_index);
+    let release_result = store.release_lease_blocking(project.id, &lease_holder);
+    if let Err(release_error) = release_result {
+        return match move_result {
+            Ok(()) => Err(release_error).with_context(|| {
+                format!(
+                    "Task {session_id} moved to Done, but CLT could not release its external-completion fence"
+                )
+            }),
+            Err(move_error) => Err(move_error).with_context(|| {
+                format!(
+                    "CLT also could not release the external-completion fence: {release_error:#}"
+                )
+            }),
+        };
+    }
+    move_result?;
+    Ok(Some(session_id.to_string()))
+}
+
+fn move_user_task_to_done_after_lock(
+    board_dir: &Path,
+    from: &str,
+    task_index: usize,
+    entry: &TaskEntry,
+) -> Result<Option<String>> {
+    let Some(_session_id) = recoverable_codex_session_id_from_task_content(&entry.content) else {
+        move_task_in_board_after_lock(board_dir, from, "done", task_index)?;
+        return Ok(None);
+    };
+    let state_dir = agent_state_dir()?;
+    if !state_dir.join(AGENT_DB_FILE).is_file() {
+        move_task_in_board_after_lock(board_dir, from, "done", task_index)?;
+        return Ok(None);
+    }
+    let store = open_agent_store_at(&state_dir)?;
+    if store.pending_migration_version().is_some() {
+        move_task_in_board_after_lock(board_dir, from, "done", task_index)?;
+        return Ok(None);
+    }
+    move_user_task_to_done_with_store_after_lock(board_dir, from, task_index, entry, &store)
+}
+
+fn move_task_in_board(
+    board_dir: &Path,
+    from: &str,
+    to: &str,
+    task_index_str: &str,
+) -> Result<Option<String>> {
     let task_index = parse_one_based_task_index(task_index_str)?;
     let _mutation_lock = acquire_board_mutation_lock(board_dir)?;
     let entry = task_entry_at(board_dir, from, task_index)?;
+    if to == "done" {
+        return move_user_task_to_done_after_lock(board_dir, from, task_index, &entry);
+    }
     ensure_managed_git_task_mutation_allowed(
         board_dir,
         &entry,
         matches!(from, "todo" | "doing") && matches!(to, "todo" | "doing"),
         None,
     )?;
-    move_task_in_board_after_lock(board_dir, from, to, task_index)
+    move_task_in_board_after_lock(board_dir, from, to, task_index)?;
+    Ok(None)
+}
+
+#[cfg(test)]
+fn move_task_to_done_in_board_with_store(
+    board_dir: &Path,
+    from: &str,
+    task_index_str: &str,
+    store: &agent_store::TursoAgentStore,
+) -> Result<Option<String>> {
+    let task_index = parse_one_based_task_index(task_index_str)?;
+    let _mutation_lock = acquire_board_mutation_lock(board_dir)?;
+    let entry = task_entry_at(board_dir, from, task_index)?;
+    move_user_task_to_done_with_store_after_lock(board_dir, from, task_index, &entry, store)
 }
 
 #[cfg(test)]
@@ -24820,13 +25197,19 @@ fn move_selected_tui_task_between_boards(
     let to = statuses[to_board];
 
     match move_task_in_board(board_dir, from, to, &(idx + 1).to_string()) {
-        Ok(_) => {
+        Ok(external_completion) => {
             *selected_board = to_board;
             for state in board_states.iter_mut() {
                 state.select(None);
             }
             select_last_task_if_present_in_board(board_dir, to, &mut board_states[*selected_board]);
-            format!("Moved task to {to}")
+            if let Some(session_id) = external_completion {
+                format!(
+                    "Moved task to Done as external completion; cancelled idle managed Git journal for {session_id}"
+                )
+            } else {
+                format!("Moved task to {to}")
+            }
         }
         Err(error) => format!("Error: {error}"),
     }
@@ -41979,6 +42362,280 @@ mod tests {
             .unwrap()
             .unwrap();
         (root, project_root, store, finalization)
+    }
+
+    fn externally_completed_working_task_fixture(
+        name: &str,
+        session_id: &str,
+    ) -> (
+        PathBuf,
+        PathBuf,
+        agent_store::TursoAgentStore,
+        agent_store::GitFinalizationRecord,
+    ) {
+        let task = "Externally completed managed task";
+        let run_token = "external-completion-run";
+        let (root, project_root, store, finalization) =
+            working_git_link_race_fixture(name, task, session_id, run_token);
+        fs::write(project_root.join("tasks/todo.md"), "# Todo Tasks\n").unwrap();
+        fs::write(
+            project_root.join("tasks/doing.md"),
+            format!(
+                "# Doing Tasks\n- {task} — COMPLETED 2026-09-03: verified externally codex:{session_id}\n"
+            ),
+        )
+        .unwrap();
+        (root, project_root, store, finalization)
+    }
+
+    #[test]
+    fn user_done_move_accepts_external_completion_for_idle_working_journal() {
+        let session_id = "session-external-completion";
+        let (root, project_root, store, finalization) = externally_completed_working_task_fixture(
+            "automated-git-user-external-completion",
+            session_id,
+        );
+        assert!(
+            store
+                .transition_session_control_state_blocking(
+                    finalization.project_id,
+                    session_id,
+                    AgentSessionControlState::Running,
+                    AgentSessionControlState::Stopped,
+                )
+                .unwrap()
+        );
+
+        let result = move_task_to_done_in_board_with_store(
+            &get_tasks_dir(&project_root),
+            "doing",
+            "1",
+            &store,
+        )
+        .unwrap();
+
+        assert_eq!(result.as_deref(), Some(session_id));
+        assert!(read_tasks(&project_root, "doing").unwrap().is_empty());
+        assert_eq!(
+            read_tasks(&project_root, "done").unwrap(),
+            vec!["- Externally completed managed task — COMPLETED 2026-09-03: verified externally"]
+        );
+        assert_eq!(
+            read_task_entries(&get_tasks_dir(&project_root), "done")
+                .unwrap()
+                .remove(0)
+                .content,
+            format!(
+                "Externally completed managed task — COMPLETED 2026-09-03: verified externally codex:{session_id}"
+            )
+        );
+        let cancelled = store
+            .git_finalization_blocking(finalization.project_id, session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancelled.state, GitFinalizationState::Cancelled);
+        assert_eq!(cancelled.generation, finalization.generation + 1);
+        assert!(cancelled.owner_run_token.is_none());
+        assert_eq!(
+            cancelled.last_error.as_deref(),
+            Some(AGENT_EXTERNAL_COMPLETION_REASON)
+        );
+        assert!(
+            store
+                .session_control_blocking(finalization.project_id, session_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .lease_for_project_blocking(finalization.project_id)
+                .unwrap()
+                .is_none()
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn externally_completed_working_task_is_not_resumed_if_board_move_was_interrupted() {
+        let session_id = "session-interrupted-external-completion";
+        let (root, project_root, store, finalization) = externally_completed_working_task_fixture(
+            "automated-git-user-external-completion-interrupted-move",
+            session_id,
+        );
+        assert!(
+            store
+                .transition_session_control_state_blocking(
+                    finalization.project_id,
+                    session_id,
+                    AgentSessionControlState::Running,
+                    AgentSessionControlState::Stopped,
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .accept_external_git_completion_blocking(
+                    finalization.project_id,
+                    session_id,
+                    finalization.generation,
+                    finalization.task_identity.as_deref().unwrap(),
+                    "external-completion-test-fence",
+                    &agent_timestamp(),
+                    &agent_timestamp_after(60),
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .release_lease_blocking(finalization.project_id, "external-completion-test-fence",)
+                .unwrap()
+        );
+        let project = store
+            .list_projects_blocking()
+            .unwrap()
+            .into_iter()
+            .find(|project| project.id == finalization.project_id)
+            .unwrap();
+
+        assert!(!project_has_resumable_doing_task(&root.join("state/clt"), &project,).unwrap());
+        assert_eq!(read_tasks(&project_root, "doing").unwrap().len(), 1);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn user_done_move_refuses_a_live_managed_git_session() {
+        let session_id = "session-live-external-completion";
+        let (root, project_root, store, finalization) = externally_completed_working_task_fixture(
+            "automated-git-user-external-completion-live",
+            session_id,
+        );
+
+        let error = move_task_to_done_in_board_with_store(
+            &get_tasks_dir(&project_root),
+            "doing",
+            "1",
+            &store,
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("is still active; stop it"));
+        assert_eq!(
+            store
+                .git_finalization_blocking(finalization.project_id, session_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            GitFinalizationState::Working
+        );
+        assert_eq!(read_tasks(&project_root, "doing").unwrap().len(), 1);
+        assert!(read_tasks(&project_root, "done").unwrap().is_empty());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn user_done_move_refuses_an_active_project_lease() {
+        let session_id = "session-leased-external-completion";
+        let (root, project_root, store, finalization) = externally_completed_working_task_fixture(
+            "automated-git-user-external-completion-leased",
+            session_id,
+        );
+        assert!(
+            store
+                .transition_session_control_state_blocking(
+                    finalization.project_id,
+                    session_id,
+                    AgentSessionControlState::Running,
+                    AgentSessionControlState::Stopped,
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .try_acquire_lease_blocking(
+                    finalization.project_id,
+                    "live-owner",
+                    &agent_timestamp(),
+                    &agent_timestamp_after(60),
+                )
+                .unwrap()
+        );
+
+        let error = move_task_to_done_in_board_with_store(
+            &get_tasks_dir(&project_root),
+            "doing",
+            "1",
+            &store,
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("still has an active project lease"));
+        assert_eq!(
+            store
+                .git_finalization_blocking(finalization.project_id, session_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            GitFinalizationState::Working
+        );
+        assert_eq!(read_tasks(&project_root, "doing").unwrap().len(), 1);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn user_done_move_does_not_cancel_a_sealed_git_finalization() {
+        let session_id = "session-sealed-external-completion";
+        let (root, project_root, store, finalization) = externally_completed_working_task_fixture(
+            "automated-git-user-external-completion-sealed",
+            session_id,
+        );
+        assert!(
+            store
+                .compare_and_set_git_finalization_with_identity_blocking(
+                    finalization.project_id,
+                    session_id,
+                    finalization.generation,
+                    GitFinalizationState::Tracking,
+                    finalization.task_identity.as_deref().unwrap(),
+                    finalization.owner_run_token.as_deref(),
+                    &agent_timestamp(),
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .transition_session_control_state_blocking(
+                    finalization.project_id,
+                    session_id,
+                    AgentSessionControlState::Running,
+                    AgentSessionControlState::Stopped,
+                )
+                .unwrap()
+        );
+
+        let error = move_task_to_done_in_board_with_store(
+            &get_tasks_dir(&project_root),
+            "doing",
+            "1",
+            &store,
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("commit proof is already sealed"));
+        assert_eq!(
+            store
+                .git_finalization_blocking(finalization.project_id, session_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            GitFinalizationState::Tracking
+        );
+        assert_eq!(read_tasks(&project_root, "doing").unwrap().len(), 1);
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -1,0 +1,3 @@
+Make a user Done move explicitly accept external completion for an idle managed Git task (UX, TUI, GIT, RECOVERY)
+
+COMPLETED 2026-09-03: Made a human Done move explicitly accept external completion for an idle managed `WORKING` task by taking a short project fence, cancelling the obsolete Git journal, clearing its resume state, and moving it to Done. Live owners and sealed commit/push proof remain protected, and an interrupted board move cannot cause the cancelled session to resume. Updated recovery documentation and changelog. Checks: focused external-completion tests; `cargo test --locked --all-targets -- --test-threads=1` (401 passed); `cargo clippy --locked --all-targets --all-features -- -D warnings`; `cargo fmt --all`; `git diff --check`.

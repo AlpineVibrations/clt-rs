@@ -60,6 +60,7 @@ Use this section while developing the next release.
 
 ### Fixed
 
+- Moving an idle, session-linked managed Git task to Done now explicitly accepts external completion: CLT safely cancels its stale `WORKING` journal and queued resume state under a short project fence, while continuing to protect live sessions and sealed commit/push proof.
 - Fixed managed Git sealing so a Todo or other task-board edit added during an agent run can remain unstaged and survive outside the exact task commit, while staged unrelated board changes and non-task baseline drift are still rejected.
 
 - Git-enabled scheduling now checkpoints dirty task-board definitions in a dedicated prelaunch commit while preserving unrelated unstaged work, so tasks created in the CLI or TUI no longer fail before Codex starts. Failed pending projects also render as red `ERROR` rows with the stored cause, automatic-retry timing, and an `r` immediate-retry action instead of appearing unexplained as `IDLE`.
