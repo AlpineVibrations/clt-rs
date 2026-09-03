@@ -9,3 +9,9 @@ Build outcome: Tests cannot resolve the user's live agent state, stable Linux/ma
 Acceptance: Direct `cargo test` and subprocess CLI tests use isolated state; format, strict Clippy, and all tests pass on current stable Rust.
 
 Early work note: 2026-09-02: Before the planning-only boundary was clarified, the unit-test state isolation, exact Turso pin, and stable Ubuntu/macOS CI workflow were added and passed format, strict Clippy, and 392 tests. Review these uncommitted changes when this task is intentionally started; they have not been accepted, committed, or used to activate later phases.
+
+Blocked note:
+
+BLOCKED 2026-09-03: Corrected test isolation so parallel unit tests ignore the parent automated-run context and use per-test temporary state; `cargo fmt --all -- --check` and strict locked Clippy pass, but the full locked suite still has two pre-existing Linux process-supervision failures (`codex_runner_renews_its_automated_project_lease_while_running` times out and `stale_guardian_keeps_a_live_registered_group_fenced_then_recovers_when_gone` hits a broken launch-gate pipe). These need process-supervision fixture or implementation repair before Phase 0 can be completed; full run: 393 passed, 2 failed.
+
+codex:01a064d8-62d4-73e0-af01-9e6a39dd624e
