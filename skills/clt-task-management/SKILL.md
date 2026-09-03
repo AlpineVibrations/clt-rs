@@ -48,6 +48,8 @@ A dirty worktree is expected in shared repositories where a person, an interacti
 
 The shared Git index is different from the shared worktree: it is a cooperative ownership boundary during automated finalization. People, interactive sessions, and parallel tools must not stage or unstage changes while the active automated task owns the index. CLT can detect many unexpected index/baseline changes, but Git cannot identify which actor staged a new clean-file change.
 
+A Todo or other task-board edit added after the automated run starts may remain unstaged. Preserve it and continue finalization: CLT's exact staged-tree proof excludes that concurrent board work from the sealed task commit. Stage only the selected task's status transition or hunks; never use a whole-board add when it would absorb the concurrent edit.
+
 ## Core Workflow
 The agent must adhere to the following state transition pipeline:
 `Backlog` → `Todo` → `Doing` → `Done`

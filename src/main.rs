@@ -238,6 +238,7 @@ Git commit:
 - Give that commit one exact final message paragraph: `CLT-Task: codex:<session-id>`.
 - If a commit hook changes files or fails after the seal, fix and stage the complete corrected payload, run `clt done done <index>` to reseal that provisional Done entry, inspect it, and retry the one commit.
 - Pre-existing unstaged changes do not prevent a commit. Stage only this task's paths or hunks, verify the staged diff, and leave unrelated changes untouched.
+- A Todo or other task-board edit added during the run may also remain unstaged. Preserve it and stage only the selected task's board transition; CLT's exact staged-tree proof keeps the concurrent edit outside the sealed commit.
 - Do not require the worktree to be clean before committing.
 - The scheduler supplies the isolated Git identity `CLT Agent <clt-agent@localhost>` for clear automated-commit attribution; do not change Git configuration.
 - Do not exit merely because the task appears in Done. Inspect the created commit and keep working until CLT can prove the task-specific commit. If this is a resumed finalization, inspect existing Git state before committing and never duplicate an already-created task commit.
@@ -11541,6 +11542,10 @@ fn capture_agent_git_worktree_baseline(project_root: &Path) -> Result<AgentGitWo
     capture_agent_git_worktree_state(project_root)
 }
 
+fn is_agent_git_task_board_path(path: &str) -> bool {
+    path == "tasks" || path.starts_with("tasks/")
+}
+
 fn require_agent_git_index_matches_head(project_root: &Path) -> Result<()> {
     let cached = Command::new("git")
         .current_dir(project_root)
@@ -11597,25 +11602,30 @@ fn worktree_matches_agent_git_baseline(project_root: &Path, raw_baseline: &str) 
     if expected.require_clean {
         return Ok(current.tracked_patch_ids.is_empty() && current.untracked_blob_ids.is_empty());
     }
-    let current_is_subset = current
+    // The private staged-tree proof below owns task-board commit scope. Ignore raw
+    // board changes here so a person can add another Todo while the agent works;
+    // they remain outside the index and therefore outside the sealed task commit.
+    let current_non_task_is_subset = current
         .tracked_patch_ids
         .iter()
+        .filter(|(path, _)| !is_agent_git_task_board_path(path))
         .all(|(path, patch_id)| expected.tracked_patch_ids.get(path) == Some(patch_id))
         && current
             .untracked_blob_ids
             .iter()
+            .filter(|(path, _)| !is_agent_git_task_board_path(path))
             .all(|(path, blob_id)| expected.untracked_blob_ids.get(path) == Some(blob_id));
     let non_task_baseline_preserved = expected
         .tracked_patch_ids
         .iter()
-        .filter(|(path, _)| !path.starts_with("tasks/"))
+        .filter(|(path, _)| !is_agent_git_task_board_path(path))
         .all(|(path, patch_id)| current.tracked_patch_ids.get(path) == Some(patch_id))
         && expected
             .untracked_blob_ids
             .iter()
-            .filter(|(path, _)| !path.starts_with("tasks/"))
+            .filter(|(path, _)| !is_agent_git_task_board_path(path))
             .all(|(path, blob_id)| current.untracked_blob_ids.get(path) == Some(blob_id));
-    Ok(current_is_subset && non_task_baseline_preserved)
+    Ok(current_non_task_is_subset && non_task_baseline_preserved)
 }
 
 fn git_ref_has_one_active_session_task(
@@ -11997,7 +12007,7 @@ fn capture_agent_git_staged_manifest(
     let baseline = AgentGitWorktreeBaseline::from_json(raw_baseline)?;
     if !worktree_matches_agent_git_baseline(project_root, raw_baseline)? {
         anyhow::bail!(
-            "Stage every task-owned change before `clt done`; the remaining unstaged and untracked work must match the pre-task baseline"
+            "Stage every task-owned change before `clt done`; remaining unstaged and untracked non-task work must match the pre-task baseline, while concurrent task-board edits must stay unstaged"
         );
     }
     let manifest_parent_head = resolve_git_commit(
@@ -12115,7 +12125,7 @@ fn capture_agent_git_resealed_manifest(
     }
     if !worktree_matches_agent_git_baseline(project_root, raw_baseline)? {
         anyhow::bail!(
-            "Stage every corrected task-owned change before resealing; remaining unstaged and untracked work must match the pre-task baseline"
+            "Stage every corrected task-owned change before resealing; remaining unstaged and untracked non-task work must match the pre-task baseline, while concurrent task-board edits must stay unstaged"
         );
     }
     let manifest_parent_head =
@@ -42540,6 +42550,114 @@ mod tests {
         )
         .unwrap();
         assert_eq!(completed.state, GitFinalizationState::Completed);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn git_finalization_preserves_a_concurrent_unstaged_todo() {
+        let root = temp_root("automated-git-finalization-concurrent-todo");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        fs::write(
+            project_root.join("tasks/doing.md"),
+            "# Doing Tasks\n- Finish feature — COMPLETED 2026-09-02: checked codex:session-concurrent-todo\n",
+        )
+        .unwrap();
+        initialize_test_git_repository(&project_root);
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        store
+            .set_project_git_mode_for_path_blocking(&project_root, AgentGitMode::Commit)
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        store
+            .mark_session_running_blocking(
+                project.id,
+                "session-concurrent-todo",
+                123,
+                "run-concurrent-todo",
+                &root.join("concurrent.out"),
+                &root.join("concurrent.err"),
+            )
+            .unwrap();
+        let git_start = capture_agent_git_start_state(&project_root, AgentGitMode::Commit).unwrap();
+        ensure_agent_git_working_record(
+            &store,
+            &project,
+            "session-concurrent-todo",
+            "run-concurrent-todo",
+            Some(&git_start),
+        )
+        .unwrap();
+        bind_agent_git_working_task_identity(
+            &store,
+            &project,
+            "session-concurrent-todo",
+            "run-concurrent-todo",
+        )
+        .unwrap();
+
+        fs::write(project_root.join("feature.txt"), "implemented\n").unwrap();
+        run_test_git(&project_root, &["add", "feature.txt"]);
+        fs::write(
+            project_root.join("tasks/todo.md"),
+            "# To Do Tasks\n- Added by a person while the agent was working\n",
+        )
+        .unwrap();
+
+        move_task_to_done_with_agent_store(
+            &project_root,
+            "doing",
+            "1",
+            &AutomatedAgentChildContext {
+                project_id: project.id,
+                run_token: "run-concurrent-todo".to_string(),
+            },
+            &store,
+        )
+        .unwrap();
+        run_test_git(&project_root, &["add", "tasks/doing.md", "tasks/done.md"]);
+        run_test_agent_git(
+            &project_root,
+            &[
+                "commit",
+                "-m",
+                "Finish feature",
+                "-m",
+                "CLT-Task: codex:session-concurrent-todo",
+            ],
+        );
+
+        let pending = store
+            .git_finalization_blocking(project.id, "session-concurrent-todo")
+            .unwrap()
+            .unwrap();
+        let completed = reconcile_agent_git_finalization(
+            &store,
+            &project_root,
+            pending,
+            Some("run-concurrent-todo"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(completed.state, GitFinalizationState::Completed);
+        assert_eq!(
+            fs::read_to_string(project_root.join("tasks/todo.md")).unwrap(),
+            "# To Do Tasks\n- Added by a person while the agent was working\n"
+        );
+        assert_eq!(
+            run_test_git(&project_root, &["show", "HEAD:tasks/todo.md"]),
+            "# To Do Tasks"
+        );
+        assert_eq!(
+            run_test_git(&project_root, &["status", "--short", "--", "tasks/todo.md"]),
+            "M tasks/todo.md"
+        );
 
         fs::remove_dir_all(root).unwrap();
     }

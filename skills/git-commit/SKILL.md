@@ -141,6 +141,8 @@ If unrelated changes are present, commit only the requested or coherent set and 
 
 Pre-existing unstaged changes do not prevent a commit. Use path-specific or patch staging to isolate the completed task. Do not require the whole worktree to become clean before committing.
 
+A Todo or other task-board edit added after an automated CLT run starts may also remain unstaged. Preserve it and continue finalization: CLT proves the exact staged task tree, so the concurrent board edit stays outside the sealed commit. Use path-specific or patch staging for the selected task's transition instead of adding the whole board.
+
 ## CLT Task Updates
 
 If the work is tracked with `clt`, update the current task through `clt` before staging and include the resulting task-board changes in the same commit as the implementation. Check both supported layouts:

@@ -60,6 +60,8 @@ Use this section while developing the next release.
 
 ### Fixed
 
+- Fixed managed Git sealing so a Todo or other task-board edit added during an agent run can remain unstaged and survive outside the exact task commit, while staged unrelated board changes and non-task baseline drift are still rejected.
+
 - Git-enabled scheduling now checkpoints dirty task-board definitions in a dedicated prelaunch commit while preserving unrelated unstaged work, so tasks created in the CLI or TUI no longer fail before Codex starts. Failed pending projects also render as red `ERROR` rows with the stored cause, automatic-retry timing, and an `r` immediate-retry action instead of appearing unexplained as `IDLE`.
 - Reclaim orphaned interactive reservations as soon as their generated holder process exits, release the exact lease when a guarded session disappears after reap, and show interactive lease-only states as `FENCED` or `STALE` instead of a false `RUNNING` agent.
 - Allowed `c` to reopen a linked Doing task when its exact Codex session is stopped or otherwise idle, while continuing to reject sessions that are still running.
