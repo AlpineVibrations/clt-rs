@@ -18,8 +18,12 @@ UNBLOCKED 2026-09-03: Stabilized the Linux process-supervision fixtures by exerc
 
 Completion note:
 
-COMPLETED 2026-09-03: Isolated unit-test agent state per test, ignored inherited automated-run context in test builds, retained the exact Turso 0.7.0 pin and stable Ubuntu/macOS CI, and stabilized subprocess supervision coverage. Checks: `cargo fmt --all -- --check`; `cargo clippy --locked --all-targets --all-features -- -D warnings`; `cargo test --locked --all-targets --all-features` (396 passed).
+COMPLETED 2026-09-03: Isolated unit-test agent state per test, ignored inherited automated-run context in test builds, retained the exact Turso 0.7.0 pin and stable Ubuntu/macOS CI, and stabilized subprocess supervision coverage. Checks: `cargo fmt --all -- --check`; `cargo clippy --locked --all-targets --all-features -- -D warnings`; `cargo test --locked --all-targets --all-features` (396 unit and 7 integration tests passed).
 
 BLOCKED 2026-09-03: Implementation and all checks pass, but `clt done doing 1` refused to seal because commit `409dd93` is an unproven intervening CLT task-board checkpoint in this session's older WORKING history. External CLT journal recovery is required; the frozen-boundary contract forbids resetting, rebasing, amending, or committing an unsealed payload.
+
+UNBLOCKED 2026-09-03: CLT subsequently proved the intervening Phase 1 finalization at `c11aaa1`; the current full quality run passes against that non-overlapping HEAD.
+
+BLOCKED 2026-09-03: Retried `clt done doing 1` after CLT proved the intervening Phase 1 commit, but sealing still fails because this older WORKING journal contains an unproven intervening commit. The implementation and full quality run pass; CLT journal recovery is required before this task can be sealed and committed safely.
 
 codex:01a064d8-62d4-73e0-af01-9e6a39dd624e
