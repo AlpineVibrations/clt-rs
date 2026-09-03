@@ -6308,10 +6308,7 @@ fn run_agent_scheduler_pass_with_max_global_jobs(
         if !finalizations_before_reconcile.is_empty() {
             for finalization in finalizations_before_reconcile
                 .iter()
-                .filter(|finalization| {
-                    finalization.state.is_finalizing()
-                        && finalization.state != GitFinalizationState::PushPending
-                })
+                .filter(|finalization| finalization.state != GitFinalizationState::PushPending)
             {
                 with_agent_store_at(state_dir, |store| {
                     store
@@ -27006,38 +27003,13 @@ fn load_tui_agent_panel_snapshot_inner(
             };
             let failure_problem =
                 tui_agent_failure_problem(&project, latest_run.as_ref(), now, failure_backoff);
-            let mut runtime_state = tui_agent_runtime_state(project.id, &active_leases);
-            if matches!(
-                runtime_state,
-                TuiAgentRuntimeState::Idle | TuiAgentRuntimeState::Fenced
-            ) && interactive_session_projects.contains(&project.id)
-            {
-                runtime_state = TuiAgentRuntimeState::Interactive;
-            }
-            if runtime_state == TuiAgentRuntimeState::Idle
-                && suspending_session_projects.contains(&project.id)
-            {
-                runtime_state = TuiAgentRuntimeState::Fenced;
-            }
-            if matches!(
-                runtime_state,
-                TuiAgentRuntimeState::Idle
-                    | TuiAgentRuntimeState::Fenced
-                    | TuiAgentRuntimeState::Error
-            ) && let Some(finalization_state) =
-                pending_git_finalizations.get(&project.id).copied()
-            {
-                runtime_state = if finalization_state == GitFinalizationState::PushPending {
-                    TuiAgentRuntimeState::PushPending
-                } else {
-                    TuiAgentRuntimeState::Finalizing
-                };
-            }
-            if runtime_state == TuiAgentRuntimeState::Idle
-                && (daemon_scan_problem.is_some() || failure_problem.is_some())
-            {
-                runtime_state = TuiAgentRuntimeState::Error;
-            }
+            let runtime_state = resolve_tui_agent_runtime_state(
+                tui_agent_runtime_state(project.id, &active_leases),
+                interactive_session_projects.contains(&project.id),
+                suspending_session_projects.contains(&project.id),
+                pending_git_finalizations.get(&project.id).copied(),
+                daemon_scan_problem.is_some() || failure_problem.is_some(),
+            );
             Ok(TuiAgentProject {
                 project,
                 scan,
@@ -27052,6 +27024,44 @@ fn load_tui_agent_panel_snapshot_inner(
         projects,
         daemon_status,
     })
+}
+
+fn resolve_tui_agent_runtime_state(
+    mut runtime_state: TuiAgentRuntimeState,
+    has_interactive_session: bool,
+    has_suspending_session: bool,
+    pending_git_finalization: Option<GitFinalizationState>,
+    has_problem: bool,
+) -> TuiAgentRuntimeState {
+    if matches!(
+        runtime_state,
+        TuiAgentRuntimeState::Idle | TuiAgentRuntimeState::Fenced
+    ) && has_interactive_session
+    {
+        runtime_state = TuiAgentRuntimeState::Interactive;
+    }
+    if runtime_state == TuiAgentRuntimeState::Idle && has_suspending_session {
+        runtime_state = TuiAgentRuntimeState::Fenced;
+    }
+    if matches!(
+        runtime_state,
+        TuiAgentRuntimeState::Idle | TuiAgentRuntimeState::Fenced
+    ) && has_problem
+    {
+        return TuiAgentRuntimeState::Error;
+    }
+    if matches!(
+        runtime_state,
+        TuiAgentRuntimeState::Idle | TuiAgentRuntimeState::Fenced
+    ) && let Some(finalization_state) = pending_git_finalization
+    {
+        runtime_state = if finalization_state == GitFinalizationState::PushPending {
+            TuiAgentRuntimeState::PushPending
+        } else {
+            TuiAgentRuntimeState::Finalizing
+        };
+    }
+    runtime_state
 }
 
 fn tui_agent_daemon_scan_problem(project: &agent_store::AgentProject) -> Option<String> {
@@ -38455,6 +38465,50 @@ mod tests {
     }
 
     #[test]
+    fn tui_agent_runtime_state_surfaces_failed_recovery_over_pending_finalization() {
+        assert_eq!(
+            resolve_tui_agent_runtime_state(
+                TuiAgentRuntimeState::Idle,
+                false,
+                true,
+                Some(GitFinalizationState::Working),
+                true,
+            ),
+            TuiAgentRuntimeState::Error
+        );
+        assert_eq!(
+            resolve_tui_agent_runtime_state(
+                TuiAgentRuntimeState::Idle,
+                false,
+                true,
+                Some(GitFinalizationState::Working),
+                false,
+            ),
+            TuiAgentRuntimeState::Finalizing
+        );
+        assert_eq!(
+            resolve_tui_agent_runtime_state(
+                TuiAgentRuntimeState::Idle,
+                false,
+                false,
+                Some(GitFinalizationState::PushPending),
+                false,
+            ),
+            TuiAgentRuntimeState::PushPending
+        );
+        assert_eq!(
+            resolve_tui_agent_runtime_state(
+                TuiAgentRuntimeState::Running,
+                false,
+                false,
+                Some(GitFinalizationState::Working),
+                true,
+            ),
+            TuiAgentRuntimeState::Running
+        );
+    }
+
+    #[test]
     fn agent_project_table_surfaces_external_daemon_scan_errors() {
         let mut item = tui_agent_project_for_test(1, "fishdome");
         item.project.path = PathBuf::from("/Volumes/External/FISHDOME");
@@ -45138,6 +45192,103 @@ mod tests {
         assert_eq!(
             start.jobs[0].resume_session_id.as_deref(),
             Some("session-pending")
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scheduler_retags_abandoned_working_session_before_finalization_lease() {
+        let root = temp_root("scheduler-working-finalization-recovery-token");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        let task_content = "Interrupted task codex:session-working";
+        fs::write(
+            project_root.join("tasks/doing.md"),
+            format!("# Doing Tasks\n- {task_content}\n"),
+        )
+        .unwrap();
+        let starting_head = initialize_test_git_repository(&project_root);
+        let branch_ref = run_test_git(&project_root, &["symbolic-ref", "HEAD"]);
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        assert!(
+            store
+                .set_project_git_mode_for_path_blocking(&project_root, AgentGitMode::Commit)
+                .unwrap()
+        );
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        store
+            .mark_session_running_blocking(
+                project.id,
+                "session-working",
+                123,
+                "dead-worker-token",
+                &root.join("worker.out"),
+                &root.join("worker.err"),
+            )
+            .unwrap();
+        let task_identity = durable_task_identity(task_content).unwrap();
+        assert!(
+            store
+                .create_git_finalization_blocking(agent_store::NewGitFinalization {
+                    project_id: project.id,
+                    codex_session_id: "session-working",
+                    git_mode: AgentGitMode::Commit,
+                    starting_head: Some(&starting_head),
+                    branch_ref: Some(&branch_ref),
+                    upstream_ref: None,
+                    worktree_baseline: r#"{"version":1,"tracked_patch_ids":{},"untracked_blob_ids":{},"require_clean":false}"#,
+                    task_identity: Some(&task_identity),
+                    owner_run_token: Some("dead-worker-token"),
+                    created_at: "100",
+                })
+                .unwrap()
+        );
+        store
+            .set_session_control_recovery_token_blocking(
+                project.id,
+                "session-working",
+                "dead-worker-token",
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .session_control_blocking(project.id, "session-working")
+                .unwrap()
+                .unwrap()
+                .run_token
+                .as_deref(),
+            Some("dead-worker-token")
+        );
+        drop(store);
+
+        let start =
+            run_agent_scheduler_pass_with_max_global_jobs(&state_dir, true, &[], 1, None).unwrap();
+
+        assert_eq!(start.jobs.len(), 1);
+        assert_eq!(
+            start.jobs[0].task_selection,
+            AgentTaskSelection::ResumeSession
+        );
+        assert_eq!(
+            start.jobs[0].resume_session_id.as_deref(),
+            Some("session-working")
+        );
+        assert_eq!(start.pass.skipped_active_lease, 0);
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        assert_eq!(
+            store
+                .session_control_blocking(project.id, "session-working")
+                .unwrap()
+                .unwrap()
+                .run_token
+                .as_deref(),
+            Some("clt-git-finalization:0")
         );
 
         fs::remove_dir_all(root).unwrap();

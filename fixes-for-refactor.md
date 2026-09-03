@@ -22,6 +22,16 @@ Keep the active-worker index definition canonical with single-quoted state value
 
 Apply that recovery wrapper to independent worker reservation as well as scheduler scanning. Do not release the scheduler lease before the rebuild and reservation retry complete; release it through the existing failure path only if recovery still fails. Preserve regression coverage for the malformed-index error, the existing index-corruption signature, unrelated-error rejection, and daemon-to-independent-worker dispatch.
 
+## Abandoned `WORKING` finalization recovery and truthful status
+
+Port the master fix for the stranded Phase 12 recovery observed on 2026-09-03. The worker exited during verification after Turso panicked with `shared WAL frame index length changed while publishing an entry`. Worker abandonment correctly left the exact Codex session resumable, but its `resume_requested` control retained the dead worker token while the Git journal remained `WORKING`. The guarded finalization lease accepts only the generation-bound `clt-git-finalization:<generation>` token, producing a catch-22: the scheduler reported `reason=active_lease` despite there being no lease or active worker, and it could never reach the later code that retagged the session.
+
+Before trying to acquire the guarded finalization lease, call the exact-session recovery tagging operation for every non-push pending journal, including `WORKING`, `TRACKING`, and `COMMIT_PENDING`. Keep `PUSH_PENDING` autonomous; it must not resume Codex. A project with a live durable worker remains protected because the scheduler skips durable-worker projects before this step, and the lease transaction must continue to reject active workers and incompatible session controls.
+
+Preserve the runtime-status distinction in the refactored TUI stages. A live lease still wins as `RUNNING`, and a healthy pending journal with no recorded problem remains `FINAL` or `PUSH`. When there is no live worker/lease and the project has a stored run or scan failure, `ERROR` must take precedence over the pending-journal label so `FINAL` cannot hide a stalled recovery or its actionable failure message.
+
+Port regression coverage equivalent to `scheduler_retags_abandoned_working_session_before_finalization_lease` and `tui_agent_runtime_state_surfaces_failed_recovery_over_pending_finalization`. The scheduler test must reproduce a `WORKING` journal plus an idle `resume_requested` session carrying the dead worker token, then prove one pass retags it to the journal generation and queues `ResumeSession` without incrementing the active-lease skip count.
+
 ## Rebuildable Turso agent registry
 
 After the recovery refactor is complete, make Turso shared-WAL failures recoverable instead of allowing an ownership panic to disable the agent workflow. CLT is staying on Turso, but the agent registry should be treated as rebuildable runtime state rather than an irreplaceable source of truth. The task boards and Git repositories remain authoritative for work and completed code.
