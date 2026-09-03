@@ -14,4 +14,6 @@ COMPLETED 2026-09-03: Added the public `clt_rs::run()` launcher, reduced `src/ma
 
 BLOCKED 2026-09-03: Implementation and all gates pass, but `clt done doing 2` cannot seal because the frozen baseline records Phase 0's unrelated unstaged patch at `src/main.rs`, while this required file split preserves that patch at `src/lib.rs`. Finalization needs external CLT journal recovery after Phase 0 is resolved, or supported baseline path-relocation handling; committing Phase 0's changes in this task would violate the scoped-commit contract.
 
+BLOCKED 2026-09-03: Reverified the durable launcher split and all locked quality gates. Phase 0's older WORKING journal remains unresolved, and CLT's per-path worktree baseline cannot preserve its `src/main.rs` patch after Phase 2 relocates that code to `src/lib.rs`; Phase 0 must be finalized first or CLT must support baseline path relocation before this task can be sealed safely.
+
 codex:01a064fb-ac78-7ac0-ba28-963a09cac536
