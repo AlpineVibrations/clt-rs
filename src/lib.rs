@@ -19180,6 +19180,25 @@ exit 0
     }
 
     #[test]
+    fn agent_store_centralizes_blocking_runtime_and_repository_boundaries() {
+        let facade = include_str!("agent.rs");
+        let runtime = include_str!("agent/runtime.rs");
+        let repositories = [
+            include_str!("agent/repositories/projects_models.rs"),
+            include_str!("agent/repositories/workers_leases.rs"),
+            include_str!("agent/repositories/sessions_runs.rs"),
+            include_str!("agent/repositories/git_journals.rs"),
+        ];
+
+        assert!(!facade.contains("tokio::runtime::Runtime::new()"));
+        assert_eq!(runtime.matches("tokio::runtime::Runtime::new()").count(), 1);
+        assert!(repositories.iter().all(|source| {
+            source.contains("impl TursoAgentStore")
+                && !source.contains("tokio::runtime::Runtime::new()")
+        }));
+    }
+
+    #[test]
     fn move_task_supports_backlog_as_a_status() {
         let root = temp_root("move-backlog");
 
