@@ -198,7 +198,7 @@ Each project run should execute a prompt equivalent to the current shell script:
 1. Inspect the task board using `clt`.
 2. Pick the next available ready/todo task.
 3. If no task exists, print `NO_TASKS_LEFT`.
-4. Move exactly one task to `doing`. With Git automation enabled, the task must already exist in `HEAD`; the scheduler has already synchronized and frozen the checkout before releasing Codex. The command rechecks that launch state and binds it to a durable `WORKING` journal before this board mutation. Codex must not pull, synchronize, or switch branches itself.
+4. Move exactly one task to `doing`. With Git automation enabled, the task already exists in `HEAD` because the scheduler checkpointed a dirty task board before freezing and releasing the checkout. The command rechecks that launch state and binds it to a durable `WORKING` journal before this board mutation. Codex must not pull, synchronize, or switch branches itself.
 5. Complete that task.
 6. Run relevant checks/tests.
 7. Update the task board.
@@ -229,7 +229,7 @@ For a fresh project run in `commit` or `commit-and-push` mode, checkout selectio
 
 The launch record initially exists before a Codex session can be registered. This unconsumed pre-registration boundary is immutable: neither the same run nor a replacement worker may overwrite or recapture it from a later checkout. If Codex exits before announcing a session, its supervisor first reaps the exact child and terminalizes that worker generation without erasing the boundary. CLT reclaims it automatically only when the exact worker is terminal, no session-control row owns its run token, and the checkout and Git mode match the frozen snapshot. Any uncertainty or changed checkout fails closed and prevents later project work. Unregister and clean also refuse to erase this evidence.
 
-The selected Todo task must already have the same durable identity in the frozen starting commit. This makes task creation and task execution separate commit boundaries: a user or prior workflow commits the task definition once, then the automated run makes the single implementation-and-completion commit.
+The selected Todo task must have the same durable identity in the frozen starting commit. When the task board is dirty, CLT creates a dedicated prelaunch checkpoint containing the complete `tasks/` tree without including unrelated worktree changes. This keeps task registration and task execution as separate commit boundaries automatically; the automated run then makes the single implementation-and-completion commit.
 
 The Todo-to-Doing command verifies the server-owned launch state has not changed and binds it to the session's durable `WORKING` journal before moving the task. Once released, Codex may inspect Git, implement the task, and create the sealed commit. It never pushes and must not run a startup pull, fetch/synchronize, merge, rebase, switch branches, reset history, or reconfigure the destination; those are CLT-owned operations, not agent work.
 

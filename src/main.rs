@@ -11105,11 +11105,179 @@ fn prepare_agent_git_start_state_for_run(
         let board_dir = get_tasks_dir(&project.path);
         let _mutation_lock = acquire_board_mutation_lock(&board_dir)?;
         cleanup_clt_atomic_task_temporaries(&board_dir)?;
+        require_agent_git_board_storage_compatible(&project.path)?;
+        checkpoint_agent_git_task_board_before_launch(&project.path)?;
     }
-    require_agent_git_board_storage_compatible(&project.path)?;
     let start = capture_agent_git_start_state(&project.path, project.git_mode)?;
     require_agent_git_todo_candidates_committed(&project.path, &start.starting_head)?;
     Ok(Some(start))
+}
+
+fn checkpoint_agent_git_task_board_before_launch(project_root: &Path) -> Result<Option<String>> {
+    require_agent_git_index_matches_head(project_root)?;
+    let starting_head = resolve_git_commit(
+        project_root,
+        "HEAD",
+        "resolve the parent for the automated task-board checkpoint",
+    )?;
+    let branch_ref = git_optional_stdout(
+        project_root,
+        &["symbolic-ref", "-q", "HEAD"],
+        &[1],
+        "resolve the branch for the automated task-board checkpoint",
+    )?
+    .context("Git-enabled automated tasks require an attached branch before CLT checkpoints the task board")?;
+    let starting_tree = git_stdout(
+        project_root,
+        &[
+            "rev-parse",
+            "--verify",
+            &format!("{starting_head}^{{tree}}"),
+        ],
+        "resolve the tree before the automated task-board checkpoint",
+    )?;
+    let (_projection, index_path, _) =
+        create_agent_git_tree_projection(project_root, &starting_head)?;
+    run_agent_git_projection_command(
+        project_root,
+        &index_path,
+        None,
+        &["add", "-A", "--", "tasks"],
+        "stage the prelaunch task-board checkpoint",
+    )?;
+    let checkpoint_tree = run_agent_git_projection_command(
+        project_root,
+        &index_path,
+        None,
+        &["write-tree"],
+        "snapshot the prelaunch task board",
+    )?;
+    if checkpoint_tree == starting_tree {
+        return Ok(None);
+    }
+
+    require_agent_git_index_matches_head(project_root)?;
+    let rechecked_head = resolve_git_commit(
+        project_root,
+        "HEAD",
+        "recheck the task-board checkpoint parent",
+    )?;
+    let rechecked_branch = git_optional_stdout(
+        project_root,
+        &["symbolic-ref", "-q", "HEAD"],
+        &[1],
+        "recheck the task-board checkpoint branch",
+    )?;
+    run_agent_git_projection_command(
+        project_root,
+        &index_path,
+        None,
+        &["add", "-A", "--", "tasks"],
+        "recheck the prelaunch task-board checkpoint",
+    )?;
+    let rechecked_tree = run_agent_git_projection_command(
+        project_root,
+        &index_path,
+        None,
+        &["write-tree"],
+        "recheck the prelaunch task-board tree",
+    )?;
+    if rechecked_head != starting_head
+        || rechecked_branch.as_deref() != Some(branch_ref.as_str())
+        || rechecked_tree != checkpoint_tree
+    {
+        anyhow::bail!(
+            "Git HEAD, branch, index, or task board changed while CLT was preparing its prelaunch checkpoint; retry"
+        );
+    }
+
+    let output = Command::new("git")
+        .current_dir(project_root)
+        .env("GIT_AUTHOR_NAME", AGENT_GIT_IDENTITY_NAME)
+        .env("GIT_AUTHOR_EMAIL", AGENT_GIT_IDENTITY_EMAIL)
+        .env("GIT_COMMITTER_NAME", AGENT_GIT_IDENTITY_NAME)
+        .env("GIT_COMMITTER_EMAIL", AGENT_GIT_IDENTITY_EMAIL)
+        .args([
+            "commit-tree",
+            checkpoint_tree.as_str(),
+            "-p",
+            starting_head.as_str(),
+            "-m",
+            "Record CLT task board",
+        ])
+        .output()
+        .with_context(|| {
+            format!(
+                "Failed to create the automated task-board checkpoint in {}",
+                project_root.display()
+            )
+        })?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to create the automated task-board checkpoint in {}: {}",
+            project_root.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let checkpoint_commit = String::from_utf8(output.stdout)
+        .context("Git returned a non-UTF-8 task-board checkpoint commit")?
+        .trim()
+        .to_string();
+
+    require_agent_git_index_matches_head(project_root)?;
+    if resolve_git_commit(
+        project_root,
+        "HEAD",
+        "recheck the task-board checkpoint parent",
+    )? != starting_head
+        || git_optional_stdout(
+            project_root,
+            &["symbolic-ref", "-q", "HEAD"],
+            &[1],
+            "recheck the task-board checkpoint branch",
+        )?
+        .as_deref()
+            != Some(branch_ref.as_str())
+    {
+        anyhow::bail!(
+            "Git HEAD, branch, or index changed before CLT could publish its task-board checkpoint; retry"
+        );
+    }
+    git_stdout(
+        project_root,
+        &[
+            "update-ref",
+            branch_ref.as_str(),
+            checkpoint_commit.as_str(),
+            starting_head.as_str(),
+        ],
+        "publish the automated task-board checkpoint",
+    )?;
+    git_stdout(
+        project_root,
+        &[
+            "reset",
+            "--quiet",
+            checkpoint_commit.as_str(),
+            "--",
+            "tasks",
+        ],
+        "align the task-board index with its automated checkpoint",
+    )?;
+    require_agent_git_index_matches_head(project_root)?;
+    let remaining = capture_agent_git_worktree_baseline(project_root)?;
+    if remaining
+        .tracked_patch_ids
+        .keys()
+        .chain(remaining.untracked_blob_ids.keys())
+        .any(|path| path == "tasks" || path.starts_with("tasks/"))
+    {
+        anyhow::bail!(
+            "The task board changed while CLT was publishing its prelaunch checkpoint; retry"
+        );
+    }
+
+    Ok(Some(checkpoint_commit))
 }
 
 fn require_agent_git_todo_candidates_committed(
@@ -11734,7 +11902,7 @@ fn agent_git_task_scope_without_selected(
     }
     match selected.as_slice() {
         [] => anyhow::bail!(
-            "The selected Git-enabled task is not present in the manifest parent; commit the task board before starting automated work"
+            "The selected Git-enabled task is not present in the checkpointed manifest parent"
         ),
         [(status, entry)] => {
             remove_agent_git_task_entry_without_reordering(&board_dir, status, entry)?
@@ -24981,6 +25149,17 @@ struct TuiAgentProject {
     scan: AgentProjectScan,
     runtime_state: TuiAgentRuntimeState,
     daemon_scan_problem: Option<String>,
+    failure_problem: Option<String>,
+}
+
+impl TuiAgentProject {
+    fn displayed_problem(&self) -> Option<&str> {
+        self.daemon_scan_problem.as_deref().or_else(|| {
+            (self.runtime_state == TuiAgentRuntimeState::Error)
+                .then_some(self.failure_problem.as_deref())
+                .flatten()
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -26383,6 +26562,7 @@ fn load_tui_agent_panel_snapshot_inner(
             .collect::<HashMap<_, _>>()
     };
     let suspending_session_projects = store.suspending_session_project_ids_blocking()?;
+    let failure_backoff = agent_failure_backoff()?;
     let mut interactive_session_projects = HashSet::new();
     for project_id in &suspending_session_projects {
         if store
@@ -26407,6 +26587,16 @@ fn load_tui_agent_panel_snapshot_inner(
         .map(|project| {
             let scan = scan_agent_project(&project.path);
             let daemon_scan_problem = tui_agent_daemon_scan_problem(&project);
+            let latest_run = if project.enabled
+                && project.failure_count > 0
+                && (scan.todo_count > 0 || scan.doing_count > 0)
+            {
+                store.latest_run_for_project_blocking(project.id)?
+            } else {
+                None
+            };
+            let failure_problem =
+                tui_agent_failure_problem(&project, latest_run.as_ref(), now, failure_backoff);
             let mut runtime_state = tui_agent_runtime_state(project.id, &active_leases);
             if matches!(
                 runtime_state,
@@ -26434,17 +26624,20 @@ fn load_tui_agent_panel_snapshot_inner(
                     TuiAgentRuntimeState::Finalizing
                 };
             }
-            if runtime_state == TuiAgentRuntimeState::Idle && daemon_scan_problem.is_some() {
+            if runtime_state == TuiAgentRuntimeState::Idle
+                && (daemon_scan_problem.is_some() || failure_problem.is_some())
+            {
                 runtime_state = TuiAgentRuntimeState::Error;
             }
-            TuiAgentProject {
+            Ok(TuiAgentProject {
                 project,
                 scan,
                 runtime_state,
                 daemon_scan_problem,
-            }
+                failure_problem,
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
 
     Ok(TuiAgentPanelSnapshot {
         projects,
@@ -26488,6 +26681,40 @@ fn tui_agent_daemon_scan_problem(project: &agent_store::AgentProject) -> Option<
         )),
         _ => None,
     }
+}
+
+fn tui_agent_failure_problem(
+    project: &agent_store::AgentProject,
+    latest_run: Option<&agent_store::AgentRunRecord>,
+    now: u64,
+    failure_backoff: Duration,
+) -> Option<String> {
+    if !project.enabled || project.failure_count <= 0 {
+        return None;
+    }
+    let run = latest_run.filter(|run| matches!(run.status.as_str(), "failure" | "timeout"))?;
+    let summary = run
+        .summary
+        .as_deref()
+        .unwrap_or("No failure summary was recorded")
+        .strip_prefix("Codex runner failed before completion: ")
+        .unwrap_or_else(|| {
+            run.summary
+                .as_deref()
+                .unwrap_or("No failure summary was recorded")
+        });
+    let retry = remaining_agent_delay(project.last_failure_at.as_deref(), now, failure_backoff)
+        .map(|remaining| format!("Automatic retry in {remaining}s while the daemon is active."))
+        .unwrap_or_else(|| "Automatic retry is ready when the daemon is active.".to_string());
+    let correction = if summary.contains("not committed exactly once at the frozen task boundary") {
+        "This build checkpoints dirty Todo definitions automatically before the next attempt."
+    } else {
+        "Correct the reported cause before forcing another attempt."
+    };
+
+    Some(format!(
+        "Last agent run failed: {summary}\n{retry} {correction} Press r to clear the cooldown and retry now."
+    ))
 }
 
 fn agent_service_needs_restart(
@@ -26733,6 +26960,31 @@ fn toggle_selected_tui_agent_project(
     }
 }
 
+fn retry_selected_tui_agent_project(
+    panel: &mut TuiAgentPanel,
+    active_root: &Path,
+) -> Result<String> {
+    let Some(project) = panel.selected_project().map(|entry| entry.project.clone()) else {
+        return Ok("No registered project selected".to_string());
+    };
+
+    let store = open_agent_store()?;
+    let changed = store.clear_project_failure_backoff_for_path_blocking(&project.path)?;
+    panel.refresh(active_root);
+
+    if changed {
+        Ok(format!(
+            "Queued {} for immediate retry; the daemon will run it when active",
+            project.name
+        ))
+    } else {
+        Ok(format!(
+            "Project is no longer registered: {}",
+            project.path.display()
+        ))
+    }
+}
+
 fn cycle_selected_tui_agent_project_git_mode(
     panel: &mut TuiAgentPanel,
     active_root: &Path,
@@ -26906,7 +27158,7 @@ fn tui_agent_log_refresh_interval() -> Duration {
 }
 
 fn tui_agent_panel_instructions() -> &'static str {
-    "Up/Down selects, Enter opens/adds, Space toggles ON/OFF, Delete removes with confirmation, g cycles Git off/commit/push, m cycles the selected target, M opens Models, f toggles fast, t cycles thinking, l shows output. s directly stops the selected active, interactive, or fenced session; with output open it controls that exact session. With output open: i takes over a live session and c continues an idle session. Tab returns to Kanban."
+    "Up/Down selects, Enter opens/adds, Space toggles ON/OFF, Delete removes with confirmation, g cycles Git off/commit/push, m cycles the selected target, M opens Models, f toggles fast, t cycles thinking, r retries after fixing an error, l shows output. s directly stops the selected active, interactive, or fenced session; with output open it controls that exact session. With output open: i takes over a live session and c continues an idle session. Tab returns to Kanban."
 }
 
 fn parse_agent_codex_session_id(line: &str) -> Option<String> {
@@ -28009,8 +28261,7 @@ fn format_agent_project_table_row(
     let doing = item.scan.doing_count.to_string();
     let last_run = format_agent_table_last_run(&item.project);
     let path_or_error = item
-        .daemon_scan_problem
-        .as_deref()
+        .displayed_problem()
         .unwrap_or_else(|| item.project.path.to_str().unwrap_or("<non-UTF-8 path>"));
 
     if width < 120 {
@@ -28352,7 +28603,7 @@ fn render_tui_agent_panel(
                         codex_width,
                         item.project.path == active_root,
                     ),
-                    if item.daemon_scan_problem.is_some() {
+                    if item.displayed_problem().is_some() {
                         Style::default().fg(Color::LightRed)
                     } else if item.project.enabled {
                         Style::default().fg(text_color)
@@ -28373,7 +28624,7 @@ fn render_tui_agent_panel(
                     codex_width,
                     item.project.path == active_root,
                 ),
-                if item.daemon_scan_problem.is_some() {
+                if item.displayed_problem().is_some() {
                     Style::default().fg(Color::LightRed)
                 } else if item.project.enabled {
                     Style::default().fg(text_color)
@@ -28803,7 +29054,7 @@ fn tui_console_content<'a>(
     if agent_pane
         && let Some(problem) = panel
             .selected_project()
-            .and_then(|project| project.daemon_scan_problem.as_deref())
+            .and_then(TuiAgentProject::displayed_problem)
     {
         return (problem, Color::LightRed);
     }
@@ -30742,6 +30993,18 @@ fn tui_view_with_active_board(root: &Path, start_with_active_board: bool) -> Res
                                             }
                                             Err(e) => feedback_buffer = format!("Error: {}", e),
                                         }
+                                    }
+                                    KeyCode::Char('r') | KeyCode::Char('R') => {
+                                        feedback_buffer = match retry_selected_tui_agent_project(
+                                            &mut agent_panel,
+                                            &active_root,
+                                        ) {
+                                            Ok(message) => message,
+                                            Err(error) => {
+                                                format!("Unable to retry selected project: {error}")
+                                            }
+                                        };
+                                        last_agent_panel_refresh = Instant::now();
                                     }
                                     KeyCode::Char('s') => {
                                         let target_result = if agent_log_view.is_some() {
@@ -33146,6 +33409,7 @@ mod tests {
             scan: AgentProjectScan::empty(),
             runtime_state: TuiAgentRuntimeState::Idle,
             daemon_scan_problem: None,
+            failure_problem: None,
         }
     }
 
@@ -33407,6 +33671,7 @@ mod tests {
         assert!(tui_agent_panel_instructions().contains("M opens Models"));
         assert!(tui_agent_panel_instructions().contains("f toggles fast"));
         assert!(tui_agent_panel_instructions().contains("t cycles thinking"));
+        assert!(tui_agent_panel_instructions().contains("r retries after fixing an error"));
         assert!(tui_agent_panel_instructions().contains("l shows output"));
         assert!(tui_agent_panel_instructions().contains("g cycles Git off/commit/push"));
         assert!(tui_agent_panel_instructions().contains("Delete removes with confirmation"));
@@ -33430,6 +33695,7 @@ mod tests {
                 scan: AgentProjectScan::empty(),
                 runtime_state: TuiAgentRuntimeState::Idle,
                 daemon_scan_problem: None,
+                failure_problem: None,
             }],
             current_project_registration: None,
             daemon_status: "not-installed".to_string(),
@@ -36831,6 +37097,7 @@ mod tests {
                 scan: AgentProjectScan::empty(),
                 runtime_state: TuiAgentRuntimeState::Idle,
                 daemon_scan_problem: None,
+                failure_problem: None,
             }],
             current_project_registration: None,
             daemon_status: "running".to_string(),
@@ -36987,6 +37254,7 @@ mod tests {
                 scan: AgentProjectScan::empty(),
                 runtime_state: TuiAgentRuntimeState::Interactive,
                 daemon_scan_problem: None,
+                failure_problem: None,
             }],
             current_project_registration: None,
             daemon_status: "running".to_string(),
@@ -37413,6 +37681,7 @@ mod tests {
                 scan: AgentProjectScan::empty(),
                 runtime_state: TuiAgentRuntimeState::Fenced,
                 daemon_scan_problem: None,
+                failure_problem: None,
             }],
             current_project_registration: None,
             daemon_status: "running".to_string(),
@@ -37584,6 +37853,7 @@ mod tests {
                 scan: AgentProjectScan::empty(),
                 runtime_state: TuiAgentRuntimeState::Idle,
                 daemon_scan_problem: None,
+                failure_problem: None,
             }],
             current_project_registration: None,
             daemon_status: "not-installed".to_string(),
@@ -37693,6 +37963,7 @@ mod tests {
                     scan: AgentProjectScan::empty(),
                     runtime_state: TuiAgentRuntimeState::Idle,
                     daemon_scan_problem: None,
+                    failure_problem: None,
                 })
                 .collect(),
             current_project_registration: None,
@@ -37803,6 +38074,61 @@ mod tests {
         assert!(row.contains("External project scan failed"));
         assert!(console.contains("Full Disk Access"));
         assert!(console.contains("restart the agent"));
+        assert_eq!(color, Color::LightRed);
+    }
+
+    #[test]
+    fn agent_project_table_surfaces_failed_run_reason_and_retry_guidance() {
+        let mut item = tui_agent_project_for_test(13, "chitty");
+        item.project.git_mode = AgentGitMode::CommitAndPush;
+        item.project.last_failure_at = Some("100".to_string());
+        item.project.failure_count = 1;
+        item.scan = AgentProjectScan::pending(2);
+        let latest_run = agent_store::AgentRunRecord {
+            id: 2049,
+            project_id: item.project.id,
+            project_name: item.project.name.clone(),
+            project_path: item.project.path.clone(),
+            status: "failure".to_string(),
+            started_at: "99".to_string(),
+            finished_at: Some("100".to_string()),
+            exit_code: None,
+            stdout_path: None,
+            stderr_path: None,
+            summary: Some(
+                "Codex runner failed before completion: Todo candidate is not committed exactly once at the frozen task boundary"
+                    .to_string(),
+            ),
+            codex_session_id: None,
+        };
+        item.failure_problem = tui_agent_failure_problem(
+            &item.project,
+            Some(&latest_run),
+            250,
+            Duration::from_secs(300),
+        );
+        item.runtime_state = TuiAgentRuntimeState::Error;
+
+        let codex_width = agent_codex_column_width(std::slice::from_ref(&item), false);
+        let project_width =
+            agent_project_column_width(std::slice::from_ref(&item), None, 180, codex_width);
+        let row = format_agent_project_table_row(0, &item, 180, project_width, codex_width, false);
+        let mut panel = TuiAgentPanel {
+            projects: vec![item],
+            current_project_registration: None,
+            daemon_status: "service active".to_string(),
+            state: ListState::default(),
+            scroll_offset: 0,
+            last_error: None,
+        };
+        panel.state.select(Some(0));
+        let (console, color) = tui_console_content(true, &panel, None, "instructions");
+
+        assert!(row.contains("ERROR"));
+        assert!(row.contains("Last agent run failed"));
+        assert!(console.contains("Automatic retry in 150s"));
+        assert!(console.contains("checkpoints dirty Todo definitions automatically"));
+        assert!(console.contains("Press r"));
         assert_eq!(color, Color::LightRed);
     }
 
@@ -41331,17 +41657,20 @@ mod tests {
     }
 
     #[test]
-    fn git_start_preflight_rejects_an_uncommitted_todo_before_launch() {
+    fn git_start_preflight_checkpoints_uncommitted_todos_before_launch() {
         let root = temp_root("automated-git-uncommitted-todo");
         let state_dir = root.join("state/clt");
         let project_root = root.join("project");
         init_tasks(&project_root, false).unwrap();
+        fs::write(project_root.join("source.txt"), "before\n").unwrap();
         initialize_test_git_repository(&project_root);
         fs::write(
             project_root.join("tasks/todo.md"),
             "# Todo Tasks\n- This task exists only in the worktree\n",
         )
         .unwrap();
+        fs::write(project_root.join("source.txt"), "after\n").unwrap();
+        fs::write(project_root.join("unrelated.txt"), "preserve me\n").unwrap();
         let project_root = fs::canonicalize(project_root).unwrap();
         let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
         store
@@ -41351,8 +41680,9 @@ mod tests {
             .set_project_git_mode_for_path_blocking(&project_root, AgentGitMode::Commit)
             .unwrap();
         let project = store.list_projects_blocking().unwrap().remove(0);
+        let previous_head = run_test_git(&project_root, &["rev-parse", "HEAD"]);
 
-        let error = prepare_agent_git_start_state_for_run(
+        let start = prepare_agent_git_start_state_for_run(
             &store,
             &project,
             AgentTaskSelection::NextTodo,
@@ -41360,8 +41690,30 @@ mod tests {
             false,
             "uncommitted-run",
         )
-        .unwrap_err();
-        assert!(format!("{error:#}").contains("not committed exactly once"));
+        .unwrap()
+        .unwrap();
+        assert_ne!(start.starting_head, previous_head);
+        assert_eq!(
+            run_test_git(&project_root, &["show", "-s", "--format=%s", "HEAD"]),
+            "Record CLT task board"
+        );
+        assert!(git_commit_uses_agent_identity(&project_root, &start.starting_head).unwrap());
+        require_agent_git_start_task_identity(
+            &project_root,
+            &start.starting_head,
+            &durable_task_identity("This task exists only in the worktree").unwrap(),
+        )
+        .unwrap();
+        assert!(run_test_git(&project_root, &["status", "--short", "--", "tasks"]).is_empty());
+        assert_eq!(
+            run_test_git(&project_root, &["status", "--short", "--", "unrelated.txt"]),
+            "?? unrelated.txt"
+        );
+        assert_eq!(
+            run_test_git(&project_root, &["status", "--short", "--", "source.txt"]),
+            "M source.txt"
+        );
+        assert!(run_test_git(&project_root, &["diff", "--cached", "--name-only"]).is_empty());
         assert!(
             store
                 .git_launch_state_blocking(project.id, "uncommitted-run")
