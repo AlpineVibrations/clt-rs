@@ -12,6 +12,16 @@ Keep the fail-closed boundary: this override must not cancel sealed `FINALIZING`
 
 The reference commit includes CLI/TUI handling, the transactional store operation, scheduler recovery protection, documentation, and tests for idle acceptance, live-owner/lease rejection, sealed-proof rejection, and the interrupted-board-move case.
 
+## Malformed active-worker index recovery
+
+Reference: master commit `ec4b456` (`Recover malformed active-worker index`).
+
+A registry restored through SQLite can contain the `agent_workers_active_project_unique` partial index with worker states written as double-quoted values. SQLite accepts those values as string literals, but Turso later interprets them as identifiers while maintaining the index and rejects worker reservation with `Parse error: no such column: dispatching`. Task discovery still succeeds, so without this recovery the daemon repeatedly acquires and releases the project lease without ever starting Codex.
+
+Keep the active-worker index definition canonical with single-quoted state values. Treat both the existing missing-index-entry signature and Turso's `no such column` errors for `dispatching`, `running`, or `finalizing` as evidence that this derived index must be rebuilt. Drop and recreate the index in an immediate transaction, run `PRAGMA integrity_check`, and retry the failed database operation only once.
+
+Apply that recovery wrapper to independent worker reservation as well as scheduler scanning. Do not release the scheduler lease before the rebuild and reservation retry complete; release it through the existing failure path only if recovery still fails. Preserve regression coverage for the malformed-index error, the existing index-corruption signature, unrelated-error rejection, and daemon-to-independent-worker dispatch.
+
 ## Rebuildable Turso agent registry
 
 After the recovery refactor is complete, make Turso shared-WAL failures recoverable instead of allowing an ownership panic to disable the agent workflow. CLT is staying on Turso, but the agent registry should be treated as rebuildable runtime state rather than an irreplaceable source of truth. The task boards and Git repositories remain authoritative for work and completed code.
