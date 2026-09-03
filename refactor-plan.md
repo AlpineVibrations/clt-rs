@@ -1,6 +1,6 @@
 # CLT Refactor Design/Build Plan
 
-Status: Stage A in progress; Phases 0–7 are complete and Phases 8–14 remain queued
+Status: Stage A in progress; Phases 0–8 are complete and Phases 9–14 remain queued
 
 ## Early work already present
 
