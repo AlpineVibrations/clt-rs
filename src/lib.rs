@@ -1293,7 +1293,7 @@ mod tests {
 
         let message = reorder_selected_tui_task(
             &board_dir,
-            "todo",
+            TaskStatus::Todo,
             &mut state,
             TuiTaskReorderDirection::Down,
         );
@@ -1305,8 +1305,12 @@ mod tests {
             vec!["- beta", "- alpha"]
         );
 
-        let message =
-            reorder_selected_tui_task(&board_dir, "todo", &mut state, TuiTaskReorderDirection::Up);
+        let message = reorder_selected_tui_task(
+            &board_dir,
+            TaskStatus::Todo,
+            &mut state,
+            TuiTaskReorderDirection::Up,
+        );
 
         assert_eq!(message, "Moved task up to position 1");
         assert_eq!(state.selected(), Some(0));
@@ -1765,15 +1769,20 @@ mod tests {
         ]);
 
         assert_eq!(
-            task_display_text_with_agent_flag(&running, "doing", &session_states),
+            task_display_text_with_agent_flag(&running, TaskStatus::Doing, &session_states),
             "running task"
         );
         assert_eq!(
-            task_tui_display_text_with_agent_flag(&stopped, "doing", true, &session_states),
+            task_tui_display_text_with_agent_flag(
+                &stopped,
+                TaskStatus::Doing,
+                true,
+                &session_states
+            ),
             "[STOPPED] stopped task"
         );
         assert_eq!(
-            task_display_text_with_agent_flag(&stopped, "done", &session_states),
+            task_display_text_with_agent_flag(&stopped, TaskStatus::Done, &session_states),
             "stopped task"
         );
     }
@@ -1818,7 +1827,9 @@ mod tests {
         )
         .unwrap();
         let board_dir = root.join("tasks");
-        let entry = read_task_entries(&board_dir, "done").unwrap().remove(0);
+        let entry = read_task_entries(&board_dir, TaskStatus::Done)
+            .unwrap()
+            .remove(0);
 
         assert_eq!(task_display_text(&entry), "original task");
         assert_eq!(task_full_display_text(&entry), "original task");
@@ -1827,7 +1838,7 @@ mod tests {
             "original task"
         );
 
-        update_task_in_board(&board_dir, "done", 1, "edited task").unwrap();
+        update_task_in_board(&board_dir, TaskStatus::Done, 1, "edited task").unwrap();
 
         assert_eq!(
             fs::read_to_string(root.join("tasks/done.md")).unwrap(),
@@ -1863,9 +1874,12 @@ mod tests {
         let done_path = root.join("tasks/done/0001-finished-task.md");
         fs::write(&done_path, "Finished task.\n\nCompletion details.\n").unwrap();
         let board_dir = root.join("tasks");
-        let entry = read_task_entries(&board_dir, "done").unwrap().remove(0);
+        let entry = read_task_entries(&board_dir, TaskStatus::Done)
+            .unwrap()
+            .remove(0);
 
-        let content = attach_codex_session_to_task(&root, "done", &entry, "session-456").unwrap();
+        let content =
+            attach_codex_session_to_task(&root, TaskStatus::Done, &entry, "session-456").unwrap();
 
         assert_eq!(
             content,
@@ -1875,14 +1889,22 @@ mod tests {
             fs::read_to_string(&done_path).unwrap(),
             "Finished task.\n\nCompletion details. codex:session-456\n"
         );
-        let entry = read_task_entries(&board_dir, "done").unwrap().remove(0);
+        let entry = read_task_entries(&board_dir, TaskStatus::Done)
+            .unwrap()
+            .remove(0);
         assert_eq!(task_display_text(&entry), "Finished task.");
         assert_eq!(
             task_full_display_text(&entry),
             "Finished task. Completion details."
         );
 
-        update_task_in_board(&board_dir, "done", 1, "Edited task.\n\nNew details.").unwrap();
+        update_task_in_board(
+            &board_dir,
+            TaskStatus::Done,
+            1,
+            "Edited task.\n\nNew details.",
+        )
+        .unwrap();
         assert_eq!(
             fs::read_to_string(&done_path).unwrap(),
             "Edited task.\n\nNew details. codex:session-456\n"
@@ -1902,7 +1924,9 @@ mod tests {
         )
         .unwrap();
         let board_dir = root.join("tasks");
-        let entry = read_task_entries(&board_dir, "done").unwrap().remove(0);
+        let entry = read_task_entries(&board_dir, TaskStatus::Done)
+            .unwrap()
+            .remove(0);
 
         assert_eq!(
             codex_session_for_task(&entry).as_deref(),
@@ -1911,7 +1935,7 @@ mod tests {
         assert_eq!(task_display_text(&entry), "Finished task.");
         update_task_in_board(
             &board_dir,
-            "done",
+            TaskStatus::Done,
             1,
             "Edited task.\n\nUpdated completion note.",
         )
@@ -1921,7 +1945,9 @@ mod tests {
             fs::read_to_string(&done_path).unwrap(),
             "Edited task.\n\nUpdated completion note. codex:session-456\n"
         );
-        let updated = read_task_entries(&board_dir, "done").unwrap().remove(0);
+        let updated = read_task_entries(&board_dir, TaskStatus::Done)
+            .unwrap()
+            .remove(0);
         assert_eq!(
             codex_session_id_from_task_content(&updated.content),
             Some("session-456")
@@ -1940,9 +1966,9 @@ mod tests {
         )
         .unwrap();
 
-        move_task(&root, "doing", "done", "1").unwrap();
+        move_task(&root, TaskStatus::Doing, TaskStatus::Done, "1").unwrap();
 
-        let done = read_task_entries(&get_tasks_dir(&root), "done")
+        let done = read_task_entries(&get_tasks_dir(&root), TaskStatus::Done)
             .unwrap()
             .remove(0);
         assert_eq!(
@@ -1959,21 +1985,23 @@ mod tests {
         init_tasks(&root, false).unwrap();
         let doing_path = root.join("tasks/doing.md");
         fs::write(&doing_path, "# Doing Tasks\n- original task\n").unwrap();
-        let stale = read_task_entries(&root.join("tasks"), "doing")
+        let stale = read_task_entries(&root.join("tasks"), TaskStatus::Doing)
             .unwrap()
             .remove(0);
         fs::write(&doing_path, "# Doing Tasks\n- concurrently edited task\n").unwrap();
 
-        assert!(attach_codex_session_to_task(&root, "doing", &stale, "session-123").is_err());
+        assert!(
+            attach_codex_session_to_task(&root, TaskStatus::Doing, &stale, "session-123").is_err()
+        );
         assert_eq!(
             fs::read_to_string(&doing_path).unwrap(),
             "# Doing Tasks\n- concurrently edited task\n"
         );
 
-        let fresh = read_task_entries(&root.join("tasks"), "doing")
+        let fresh = read_task_entries(&root.join("tasks"), TaskStatus::Doing)
             .unwrap()
             .remove(0);
-        attach_codex_session_to_task(&root, "doing", &fresh, "session-123").unwrap();
+        attach_codex_session_to_task(&root, TaskStatus::Doing, &fresh, "session-123").unwrap();
         assert_eq!(
             fs::read_to_string(&doing_path).unwrap(),
             "# Doing Tasks\n- concurrently edited task codex:session-123\n"
@@ -1988,21 +2016,23 @@ mod tests {
         init_tasks(&root, true).unwrap();
         let doing_path = root.join("tasks/doing/0001-active-task.md");
         fs::write(&doing_path, "Original task.\n").unwrap();
-        let stale = read_task_entries(&root.join("tasks"), "doing")
+        let stale = read_task_entries(&root.join("tasks"), TaskStatus::Doing)
             .unwrap()
             .remove(0);
         fs::write(&doing_path, "Concurrently edited task.\n").unwrap();
 
-        assert!(attach_codex_session_to_task(&root, "doing", &stale, "session-123").is_err());
+        assert!(
+            attach_codex_session_to_task(&root, TaskStatus::Doing, &stale, "session-123").is_err()
+        );
         assert_eq!(
             fs::read_to_string(&doing_path).unwrap(),
             "Concurrently edited task.\n"
         );
 
-        let fresh = read_task_entries(&root.join("tasks"), "doing")
+        let fresh = read_task_entries(&root.join("tasks"), TaskStatus::Doing)
             .unwrap()
             .remove(0);
-        attach_codex_session_to_task(&root, "doing", &fresh, "session-123").unwrap();
+        attach_codex_session_to_task(&root, TaskStatus::Doing, &fresh, "session-123").unwrap();
         assert_eq!(
             fs::read_to_string(&doing_path).unwrap(),
             "Concurrently edited task. codex:session-123\n"
@@ -2021,7 +2051,9 @@ mod tests {
             "# Doing Tasks\n- original task\n",
         )
         .unwrap();
-        let entry = read_task_entries(&board_dir, "doing").unwrap().remove(0);
+        let entry = read_task_entries(&board_dir, TaskStatus::Doing)
+            .unwrap()
+            .remove(0);
 
         let (marker_ready_tx, marker_ready_rx) = mpsc::channel();
         let (release_marker_tx, release_marker_rx) = mpsc::channel();
@@ -2029,7 +2061,7 @@ mod tests {
         let marker_thread = thread::spawn(move || {
             attach_codex_session_to_task_with_before_replace(
                 &marker_root,
-                "doing",
+                TaskStatus::Doing,
                 &entry,
                 "session-123",
                 move || {
@@ -2047,7 +2079,7 @@ mod tests {
         let edit_thread = thread::spawn(move || {
             update_task_in_board_with_contention_callback(
                 &edit_board_dir,
-                "doing",
+                TaskStatus::Doing,
                 1,
                 "edited task",
                 move || edit_contended_tx.send(()).unwrap(),
@@ -2080,7 +2112,9 @@ mod tests {
             "# Doing Tasks\n- original task\n",
         )
         .unwrap();
-        let entry = read_task_entries(&board_dir, "doing").unwrap().remove(0);
+        let entry = read_task_entries(&board_dir, TaskStatus::Doing)
+            .unwrap()
+            .remove(0);
 
         let (marker_ready_tx, marker_ready_rx) = mpsc::channel();
         let (release_marker_tx, release_marker_rx) = mpsc::channel();
@@ -2088,7 +2122,7 @@ mod tests {
         let marker_thread = thread::spawn(move || {
             attach_codex_session_to_task_with_before_replace(
                 &marker_root,
-                "doing",
+                TaskStatus::Doing,
                 &entry,
                 "session-123",
                 move || {
@@ -2106,8 +2140,8 @@ mod tests {
         let move_thread = thread::spawn(move || {
             move_task_in_board_with_contention_callback(
                 &move_board_dir,
-                "doing",
-                "done",
+                TaskStatus::Doing,
+                TaskStatus::Done,
                 "1",
                 move || move_contended_tx.send(()).unwrap(),
             )
@@ -2121,8 +2155,12 @@ mod tests {
             move_contended.is_ok(),
             "task move did not wait for the in-flight marker attachment"
         );
-        assert!(read_task_entries(&board_dir, "doing").unwrap().is_empty());
-        let done = read_task_entries(&board_dir, "done").unwrap();
+        assert!(
+            read_task_entries(&board_dir, TaskStatus::Doing)
+                .unwrap()
+                .is_empty()
+        );
+        let done = read_task_entries(&board_dir, TaskStatus::Done).unwrap();
         assert_eq!(done.len(), 1);
         assert_eq!(
             codex_session_for_task(&done[0]).as_deref(),
@@ -2993,7 +3031,7 @@ mod tests {
             .unwrap();
         drop(store);
 
-        move_task(&project_root, "doing", "done", "1").unwrap();
+        move_task(&project_root, TaskStatus::Doing, TaskStatus::Done, "1").unwrap();
         let scheduled = run_agent_scheduler_pass(&state_dir, false, &[]).unwrap();
         assert_eq!(scheduled.jobs.len(), 1);
         assert_eq!(
@@ -4731,8 +4769,8 @@ mod tests {
     fn live_codex_session_is_attached_when_a_todo_task_enters_doing() {
         let root = temp_root("live-codex-session-link");
         add_task(&root, "existing todo", None).unwrap();
-        let before = task_contents_for_status(&root, "doing").unwrap();
-        move_task(&root, "todo", "doing", "1").unwrap();
+        let before = task_contents_for_status(&root, TaskStatus::Doing).unwrap();
+        move_task(&root, TaskStatus::Todo, TaskStatus::Doing, "1").unwrap();
 
         assert!(
             attach_codex_session_to_active_task(
@@ -4744,7 +4782,7 @@ mod tests {
             )
             .unwrap()
         );
-        let task = read_task_entries(&get_tasks_dir(&root), "doing")
+        let task = read_task_entries(&get_tasks_dir(&root), TaskStatus::Doing)
             .unwrap()
             .remove(0);
         assert_eq!(
@@ -4780,7 +4818,7 @@ mod tests {
             )
             .unwrap()
         );
-        let doing = read_task_entries(&get_tasks_dir(&root), "doing").unwrap();
+        let doing = read_task_entries(&get_tasks_dir(&root), TaskStatus::Doing).unwrap();
         assert_eq!(doing.len(), 1);
         assert!(codex_session_for_task(&doing[0]).is_none());
 
@@ -4821,14 +4859,14 @@ mod tests {
             blocked_task_snapshots_before: Vec::new(),
         };
 
-        let done = read_task_entries(&get_tasks_dir(&root), "done")
+        let done = read_task_entries(&get_tasks_dir(&root), TaskStatus::Done)
             .unwrap()
             .remove(0);
         assert_eq!(codex_session_for_task(&done).as_deref(), Some(session_id));
         attach_codex_session_after_run(&job, session_id, "success").unwrap();
         assert_eq!(
             task_status_for_codex_session(&root, session_id).unwrap(),
-            Some("done")
+            Some(TaskStatus::Done)
         );
         let scan = scan_agent_project(&root);
         assert_eq!(scan.available_todo_count(), 1);
@@ -4857,7 +4895,7 @@ mod tests {
             )
             .unwrap()
         );
-        let doing = read_task_entries(&get_tasks_dir(&root), "doing").unwrap();
+        let doing = read_task_entries(&get_tasks_dir(&root), TaskStatus::Doing).unwrap();
         assert!(codex_session_for_task(&doing[0]).is_none());
 
         let mut project = tui_agent_project_for_test(1, "project").project;
@@ -4899,7 +4937,7 @@ mod tests {
 
         assert_eq!(
             task_status_for_codex_session(&root, "session-live").unwrap(),
-            Some("done")
+            Some(TaskStatus::Done)
         );
         assert!(
             attach_codex_session_to_active_task(
@@ -4931,7 +4969,7 @@ mod tests {
             "# Todo Tasks\n- blocked todo — BLOCKED 2026-08-25: waiting\n",
         )
         .unwrap();
-        let doing_before = task_contents_for_status(&root, "doing").unwrap();
+        let doing_before = task_contents_for_status(&root, TaskStatus::Doing).unwrap();
         let blocked_before = blocked_task_snapshots(&root).unwrap();
 
         assert!(
@@ -4944,7 +4982,7 @@ mod tests {
             )
             .unwrap()
         );
-        let doing = read_task_entries(&get_tasks_dir(&root), "doing").unwrap();
+        let doing = read_task_entries(&get_tasks_dir(&root), TaskStatus::Doing).unwrap();
         assert!(codex_session_for_task(&doing[0]).is_none());
 
         fs::remove_dir_all(root).unwrap();
@@ -5000,12 +5038,30 @@ mod tests {
             false,
         );
 
-        assert!(task_supports_interactive_codex_resume("done", &done));
-        assert!(task_supports_interactive_codex_resume("todo", &blocked));
-        assert!(task_supports_interactive_codex_resume("doing", &blocked));
-        assert!(task_supports_interactive_codex_resume("doing", &unblocked));
-        assert!(!task_supports_interactive_codex_resume("todo", &unblocked));
-        assert!(!task_supports_interactive_codex_resume("backlog", &blocked));
+        assert!(task_supports_interactive_codex_resume(
+            TaskStatus::Done,
+            &done
+        ));
+        assert!(task_supports_interactive_codex_resume(
+            TaskStatus::Todo,
+            &blocked
+        ));
+        assert!(task_supports_interactive_codex_resume(
+            TaskStatus::Doing,
+            &blocked
+        ));
+        assert!(task_supports_interactive_codex_resume(
+            TaskStatus::Doing,
+            &unblocked
+        ));
+        assert!(!task_supports_interactive_codex_resume(
+            TaskStatus::Todo,
+            &unblocked
+        ));
+        assert!(!task_supports_interactive_codex_resume(
+            TaskStatus::Backlog,
+            &blocked
+        ));
     }
 
     #[test]
@@ -5724,7 +5780,7 @@ mod tests {
         let log_view = selected_tui_task_log_view_for_path_at(
             &mut panel,
             &active_path,
-            "doing",
+            TaskStatus::Doing,
             &task,
             &state_dir,
         )
@@ -5740,7 +5796,7 @@ mod tests {
         let project_log_view = selected_tui_task_or_project_log_view_for_path_at(
             &mut panel,
             &active_path,
-            "doing",
+            TaskStatus::Doing,
             None,
             &state_dir,
         )
@@ -5753,7 +5809,7 @@ mod tests {
         let completed_view = selected_tui_task_log_view_for_path_at(
             &mut panel,
             &active_path,
-            "done",
+            TaskStatus::Done,
             &task,
             &state_dir,
         )
@@ -5852,7 +5908,7 @@ mod tests {
         let mut log_view = selected_tui_task_log_view_for_path_at(
             &mut panel,
             &project_root,
-            "done",
+            TaskStatus::Done,
             &first_task,
             &state_dir,
         )
@@ -5862,7 +5918,7 @@ mod tests {
         sync_open_tui_task_log_view_at(
             &mut panel,
             &project_root,
-            "done",
+            TaskStatus::Done,
             Some(&second_task),
             &mut log_view,
             &state_dir,
@@ -5873,7 +5929,7 @@ mod tests {
         sync_open_tui_task_log_view_at(
             &mut panel,
             &project_root,
-            "done",
+            TaskStatus::Done,
             None,
             &mut log_view,
             &state_dir,
@@ -6470,7 +6526,7 @@ mod tests {
         assert!(tasks_dir.join("todo").is_dir());
         assert!(tasks_dir.join("todo.md.bak").exists());
         assert!(tasks_dir.join("doing.md").exists());
-        let entries = read_task_entries(&tasks_dir, "todo").unwrap();
+        let entries = read_task_entries(&tasks_dir, TaskStatus::Todo).unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].summary, "first task");
         assert_eq!(entries[1].summary, "second task");
@@ -6482,7 +6538,7 @@ mod tests {
     fn expand_tasks_without_status_expands_all_statuses() {
         let root = temp_root("expand-all");
         add_task(&root, "todo task", None).unwrap();
-        move_task(&root, "todo", "doing", "1").unwrap();
+        move_task(&root, TaskStatus::Todo, TaskStatus::Doing, "1").unwrap();
 
         expand_tasks(&root, None).unwrap();
 
@@ -6504,11 +6560,11 @@ mod tests {
         add_task(&root, "Ship dashboard", Some("FEATURE".to_string())).unwrap();
         add_task(&root, "Keep sibling", None).unwrap();
         let tasks_dir = root.join("tasks");
-        let expected_parent = task_entry_at(&tasks_dir, "todo", 1).unwrap();
+        let expected_parent = task_entry_at(&tasks_dir, TaskStatus::Todo, 1).unwrap();
 
         let subtask_board = insert_subtask_in_board(
             &tasks_dir,
-            "todo",
+            TaskStatus::Todo,
             1,
             &expected_parent,
             "Draft dashboard spec",
@@ -6518,7 +6574,7 @@ mod tests {
 
         assert!(tasks_dir.join("todo").is_dir());
         assert!(tasks_dir.join("todo.md.bak").is_file());
-        let parent_entries = read_task_entries(&tasks_dir, "todo").unwrap();
+        let parent_entries = read_task_entries(&tasks_dir, TaskStatus::Todo).unwrap();
         assert_eq!(parent_entries.len(), 2);
         assert_eq!(parent_entries[0].summary, "Ship dashboard");
         assert_eq!(parent_entries[0].metadata.as_deref(), Some("FEATURE"));
@@ -6529,14 +6585,14 @@ mod tests {
             "Ship dashboard (FEATURE)\n"
         );
         assert_eq!(
-            read_tasks_in_board(&subtask_board, "todo").unwrap(),
+            read_tasks_in_board(&subtask_board, TaskStatus::Todo).unwrap(),
             vec!["- Draft dashboard spec (DOCS)"]
         );
 
-        let expected_parent = task_entry_at(&tasks_dir, "todo", 1).unwrap();
+        let expected_parent = task_entry_at(&tasks_dir, TaskStatus::Todo, 1).unwrap();
         let reused_board = insert_subtask_in_board(
             &tasks_dir,
-            "todo",
+            TaskStatus::Todo,
             1,
             &expected_parent,
             "Build dashboard",
@@ -6546,7 +6602,7 @@ mod tests {
 
         assert_eq!(reused_board, subtask_board);
         assert_eq!(
-            read_tasks_in_board(&subtask_board, "todo").unwrap(),
+            read_tasks_in_board(&subtask_board, TaskStatus::Todo).unwrap(),
             vec!["- Draft dashboard spec (DOCS)", "- Build dashboard"]
         );
 
@@ -6562,11 +6618,11 @@ mod tests {
         let parent_content =
             "Research the API. Keep detailed notes.\n\n- Audit callers\n- Draft rollout\n";
         fs::write(&parent_path, parent_content).unwrap();
-        let expected_parent = task_entry_at(&tasks_dir, "doing", 1).unwrap();
+        let expected_parent = task_entry_at(&tasks_dir, TaskStatus::Doing, 1).unwrap();
 
         let subtask_board = insert_subtask_in_board(
             &tasks_dir,
-            "doing",
+            TaskStatus::Doing,
             1,
             &expected_parent,
             "Audit callers",
@@ -6579,7 +6635,7 @@ mod tests {
             parent_content
         );
         assert_eq!(
-            read_tasks_in_board(&subtask_board, "todo").unwrap(),
+            read_tasks_in_board(&subtask_board, TaskStatus::Todo).unwrap(),
             vec!["- Audit callers"]
         );
         assert!(!tasks_dir.join("doing.md.bak").exists());
@@ -6592,12 +6648,12 @@ mod tests {
         let root = temp_root("insert-subtask-stale-parent");
         add_task(&root, "Original parent", None).unwrap();
         let tasks_dir = root.join("tasks");
-        let expected_parent = task_entry_at(&tasks_dir, "todo", 1).unwrap();
-        update_task_in_board(&tasks_dir, "todo", 1, "Changed parent").unwrap();
+        let expected_parent = task_entry_at(&tasks_dir, TaskStatus::Todo, 1).unwrap();
+        update_task_in_board(&tasks_dir, TaskStatus::Todo, 1, "Changed parent").unwrap();
 
         let error = insert_subtask_in_board(
             &tasks_dir,
-            "todo",
+            TaskStatus::Todo,
             1,
             &expected_parent,
             "Must not attach",
@@ -9052,7 +9108,7 @@ mod tests {
 
         move_task_to_done_with_agent_store(
             &project_root,
-            "doing",
+            TaskStatus::Doing,
             "1",
             &AutomatedAgentChildContext {
                 project_id: project.id,
@@ -10113,7 +10169,7 @@ mod tests {
         assert!(repair_thread.join().unwrap());
         assert!(!cancel_thread.join().unwrap());
         assert!(read_tasks(&project_root, "todo").unwrap().is_empty());
-        let doing = read_task_entries(&get_tasks_dir(&project_root), "doing").unwrap();
+        let doing = read_task_entries(&get_tasks_dir(&project_root), TaskStatus::Doing).unwrap();
         assert_eq!(doing.len(), 1);
         assert_eq!(doing[0].content, format!("{task} codex:{session_id}"));
         assert_eq!(
@@ -10322,7 +10378,7 @@ mod tests {
 
         assert!(repair_working_git_task_link(&store, &project_root, &finalization).unwrap());
         assert!(read_tasks(&project_root, "todo").unwrap().is_empty());
-        let doing = read_task_entries(&get_tasks_dir(&project_root), "doing").unwrap();
+        let doing = read_task_entries(&get_tasks_dir(&project_root), TaskStatus::Doing).unwrap();
         assert_eq!(doing.len(), 1);
         assert_eq!(doing[0].content, linked);
 
@@ -10333,7 +10389,7 @@ mod tests {
         .unwrap();
         assert!(repair_working_git_task_link(&store, &project_root, &finalization).unwrap());
         assert!(read_tasks(&project_root, "todo").unwrap().is_empty());
-        let doing = read_task_entries(&get_tasks_dir(&project_root), "doing").unwrap();
+        let doing = read_task_entries(&get_tasks_dir(&project_root), TaskStatus::Doing).unwrap();
         assert_eq!(doing.len(), 1);
         assert_eq!(doing[0].content, linked);
 
@@ -10391,7 +10447,7 @@ mod tests {
         run_test_git(&project_root, &["add", "feature.txt"]);
         move_task_to_done_with_agent_store(
             &project_root,
-            "doing",
+            TaskStatus::Doing,
             "1",
             &AutomatedAgentChildContext {
                 project_id: project.id,
@@ -10476,7 +10532,7 @@ mod tests {
         run_test_git(&project_root, &["add", "formatted.txt"]);
         move_task_to_done_with_agent_store(
             &project_root,
-            "doing",
+            TaskStatus::Doing,
             "1",
             &AutomatedAgentChildContext {
                 project_id: project.id,
@@ -10604,7 +10660,7 @@ mod tests {
 
         move_task_to_done_with_agent_store(
             &project_root,
-            "doing",
+            TaskStatus::Doing,
             "1",
             &AutomatedAgentChildContext {
                 project_id: project.id,
@@ -10710,7 +10766,7 @@ mod tests {
         run_test_git(&project_root, &["add", "feature.txt", "tasks/todo.md"]);
         let error = move_task_to_done_with_agent_store(
             &project_root,
-            "doing",
+            TaskStatus::Doing,
             "1",
             &AutomatedAgentChildContext {
                 project_id: project.id,
@@ -10750,7 +10806,7 @@ mod tests {
             .unwrap()
         );
         assert!(read_tasks(&root, "doing").unwrap().is_empty());
-        let done = read_task_entries(&root.join("tasks"), "done").unwrap();
+        let done = read_task_entries(&root.join("tasks"), TaskStatus::Done).unwrap();
         assert_eq!(done.len(), 1);
         assert_eq!(done[0].content, content);
 
@@ -10785,7 +10841,7 @@ mod tests {
             .unwrap()
         );
         assert!(read_tasks(&root, "doing").unwrap().is_empty());
-        let done = read_task_entries(&root.join("tasks"), "done").unwrap();
+        let done = read_task_entries(&root.join("tasks"), TaskStatus::Done).unwrap();
         assert_eq!(done.len(), 1);
         assert_eq!(done[0].content.trim_end(), content);
         assert!(matches!(
@@ -10812,10 +10868,10 @@ mod tests {
         let unrelated = root.join("tasks/done/0007-unrelated.md");
         fs::write(&unrelated, "Unrelated completed task\n").unwrap();
 
-        let error = move_agent_git_task_in_board_with_after_destination(
+        let error = move_task_without_reordering_with_after_destination(
             &root.join("tasks"),
-            "doing",
-            "done",
+            TaskStatus::Doing,
+            TaskStatus::Done,
             1,
             || anyhow::bail!("simulated crash after destination publication"),
         )
@@ -10989,7 +11045,7 @@ mod tests {
         run_test_git(&project_root, &["add", "publish.txt"]);
         move_task_to_done_with_agent_store(
             &project_root,
-            "doing",
+            TaskStatus::Doing,
             "1",
             &AutomatedAgentChildContext {
                 project_id: project.id,
@@ -11184,7 +11240,7 @@ mod tests {
         run_test_git(&project_root, &["add", "local-only.txt"]);
         move_task_to_done_with_agent_store(
             &project_root,
-            "doing",
+            TaskStatus::Doing,
             "1",
             &AutomatedAgentChildContext {
                 project_id: project.id,
@@ -11372,7 +11428,7 @@ mod tests {
         fs::write(project_root.join("source.txt"), "after\n").unwrap();
         let error = move_task_to_done_with_agent_store(
             &project_root,
-            "doing",
+            TaskStatus::Doing,
             "1",
             &AutomatedAgentChildContext {
                 project_id: project.id,
@@ -11604,13 +11660,13 @@ mod tests {
             run_test_git(&project_root, &["rev-parse", "HEAD"]),
             starting_head
         );
-        move_task(&project_root, "todo", "doing", "2").unwrap();
-        let task_b = read_task_entries(&get_tasks_dir(&project_root), "doing")
+        move_task(&project_root, TaskStatus::Todo, TaskStatus::Doing, "2").unwrap();
+        let task_b = read_task_entries(&get_tasks_dir(&project_root), TaskStatus::Doing)
             .unwrap()
             .remove(0);
         attach_codex_session_to_task_after_lock(
             &project_root,
-            "doing",
+            TaskStatus::Doing,
             &task_b,
             "session-b",
             || {},
@@ -11635,7 +11691,7 @@ mod tests {
         run_test_git(&project_root, &["add", "--all"]);
         move_task_to_done_with_agent_store(
             &project_root,
-            "doing",
+            TaskStatus::Doing,
             "1",
             &AutomatedAgentChildContext {
                 project_id: project.id,
@@ -12618,7 +12674,7 @@ mod tests {
         run_test_git(&project_root, &["add", "durable.txt"]);
         move_task_to_done_with_agent_store(
             &project_root,
-            "doing",
+            TaskStatus::Doing,
             "1",
             &AutomatedAgentChildContext {
                 project_id: project.id,
@@ -14120,7 +14176,7 @@ mod tests {
         let root = temp_root("agent-scan-markdown");
         add_task(&root, "agent should run", None).unwrap();
         add_task(&root, "agent is running this", None).unwrap();
-        move_task(&root, "todo", "doing", "2").unwrap();
+        move_task(&root, TaskStatus::Todo, TaskStatus::Doing, "2").unwrap();
 
         let scan = scan_agent_project(&root);
 
@@ -14254,7 +14310,7 @@ mod tests {
     fn agent_scan_does_not_treat_backlog_as_actionable_work() {
         let root = temp_root("agent-scan-backlog");
         add_task(&root, "not ready for an agent", None).unwrap();
-        move_task(&root, "todo", "backlog", "1").unwrap();
+        move_task(&root, TaskStatus::Todo, TaskStatus::Backlog, "1").unwrap();
 
         let scan = scan_agent_project(&root);
 
@@ -15097,7 +15153,7 @@ mod tests {
         let project_root = root.join("project");
         init_tasks(&project_root, false).unwrap();
         add_task(&project_root, "interrupted task", None).unwrap();
-        move_task(&project_root, "todo", "doing", "1").unwrap();
+        move_task(&project_root, TaskStatus::Todo, TaskStatus::Doing, "1").unwrap();
         let project_root = fs::canonicalize(project_root).unwrap();
         let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
         store
@@ -15140,7 +15196,7 @@ mod tests {
         let project_root = root.join("project");
         init_tasks(&project_root, false).unwrap();
         add_task(&project_root, "expired interrupted task", None).unwrap();
-        move_task(&project_root, "todo", "doing", "1").unwrap();
+        move_task(&project_root, TaskStatus::Todo, TaskStatus::Doing, "1").unwrap();
         let project_root = fs::canonicalize(project_root).unwrap();
         let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
         store
@@ -15328,15 +15384,15 @@ mod tests {
 
         let mut start = run_agent_scheduler_pass(&state_dir, false, &[]).unwrap();
         assert_eq!(start.jobs.len(), 1);
-        move_task(&project_root, "todo", "doing", "1").unwrap();
-        move_task(&project_root, "doing", "done", "1").unwrap();
+        move_task(&project_root, TaskStatus::Todo, TaskStatus::Doing, "1").unwrap();
+        move_task(&project_root, TaskStatus::Doing, TaskStatus::Done, "1").unwrap();
 
         let mut runner = FakeAgentRunner::new(&state_dir, "success");
         runner.result.codex_session_id = Some("session-for-task".to_string());
         let shutdown = new_agent_shutdown_signal();
         run_agent_job(start.jobs.pop().unwrap(), &runner, &shutdown).unwrap();
 
-        let done_task = read_task_entries(&get_tasks_dir(&project_root), "done")
+        let done_task = read_task_entries(&get_tasks_dir(&project_root), TaskStatus::Done)
             .unwrap()
             .remove(0);
         assert_eq!(done_task.content, "resumable task codex:session-for-task");
@@ -15380,8 +15436,8 @@ mod tests {
         drop(store);
 
         let mut start = run_agent_scheduler_pass(&state_dir, false, &[]).unwrap();
-        move_task(&project_root, "todo", "doing", "1").unwrap();
-        move_task(&project_root, "doing", "done", "1").unwrap();
+        move_task(&project_root, TaskStatus::Todo, TaskStatus::Doing, "1").unwrap();
+        move_task(&project_root, TaskStatus::Doing, TaskStatus::Done, "1").unwrap();
         let done_path = project_root.join("tasks/done.md");
         let mut permissions = fs::metadata(&done_path).unwrap().permissions();
         permissions.set_mode(0o444);
@@ -15430,7 +15486,7 @@ mod tests {
 
         let mut start = run_agent_scheduler_pass(&state_dir, false, &[]).unwrap();
         assert_eq!(start.jobs.len(), 1);
-        move_task(&project_root, "todo", "doing", "1").unwrap();
+        move_task(&project_root, TaskStatus::Todo, TaskStatus::Doing, "1").unwrap();
         let blocked_content = "resumable blocker — BLOCKED 2026-08-13: dependency unavailable";
         fs::write(
             project_root.join("tasks/doing.md"),
@@ -15443,7 +15499,7 @@ mod tests {
         let shutdown = new_agent_shutdown_signal();
         run_agent_job(start.jobs.pop().unwrap(), &runner, &shutdown).unwrap();
 
-        let blocked_task = read_task_entries(&get_tasks_dir(&project_root), "doing")
+        let blocked_task = read_task_entries(&get_tasks_dir(&project_root), TaskStatus::Doing)
             .unwrap()
             .remove(0);
         assert_eq!(
@@ -15663,7 +15719,7 @@ mod tests {
         let state_dir = root.join("state/clt");
         let project_root = root.join("project");
         add_task(&project_root, "interrupted task", None).unwrap();
-        move_task(&project_root, "todo", "doing", "1").unwrap();
+        move_task(&project_root, TaskStatus::Todo, TaskStatus::Doing, "1").unwrap();
         let project_root = fs::canonicalize(project_root).unwrap();
         let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
         store
@@ -18794,7 +18850,7 @@ exit 0
             while !started_marker.exists() && Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(10));
             }
-            move_task(&move_root, "todo", "doing", "1").unwrap();
+            move_task(&move_root, TaskStatus::Todo, TaskStatus::Doing, "1").unwrap();
         });
         let runner =
             CodexAgentRunner::with_command(state_dir.clone(), Duration::from_secs(5), fake_codex);
@@ -18812,7 +18868,7 @@ exit 0
         move_thread.join().unwrap();
 
         assert_eq!(result.codex_session_id.as_deref(), Some("session-live"));
-        let task = read_task_entries(&get_tasks_dir(&project_root), "doing")
+        let task = read_task_entries(&get_tasks_dir(&project_root), TaskStatus::Doing)
             .unwrap()
             .remove(0);
         assert_eq!(
@@ -19060,7 +19116,9 @@ exit 0
         let root = temp_root("move");
 
         add_task(&root, "ship the fix", None).unwrap();
-        move_task(&root, "todo", "doing", "1").unwrap();
+        ManagedTaskWorkflow::new(&root)
+            .move_task(TaskStatus::Todo, TaskStatus::Doing, "1")
+            .unwrap();
 
         let todo = fs::read_to_string(root.join("tasks/todo.md")).unwrap();
         let doing = fs::read_to_string(root.join("tasks/doing.md")).unwrap();
@@ -19072,18 +19130,68 @@ exit 0
     }
 
     #[test]
+    fn task_status_keeps_the_existing_serialized_names_and_order() {
+        assert_eq!(
+            TaskStatus::ALL.map(TaskStatus::as_str),
+            ["todo", "doing", "done", "backlog"]
+        );
+        assert_eq!(TaskStatus::parse_arg("0").unwrap(), TaskStatus::Backlog);
+        assert_eq!(TaskStatus::parse_arg("1").unwrap(), TaskStatus::Todo);
+        assert_eq!(TaskStatus::parse_arg("2").unwrap(), TaskStatus::Doing);
+        assert_eq!(TaskStatus::parse_arg("3").unwrap(), TaskStatus::Done);
+        assert_eq!(TaskStatus::Todo.filename(), "todo.md");
+        assert_eq!(TaskStatus::Doing.header(), "# Doing Tasks\n");
+    }
+
+    #[test]
+    fn task_board_exposes_typed_storage_operations() {
+        let root = temp_root("typed-task-board");
+        init_tasks(&root, false).unwrap();
+        let board = TaskBoard::for_project(&root);
+
+        board
+            .insert_content(TaskStatus::Todo, None, "typed task")
+            .unwrap();
+        let entry = board.entry(TaskStatus::Todo, 1).unwrap();
+
+        assert_eq!(entry.summary, "typed task");
+        assert!(board.entries(TaskStatus::Doing).unwrap().is_empty());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn task_module_has_no_agent_or_tui_dependencies() {
+        let source = include_str!("task.rs");
+        for forbidden in [
+            "use super::*",
+            "crate::agent",
+            "super::agent",
+            "agent::",
+            "crate::tui",
+            "super::tui",
+            "tui::",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "task.rs must not depend on {forbidden}"
+            );
+        }
+    }
+
+    #[test]
     fn move_task_supports_backlog_as_a_status() {
         let root = temp_root("move-backlog");
 
         add_task(&root, "consider this later", None).unwrap();
-        move_task(&root, "todo", "backlog", "1").unwrap();
+        move_task(&root, TaskStatus::Todo, TaskStatus::Backlog, "1").unwrap();
 
         assert!(read_tasks(&root, "todo").unwrap().is_empty());
         assert_eq!(
             read_tasks(&root, "backlog").unwrap(),
             vec!["- consider this later"]
         );
-        assert_eq!(normalize_status_arg("0").unwrap(), "backlog");
+        assert_eq!(normalize_status_arg("0").unwrap(), TaskStatus::Backlog);
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -19188,8 +19296,8 @@ exit 0
 
         add_task(&root, "older done task", None).unwrap();
         add_task(&root, "newer done task", None).unwrap();
-        move_task(&root, "todo", "done", "1").unwrap();
-        move_task(&root, "todo", "done", "1").unwrap();
+        move_task(&root, TaskStatus::Todo, TaskStatus::Done, "1").unwrap();
+        move_task(&root, TaskStatus::Todo, TaskStatus::Done, "1").unwrap();
 
         let done = fs::read_to_string(root.join("tasks/done.md")).unwrap();
 
@@ -19266,7 +19374,7 @@ exit 0
         )
         .unwrap();
 
-        move_task_to_archive_in_board(&tasks_dir, "todo", "1").unwrap();
+        move_task_to_archive_in_board(&tasks_dir, TaskStatus::Todo, "1").unwrap();
 
         assert!(
             directory_task_paths(&tasks_dir.join("todo"))
@@ -19294,10 +19402,10 @@ exit 0
         )
         .unwrap();
 
-        move_task(&root, "todo", "doing", "1").unwrap();
+        move_task(&root, TaskStatus::Todo, TaskStatus::Doing, "1").unwrap();
 
         assert!(directory_task_paths(&todo_dir).unwrap().is_empty());
-        let doing_entries = read_task_entries(&root.join("tasks"), "doing").unwrap();
+        let doing_entries = read_task_entries(&root.join("tasks"), TaskStatus::Doing).unwrap();
         assert_eq!(doing_entries.len(), 1);
         assert_eq!(doing_entries[0].summary, "Research the API migration.");
         assert!(doing_entries[0].content.contains("Audit callers"));
@@ -19321,11 +19429,11 @@ exit 0
         )
         .unwrap();
 
-        move_task(&root, "todo", "doing", "1").unwrap();
+        move_task(&root, TaskStatus::Todo, TaskStatus::Doing, "1").unwrap();
 
         assert!(tasks_dir.join("doing").is_dir());
         assert!(tasks_dir.join("doing.md.bak").exists());
-        let doing_entries = read_task_entries(&tasks_dir, "doing").unwrap();
+        let doing_entries = read_task_entries(&tasks_dir, TaskStatus::Doing).unwrap();
         assert_eq!(doing_entries.len(), 2);
         assert!(
             doing_entries
@@ -19351,13 +19459,13 @@ exit 0
         fs::write(epic_dir.join("doing.md"), "# Doing Tasks\n").unwrap();
         fs::write(epic_dir.join("done.md"), "# Done Tasks\n").unwrap();
 
-        let entries = read_task_entries(&root.join("tasks"), "doing").unwrap();
+        let entries = read_task_entries(&root.join("tasks"), TaskStatus::Doing).unwrap();
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].summary, "Ship epic.");
         assert!(entries[0].has_subtasks);
         assert_eq!(
-            read_tasks_in_board(&epic_dir, "todo").unwrap(),
+            read_tasks_in_board(&epic_dir, TaskStatus::Todo).unwrap(),
             vec!["- draft spec"]
         );
 
@@ -19415,8 +19523,14 @@ exit 0
 
         let mut state = ListState::default();
         state.select(Some(1));
-        insert_task_at_selection_in_board(&root.join("tasks"), "todo", &state, "new task", None)
-            .unwrap();
+        insert_task_at_selection_in_board(
+            &root.join("tasks"),
+            TaskStatus::Todo,
+            &state,
+            "new task",
+            None,
+        )
+        .unwrap();
 
         assert_eq!(
             read_tasks(&root, "todo").unwrap(),
@@ -19441,8 +19555,14 @@ exit 0
 
         let mut state = ListState::default();
         state.select(Some(1));
-        insert_task_at_selection_in_board(&root.join("tasks"), "todo", &state, "new task", None)
-            .unwrap();
+        insert_task_at_selection_in_board(
+            &root.join("tasks"),
+            TaskStatus::Todo,
+            &state,
+            "new task",
+            None,
+        )
+        .unwrap();
 
         assert_eq!(
             read_tasks(&root, "todo").unwrap(),

@@ -1,14 +1,85 @@
 use anyhow::{Context, Result};
 use std::{
     ffi::OsStr,
-    fs,
+    fmt, fs,
     io::Write,
     path::{Path, PathBuf},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-pub(super) const TASK_STATUSES: [&str; 4] = ["todo", "doing", "done", "backlog"];
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) enum TaskStatus {
+    Todo,
+    Doing,
+    Done,
+    Backlog,
+}
+
+impl TaskStatus {
+    pub(super) const ALL: [Self; 4] = [Self::Todo, Self::Doing, Self::Done, Self::Backlog];
+    pub(super) const SESSION_SEARCH_ORDER: [Self; 4] =
+        [Self::Doing, Self::Todo, Self::Backlog, Self::Done];
+
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Todo => "todo",
+            Self::Doing => "doing",
+            Self::Done => "done",
+            Self::Backlog => "backlog",
+        }
+    }
+
+    pub(super) const fn filename(self) -> &'static str {
+        match self {
+            Self::Todo => "todo.md",
+            Self::Doing => "doing.md",
+            Self::Done => "done.md",
+            Self::Backlog => "backlog.md",
+        }
+    }
+
+    pub(super) const fn header(self) -> &'static str {
+        match self {
+            Self::Todo => "# To Do Tasks\n",
+            Self::Doing => "# Doing Tasks\n",
+            Self::Done => "# Done Tasks\n",
+            Self::Backlog => "# Backlog Tasks\n",
+        }
+    }
+
+    pub(super) fn parse(value: &str) -> Result<Self> {
+        match value {
+            "backlog" => Ok(Self::Backlog),
+            "todo" => Ok(Self::Todo),
+            "doing" => Ok(Self::Doing),
+            "done" => Ok(Self::Done),
+            _ => anyhow::bail!("Invalid status. Use 'backlog', 'todo', 'doing', or 'done'."),
+        }
+    }
+
+    pub(super) fn parse_arg(value: &str) -> Result<Self> {
+        match value {
+            "0" => Ok(Self::Backlog),
+            "1" => Ok(Self::Todo),
+            "2" => Ok(Self::Doing),
+            "3" => Ok(Self::Done),
+            value => Self::parse(value),
+        }
+    }
+
+    pub(super) const fn is_active(self) -> bool {
+        matches!(self, Self::Todo | Self::Doing)
+    }
+}
+
+impl fmt::Display for TaskStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+pub(super) const TASK_STATUSES: [TaskStatus; 4] = TaskStatus::ALL;
 pub(super) const TASK_DETAIL_FILES: [&str; 3] = ["task.md", "README.md", "index.md"];
 const ARCHIVE_STATUS_CANDIDATES: [&str; 2] = ["archived", "archive"];
 const BOARD_MUTATION_LOCK_TIMEOUT_MILLIS: u64 = 10_000;
@@ -36,13 +107,101 @@ pub(super) enum StatusStore {
     Directory(PathBuf),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct TaskBoard {
+    directory: PathBuf,
+}
+
+impl TaskBoard {
+    pub(super) fn new(directory: impl Into<PathBuf>) -> Self {
+        Self {
+            directory: directory.into(),
+        }
+    }
+
+    pub(super) fn for_project(root: &Path) -> Self {
+        Self::new(get_tasks_dir(root))
+    }
+
+    pub(super) fn path(&self) -> &Path {
+        &self.directory
+    }
+
+    pub(super) fn entries(&self, status: TaskStatus) -> Result<Vec<TaskEntry>> {
+        read_task_entries(self.path(), status)
+    }
+
+    pub(super) fn entry(&self, status: TaskStatus, task_index: usize) -> Result<TaskEntry> {
+        task_entry_at(self.path(), status, task_index)
+    }
+
+    pub(super) fn status_store(&self, status: TaskStatus) -> Result<StatusStore> {
+        get_status_store(self.path(), status)
+    }
+
+    pub(super) fn insert_content(
+        &self,
+        status: TaskStatus,
+        index: Option<usize>,
+        content: &str,
+    ) -> Result<()> {
+        insert_task_content(self.path(), status, index, content)
+    }
+
+    pub(super) fn remove_entry(&self, status: TaskStatus, entry: &TaskEntry) -> Result<()> {
+        remove_task_entry(self.path(), status, entry)
+    }
+
+    pub(super) fn remove_entry_without_reordering(
+        &self,
+        status: TaskStatus,
+        entry: &TaskEntry,
+    ) -> Result<()> {
+        remove_task_entry_without_reordering(self.path(), status, entry)
+    }
+
+    pub(super) fn write_entry_content(
+        &self,
+        status: TaskStatus,
+        entry: &TaskEntry,
+        content: &str,
+    ) -> Result<()> {
+        write_task_entry_content(self.path(), status, entry, content)
+    }
+
+    pub(super) fn move_task_after_lock(
+        &self,
+        from: TaskStatus,
+        to: TaskStatus,
+        task_index: usize,
+    ) -> Result<()> {
+        move_task_in_board_after_lock(self.path(), from, to, task_index)
+    }
+
+    pub(super) fn move_task_without_reordering_after_lock(
+        &self,
+        from: TaskStatus,
+        to: TaskStatus,
+        task_index: usize,
+    ) -> Result<()> {
+        move_task_without_reordering_after_lock(self.path(), from, to, task_index)
+    }
+
+    pub(super) fn terminal_task_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<(TaskStatus, TaskEntry)>> {
+        terminal_task_for_codex_session_in_board(self.path(), session_id)
+    }
+}
+
 pub(super) enum ExpansionSummary {
     AlreadyDirectory {
-        status: &'static str,
+        status: TaskStatus,
         dir: PathBuf,
     },
     Expanded {
-        status: &'static str,
+        status: TaskStatus,
         dir: PathBuf,
         backup: PathBuf,
         task_count: usize,
@@ -222,52 +381,31 @@ pub(super) fn ensure_task_store(root: &Path) -> Result<()> {
     ensure_board_store(&get_tasks_dir(root))
 }
 
-pub(super) fn status_filename(status: &str) -> Result<&'static str> {
-    match status {
-        "backlog" => Ok("backlog.md"),
-        "todo" => Ok("todo.md"),
-        "doing" => Ok("doing.md"),
-        "done" => Ok("done.md"),
-        _ => anyhow::bail!("Invalid status. Use 'backlog', 'todo', 'doing', or 'done'."),
-    }
+pub(super) fn status_filename(status: TaskStatus) -> &'static str {
+    status.filename()
 }
 
-pub(super) fn normalize_status_arg(status: &str) -> Result<&'static str> {
-    match status {
-        "0" | "backlog" => Ok("backlog"),
-        "1" | "todo" => Ok("todo"),
-        "2" | "doing" => Ok("doing"),
-        "3" | "done" => Ok("done"),
-        _ => anyhow::bail!("Invalid status. Use 'backlog', 'todo', 'doing', or 'done'."),
-    }
+pub(super) fn normalize_status_arg(status: &str) -> Result<TaskStatus> {
+    TaskStatus::parse_arg(status)
 }
 
-pub(super) fn status_header(status: &str) -> Result<&'static str> {
-    match status {
-        "backlog" => Ok("# Backlog Tasks\n"),
-        "todo" => Ok("# To Do Tasks\n"),
-        "doing" => Ok("# Doing Tasks\n"),
-        "done" => Ok("# Done Tasks\n"),
-        _ => anyhow::bail!("Invalid status. Use 'backlog', 'todo', 'doing', or 'done'."),
-    }
+pub(super) fn status_header(status: TaskStatus) -> &'static str {
+    status.header()
 }
 
-pub(super) fn status_store_exists(board_dir: &Path, status: &str) -> bool {
-    board_dir.join(status).is_dir()
-        || status_filename(status)
-            .map(|filename| board_dir.join(filename).is_file())
-            .unwrap_or(false)
+pub(super) fn status_store_exists(board_dir: &Path, status: TaskStatus) -> bool {
+    board_dir.join(status.as_str()).is_dir() || board_dir.join(status.filename()).is_file()
 }
 
 pub(super) fn ensure_board_store(board_dir: &Path) -> Result<()> {
     fs::create_dir_all(board_dir).context("Failed to create tasks directory")?;
     let directory_mode = TASK_STATUSES
         .iter()
-        .any(|status| board_dir.join(status).is_dir());
+        .any(|status| board_dir.join(status.as_str()).is_dir());
 
     for status in TASK_STATUSES {
-        let dir_path = board_dir.join(status);
-        let file_path = board_dir.join(status_filename(status)?);
+        let dir_path = board_dir.join(status.as_str());
+        let file_path = board_dir.join(status_filename(status));
         if dir_path.is_dir() || file_path.exists() {
             continue;
         }
@@ -276,7 +414,7 @@ pub(super) fn ensure_board_store(board_dir: &Path) -> Result<()> {
             fs::create_dir_all(&dir_path)
                 .context(format!("Failed to create directory {:?}", dir_path))?;
         } else {
-            fs::write(&file_path, status_header(status)?)
+            fs::write(&file_path, status_header(status))
                 .context(format!("Failed to create file {:?}", file_path))?;
         }
     }
@@ -284,17 +422,16 @@ pub(super) fn ensure_board_store(board_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn get_status_store(board_dir: &Path, status: &str) -> Result<StatusStore> {
-    status_filename(status)?;
+pub(super) fn get_status_store(board_dir: &Path, status: TaskStatus) -> Result<StatusStore> {
     ensure_board_store(board_dir)?;
 
-    let dir_path = board_dir.join(status);
+    let dir_path = board_dir.join(status.as_str());
     if dir_path.is_dir() {
         return Ok(StatusStore::Directory(dir_path));
     }
 
     Ok(StatusStore::MarkdownFile(
-        board_dir.join(status_filename(status)?),
+        board_dir.join(status_filename(status)),
     ))
 }
 
@@ -328,7 +465,7 @@ pub(super) fn get_or_create_archive_status_store(board_dir: &Path) -> Result<Sta
 // find_task_status is no longer needed for index-based referencing
 // as the user must specify the source list.
 
-pub(super) fn read_task_entries(board_dir: &Path, status: &str) -> Result<Vec<TaskEntry>> {
+pub(super) fn read_task_entries(board_dir: &Path, status: TaskStatus) -> Result<Vec<TaskEntry>> {
     match get_status_store(board_dir, status)? {
         StatusStore::MarkdownFile(path) => read_markdown_entries(&path),
         StatusStore::Directory(path) => read_directory_entries(&path),
@@ -417,7 +554,7 @@ pub(super) fn task_entry_from_text(
 pub(super) fn board_has_any_status_store(board_dir: &Path) -> bool {
     TASK_STATUSES
         .iter()
-        .any(|status| status_store_exists(board_dir, status))
+        .any(|status| status_store_exists(board_dir, *status))
 }
 
 pub(super) fn directory_task_paths(path: &Path) -> Result<Vec<PathBuf>> {
@@ -751,7 +888,7 @@ pub(super) fn parse_one_based_task_index(task_index_str: &str) -> Result<usize> 
 
 pub(super) fn task_entry_at(
     board_dir: &Path,
-    status: &str,
+    status: TaskStatus,
     task_index: usize,
 ) -> Result<TaskEntry> {
     let entries = read_task_entries(board_dir, status)?;
@@ -898,12 +1035,17 @@ pub(super) fn cleanup_clt_atomic_task_temporaries_in_directory(path: &Path) -> R
 pub(super) fn cleanup_clt_atomic_task_temporaries(board_dir: &Path) -> Result<usize> {
     let mut removed = cleanup_clt_atomic_task_temporaries_in_directory(board_dir)?;
     for status in TASK_STATUSES {
-        removed += cleanup_clt_atomic_task_temporaries_in_directory(&board_dir.join(status))?;
+        removed +=
+            cleanup_clt_atomic_task_temporaries_in_directory(&board_dir.join(status.as_str()))?;
     }
     Ok(removed)
 }
 
-pub(super) fn remove_task_entry(board_dir: &Path, status: &str, entry: &TaskEntry) -> Result<()> {
+pub(super) fn remove_task_entry(
+    board_dir: &Path,
+    status: TaskStatus,
+    entry: &TaskEntry,
+) -> Result<()> {
     match &entry.source {
         TaskSource::MarkdownLine { line_index } => {
             let StatusStore::MarkdownFile(path) = get_status_store(board_dir, status)? else {
@@ -937,9 +1079,9 @@ pub(super) fn remove_task_entry(board_dir: &Path, status: &str, entry: &TaskEntr
     Ok(())
 }
 
-pub(super) fn remove_agent_git_task_entry_without_reordering(
+pub(super) fn remove_task_entry_without_reordering(
     board_dir: &Path,
-    status: &str,
+    status: TaskStatus,
     entry: &TaskEntry,
 ) -> Result<()> {
     match &entry.source {
@@ -980,7 +1122,7 @@ pub(super) fn content_with_metadata(description: &str, metadata: Option<String>)
 
 pub(super) fn insert_task_content(
     board_dir: &Path,
-    status: &str,
+    status: TaskStatus,
     index: Option<usize>,
     content: &str,
 ) -> Result<()> {
@@ -1028,7 +1170,7 @@ pub(super) fn insert_content_into_directory(
     insert_content_into_directory_with_before_publish(path, index, content, |_| Ok(()))
 }
 
-pub(super) fn insert_agent_git_content_into_directory(
+pub(super) fn insert_content_into_directory_without_reordering(
     path: &Path,
     content: &str,
 ) -> Result<PathBuf> {
@@ -1321,7 +1463,7 @@ pub(super) fn move_path_into_directory(
     Ok(dest_path)
 }
 
-pub(super) fn move_agent_git_path_into_directory_without_reordering(
+pub(super) fn move_path_into_directory_without_reordering(
     source_path: &Path,
     dest_dir: &Path,
 ) -> Result<PathBuf> {
@@ -1354,7 +1496,7 @@ pub(super) fn move_agent_git_path_into_directory_without_reordering(
 
 pub(super) fn write_task_entry_content(
     board_dir: &Path,
-    status: &str,
+    status: TaskStatus,
     entry: &TaskEntry,
     content: &str,
 ) -> Result<()> {
@@ -1363,7 +1505,7 @@ pub(super) fn write_task_entry_content(
 
 pub(super) fn write_task_entry_content_with_before_replace(
     board_dir: &Path,
-    status: &str,
+    status: TaskStatus,
     entry: &TaskEntry,
     content: &str,
     before_replace: impl FnOnce(),
@@ -1513,13 +1655,13 @@ pub(super) fn looks_like_metadata(value: &str) -> bool {
 }
 
 pub(super) fn add_task(root: &Path, description: &str, metadata: Option<String>) -> Result<String> {
-    insert_task(root, "todo", None, description, metadata)
+    insert_task(root, TaskStatus::Todo, None, description, metadata)
         .map(|_| "Task added successfully.".to_string())
 }
 
 pub(super) fn insert_task(
     root: &Path,
-    status: &str,
+    status: TaskStatus,
     index: Option<usize>,
     description: &str,
     metadata: Option<String>,
@@ -1529,7 +1671,7 @@ pub(super) fn insert_task(
 
 pub(super) fn insert_task_in_board(
     board_dir: &Path,
-    status: &str,
+    status: TaskStatus,
     index: Option<usize>,
     description: &str,
     metadata: Option<String>,
@@ -1541,10 +1683,10 @@ pub(super) fn insert_task_in_board(
 
 #[cfg(test)]
 pub(super) fn read_tasks(root: &Path, status: &str) -> Result<Vec<String>> {
-    read_tasks_in_board(&get_tasks_dir(root), status)
+    read_tasks_in_board(&get_tasks_dir(root), TaskStatus::parse(status)?)
 }
 
-pub(super) fn read_tasks_in_board(board_dir: &Path, status: &str) -> Result<Vec<String>> {
+pub(super) fn read_tasks_in_board(board_dir: &Path, status: TaskStatus) -> Result<Vec<String>> {
     Ok(read_task_entries(board_dir, status)?
         .iter()
         .map(|entry| format!("- {}", task_display_text(entry)))
@@ -1563,11 +1705,11 @@ pub(super) fn init_tasks(root: &Path, folders: bool) -> Result<()> {
     let directory_mode = folders
         || TASK_STATUSES
             .iter()
-            .any(|status| tasks_dir.join(status).is_dir());
+            .any(|status| tasks_dir.join(status.as_str()).is_dir());
 
     for status in TASK_STATUSES {
-        let dir_path = tasks_dir.join(status);
-        let file_path = tasks_dir.join(status_filename(status)?);
+        let dir_path = tasks_dir.join(status.as_str());
+        let file_path = tasks_dir.join(status_filename(status));
         if dir_path.is_dir() {
             println!("Directory already exists: {:?}", dir_path);
         } else if file_path.exists() {
@@ -1579,7 +1721,7 @@ pub(super) fn init_tasks(root: &Path, folders: bool) -> Result<()> {
         } else {
             let mut file = fs::File::create(&file_path)
                 .context(format!("Failed to create file {:?}", file_path))?;
-            file.write_all(status_header(status)?.as_bytes())
+            file.write_all(status_header(status).as_bytes())
                 .context(format!("Failed to write to file {:?}", file_path))?;
             println!("Created file: {:?}", file_path);
         }
@@ -1592,21 +1734,21 @@ pub(super) fn init_tasks(root: &Path, folders: bool) -> Result<()> {
 pub(super) fn task_status_for_codex_session_in_board(
     board_dir: &Path,
     session_id: &str,
-) -> Result<Option<&'static str>> {
+) -> Result<Option<TaskStatus>> {
     Ok(task_for_codex_session_in_board(board_dir, session_id)?.map(|(status, _)| status))
 }
 
 pub(super) fn task_for_codex_session_in_board(
     board_dir: &Path,
     session_id: &str,
-) -> Result<Option<(&'static str, TaskEntry)>> {
+) -> Result<Option<(TaskStatus, TaskEntry)>> {
     task_for_codex_session_in_board_matching(board_dir, session_id, true)
 }
 
 pub(super) fn terminal_task_for_codex_session_in_board(
     board_dir: &Path,
     session_id: &str,
-) -> Result<Option<(&'static str, TaskEntry)>> {
+) -> Result<Option<(TaskStatus, TaskEntry)>> {
     task_for_codex_session_in_board_matching(board_dir, session_id, false)
 }
 
@@ -1614,8 +1756,8 @@ pub(super) fn task_for_codex_session_in_board_matching(
     board_dir: &Path,
     session_id: &str,
     recover_displaced_marker: bool,
-) -> Result<Option<(&'static str, TaskEntry)>> {
-    for status in ["doing", "todo", "backlog", "done"] {
+) -> Result<Option<(TaskStatus, TaskEntry)>> {
+    for status in TaskStatus::SESSION_SEARCH_ORDER {
         let tasks = read_task_entries(board_dir, status)?;
         for task in tasks {
             let task_session_id = if recover_displaced_marker {
@@ -1641,13 +1783,13 @@ pub(super) fn task_for_codex_session_in_board_matching(
     Ok(None)
 }
 
-pub(super) fn convert_status_to_directory(board_dir: &Path, status: &str) -> Result<PathBuf> {
-    let dir_path = board_dir.join(status);
+pub(super) fn convert_status_to_directory(board_dir: &Path, status: TaskStatus) -> Result<PathBuf> {
+    let dir_path = board_dir.join(status.as_str());
     if dir_path.is_dir() {
         return Ok(dir_path);
     }
 
-    let file_path = board_dir.join(status_filename(status)?);
+    let file_path = board_dir.join(status_filename(status));
     fs::create_dir_all(&dir_path)
         .with_context(|| format!("Failed to create directory {:?}", dir_path))?;
 
@@ -1657,7 +1799,7 @@ pub(super) fn convert_status_to_directory(board_dir: &Path, status: &str) -> Res
             insert_content_into_directory(&dir_path, None, &entry.content)?;
         }
 
-        let backup_name = format!("{}.bak", status_filename(status)?);
+        let backup_name = format!("{}.bak", status_filename(status));
         let backup_path = unique_child_path(board_dir, &backup_name);
         fs::rename(&file_path, &backup_path).with_context(|| {
             format!(
@@ -1703,11 +1845,11 @@ pub(super) fn convert_archive_to_directory(archive_file: &Path) -> Result<PathBu
 
 pub(super) fn expand_status_for_command(
     board_dir: &Path,
-    status: &'static str,
+    status: TaskStatus,
 ) -> Result<ExpansionSummary> {
     ensure_board_store(board_dir)?;
 
-    let dir_path = board_dir.join(status);
+    let dir_path = board_dir.join(status.as_str());
     if dir_path.is_dir() {
         return Ok(ExpansionSummary::AlreadyDirectory {
             status,
@@ -1715,7 +1857,7 @@ pub(super) fn expand_status_for_command(
         });
     }
 
-    let file_path = board_dir.join(status_filename(status)?);
+    let file_path = board_dir.join(status_filename(status));
     let entries = read_markdown_entries(&file_path)?;
     let task_count = entries.len();
     fs::create_dir_all(&dir_path)
@@ -1725,7 +1867,7 @@ pub(super) fn expand_status_for_command(
         insert_content_into_directory(&dir_path, None, &entry.content)?;
     }
 
-    let backup_name = format!("{}.bak", status_filename(status)?);
+    let backup_name = format!("{}.bak", status_filename(status));
     let backup_path = unique_child_path(board_dir, &backup_name);
     fs::rename(&file_path, &backup_path).with_context(|| {
         format!(
@@ -1742,19 +1884,19 @@ pub(super) fn expand_status_for_command(
     })
 }
 
-pub(super) fn move_agent_git_task_in_board_after_lock(
+pub(super) fn move_task_without_reordering_after_lock(
     board_dir: &Path,
-    from: &str,
-    to: &str,
+    from: TaskStatus,
+    to: TaskStatus,
     task_index: usize,
 ) -> Result<()> {
-    move_agent_git_task_in_board_with_after_destination(board_dir, from, to, task_index, || Ok(()))
+    move_task_without_reordering_with_after_destination(board_dir, from, to, task_index, || Ok(()))
 }
 
-pub(super) fn move_agent_git_task_in_board_with_after_destination(
+pub(super) fn move_task_without_reordering_with_after_destination(
     board_dir: &Path,
-    from: &str,
-    to: &str,
+    from: TaskStatus,
+    to: TaskStatus,
     task_index: usize,
     after_destination: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
@@ -1762,7 +1904,7 @@ pub(super) fn move_agent_git_task_in_board_with_after_destination(
     let entry = task_entry_at(board_dir, from, task_index)?;
     match (&entry.source, get_status_store(board_dir, to)?) {
         (TaskSource::Path { path, .. }, StatusStore::Directory(dest_dir)) => {
-            move_agent_git_path_into_directory_without_reordering(path, &dest_dir)?;
+            move_path_into_directory_without_reordering(path, &dest_dir)?;
             after_destination()?;
         }
         (TaskSource::Path { .. }, StatusStore::MarkdownFile(_)) => {
@@ -1771,15 +1913,15 @@ pub(super) fn move_agent_git_task_in_board_with_after_destination(
             );
         }
         (TaskSource::MarkdownLine { .. }, StatusStore::Directory(dest_dir)) => {
-            insert_agent_git_content_into_directory(&dest_dir, &entry.content)?;
+            insert_content_into_directory_without_reordering(&dest_dir, &entry.content)?;
             after_destination()?;
-            remove_agent_git_task_entry_without_reordering(board_dir, from, &entry)?;
+            remove_task_entry_without_reordering(board_dir, from, &entry)?;
         }
         (TaskSource::MarkdownLine { .. }, StatusStore::MarkdownFile(dest_file)) => {
-            let dest_index = (to == "done").then_some(0);
+            let dest_index = (to == TaskStatus::Done).then_some(0);
             insert_content_into_markdown(&dest_file, dest_index, &entry.content)?;
             after_destination()?;
-            remove_agent_git_task_entry_without_reordering(board_dir, from, &entry)?;
+            remove_task_entry_without_reordering(board_dir, from, &entry)?;
         }
     }
     Ok(())
@@ -1787,12 +1929,12 @@ pub(super) fn move_agent_git_task_in_board_with_after_destination(
 
 pub(super) fn move_task_in_board_after_lock(
     board_dir: &Path,
-    from: &str,
-    to: &str,
+    from: TaskStatus,
+    to: TaskStatus,
     task_index: usize,
 ) -> Result<()> {
     let entry = task_entry_at(board_dir, from, task_index)?;
-    let dest_index = if to == "done" { Some(0) } else { None };
+    let dest_index = (to == TaskStatus::Done).then_some(0);
 
     match (&entry.source, get_status_store(board_dir, to)?) {
         (TaskSource::Path { path, .. }, StatusStore::Directory(dest_dir)) => {
@@ -1814,7 +1956,7 @@ pub(super) fn move_task_in_board_after_lock(
 #[cfg(test)]
 pub(super) fn attach_codex_session_to_task(
     project_root: &Path,
-    status: &str,
+    status: TaskStatus,
     entry: &TaskEntry,
     session_id: &str,
 ) -> Result<String> {
@@ -1824,7 +1966,7 @@ pub(super) fn attach_codex_session_to_task(
 #[cfg(test)]
 pub(super) fn attach_codex_session_to_task_with_before_replace(
     project_root: &Path,
-    status: &str,
+    status: TaskStatus,
     entry: &TaskEntry,
     session_id: &str,
     before_replace: impl FnOnce(),
@@ -1836,7 +1978,7 @@ pub(super) fn attach_codex_session_to_task_with_before_replace(
 
 pub(super) fn attach_codex_session_to_task_after_lock(
     project_root: &Path,
-    status: &str,
+    status: TaskStatus,
     entry: &TaskEntry,
     session_id: &str,
     before_replace: impl FnOnce(),
@@ -1879,7 +2021,7 @@ pub(super) fn attach_codex_session_to_task_after_lock(
 
 pub(super) fn ensure_subtask_board_after_lock(
     board_dir: &Path,
-    status: &str,
+    status: TaskStatus,
     parent_task_index: usize,
 ) -> Result<PathBuf> {
     let status_dir = convert_status_to_directory(board_dir, status)?;

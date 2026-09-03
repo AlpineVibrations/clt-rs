@@ -7,16 +7,16 @@ use std::{
 };
 
 use crate::{
-    AgentGitMode, AgentServiceAction, AgentTaskSelection, InteractiveCodexResumeMode, add_task,
-    clean_agent_state, delete_task, ensure_agent_state_dir, ensure_existing_board, expand_tasks,
-    get_task_root, init_tasks, list_agent_projects, list_tasks, manage_agent_service, move_task,
-    move_task_to_done, open_agent_store, open_agent_store_at, parse_add_task_args,
+    AgentGitMode, AgentServiceAction, AgentTaskSelection, InteractiveCodexResumeMode,
+    ManagedTaskWorkflow, TaskStatus, add_task, clean_agent_state, ensure_agent_state_dir,
+    ensure_existing_board, expand_tasks, get_task_root, init_tasks, list_agent_projects,
+    list_tasks, manage_agent_service, open_agent_store, open_agent_store_at, parse_add_task_args,
     print_agent_scheduler_pass, prompt_to_initialize_tasks, register_agent_project,
-    reseal_provisional_done_task, retry_agent_project, run_agent_daemon,
-    run_agent_interactive_session_worker, run_agent_once, run_agent_session_resume_worker,
-    run_automated_exec_gate, run_independent_agent_worker, run_interactive_exec_gate,
-    set_agent_project_enabled, set_agent_project_git_mode, show_agent_logs, show_agent_status,
-    tui_view, tui_view_without_active_board, unregister_agent_project,
+    retry_agent_project, run_agent_daemon, run_agent_interactive_session_worker, run_agent_once,
+    run_agent_session_resume_worker, run_automated_exec_gate, run_independent_agent_worker,
+    run_interactive_exec_gate, set_agent_project_enabled, set_agent_project_git_mode,
+    show_agent_logs, show_agent_status, tui_view, tui_view_without_active_board,
+    unregister_agent_project,
 };
 #[cfg(unix)]
 use crate::{AutomatedSupervisorSpec, run_automated_session_supervisor};
@@ -342,15 +342,20 @@ pub(crate) fn run() -> Result<()> {
             task_index,
             to,
         }) => {
-            if to == "done" {
-                move_task_to_done(&root, &from, &task_index)?;
+            let from_status = TaskStatus::parse(&from)?;
+            let to_status = TaskStatus::parse(&to)?;
+            let workflow = ManagedTaskWorkflow::new(&root);
+            if to_status == TaskStatus::Done {
+                workflow.complete_task(from_status, &task_index)?;
             } else {
-                move_task(&root, &from, &to, &task_index)?;
+                workflow.move_task(from_status, to_status, &task_index)?;
             }
         }
         Some(Commands::Done { status, task_index }) => {
-            if status == "done" {
-                if reseal_provisional_done_task(&root, &task_index)? {
+            let task_status = TaskStatus::parse(&status)?;
+            let workflow = ManagedTaskWorkflow::new(&root);
+            if task_status == TaskStatus::Done {
+                if workflow.reseal_completed_task(&task_index)? {
                     println!(
                         "Task {} in done was resealed; Git finalization is pending.",
                         task_index
@@ -359,7 +364,7 @@ pub(crate) fn run() -> Result<()> {
                     println!("Task is already done.");
                 }
             } else {
-                let provisional = move_task_to_done(&root, &status, &task_index)?;
+                let provisional = workflow.complete_task(task_status, &task_index)?;
                 if provisional {
                     println!(
                         "Task {} from {} moved provisionally; Git finalization is pending.",
@@ -371,7 +376,8 @@ pub(crate) fn run() -> Result<()> {
             }
         }
         Some(Commands::Delete { status, task_index }) => {
-            delete_task(&root, &status, &task_index)?;
+            let task_status = TaskStatus::parse(&status)?;
+            ManagedTaskWorkflow::new(&root).delete_task(task_status, &task_index)?;
             println!("Task {} from {} deleted successfully.", task_index, status);
         }
         Some(Commands::List { status }) => {

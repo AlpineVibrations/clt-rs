@@ -90,7 +90,7 @@ pub(super) struct AgentRunJob {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) struct BlockedTaskSnapshot {
-    pub(super) status: &'static str,
+    pub(super) status: TaskStatus,
     pub(super) content: String,
 }
 
@@ -651,11 +651,47 @@ pub(super) fn project_display_name(root: &Path) -> String {
         .unwrap_or_else(|| root.display().to_string())
 }
 
-pub(super) fn ensure_status_conversion_allowed(board_dir: &Path, status: &str) -> Result<()> {
-    if board_dir.join(status).is_dir() {
+#[derive(Clone, Debug)]
+pub(super) struct ManagedTaskWorkflow {
+    root: PathBuf,
+    board: TaskBoard,
+}
+
+impl ManagedTaskWorkflow {
+    pub(super) fn new(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            board: TaskBoard::for_project(root),
+        }
+    }
+
+    pub(super) fn move_task(
+        &self,
+        from: TaskStatus,
+        to: TaskStatus,
+        task_index: &str,
+    ) -> Result<()> {
+        move_task(&self.root, from, to, task_index)
+    }
+
+    pub(super) fn complete_task(&self, from: TaskStatus, task_index: &str) -> Result<bool> {
+        move_task_to_done(&self.root, from, task_index)
+    }
+
+    pub(super) fn reseal_completed_task(&self, task_index: &str) -> Result<bool> {
+        reseal_provisional_done_task(&self.root, task_index)
+    }
+
+    pub(super) fn delete_task(&self, status: TaskStatus, task_index: &str) -> Result<()> {
+        delete_task_in_board(self.board.path(), status, task_index)
+    }
+}
+
+pub(super) fn ensure_status_conversion_allowed(board_dir: &Path, status: TaskStatus) -> Result<()> {
+    if board_dir.join(status.as_str()).is_dir() {
         return Ok(());
     }
-    for entry in read_task_entries(board_dir, status)? {
+    for entry in TaskBoard::new(board_dir).entries(status)? {
         ensure_managed_git_task_mutation_allowed(board_dir, &entry, false, None)?;
     }
     Ok(())
@@ -676,7 +712,7 @@ pub(super) fn ensure_archive_conversion_allowed(
 
 pub(super) fn expand_tasks(root: &Path, filter_status: Option<String>) -> Result<()> {
     let board_dir = get_tasks_dir(root);
-    let statuses: Vec<&'static str> = match filter_status {
+    let statuses: Vec<TaskStatus> = match filter_status {
         Some(status) => vec![normalize_status_arg(&status)?],
         None => TASK_STATUSES.to_vec(),
     };
@@ -705,8 +741,13 @@ pub(super) fn expand_tasks(root: &Path, filter_status: Option<String>) -> Result
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn delete_task(root: &Path, status: &str, task_index_str: &str) -> Result<()> {
-    delete_task_in_board(&get_tasks_dir(root), status, task_index_str)
+    delete_task_in_board(
+        &get_tasks_dir(root),
+        TaskStatus::parse(status)?,
+        task_index_str,
+    )
 }
 
 pub(super) fn reseal_provisional_done_task(root: &Path, task_index_str: &str) -> Result<bool> {
@@ -739,7 +780,7 @@ pub(super) fn reseal_provisional_done_task(root: &Path, task_index_str: &str) ->
     let task_index = parse_one_based_task_index(task_index_str)?;
     let board_dir = get_tasks_dir(&root);
     let _mutation_lock = acquire_board_mutation_lock(&board_dir)?;
-    let entry = task_entry_at(&board_dir, "done", task_index)?;
+    let entry = TaskBoard::new(&board_dir).entry(TaskStatus::Done, task_index)?;
     let session_id = codex_session_id_from_task_content(&entry.content).context(
         "Resealing a provisional Done task requires its terminal codex:<session-id> marker",
     )?;
@@ -797,14 +838,15 @@ pub(super) fn reseal_provisional_done_task(root: &Path, task_index_str: &str) ->
 
 pub(super) fn delete_task_in_board(
     board_dir: &Path,
-    status: &str,
+    status: TaskStatus,
     task_index_str: &str,
 ) -> Result<()> {
     let task_index = parse_one_based_task_index(task_index_str)?;
     let _mutation_lock = acquire_board_mutation_lock(board_dir)?;
-    let entry = task_entry_at(board_dir, status, task_index)?;
+    let board = TaskBoard::new(board_dir);
+    let entry = board.entry(status, task_index)?;
     ensure_managed_git_task_mutation_allowed(board_dir, &entry, false, None)?;
-    remove_task_entry(board_dir, status, &entry)
+    board.remove_entry(status, &entry)
 }
 
 pub(super) fn ensure_managed_git_task_mutation_allowed(
@@ -871,9 +913,14 @@ pub(super) fn ensure_working_task_content_preserves_identity(
     Ok(())
 }
 
-pub(super) fn move_task(root: &Path, from: &str, to: &str, task_index_str: &str) -> Result<()> {
-    if from == "todo"
-        && to == "doing"
+pub(super) fn move_task(
+    root: &Path,
+    from: TaskStatus,
+    to: TaskStatus,
+    task_index_str: &str,
+) -> Result<()> {
+    if from == TaskStatus::Todo
+        && to == TaskStatus::Doing
         && let Some(context) = automated_agent_child_context()?
     {
         let store = open_agent_store()?;
@@ -950,7 +997,8 @@ pub(super) fn move_task_to_doing_with_agent_git_journal(
     let board_dir = get_tasks_dir(&root);
     let _mutation_lock = acquire_board_mutation_lock(&board_dir)?;
     cleanup_clt_atomic_task_temporaries(&board_dir)?;
-    let entry = task_entry_at(&board_dir, "todo", task_index)?;
+    let board = TaskBoard::new(&board_dir);
+    let entry = board.entry(TaskStatus::Todo, task_index)?;
     let task_identity = durable_task_identity(&entry.content)
         .context("Automated Git task has no durable task payload")?;
     let existing = store
@@ -1010,12 +1058,20 @@ pub(super) fn move_task_to_doing_with_agent_git_journal(
             "Codex session {session_id} lost its running-session fence while binding Todo activation"
         );
     }
-    attach_codex_session_to_task_after_lock(&root, "todo", &entry, &session_id, || {})?;
-    move_agent_git_task_in_board_after_lock(&board_dir, "todo", "doing", task_index)?;
+    attach_codex_session_to_task_after_lock(&root, TaskStatus::Todo, &entry, &session_id, || {})?;
+    board.move_task_without_reordering_after_lock(
+        TaskStatus::Todo,
+        TaskStatus::Doing,
+        task_index,
+    )?;
     Ok(())
 }
 
-pub(super) fn move_task_to_done(root: &Path, from: &str, task_index_str: &str) -> Result<bool> {
+pub(super) fn move_task_to_done(
+    root: &Path,
+    from: TaskStatus,
+    task_index_str: &str,
+) -> Result<bool> {
     let Some(context) = automated_agent_child_context()? else {
         let task_index = parse_one_based_task_index(task_index_str)?;
         let board_dir = get_tasks_dir(root);
@@ -1041,7 +1097,7 @@ pub(super) fn move_task_to_done(root: &Path, from: &str, task_index_str: &str) -
                 }
             }
         }
-        move_task_in_board_after_lock(&board_dir, from, "done", task_index)?;
+        move_task_in_board_after_lock(&board_dir, from, TaskStatus::Done, task_index)?;
         return Ok(false);
     };
     move_task_to_done_with_agent_context(root, from, task_index_str, &context)
@@ -1049,7 +1105,7 @@ pub(super) fn move_task_to_done(root: &Path, from: &str, task_index_str: &str) -
 
 pub(super) fn move_task_to_done_with_agent_context(
     root: &Path,
-    from: &str,
+    from: TaskStatus,
     task_index_str: &str,
     context: &AutomatedAgentChildContext,
 ) -> Result<bool> {
@@ -1059,7 +1115,7 @@ pub(super) fn move_task_to_done_with_agent_context(
 
 pub(super) fn move_task_to_done_with_agent_store(
     root: &Path,
-    from: &str,
+    from: TaskStatus,
     task_index_str: &str,
     context: &AutomatedAgentChildContext,
     store: &agent::TursoAgentStore,
@@ -1087,7 +1143,8 @@ pub(super) fn move_task_to_done_with_agent_store(
     let board_dir = get_tasks_dir(&root);
     let _mutation_lock = acquire_board_mutation_lock(&board_dir)?;
     cleanup_clt_atomic_task_temporaries(&board_dir)?;
-    let entry = task_entry_at(&board_dir, from, task_index)?;
+    let board = TaskBoard::new(&board_dir);
+    let entry = board.entry(from, task_index)?;
     let session_id = codex_session_id_from_task_content(&entry.content).with_context(|| {
         "Automated Git completion requires the selected task's terminal codex:<session-id> marker"
     })?;
@@ -1098,7 +1155,7 @@ pub(super) fn move_task_to_done_with_agent_store(
     }
     let Some(mut finalization) = store.git_finalization_blocking(project.id, session_id)? else {
         if project.git_mode == AgentGitMode::Off {
-            move_task_in_board_after_lock(&board_dir, from, "done", task_index)?;
+            board.move_task_after_lock(from, TaskStatus::Done, task_index)?;
             return Ok(false);
         }
         anyhow::bail!(
@@ -1202,7 +1259,7 @@ pub(super) fn move_task_to_done_with_agent_store(
         );
     }
 
-    move_agent_git_task_in_board_after_lock(&board_dir, from, "done", task_index)?;
+    move_task_without_reordering_after_lock(&board_dir, from, TaskStatus::Done, task_index)?;
     let updated = store.compare_and_set_owned_git_finalization_blocking(
         project.id,
         session_id,
@@ -1223,27 +1280,28 @@ pub(super) fn move_task_to_done_with_agent_store(
 
 pub(super) fn move_task_in_board(
     board_dir: &Path,
-    from: &str,
-    to: &str,
+    from: TaskStatus,
+    to: TaskStatus,
     task_index_str: &str,
 ) -> Result<()> {
     let task_index = parse_one_based_task_index(task_index_str)?;
     let _mutation_lock = acquire_board_mutation_lock(board_dir)?;
-    let entry = task_entry_at(board_dir, from, task_index)?;
+    let board = TaskBoard::new(board_dir);
+    let entry = board.entry(from, task_index)?;
     ensure_managed_git_task_mutation_allowed(
         board_dir,
         &entry,
-        matches!(from, "todo" | "doing") && matches!(to, "todo" | "doing"),
+        from.is_active() && to.is_active(),
         None,
     )?;
-    move_task_in_board_after_lock(board_dir, from, to, task_index)
+    board.move_task_after_lock(from, to, task_index)
 }
 
 #[cfg(test)]
 pub(super) fn move_task_in_board_with_contention_callback(
     board_dir: &Path,
-    from: &str,
-    to: &str,
+    from: TaskStatus,
+    to: TaskStatus,
     task_index_str: &str,
     on_contention: impl FnOnce(),
 ) -> Result<()> {
@@ -1255,8 +1313,8 @@ pub(super) fn move_task_in_board_with_contention_callback(
 
 pub(super) fn move_task_in_board_after_lock(
     board_dir: &Path,
-    from: &str,
-    to: &str,
+    from: TaskStatus,
+    to: TaskStatus,
     task_index: usize,
 ) -> Result<()> {
     ensure_status_conversion_allowed(board_dir, to)?;
@@ -1265,7 +1323,7 @@ pub(super) fn move_task_in_board_after_lock(
 
 pub(super) fn move_task_to_archive_in_board(
     board_dir: &Path,
-    from: &str,
+    from: TaskStatus,
     task_index_str: &str,
 ) -> Result<()> {
     let task_index = parse_one_based_task_index(task_index_str)?;
@@ -1300,7 +1358,7 @@ pub(super) fn move_task_to_archive_in_board(
 
 pub(super) fn update_task_in_board(
     board_dir: &Path,
-    status: &str,
+    status: TaskStatus,
     task_index: usize,
     new_description: &str,
 ) -> Result<()> {
@@ -1311,7 +1369,7 @@ pub(super) fn update_task_in_board(
 #[cfg(test)]
 pub(super) fn update_task_in_board_with_contention_callback(
     board_dir: &Path,
-    status: &str,
+    status: TaskStatus,
     task_index: usize,
     new_description: &str,
     on_contention: impl FnOnce(),
@@ -1323,11 +1381,12 @@ pub(super) fn update_task_in_board_with_contention_callback(
 
 pub(super) fn update_task_in_board_after_lock(
     board_dir: &Path,
-    status: &str,
+    status: TaskStatus,
     task_index: usize,
     new_description: &str,
 ) -> Result<()> {
-    let entry = task_entry_at(board_dir, status, task_index)?;
+    let board = TaskBoard::new(board_dir);
+    let entry = board.entry(status, task_index)?;
     let session_id = recoverable_codex_session_id_from_task_content(&entry.content);
     let updated_content = match session_id {
         Some(session_id) => task_content_with_codex_session(new_description, session_id),
@@ -1335,39 +1394,41 @@ pub(super) fn update_task_in_board_after_lock(
     };
     ensure_managed_git_task_mutation_allowed(board_dir, &entry, true, Some(&updated_content))?;
 
-    write_task_entry_content(board_dir, status, &entry, &updated_content)
+    board.write_entry_content(status, &entry, &updated_content)
 }
 
 pub(super) fn reorder_task_in_board(
     board_dir: &Path,
-    status: &str,
+    status: TaskStatus,
     from_idx: usize,
     to_idx: usize,
 ) -> Result<()> {
     let _mutation_lock = acquire_board_mutation_lock(board_dir)?;
-    let entry = task_entry_at(board_dir, status, from_idx + 1)?;
+    let board = TaskBoard::new(board_dir);
+    let entry = board.entry(status, from_idx + 1)?;
     ensure_managed_git_task_mutation_allowed(board_dir, &entry, false, None)?;
-    match get_status_store(board_dir, status)? {
+    match board.status_store(status)? {
         StatusStore::MarkdownFile(path) => reorder_markdown_task(&path, from_idx, to_idx),
         StatusStore::Directory(path) => reorder_directory_task(&path, from_idx, to_idx),
     }
 }
 
 pub(super) fn list_tasks(root: &Path, filter_status: Option<String>) -> Result<()> {
-    let board_dir = get_tasks_dir(root);
+    let board = TaskBoard::for_project(root);
     let session_states = load_task_agent_session_states(root);
 
     if let Some(ref s) = filter_status {
-        let status = match s.as_str() {
-            "0" => "backlog",
-            "1" => "todo",
-            "2" => "doing",
-            "3" => "done",
-            _ => s.as_str(),
+        let status_name = match s.as_str() {
+            "0" => TaskStatus::Backlog.as_str(),
+            "1" => TaskStatus::Todo.as_str(),
+            "2" => TaskStatus::Doing.as_str(),
+            "3" => TaskStatus::Done.as_str(),
+            status => status,
         };
 
-        println!("\n--- {} ---", status.to_uppercase());
-        for (index, entry) in read_task_entries(&board_dir, status)?.iter().enumerate() {
+        println!("\n--- {} ---", status_name.to_uppercase());
+        let status = TaskStatus::parse(status_name)?;
+        for (index, entry) in board.entries(status)?.iter().enumerate() {
             println!(
                 "{}. {}{}",
                 index + 1,
@@ -1381,8 +1442,8 @@ pub(super) fn list_tasks(root: &Path, filter_status: Option<String>) -> Result<(
         }
     } else {
         for status in TASK_STATUSES {
-            println!("\n--- {} ---", status.to_uppercase());
-            for (index, entry) in read_task_entries(&board_dir, status)?.iter().enumerate() {
+            println!("\n--- {} ---", status.as_str().to_uppercase());
+            for (index, entry) in board.entries(status)?.iter().enumerate() {
                 println!(
                     "{}. {}{}",
                     index + 1,

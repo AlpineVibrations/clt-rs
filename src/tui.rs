@@ -102,11 +102,11 @@ pub(super) fn task_tui_display_text(entry: &TaskEntry, is_selected: bool) -> Str
 pub(super) type TaskAgentSessionStates = HashMap<String, AgentSessionControlState>;
 
 pub(super) fn task_has_stopped_agent_flag(
-    status: &str,
+    status: TaskStatus,
     entry: &TaskEntry,
     session_states: &TaskAgentSessionStates,
 ) -> bool {
-    if status == "done" {
+    if status == TaskStatus::Done {
         return false;
     }
 
@@ -118,7 +118,7 @@ pub(super) fn task_has_stopped_agent_flag(
 
 pub(super) fn prefix_task_agent_flag(
     text: String,
-    status: &str,
+    status: TaskStatus,
     entry: &TaskEntry,
     session_states: &TaskAgentSessionStates,
 ) -> String {
@@ -131,7 +131,7 @@ pub(super) fn prefix_task_agent_flag(
 
 pub(super) fn task_display_text_with_agent_flag(
     entry: &TaskEntry,
-    status: &str,
+    status: TaskStatus,
     session_states: &TaskAgentSessionStates,
 ) -> String {
     prefix_task_agent_flag(task_display_text(entry), status, entry, session_states)
@@ -139,7 +139,7 @@ pub(super) fn task_display_text_with_agent_flag(
 
 pub(super) fn task_tui_display_text_with_agent_flag(
     entry: &TaskEntry,
-    status: &str,
+    status: TaskStatus,
     is_selected: bool,
     session_states: &TaskAgentSessionStates,
 ) -> String {
@@ -180,7 +180,7 @@ pub(super) fn try_load_task_agent_session_states(root: &Path) -> Result<TaskAgen
 
 pub(super) fn insert_task_at_selection_in_board(
     board_dir: &Path,
-    status: &str,
+    status: TaskStatus,
     state: &ListState,
     description: &str,
     metadata: Option<String>,
@@ -191,7 +191,7 @@ pub(super) fn insert_task_at_selection_in_board(
 
 pub(super) fn insert_subtask_in_board(
     board_dir: &Path,
-    status: &str,
+    status: TaskStatus,
     parent_task_index: usize,
     expected_parent: &TaskEntry,
     description: &str,
@@ -209,13 +209,13 @@ pub(super) fn insert_subtask_in_board(
     }
     ensure_status_conversion_allowed(board_dir, status)?;
     let subtask_board = ensure_subtask_board_after_lock(board_dir, status, parent_task_index)?;
-    insert_task_content(&subtask_board, "todo", None, &content)?;
+    TaskBoard::new(&subtask_board).insert_content(TaskStatus::Todo, None, &content)?;
     Ok(subtask_board)
 }
 
 pub(super) fn select_first_task_if_present_in_board(
     board_dir: &Path,
-    status: &str,
+    status: TaskStatus,
     state: &mut ListState,
 ) {
     let has_tasks = read_tasks_in_board(board_dir, status)
@@ -227,7 +227,7 @@ pub(super) fn select_first_task_if_present_in_board(
 
 pub(super) fn select_last_task_if_present_in_board(
     board_dir: &Path,
-    status: &str,
+    status: TaskStatus,
     state: &mut ListState,
 ) {
     let last_idx = read_tasks_in_board(board_dir, status)
@@ -239,12 +239,12 @@ pub(super) fn select_last_task_if_present_in_board(
 
 #[cfg(test)]
 pub(super) fn selected_task_index(root: &Path, status: &str, state: &ListState) -> Option<usize> {
-    selected_task_index_in_board(&get_tasks_dir(root), status, state)
+    selected_task_index_in_board(&get_tasks_dir(root), TaskStatus::parse(status).ok()?, state)
 }
 
 pub(super) fn selected_task_index_in_board(
     board_dir: &Path,
-    status: &str,
+    status: TaskStatus,
     state: &ListState,
 ) -> Option<usize> {
     let idx = state.selected()?;
@@ -259,13 +259,13 @@ pub(super) fn selected_task(
     status: &str,
     state: &ListState,
 ) -> Option<(usize, String)> {
-    selected_task_in_board(&get_tasks_dir(root), status, state)
+    selected_task_in_board(&get_tasks_dir(root), TaskStatus::parse(status).ok()?, state)
 }
 
 #[cfg(test)]
 pub(super) fn selected_task_in_board(
     board_dir: &Path,
-    status: &str,
+    status: TaskStatus,
     state: &ListState,
 ) -> Option<(usize, String)> {
     let idx = state.selected()?;
@@ -275,7 +275,7 @@ pub(super) fn selected_task_in_board(
 
 pub(super) fn selected_task_entry_in_board(
     board_dir: &Path,
-    status: &str,
+    status: TaskStatus,
     state: &ListState,
 ) -> Option<(usize, TaskEntry)> {
     let idx = state.selected()?;
@@ -285,12 +285,16 @@ pub(super) fn selected_task_entry_in_board(
 
 #[cfg(test)]
 pub(super) fn normalize_board_selection(root: &Path, status: &str, state: &mut ListState) {
-    normalize_board_selection_in_board(&get_tasks_dir(root), status, state);
+    normalize_board_selection_in_board(
+        &get_tasks_dir(root),
+        TaskStatus::parse(status).expect("test status must be valid"),
+        state,
+    );
 }
 
 pub(super) fn normalize_board_selection_in_board(
     board_dir: &Path,
-    status: &str,
+    status: TaskStatus,
     state: &mut ListState,
 ) {
     let selected = state.selected();
@@ -331,11 +335,11 @@ pub(super) fn select_first_archive_task_if_present_in_board(
 
 pub(super) fn normalize_board_selections_in_board(
     board_dir: &Path,
-    statuses: &[&str],
+    statuses: &[TaskStatus],
     states: &mut [ListState],
 ) {
     for (status, state) in statuses.iter().zip(states.iter_mut()) {
-        normalize_board_selection_in_board(board_dir, status, state);
+        normalize_board_selection_in_board(board_dir, *status, state);
     }
 }
 
@@ -384,7 +388,7 @@ pub(super) fn toggle_tui_backlog_column(
 ) -> String {
     *backlog_visible = !*backlog_visible;
     if *backlog_visible {
-        let backlog_count = read_task_entries(board_dir, "backlog")
+        let backlog_count = read_task_entries(board_dir, TaskStatus::Backlog)
             .map(|entries| entries.len())
             .unwrap_or(0);
         format!("Backlog column shown ({backlog_count} tasks). Press B again to hide it.")
@@ -396,7 +400,7 @@ pub(super) fn toggle_tui_backlog_column(
             }
             select_first_task_if_present_in_board(
                 board_dir,
-                "todo",
+                TaskStatus::Todo,
                 &mut board_states[TODO_BOARD_INDEX],
             );
         }
@@ -406,7 +410,7 @@ pub(super) fn toggle_tui_backlog_column(
 
 pub(super) fn move_selected_tui_task_to_backlog(
     board_dir: &Path,
-    statuses: &[&str],
+    statuses: &[TaskStatus],
     board_states: &mut [ListState],
     selected_board: &mut usize,
     backlog_visible: bool,
@@ -427,7 +431,7 @@ pub(super) fn move_selected_tui_task_to_backlog(
     move_task_in_board(
         board_dir,
         statuses[from_board],
-        "backlog",
+        TaskStatus::Backlog,
         &(idx + 1).to_string(),
     )?;
 
@@ -438,7 +442,7 @@ pub(super) fn move_selected_tui_task_to_backlog(
         }
         select_last_task_if_present_in_board(
             board_dir,
-            "backlog",
+            TaskStatus::Backlog,
             &mut board_states[BACKLOG_BOARD_INDEX],
         );
     } else {
@@ -455,7 +459,7 @@ pub(super) fn move_selected_tui_task_to_backlog(
 
 pub(super) fn move_selected_tui_task_to_archive(
     board_dir: &Path,
-    statuses: &[&str],
+    statuses: &[TaskStatus],
     board_states: &mut [ListState],
     selected_board: usize,
 ) -> Result<String> {
@@ -605,7 +609,7 @@ pub(super) fn render_tui_task_column_header(
 
 pub(super) fn reorder_selected_tui_task(
     board_dir: &Path,
-    status: &str,
+    status: TaskStatus,
     state: &mut ListState,
     direction: TuiTaskReorderDirection,
 ) -> String {
@@ -647,7 +651,7 @@ pub(super) fn reorder_selected_tui_task(
 
 pub(super) fn move_selected_tui_task_between_boards(
     board_dir: &Path,
-    statuses: &[&str],
+    statuses: &[TaskStatus],
     board_states: &mut [ListState],
     selected_board: &mut usize,
     backlog_visible: bool,
@@ -688,7 +692,7 @@ pub(super) fn move_selected_tui_task_between_boards(
 
 pub(super) fn reorganize_selected_tui_task(
     board_dir: &Path,
-    statuses: &[&str],
+    statuses: &[TaskStatus],
     board_states: &mut [ListState],
     selected_board: &mut usize,
     backlog_visible: bool,
@@ -3065,7 +3069,7 @@ pub(super) fn selected_tui_agent_log_view(
 pub(super) fn selected_tui_task_or_project_log_view_for_path(
     panel: &mut TuiAgentPanel,
     project_path: &Path,
-    task_status: &str,
+    task_status: TaskStatus,
     task: Option<&TaskEntry>,
 ) -> Result<Option<TuiAgentLogView>> {
     let state_dir = agent_state_dir()?;
@@ -3081,7 +3085,7 @@ pub(super) fn selected_tui_task_or_project_log_view_for_path(
 pub(super) fn selected_tui_task_or_project_log_view_for_path_at(
     panel: &mut TuiAgentPanel,
     project_path: &Path,
-    task_status: &str,
+    task_status: TaskStatus,
     task: Option<&TaskEntry>,
     state_dir: &Path,
 ) -> Result<Option<TuiAgentLogView>> {
@@ -3105,7 +3109,7 @@ pub(super) fn selected_tui_task_or_project_log_view_for_path_at(
 pub(super) fn selected_tui_task_log_view_for_path_at(
     panel: &mut TuiAgentPanel,
     project_path: &Path,
-    task_status: &str,
+    task_status: TaskStatus,
     task: &TaskEntry,
     state_dir: &Path,
 ) -> Result<Option<TuiAgentLogView>> {
@@ -3118,7 +3122,7 @@ pub(super) fn selected_tui_task_log_view_for_path_at(
 
 pub(super) fn selected_tui_task_log_view_at(
     panel: &TuiAgentPanel,
-    _task_status: &str,
+    _task_status: TaskStatus,
     task: &TaskEntry,
     state_dir: &Path,
 ) -> Result<Option<TuiAgentLogView>> {
@@ -3340,7 +3344,7 @@ pub(super) fn sync_open_tui_agent_log_view(
 pub(super) fn sync_open_tui_task_log_view(
     panel: &mut TuiAgentPanel,
     project_path: &Path,
-    task_status: &str,
+    task_status: TaskStatus,
     task: Option<&TaskEntry>,
     log_view: &mut Option<TuiAgentLogView>,
 ) {
@@ -3364,7 +3368,7 @@ pub(super) fn sync_open_tui_task_log_view(
 pub(super) fn sync_open_tui_task_log_view_at(
     panel: &mut TuiAgentPanel,
     project_path: &Path,
-    task_status: &str,
+    task_status: TaskStatus,
     task: Option<&TaskEntry>,
     log_view: &mut Option<TuiAgentLogView>,
     state_dir: &Path,
@@ -5453,7 +5457,7 @@ pub(super) fn tui_view_with_active_board(
             } else if archive_view {
                 (format!("{board_title} Archive Console"), None)
             } else if !backlog_visible {
-                let backlog_count = read_task_entries(&board_dir, "backlog")
+                let backlog_count = read_task_entries(&board_dir, TaskStatus::Backlog)
                     .map(|entries| entries.len())
                     .unwrap_or(0);
                 (

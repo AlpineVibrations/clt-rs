@@ -1273,7 +1273,7 @@ impl AgentRunner for CodexAgentRunner {
             &run_file_stem,
         )?;
         let doing_task_contents_before =
-            task_contents_for_status(&project.path, "doing").unwrap_or_default();
+            task_contents_for_status(&project.path, TaskStatus::Doing).unwrap_or_default();
         let blocked_task_snapshots_before =
             blocked_task_snapshots(&project.path).unwrap_or_default();
         let log_dir = agent_project_run_log_dir(&self.state_dir, project)?;

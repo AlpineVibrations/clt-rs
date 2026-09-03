@@ -786,7 +786,7 @@ pub(super) fn run_agent_scheduler_pass_with_max_global_jobs(
             else {
                 continue;
             };
-            let eligible = matches!(status, "todo" | "doing")
+            let eligible = status.is_active()
                 && (!task_entry_is_blocked(&task) || !blocked_recovery_backoff_active);
             if eligible {
                 working_git_finalization = Some(finalization);
@@ -1262,7 +1262,7 @@ pub(super) fn reconcile_stale_agent_session_controls(
 pub(super) fn task_status_for_codex_session(
     project_root: &Path,
     session_id: &str,
-) -> Result<Option<&'static str>> {
+) -> Result<Option<TaskStatus>> {
     task_status_for_codex_session_in_board(&get_tasks_dir(project_root), session_id)
 }
 
@@ -1556,11 +1556,11 @@ pub(super) fn scan_agent_project(project_root: &Path) -> AgentProjectScan {
     }
 
     let board_dir = get_tasks_dir(project_root);
-    let todo_entries = match read_task_entries(&board_dir, "todo") {
+    let todo_entries = match read_task_entries(&board_dir, TaskStatus::Todo) {
         Ok(entries) => entries,
         Err(err) => return AgentProjectScan::unavailable(err),
     };
-    let doing_entries = match read_task_entries(&board_dir, "doing") {
+    let doing_entries = match read_task_entries(&board_dir, TaskStatus::Doing) {
         Ok(entries) => entries,
         Err(err) => return AgentProjectScan::unavailable(err),
     };

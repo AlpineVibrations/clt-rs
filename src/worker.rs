@@ -967,7 +967,7 @@ pub(super) fn run_agent_job_inner(
                     &finalization.codex_session_id,
                 )?;
                 let durably_blocked = linked_task.as_ref().is_some_and(|(task_status, task)| {
-                    matches!(*task_status, "todo" | "doing") && task_entry_is_blocked(task)
+                    task_status.is_active() && task_entry_is_blocked(task)
                 });
                 if durably_blocked {
                     status = "blocked";
@@ -1322,7 +1322,7 @@ pub(super) fn attach_codex_session_after_run(
     }
 
     let completed = newly_completed_task(&job.project.path, &job.done_task_contents_before)?
-        .map(|entry| ("done", entry));
+        .map(|entry| (TaskStatus::Done, entry));
     let blocked = blocked_task_after_run(
         &job.project.path,
         &job.blocked_task_snapshots_before,
@@ -1350,7 +1350,10 @@ pub(super) fn attach_codex_session_after_run(
     Ok(())
 }
 
-pub(super) fn task_contents_for_status(project_root: &Path, status: &str) -> Result<Vec<String>> {
+pub(super) fn task_contents_for_status(
+    project_root: &Path,
+    status: TaskStatus,
+) -> Result<Vec<String>> {
     Ok(read_task_entries(&get_tasks_dir(project_root), status)?
         .into_iter()
         .map(|entry| entry.content)
@@ -1364,7 +1367,7 @@ pub(super) fn automated_codex_session_to_resume(
     let tasks = match task_selection {
         AgentTaskSelection::NextTodo => return Ok(None),
         AgentTaskSelection::ResumeDoing => {
-            read_task_entries(&get_tasks_dir(project_root), "doing")?
+            read_task_entries(&get_tasks_dir(project_root), TaskStatus::Doing)?
         }
         AgentTaskSelection::RecoverBlocked => blocked_tasks(project_root)?
             .into_iter()
@@ -1392,7 +1395,7 @@ pub(super) fn attach_codex_session_to_active_task(
         return Ok(true);
     }
 
-    let tasks = read_task_entries(&get_tasks_dir(project_root), "doing")?;
+    let tasks = read_task_entries(&get_tasks_dir(project_root), TaskStatus::Doing)?;
     let newly_started = newly_added_task_entry(doing_task_contents_before, &tasks);
     let task = match task_selection {
         AgentTaskSelection::NextTodo => newly_started,
@@ -1402,7 +1405,7 @@ pub(super) fn attach_codex_session_to_active_task(
             let snapshot = (blocked_task_snapshots_before.len() == 1)
                 .then(|| blocked_task_snapshots_before.first())
                 .flatten()?;
-            (snapshot.status == "doing" && snapshot.content == task.content.trim_end())
+            (snapshot.status == TaskStatus::Doing && snapshot.content == task.content.trim_end())
                 .then_some(task)
         }),
         AgentTaskSelection::ResumeSession => None,
@@ -1411,15 +1414,23 @@ pub(super) fn attach_codex_session_to_active_task(
         return Ok(false);
     };
 
-    attach_codex_session_to_task_after_lock(project_root, "doing", task, session_id, || {})?;
+    attach_codex_session_to_task_after_lock(
+        project_root,
+        TaskStatus::Doing,
+        task,
+        session_id,
+        || {},
+    )?;
     Ok(true)
 }
 
 pub(super) fn completed_task_contents(project_root: &Path) -> Result<Vec<String>> {
-    Ok(read_task_entries(&get_tasks_dir(project_root), "done")?
-        .into_iter()
-        .map(|entry| entry.content)
-        .collect())
+    Ok(
+        read_task_entries(&get_tasks_dir(project_root), TaskStatus::Done)?
+            .into_iter()
+            .map(|entry| entry.content)
+            .collect(),
+    )
 }
 
 pub(super) fn blocked_task_snapshots(project_root: &Path) -> Result<Vec<BlockedTaskSnapshot>> {
@@ -1432,11 +1443,11 @@ pub(super) fn blocked_task_snapshots(project_root: &Path) -> Result<Vec<BlockedT
         .collect())
 }
 
-pub(super) fn blocked_tasks(project_root: &Path) -> Result<Vec<(&'static str, TaskEntry)>> {
+pub(super) fn blocked_tasks(project_root: &Path) -> Result<Vec<(TaskStatus, TaskEntry)>> {
     let board_dir = get_tasks_dir(project_root);
     let mut tasks = Vec::new();
 
-    for status in ["todo", "doing"] {
+    for status in [TaskStatus::Todo, TaskStatus::Doing] {
         tasks.extend(
             read_task_entries(&board_dir, status)?
                 .into_iter()
@@ -1452,7 +1463,7 @@ pub(super) fn blocked_task_after_run(
     project_root: &Path,
     snapshots_before: &[BlockedTaskSnapshot],
     allow_unchanged_single_task: bool,
-) -> Result<Option<(&'static str, TaskEntry)>> {
+) -> Result<Option<(TaskStatus, TaskEntry)>> {
     let tasks_after = blocked_tasks(project_root)?;
     let mut remaining = std::collections::HashMap::<BlockedTaskSnapshot, usize>::new();
     for snapshot in snapshots_before {
@@ -1463,7 +1474,7 @@ pub(super) fn blocked_task_after_run(
         .iter()
         .filter(|(status, entry)| {
             let snapshot = BlockedTaskSnapshot {
-                status,
+                status: *status,
                 content: entry.content.trim_end().to_string(),
             };
             let Some(count) = remaining.get_mut(&snapshot) else {
@@ -1492,7 +1503,7 @@ pub(super) fn newly_completed_task(
     project_root: &Path,
     contents_before: &[String],
 ) -> Result<Option<TaskEntry>> {
-    let entries_after = read_task_entries(&get_tasks_dir(project_root), "done")?;
+    let entries_after = read_task_entries(&get_tasks_dir(project_root), TaskStatus::Done)?;
     Ok(newly_added_task_entry(contents_before, &entries_after).cloned())
 }
 

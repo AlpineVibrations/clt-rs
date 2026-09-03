@@ -348,7 +348,8 @@ pub(super) fn cancel_unlinked_working_git_finalization_with_lock_callbacks(
     let board_dir = get_tasks_dir(project_root);
     let _mutation_lock =
         acquire_board_mutation_lock_with_contention_callback(&board_dir, on_contention)?;
-    if terminal_task_for_codex_session_in_board(&board_dir, &finalization.codex_session_id)?
+    if TaskBoard::new(&board_dir)
+        .terminal_task_for_session(&finalization.codex_session_id)?
         .is_some()
     {
         return Ok(false);
@@ -426,7 +427,7 @@ pub(super) fn repair_working_git_task_link_with_lock_callbacks(
     after_validation();
     cleanup_clt_atomic_task_temporaries(&board_dir)?;
     let mut linked = Vec::new();
-    for status in ["todo", "doing"] {
+    for status in [TaskStatus::Todo, TaskStatus::Doing] {
         for (index, entry) in read_task_entries(&board_dir, status)?
             .into_iter()
             .enumerate()
@@ -440,14 +441,19 @@ pub(super) fn repair_working_git_task_link_with_lock_callbacks(
         }
     }
     match linked.as_slice() {
-        [("doing", _, _)] => return Ok(true),
-        [("todo", index, _)] => {
-            move_agent_git_task_in_board_after_lock(&board_dir, "todo", "doing", *index)?;
+        [(TaskStatus::Doing, _, _)] => return Ok(true),
+        [(TaskStatus::Todo, index, _)] => {
+            move_task_without_reordering_after_lock(
+                &board_dir,
+                TaskStatus::Todo,
+                TaskStatus::Doing,
+                *index,
+            )?;
             return Ok(true);
         }
         [(first_status, _, first), (second_status, _, second)]
-            if [*first_status, *second_status].contains(&"todo")
-                && [*first_status, *second_status].contains(&"doing")
+            if [*first_status, *second_status].contains(&TaskStatus::Todo)
+                && [*first_status, *second_status].contains(&TaskStatus::Doing)
                 && first.content.trim_end() == second.content.trim_end()
                 && [first, second].iter().all(|entry| {
                     matches!(
@@ -458,16 +464,17 @@ pub(super) fn repair_working_git_task_link_with_lock_callbacks(
         {
             let (_, _, todo_duplicate) = linked
                 .iter()
-                .find(|(status, _, _)| *status == "todo")
+                .find(|(status, _, _)| *status == TaskStatus::Todo)
                 .expect("one linked crash duplicate is in Todo");
-            remove_agent_git_task_entry_without_reordering(&board_dir, "todo", todo_duplicate)?;
+            TaskBoard::new(&board_dir)
+                .remove_entry_without_reordering(TaskStatus::Todo, todo_duplicate)?;
             return Ok(true);
         }
         [] => {}
         _ => return Ok(false),
     }
     let mut matches = Vec::new();
-    for status in ["todo", "doing"] {
+    for status in [TaskStatus::Todo, TaskStatus::Doing] {
         for (index, entry) in read_task_entries(&board_dir, status)?
             .into_iter()
             .enumerate()
@@ -482,13 +489,18 @@ pub(super) fn repair_working_git_task_link_with_lock_callbacks(
     };
     attach_codex_session_to_task_after_lock(
         project_root,
-        status,
+        *status,
         entry,
         &finalization.codex_session_id,
         || {},
     )?;
-    if *status == "todo" {
-        move_agent_git_task_in_board_after_lock(&board_dir, "todo", "doing", *index)?;
+    if *status == TaskStatus::Todo {
+        move_task_without_reordering_after_lock(
+            &board_dir,
+            TaskStatus::Todo,
+            TaskStatus::Doing,
+            *index,
+        )?;
     }
     Ok(true)
 }
@@ -961,7 +973,7 @@ pub(super) fn require_agent_git_todo_candidates_committed(
     project_root: &Path,
     starting_head: &str,
 ) -> Result<()> {
-    let candidates = read_task_entries(&get_tasks_dir(project_root), "todo")?
+    let candidates = read_task_entries(&get_tasks_dir(project_root), TaskStatus::Todo)?
         .into_iter()
         .filter(|entry| !task_entry_is_blocked(entry))
         .collect::<Vec<_>>();
@@ -985,15 +997,15 @@ pub(super) fn require_agent_git_todo_candidates_committed(
 pub(super) fn require_agent_git_board_storage_compatible(project_root: &Path) -> Result<()> {
     let board_dir = get_tasks_dir(project_root);
     let todo_is_directory = matches!(
-        get_status_store(&board_dir, "todo")?,
+        get_status_store(&board_dir, TaskStatus::Todo)?,
         StatusStore::Directory(_)
     );
     let doing_is_directory = matches!(
-        get_status_store(&board_dir, "doing")?,
+        get_status_store(&board_dir, TaskStatus::Doing)?,
         StatusStore::Directory(_)
     );
     let done_is_directory = matches!(
-        get_status_store(&board_dir, "done")?,
+        get_status_store(&board_dir, TaskStatus::Done)?,
         StatusStore::Directory(_)
     );
     if todo_is_directory && !doing_is_directory {
@@ -1553,13 +1565,13 @@ pub(super) fn stage_projected_task_tree(
 
 pub(super) fn projected_task_entry(
     board_dir: &Path,
-    statuses: &[&str],
+    statuses: &[TaskStatus],
     session_id: Option<&str>,
     task_identity: &str,
-) -> Result<(String, usize, TaskEntry)> {
+) -> Result<(TaskStatus, usize, TaskEntry)> {
     let mut selected = Vec::new();
     for status in statuses {
-        for (index, entry) in read_task_entries(board_dir, status)?
+        for (index, entry) in read_task_entries(board_dir, *status)?
             .into_iter()
             .enumerate()
         {
@@ -1567,7 +1579,7 @@ pub(super) fn projected_task_entry(
                 codex_session_id_from_task_content(&entry.content) == Some(session_id)
             }) && durable_task_identity(&entry.content).as_deref() == Some(task_identity)
             {
-                selected.push(((*status).to_string(), index + 1, entry));
+                selected.push((*status, index + 1, entry));
             }
         }
     }
@@ -1586,7 +1598,7 @@ pub(super) fn agent_git_task_scope_without_selected(
         create_agent_git_tree_projection(project_root, source_tree)?;
     let board_dir = get_tasks_dir(&worktree_path);
     let mut selected = Vec::new();
-    for status in ["todo", "doing"] {
+    for status in [TaskStatus::Todo, TaskStatus::Doing] {
         for entry in read_task_entries(&board_dir, status)? {
             if durable_task_identity(&entry.content).as_deref() == Some(task_identity) {
                 selected.push((status, entry));
@@ -1597,9 +1609,7 @@ pub(super) fn agent_git_task_scope_without_selected(
         [] => anyhow::bail!(
             "The selected Git-enabled task is not present in the checkpointed manifest parent"
         ),
-        [(status, entry)] => {
-            remove_agent_git_task_entry_without_reordering(&board_dir, status, entry)?
-        }
+        [(status, entry)] => remove_task_entry_without_reordering(&board_dir, *status, entry)?,
         _ => {
             anyhow::bail!(
                 "The Git manifest parent contains more than one active task with the selected identity"
@@ -1624,9 +1634,13 @@ pub(super) fn agent_git_completed_scope_without_selected(
     let (_projection, index_path, worktree_path) =
         create_agent_git_tree_projection(project_root, completed_tree)?;
     let board_dir = get_tasks_dir(&worktree_path);
-    let (_, _, entry) =
-        projected_task_entry(&board_dir, &["done"], Some(session_id), task_identity)?;
-    remove_agent_git_task_entry_without_reordering(&board_dir, "done", &entry)?;
+    let (_, _, entry) = projected_task_entry(
+        &board_dir,
+        &[TaskStatus::Done],
+        Some(session_id),
+        task_identity,
+    )?;
+    remove_task_entry_without_reordering(&board_dir, TaskStatus::Done, &entry)?;
     let sanitized_tree = stage_projected_task_tree(
         project_root,
         &index_path,
@@ -1648,11 +1662,11 @@ pub(super) fn project_agent_git_completed_tree(
     let board_dir = get_tasks_dir(&worktree_path);
     let (status, task_index, _) = projected_task_entry(
         &board_dir,
-        &["todo", "doing"],
+        &[TaskStatus::Todo, TaskStatus::Doing],
         Some(session_id),
         task_identity,
     )?;
-    move_agent_git_task_in_board_after_lock(&board_dir, &status, "done", task_index)?;
+    move_task_without_reordering_after_lock(&board_dir, status, TaskStatus::Done, task_index)?;
     let completed_tree = stage_projected_task_tree(
         project_root,
         &index_path,
@@ -3178,7 +3192,7 @@ pub(super) fn worktree_contains_completed_done_task(
     else {
         return Ok(false);
     };
-    Ok(status == "done" && task_content_has_completed_note(&task.content))
+    Ok(status == TaskStatus::Done && task_content_has_completed_note(&task.content))
 }
 
 pub(super) fn agent_git_upstream_tip_proves_task_commit(
@@ -3268,7 +3282,7 @@ pub(super) fn local_agent_git_task_commit_is_retained(
 
 pub(super) fn matching_agent_session_tasks(
     board_dir: &Path,
-    status: &str,
+    status: TaskStatus,
     session_id: &str,
     task_identity: &str,
 ) -> Result<Vec<TaskEntry>> {
@@ -3290,7 +3304,7 @@ pub(super) fn repair_tracking_agent_git_board(
     let board_dir = get_tasks_dir(project_root);
     let _mutation_lock = acquire_board_mutation_lock(&board_dir)?;
     cleanup_clt_atomic_task_temporaries(&board_dir)?;
-    if ["backlog"]
+    if [TaskStatus::Backlog]
         .into_iter()
         .map(|status| matching_agent_session_tasks(&board_dir, status, session_id, task_identity))
         .collect::<Result<Vec<_>>>()?
@@ -3300,9 +3314,10 @@ pub(super) fn repair_tracking_agent_git_board(
         return Ok(false);
     }
 
-    let mut done = matching_agent_session_tasks(&board_dir, "done", session_id, task_identity)?;
+    let mut done =
+        matching_agent_session_tasks(&board_dir, TaskStatus::Done, session_id, task_identity)?;
     let mut active = Vec::new();
-    for status in ["todo", "doing"] {
+    for status in [TaskStatus::Todo, TaskStatus::Doing] {
         for entry in matching_agent_session_tasks(&board_dir, status, session_id, task_identity)? {
             active.push((status, entry));
         }
@@ -3311,12 +3326,12 @@ pub(super) fn repair_tracking_agent_git_board(
         let [(status, entry)] = active.as_slice() else {
             return Ok(false);
         };
-        let task_index = read_task_entries(&board_dir, status)?
+        let task_index = read_task_entries(&board_dir, *status)?
             .iter()
             .position(|candidate| candidate.source == entry.source)
             .map(|index| index + 1)
             .context("The tracked Git task changed while CLT was repairing its Done move")?;
-        move_agent_git_task_in_board_after_lock(&board_dir, status, "done", task_index)?;
+        move_task_without_reordering_after_lock(&board_dir, *status, TaskStatus::Done, task_index)?;
         return Ok(true);
     }
 
@@ -3335,17 +3350,18 @@ pub(super) fn repair_tracking_agent_git_board(
     }
     while done.len() > 1 {
         let duplicate = done.pop().expect("Done duplicate exists");
-        remove_agent_git_task_entry_without_reordering(&board_dir, "done", &duplicate)?;
-        done = matching_agent_session_tasks(&board_dir, "done", session_id, task_identity)?;
+        remove_task_entry_without_reordering(&board_dir, TaskStatus::Done, &duplicate)?;
+        done =
+            matching_agent_session_tasks(&board_dir, TaskStatus::Done, session_id, task_identity)?;
     }
-    for status in ["todo", "doing"] {
+    for status in [TaskStatus::Todo, TaskStatus::Doing] {
         loop {
             let mut duplicates =
                 matching_agent_session_tasks(&board_dir, status, session_id, task_identity)?;
             let Some(duplicate) = duplicates.pop() else {
                 break;
             };
-            remove_agent_git_task_entry_without_reordering(&board_dir, status, &duplicate)?;
+            remove_task_entry_without_reordering(&board_dir, status, &duplicate)?;
         }
     }
     Ok(true)
@@ -3360,7 +3376,7 @@ pub(super) fn worktree_completed_task_identity(
     else {
         return Ok(None);
     };
-    if status != "done" || !task_content_has_completed_note(&task.content) {
+    if status != TaskStatus::Done || !task_content_has_completed_note(&task.content) {
         return Ok(None);
     }
     Ok(durable_task_identity(&task.content))

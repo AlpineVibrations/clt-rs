@@ -1411,8 +1411,9 @@ pub(super) fn stop_interactive_child_until_reaped(
     }
 }
 
-pub(super) fn task_supports_interactive_codex_resume(status: &str, task: &TaskEntry) -> bool {
-    matches!(status, "done" | "doing") || status == "todo" && task_entry_is_blocked(task)
+pub(super) fn task_supports_interactive_codex_resume(status: TaskStatus, task: &TaskEntry) -> bool {
+    matches!(status, TaskStatus::Done | TaskStatus::Doing)
+        || status == TaskStatus::Todo && task_entry_is_blocked(task)
 }
 
 pub(super) fn codex_session_task_supports_interactive_resume(
@@ -1424,15 +1425,15 @@ pub(super) fn codex_session_task_supports_interactive_resume(
     Ok(matches.len() == 1
         && matches
             .first()
-            .is_some_and(|(status, task)| task_supports_interactive_codex_resume(status, task)))
+            .is_some_and(|(status, task)| task_supports_interactive_codex_resume(*status, task)))
 }
 
 pub(super) fn collect_codex_session_tasks_in_board(
     board_dir: &Path,
     session_id: &str,
-    matches: &mut Vec<(&'static str, TaskEntry)>,
+    matches: &mut Vec<(TaskStatus, TaskEntry)>,
 ) -> Result<()> {
-    for status in ["doing", "todo", "backlog", "done"] {
+    for status in TaskStatus::SESSION_SEARCH_ORDER {
         let tasks = read_task_entries(board_dir, status)?;
         for task in tasks {
             if recoverable_codex_session_id_from_task_content(&task.content) == Some(session_id) {
