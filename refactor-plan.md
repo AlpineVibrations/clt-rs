@@ -1,6 +1,6 @@
 # CLT Refactor Design/Build Plan
 
-Status: planned; implementation tasks are not active
+Status: Stage A in progress; Phases 0–6 are complete and Phases 7–14 remain queued
 
 ## Early work already present
 
@@ -172,6 +172,6 @@ Final acceptance additionally requires:
 
 - The implementation tasks live as top-level Todo entries in dependency order so the scheduler can see them; they are not nested subtasks.
 - Phase numbers remain at the start of task titles so ordering survives file renumbering.
-- The registered CLT project remains paused, and every refactor task remains in Todo, until the task definitions and the early Phase 0 changes have been reviewed and committed.
+- The initial review gate was satisfied by the committed task definitions and early Phase 0 baseline; later phases may run in dependency order from the recorded board state.
 - Each completed phase records its exact changes and checks in its task before moving to Done.
 - Existing unrelated Backlog tasks are preserved.

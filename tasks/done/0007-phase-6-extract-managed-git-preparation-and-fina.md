@@ -14,4 +14,8 @@ COMPLETED 2026-09-03: Added the internal `managed_git` module for finalization l
 
 Blocked note:
 
-BLOCKED 2026-09-03: The extraction and all gates pass, but the frozen baseline has Phase 2–5's `src/lib.rs` and supporting modules as untracked files. Phase 6 necessarily edits `src/lib.rs` to register `managed_git` and remove the extracted implementation, so Git cannot stage a buildable Phase 6 delta without also committing older task payloads. External CLT journal recovery must resolve the earlier WORKING histories before this task can be sealed safely. codex:01a06531-8219-7302-8377-b13af936bd40
+BLOCKED 2026-09-03: The extraction and all gates pass, but the frozen baseline has Phase 2–5's `src/lib.rs` and supporting modules as untracked files. Phase 6 necessarily edits `src/lib.rs` to register `managed_git` and remove the extracted implementation, so Git cannot stage a buildable Phase 6 delta without also committing older task payloads. External CLT journal recovery must resolve the earlier WORKING histories before this task can be sealed safely.
+
+COMPLETED 2026-09-03: Manual recovery preserved the verified Phase 6 implementation in combined rescue commit `f881c4f`; the obsolete per-task WORKING journal was cancelled after the managed-Git extraction became part of that recovery boundary.
+
+codex:01a06531-8219-7302-8377-b13af936bd40

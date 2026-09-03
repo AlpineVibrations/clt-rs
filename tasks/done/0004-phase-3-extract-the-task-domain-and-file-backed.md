@@ -14,4 +14,6 @@ COMPLETED 2026-09-03: Added the internal `task` module for task models, marker a
 
 BLOCKED 2026-09-03: Implementation and all gates pass, but the frozen baseline has Phase 2's `src/lib.rs` as an untracked file and Phase 3 necessarily changes that file. Git cannot stage only Phase 3's delta against a path absent from `HEAD`; staging it would also commit the older Phase 0/2 payload and violate the task-scoped exact-one-commit contract. Finalization requires external CLT recovery that first resolves the older Phase 0/2 WORKING journals, or supported baseline/path-relocation handling.
 
+COMPLETED 2026-09-03: Manual recovery preserved the verified Phase 3 implementation in combined rescue commit `f881c4f`; the obsolete per-task WORKING journal was cancelled after the extracted task module became part of that recovery boundary.
+
 codex:01a06510-0f91-7d21-86cf-3f131faa1fd5

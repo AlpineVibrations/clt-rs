@@ -1220,6 +1220,10 @@ pub(super) fn capture_agent_git_worktree_baseline(
     capture_agent_git_worktree_state(project_root)
 }
 
+pub(super) fn is_agent_git_task_board_path(path: &str) -> bool {
+    path == "tasks" || path.starts_with("tasks/")
+}
+
 pub(super) fn require_agent_git_index_matches_head(project_root: &Path) -> Result<()> {
     let cached = Command::new("git")
         .current_dir(project_root)
@@ -1281,25 +1285,30 @@ pub(super) fn worktree_matches_agent_git_baseline(
     if expected.require_clean {
         return Ok(current.tracked_patch_ids.is_empty() && current.untracked_blob_ids.is_empty());
     }
-    let current_is_subset = current
+    // The private staged-tree proof below owns task-board commit scope. Ignore raw
+    // board changes here so a person can add another Todo while the agent works;
+    // they remain outside the index and therefore outside the sealed task commit.
+    let current_non_task_is_subset = current
         .tracked_patch_ids
         .iter()
+        .filter(|(path, _)| !is_agent_git_task_board_path(path))
         .all(|(path, patch_id)| expected.tracked_patch_ids.get(path) == Some(patch_id))
         && current
             .untracked_blob_ids
             .iter()
+            .filter(|(path, _)| !is_agent_git_task_board_path(path))
             .all(|(path, blob_id)| expected.untracked_blob_ids.get(path) == Some(blob_id));
     let non_task_baseline_preserved = expected
         .tracked_patch_ids
         .iter()
-        .filter(|(path, _)| !path.starts_with("tasks/"))
+        .filter(|(path, _)| !is_agent_git_task_board_path(path))
         .all(|(path, patch_id)| current.tracked_patch_ids.get(path) == Some(patch_id))
         && expected
             .untracked_blob_ids
             .iter()
-            .filter(|(path, _)| !path.starts_with("tasks/"))
+            .filter(|(path, _)| !is_agent_git_task_board_path(path))
             .all(|(path, blob_id)| current.untracked_blob_ids.get(path) == Some(blob_id));
-    Ok(current_is_subset && non_task_baseline_preserved)
+    Ok(current_non_task_is_subset && non_task_baseline_preserved)
 }
 
 pub(super) fn git_ref_has_one_active_session_task(
@@ -1681,7 +1690,7 @@ pub(super) fn capture_agent_git_staged_manifest(
     let baseline = AgentGitWorktreeBaseline::from_json(raw_baseline)?;
     if !worktree_matches_agent_git_baseline(project_root, raw_baseline)? {
         anyhow::bail!(
-            "Stage every task-owned change before `clt done`; the remaining unstaged and untracked work must match the pre-task baseline"
+            "Stage every task-owned change before `clt done`; remaining unstaged and untracked non-task work must match the pre-task baseline, while concurrent task-board edits must stay unstaged"
         );
     }
     let manifest_parent_head = resolve_git_commit(
@@ -1799,7 +1808,7 @@ pub(super) fn capture_agent_git_resealed_manifest(
     }
     if !worktree_matches_agent_git_baseline(project_root, raw_baseline)? {
         anyhow::bail!(
-            "Stage every corrected task-owned change before resealing; remaining unstaged and untracked work must match the pre-task baseline"
+            "Stage every corrected task-owned change before resealing; remaining unstaged and untracked non-task work must match the pre-task baseline, while concurrent task-board edits must stay unstaged"
         );
     }
     let manifest_parent_head =

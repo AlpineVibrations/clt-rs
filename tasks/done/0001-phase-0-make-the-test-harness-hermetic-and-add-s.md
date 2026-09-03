@@ -26,4 +26,6 @@ UNBLOCKED 2026-09-03: CLT subsequently proved the intervening Phase 1 finalizati
 
 BLOCKED 2026-09-03: Retried `clt done doing 1` after CLT proved the intervening Phase 1 commit, but sealing still fails because this older WORKING journal contains an unproven intervening commit. The implementation and full quality run pass; CLT journal recovery is required before this task can be sealed and committed safely.
 
+COMPLETED 2026-09-03: Manual recovery preserved the verified Phase 0 implementation in combined rescue commit `f881c4f`; the obsolete per-task WORKING journal was cancelled because the rescue commit superseded its original exact-one-commit boundary.
+
 codex:01a064d8-62d4-73e0-af01-9e6a39dd624e

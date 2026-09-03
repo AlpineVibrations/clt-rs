@@ -16,4 +16,6 @@ BLOCKED 2026-09-03: Implementation and all gates pass, but the frozen baseline h
 
 BLOCKED 2026-09-03: Reverified the platform extraction and all locked gates while the Phase 0 and Phase 2–4 journals remain WORKING. Phase 5 still cannot stage its `src/lib.rs` delta without consuming the earlier sessions' untracked baseline; resolve those journals or add supported baseline ownership transfer before sealing this task.
 
+COMPLETED 2026-09-03: Manual recovery preserved the verified Phase 5 implementation in combined rescue commit `f881c4f`; the obsolete per-task WORKING journal was cancelled after the platform extraction became part of that recovery boundary.
+
 codex:01a06525-5bff-7672-bd08-fb6cb3dfb97b

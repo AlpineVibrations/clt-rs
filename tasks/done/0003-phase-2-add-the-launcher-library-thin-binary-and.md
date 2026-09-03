@@ -20,4 +20,6 @@ BLOCKED 2026-09-03: Interactive recovery confirmed that both Phase 0 and Phase 2
 
 BLOCKED 2026-09-03: Recovery now finds Phases 3–6 also implemented on top of Phase 2's untracked `src/lib.rs`, with all six task journals still WORKING and no Phase 2 commit. Staging Phase 2 alone can no longer produce a buildable tree without absorbing or discarding later task work; resolve the ordered WORKING journals externally before finalization.
 
+COMPLETED 2026-09-03: Manual recovery preserved the verified Phase 2 implementation in combined rescue commit `f881c4f`; the obsolete per-task WORKING journal was cancelled because later extracted modules now depend on this committed launcher/library split.
+
 codex:01a064fb-ac78-7ac0-ba28-963a09cac536

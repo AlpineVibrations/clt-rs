@@ -14,4 +14,6 @@ COMPLETED 2026-09-03: Added the internal `agent` module for agent domain records
 
 BLOCKED 2026-09-03: Implementation and all gates pass, but the frozen baseline has Phase 2/3's `src/lib.rs` as an untracked file and Phase 4 necessarily changes that file to declare and consume the extracted `agent` module. Git cannot stage only Phase 4's delta against a path absent from `HEAD`; staging it would also commit the older Phase 0-3 payload and violate the task-scoped exact-one-commit contract. Finalization requires external CLT recovery that resolves the older WORKING journals first, or supported baseline/path-relocation handling.
 
+COMPLETED 2026-09-03: Manual recovery preserved the verified Phase 4 implementation in combined rescue commit `f881c4f`; the obsolete per-task WORKING journal was cancelled after the extracted agent domain and store became part of that recovery boundary.
+
 codex:01a0651a-1fd8-77e1-b899-25316ac10e50
