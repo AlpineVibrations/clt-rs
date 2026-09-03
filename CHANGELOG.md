@@ -60,6 +60,7 @@ Use this section while developing the next release.
 
 ### Fixed
 
+- Reclaim orphaned interactive reservations as soon as their generated holder process exits, release the exact lease when a guarded session disappears after reap, and show interactive lease-only states as `FENCED` or `STALE` instead of a false `RUNNING` agent.
 - Allowed `c` to reopen a linked Doing task when its exact Codex session is stopped or otherwise idle, while continuing to reject sessions that are still running.
 - Rebuild the derived active-worker project index after Turso reports a missing index entry, retry the scheduler pass once, and keep the daemon alive for later retries if a pass still fails.
 - Kept TUI startup and keyboard input responsive while agent-panel refreshes or stale-service recovery are slow.

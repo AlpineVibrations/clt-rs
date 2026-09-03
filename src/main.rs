@@ -4966,6 +4966,27 @@ fn finish_interactive_guardian_after_reap(
         ) {
             Ok(changed) => match store.session_control_blocking(project_id, session_id) {
                 Ok(control) => {
+                    if control.is_none() && disposition.holds_project_lease() {
+                        match store.release_lease_blocking(project_id, guardian_holder) {
+                            Ok(_) => {
+                                anyhow::bail!(
+                                    "Interactive Codex session {session_id} disappeared after its guarded child was reaped; CLT released the orphaned project reservation"
+                                );
+                            }
+                            Err(error) => {
+                                let should_warn = last_warning.is_none_or(|warning| {
+                                    warning.elapsed() >= Duration::from_secs(5)
+                                });
+                                if should_warn {
+                                    eprintln!(
+                                        "Interactive guardian is retrying orphaned lease cleanup after its session disappeared: {error:#}"
+                                    );
+                                    last_warning = Some(Instant::now());
+                                }
+                                continue;
+                            }
+                        }
+                    }
                     let finalized = match disposition {
                         InteractiveGuardianDisposition::ResumeExec => {
                             control.as_ref().and_then(|control| {
@@ -8326,12 +8347,15 @@ fn reconcile_stale_agent_session_controls(
             let matching_active_lease = lease.is_some_and(|lease| {
                 lease.holder == holder
                     && !agent_lease_is_reclaimable(lease, reclaim_current_process_leases, now)
+                    && !interactive_lease_holder_is_proven_dead(holder)
             });
             let recently_updated = control.updated_at.parse::<u64>().is_ok_and(|updated_at| {
                 now.saturating_sub(updated_at)
                     <= TUI_SESSION_HANDOFF_TIMEOUT_SECONDS.saturating_add(5)
             });
-            if !matching_active_lease && !recently_updated {
+            if !matching_active_lease
+                && (interactive_lease_holder_is_proven_dead(holder) || !recently_updated)
+            {
                 with_agent_store_at(state_dir, |store| {
                     store
                         .cancel_idle_session_interactive_blocking(
@@ -8354,13 +8378,14 @@ fn reconcile_stale_agent_session_controls(
             let matching_active_lease = lease.is_some_and(|lease| {
                 lease.holder == holder
                     && !agent_lease_is_reclaimable(lease, reclaim_current_process_leases, now)
+                    && !interactive_lease_holder_is_proven_dead(holder)
             });
             let requester_alive = matches!(
                 agent_lease_holder_liveness(holder),
                 AgentLeaseHolderLiveness::CurrentProcess
                     | AgentLeaseHolderLiveness::Alive
                     | AgentLeaseHolderLiveness::Unknown
-            );
+            ) && !interactive_lease_holder_is_proven_dead(holder);
             let recently_updated = control.updated_at.parse::<u64>().is_ok_and(|updated_at| {
                 now.saturating_sub(updated_at)
                     <= TUI_SESSION_HANDOFF_TIMEOUT_SECONDS.saturating_add(5)
@@ -8422,6 +8447,7 @@ fn reconcile_stale_agent_session_controls(
                                 reclaim_current_process_leases,
                                 now,
                             )
+                            && !interactive_lease_holder_is_proven_dead(holder)
                     })
                 });
                 let requester_alive = expected_holder.is_some_and(|holder| {
@@ -8430,7 +8456,7 @@ fn reconcile_stale_agent_session_controls(
                         AgentLeaseHolderLiveness::CurrentProcess
                             | AgentLeaseHolderLiveness::Alive
                             | AgentLeaseHolderLiveness::Unknown
-                    )
+                    ) && !interactive_lease_holder_is_proven_dead(holder)
                 });
                 let recently_updated = control.updated_at.parse::<u64>().is_ok_and(|updated_at| {
                     now.saturating_sub(updated_at)
@@ -8951,12 +8977,27 @@ fn try_reclaim_inactive_agent_lease(
     lease: &agent_store::AgentLeaseRecord,
     reclaim_current_process_leases: bool,
 ) -> Result<bool> {
-    let liveness = agent_lease_holder_liveness(&lease.holder);
-    if !agent_lease_is_reclaimable(
+    let ordinary_liveness = agent_lease_holder_liveness(&lease.holder);
+    let interactive_liveness = interactive_lease_holder_liveness(&lease.holder);
+    let liveness = interactive_liveness.unwrap_or(ordinary_liveness);
+    let ordinarily_reclaimable = agent_lease_is_reclaimable(
         lease,
         reclaim_current_process_leases,
         agent_timestamp_seconds(),
-    ) {
+    );
+    let orphaned_interactive_lease = if !ordinarily_reclaimable
+        && interactive_liveness == Some(AgentLeaseHolderLiveness::Dead)
+    {
+        with_agent_store_at(state_dir, |store| {
+            Ok(!store
+                .session_controls_for_project_blocking(project.id)?
+                .into_iter()
+                .any(|control| control.interactive_holder.as_deref() == Some(&lease.holder)))
+        })?
+    } else {
+        false
+    };
+    if !ordinarily_reclaimable && !orphaned_interactive_lease {
         return Ok(false);
     }
 
@@ -9048,6 +9089,37 @@ fn agent_lease_holder_liveness(holder: &str) -> AgentLeaseHolderLiveness {
     };
 
     agent_pid_liveness(pid)
+}
+
+fn interactive_lease_holder_liveness(holder: &str) -> Option<AgentLeaseHolderLiveness> {
+    interactive_lease_holder_pid(holder).map(agent_pid_liveness)
+}
+
+fn interactive_lease_holder_is_proven_dead(holder: &str) -> bool {
+    interactive_lease_holder_liveness(holder) == Some(AgentLeaseHolderLiveness::Dead)
+}
+
+fn interactive_lease_holder_pid(holder: &str) -> Option<u32> {
+    if let Some(pid) = InteractiveGuardianDisposition::guardian_process_id(holder) {
+        return Some(pid);
+    }
+
+    [
+        "clt-stopped-shared-interactive-",
+        "clt-shared-interactive-",
+        "clt-stopped-readonly-interactive-",
+        "clt-readonly-interactive-",
+        "clt-stopped-interactive-",
+        "clt-idle-interactive-",
+        "clt-interactive-",
+    ]
+    .into_iter()
+    .find_map(|prefix| {
+        holder
+            .strip_prefix(prefix)
+            .and_then(|suffix| suffix.split('-').next())
+            .and_then(|pid| pid.parse::<u32>().ok())
+    })
 }
 
 fn agent_pid_liveness(pid: u32) -> AgentLeaseHolderLiveness {
@@ -26360,8 +26432,10 @@ fn load_tui_agent_panel_snapshot_inner(
             let scan = scan_agent_project(&project.path);
             let daemon_scan_problem = tui_agent_daemon_scan_problem(&project);
             let mut runtime_state = tui_agent_runtime_state(project.id, &active_leases);
-            if runtime_state == TuiAgentRuntimeState::Idle
-                && interactive_session_projects.contains(&project.id)
+            if matches!(
+                runtime_state,
+                TuiAgentRuntimeState::Idle | TuiAgentRuntimeState::Fenced
+            ) && interactive_session_projects.contains(&project.id)
             {
                 runtime_state = TuiAgentRuntimeState::Interactive;
             }
@@ -26466,6 +26540,15 @@ fn tui_agent_runtime_state(
     else {
         return TuiAgentRuntimeState::Idle;
     };
+
+    if let Some(liveness) = interactive_lease_holder_liveness(&lease.holder) {
+        return match liveness {
+            AgentLeaseHolderLiveness::Dead => TuiAgentRuntimeState::Stale,
+            AgentLeaseHolderLiveness::CurrentProcess
+            | AgentLeaseHolderLiveness::Alive
+            | AgentLeaseHolderLiveness::Unknown => TuiAgentRuntimeState::Fenced,
+        };
+    }
 
     match agent_lease_holder_liveness(&lease.holder) {
         AgentLeaseHolderLiveness::Dead => TuiAgentRuntimeState::Stale,
@@ -35753,6 +35836,116 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn dead_interactive_holder_with_a_matching_session_is_not_blindly_reclaimed() {
+        let root = temp_root("interactive-guardian-session-fence");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        let requester = "clt-idle-interactive-requester";
+        let guardian = format!("clt-idle-interactive-worker-{}-1-1", u32::MAX);
+        assert!(
+            store
+                .try_acquire_lease_blocking(project.id, requester, "100", "9999999999",)
+                .unwrap()
+        );
+        assert!(
+            store
+                .reserve_idle_session_interactive_blocking(
+                    project.id,
+                    "session-123",
+                    requester,
+                    None,
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .adopt_interactive_guardian_blocking(
+                    project.id,
+                    Some("session-123"),
+                    requester,
+                    &guardian,
+                    60,
+                )
+                .unwrap()
+        );
+        let lease = store
+            .lease_for_project_blocking(project.id)
+            .unwrap()
+            .unwrap();
+        drop(store);
+
+        assert!(
+            !try_reclaim_inactive_agent_lease(&state_dir, &project, None, &lease, false).unwrap()
+        );
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        assert_eq!(
+            store
+                .lease_for_project_blocking(project.id)
+                .unwrap()
+                .unwrap()
+                .holder,
+            guardian
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reaped_guardian_releases_its_lease_when_the_session_row_disappeared() {
+        let root = temp_root("interactive-guardian-missing-session");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project_id = store.list_projects_blocking().unwrap().remove(0).id;
+        let requester = InteractiveAgentLease::holder_for_idle_session();
+        let guardian =
+            interactive_guardian_holder(InteractiveGuardianDisposition::PreserveIdleSession);
+        assert!(
+            store
+                .try_acquire_lease_blocking(project_id, &requester, "100", "9999999999",)
+                .unwrap()
+        );
+        assert!(
+            store
+                .adopt_interactive_guardian_blocking(project_id, None, &requester, &guardian, 60,)
+                .unwrap()
+        );
+
+        let error = finish_interactive_guardian_after_reap(
+            &store,
+            project_id,
+            "missing-session",
+            &guardian,
+            Duration::from_secs(60),
+            InteractiveGuardianDisposition::PreserveIdleSession,
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("released the orphaned project reservation"));
+        assert!(
+            store
+                .lease_for_project_blocking(project_id)
+                .unwrap()
+                .is_none()
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn stale_stopped_guardian_recovery_restores_the_stopped_generation() {
         let root = temp_root("interactive-guardian-restore-stopped");
@@ -37577,6 +37770,32 @@ mod tests {
             tui_agent_runtime_state(1, &[active_lease]),
             TuiAgentRuntimeState::Running
         );
+
+        let interactive_lease = agent_store::AgentLeaseRecord {
+            project_id: 1,
+            project_name: "alpha".to_string(),
+            project_path: PathBuf::from("/tmp/alpha"),
+            holder: InteractiveAgentLease::holder_for_idle_session(),
+            acquired_at: "100".to_string(),
+            expires_at: "200".to_string(),
+        };
+        assert_eq!(
+            tui_agent_runtime_state(1, &[interactive_lease]),
+            TuiAgentRuntimeState::Fenced
+        );
+
+        let stale_interactive_lease = agent_store::AgentLeaseRecord {
+            project_id: 1,
+            project_name: "alpha".to_string(),
+            project_path: PathBuf::from("/tmp/alpha"),
+            holder: format!("clt-idle-interactive-worker-{}-1-1", u32::MAX),
+            acquired_at: "100".to_string(),
+            expires_at: "9999999999".to_string(),
+        };
+        assert_eq!(
+            tui_agent_runtime_state(1, &[stale_interactive_lease]),
+            TuiAgentRuntimeState::Stale
+        );
     }
 
     #[test]
@@ -38819,6 +39038,14 @@ mod tests {
             interactive_guardian_holder(InteractiveGuardianDisposition::RestoreStopped),
         ] {
             assert_eq!(agent_lease_holder_pid(&holder), None);
+            assert_eq!(
+                interactive_lease_holder_pid(&holder),
+                Some(std::process::id())
+            );
+            assert_eq!(
+                interactive_lease_holder_liveness(&holder),
+                Some(AgentLeaseHolderLiveness::CurrentProcess)
+            );
             let lease = agent_store::AgentLeaseRecord {
                 project_id: 1,
                 project_name: "project".to_string(),
@@ -46269,6 +46496,44 @@ mod tests {
                     "100",
                     "9999999999",
                 )
+                .unwrap()
+        );
+        store
+            .set_project_enabled_blocking(project.id, false)
+            .unwrap();
+        let runner = FakeAgentRunner::new(&state_dir, "success");
+        drop(store);
+
+        let pass = run_agent_once_with_runner(&state_dir, &runner).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+
+        assert_eq!(pass.scanned_projects, 0);
+        assert_eq!(pass.runs_started, 0);
+        assert_eq!(store.lease_count_blocking().unwrap(), 0);
+        assert_eq!(store.run_count_blocking().unwrap(), 0);
+        assert_eq!(runner.ran_project_count(), 0);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_run_once_reclaims_dead_orphaned_interactive_lease_before_expiry() {
+        let root = temp_root("agent-run-disabled-dead-interactive-lease");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        add_task(&project_root, "disabled task", None).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent_store::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        let holder = format!("clt-idle-interactive-worker-{}-1-1", u32::MAX);
+        assert!(
+            store
+                .try_acquire_lease_blocking(project.id, &holder, "100", "9999999999",)
                 .unwrap()
         );
         store
