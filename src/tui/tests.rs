@@ -322,6 +322,77 @@ fn tui_reorganize_action_moves_the_selected_task_between_boards() {
     fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn tui_done_move_selects_and_shows_the_newest_completion() {
+    for folders in [false, true] {
+        let root = temp_root("tui-done-visible");
+        init_tasks(&root, folders).unwrap();
+        let board_dir = root.join("tasks");
+        let board = TaskBoard::new(&board_dir);
+        for index in 0..30 {
+            board
+                .insert_content(TaskStatus::Done, None, &format!("Old completion {index}"))
+                .unwrap();
+        }
+        let mut app = TuiApp::new(&root, true);
+        let done_board = 2;
+        let size = Rect::new(0, 0, 120, 16);
+        let backend = ratatui::backend::TestBackend::new(size.width, size.height);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        for task in ["New completion", "Latest completion"] {
+            board.insert_content(TaskStatus::Doing, None, task).unwrap();
+            app.refresh_task_snapshot();
+            let previous_done = app.task_snapshot.board_entries[done_board].clone();
+            app.selected_board = 1;
+            app.board_states[1].select(Some(0));
+            app.board_scroll_offsets[done_board] = previous_done.len() - 1;
+
+            let message = reorganize_selected_tui_task(
+                &board_dir,
+                &TASK_STATUSES,
+                &mut app.board_states,
+                &mut app.selected_board,
+                false,
+                TuiTaskReorganizeDirection::Right,
+            );
+
+            assert_eq!(message, "Moved task to done");
+            assert_eq!(app.selected_board, done_board);
+            assert_eq!(app.board_states[done_board].selected(), Some(0));
+            assert_eq!(app.board_states[1].selected(), None);
+            app.refresh_task_snapshot();
+            let done = &app.task_snapshot.board_entries[done_board];
+            assert_eq!(done[0].content.trim(), task);
+            assert_eq!(
+                done[1..]
+                    .iter()
+                    .map(|entry| &entry.content)
+                    .collect::<Vec<_>>(),
+                previous_done
+                    .iter()
+                    .map(|entry| &entry.content)
+                    .collect::<Vec<_>>()
+            );
+            assert!(app.task_snapshot.board_entries[1].is_empty());
+
+            app.prepare_render(size);
+            assert_eq!(app.board_scroll_offsets[done_board], 0);
+            terminal.draw(|frame| render_tui(frame, &app)).unwrap();
+            let rendered = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(rendered.contains(&format!("1. {task}")), "{rendered}");
+        }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
 pub(crate) fn tui_agent_project_for_test(id: i64, name: &str) -> TuiAgentProject {
     TuiAgentProject {
         project: agent::AgentProject {

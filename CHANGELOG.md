@@ -10,6 +10,7 @@ Use this section while developing the next release.
 
 ### Fixed
 
+- Select and reveal the newly completed task at the top of Done when moving it in the TUI, including when the Done list was scrolled down.
 - Recognize Shift+M when terminals report lowercase `m` with a Shift modifier, so the Models page opens and closes consistently from Tasks and Agent Projects while plain `m` still cycles the project model.
 
 ## [0.6.3] - 2026-09-04

@@ -750,7 +750,19 @@ pub(super) fn move_selected_tui_task_between_boards(
             for state in board_states.iter_mut() {
                 state.select(None);
             }
-            select_last_task_if_present_in_board(board_dir, to, &mut board_states[*selected_board]);
+            if to == TaskStatus::Done {
+                select_first_task_if_present_in_board(
+                    board_dir,
+                    to,
+                    &mut board_states[*selected_board],
+                );
+            } else {
+                select_last_task_if_present_in_board(
+                    board_dir,
+                    to,
+                    &mut board_states[*selected_board],
+                );
+            }
             if let Some(session_id) = external_completion {
                 format!(
                     "Moved task to Done as external completion; cancelled idle managed Git journal for {session_id}"
