@@ -25,13 +25,13 @@ use crate::{
         CODEX_TASK_SESSION_PREFIX, StatusStore, TASK_DETAIL_FILES, TASK_STATUSES, TaskBoard,
         TaskEntry, TaskSource, TaskStatus, acquire_board_mutation_lock,
         acquire_board_mutation_lock_with_contention_callback,
-        attach_codex_session_to_task_after_lock, cleanup_clt_atomic_task_temporaries,
-        codex_session_id_from_task_content, codex_session_markers_in_task_content,
-        durable_task_identity, get_status_store, get_tasks_dir,
-        move_task_without_reordering_after_lock, read_task_entries,
-        remove_task_entry_without_reordering, starts_with_task_note_date, task_entry_is_blocked,
-        task_tree_contains_session_marker, terminal_task_for_codex_session_in_board,
-        title_from_path,
+        attach_codex_session_to_task_after_lock, blocked_follow_up_session,
+        cleanup_clt_atomic_task_temporaries, codex_session_id_from_task_content,
+        codex_session_markers_in_task_content, durable_task_identity, get_status_store,
+        get_tasks_dir, move_task_without_reordering_after_lock, read_task_entries,
+        remove_task_entry_without_reordering, starts_with_task_note_date, task_content_is_blocked,
+        task_entry_is_blocked, task_tree_contains_session_marker,
+        terminal_task_for_codex_session_in_board, title_from_path,
     },
 };
 
@@ -1770,6 +1770,7 @@ pub(super) fn agent_git_task_scope_without_selected(
 pub(super) fn agent_git_completed_scope_without_selected(
     project_root: &Path,
     completed_tree: &str,
+    parent_tree: &str,
     session_id: &str,
     task_identity: &str,
 ) -> Result<String> {
@@ -1783,6 +1784,36 @@ pub(super) fn agent_git_completed_scope_without_selected(
         task_identity,
     )?;
     remove_task_entry_without_reordering(&board_dir, TaskStatus::Done, &entry)?;
+    // Only new, explicitly linked blocked follow-ups may accompany the selected
+    // task. Removing them from this private projection must restore the exact
+    // parent board; edits to existing tasks, headers, paths and attachments still fail.
+    let parent_entries = git_ref_task_entries(project_root, parent_tree)?;
+    let follow_ups = read_task_entries(&board_dir, TaskStatus::Doing)?
+        .into_iter()
+        .filter(|entry| {
+            blocked_follow_up_session(&entry.content) == Some(session_id)
+                && match &entry.source {
+                    TaskSource::MarkdownLine { .. } => true,
+                    TaskSource::Path {
+                        path,
+                        is_dir: false,
+                    } => fs::symlink_metadata(path)
+                        .is_ok_and(|metadata| metadata.file_type().is_file()),
+                    TaskSource::Path { is_dir: true, .. } => false,
+                }
+                && !parent_entries.iter().any(|parent| {
+                    parent.status == "doing"
+                        && parent.content.trim_end() == entry.content.trim_end()
+                })
+        })
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        follow_ups.len() <= 1,
+        "Only one new blocked follow-up may accompany a task commit"
+    );
+    for follow_up in follow_ups.iter().rev() {
+        remove_task_entry_without_reordering(&board_dir, TaskStatus::Doing, follow_up)?;
+    }
     let sanitized_tree = stage_projected_task_tree(
         project_root,
         &index_path,
@@ -1797,6 +1828,7 @@ pub(super) fn project_agent_git_completed_tree(
     staged_tree: &str,
     session_id: &str,
     task_identity: &str,
+    parent_tree: &str,
     expected_task_scope_tree: &str,
 ) -> Result<String> {
     let (_projection, index_path, worktree_path) =
@@ -1823,6 +1855,7 @@ pub(super) fn project_agent_git_completed_tree(
     if agent_git_completed_scope_without_selected(
         project_root,
         &completed_tree,
+        parent_tree,
         session_id,
         task_identity,
     )? != expected_task_scope_tree
@@ -1904,18 +1937,12 @@ pub(super) fn capture_agent_git_staged_manifest(
             "Stage the selected Doing task, including its terminal codex:{session_id} marker and COMPLETED note, before `clt done`"
         );
     }
-    if git_ref_other_task_entries_from_start(project_root, &manifest_parent_head, task_identity)?
-        != git_ref_other_task_entries(project_root, &staged_index_tree, session_id)?
-    {
-        anyhow::bail!(
-            "The staged task board contains changes outside the selected task; leave unrelated task-board work unstaged"
-        );
-    }
     let sealed_commit_tree = project_agent_git_completed_tree(
         project_root,
         &staged_index_tree,
         session_id,
         task_identity,
+        &manifest_parent_head,
         &expected_task_scope_tree,
     )?;
     let rechecked_parent =
@@ -2028,6 +2055,7 @@ pub(super) fn capture_agent_git_resealed_manifest(
     if agent_git_completed_scope_without_selected(
         project_root,
         &sealed_commit_tree,
+        &manifest_parent_head,
         session_id,
         task_identity,
     )? != expected_task_scope_tree
@@ -2141,46 +2169,6 @@ pub(super) fn git_commit_is_proven_completed_other_session(
         &finalization.worktree_baseline,
         true,
     )
-}
-
-pub(super) fn git_ref_other_task_entries_from_start(
-    project_root: &Path,
-    reference: &str,
-    task_identity: &str,
-) -> Result<Vec<(String, String)>> {
-    let entries = git_ref_task_entries(project_root, reference)?;
-    let mut removed_target = false;
-    let mut others = entries
-        .into_iter()
-        .filter(|entry| {
-            let is_target = !removed_target
-                && matches!(entry.status.as_str(), "todo" | "doing")
-                && durable_task_identity(&entry.content).as_deref() == Some(task_identity);
-            if is_target {
-                removed_target = true;
-                false
-            } else {
-                true
-            }
-        })
-        .map(|entry| (entry.status, entry.content.trim_end().to_string()))
-        .collect::<Vec<_>>();
-    others.sort();
-    Ok(others)
-}
-
-pub(super) fn git_ref_other_task_entries(
-    project_root: &Path,
-    reference: &str,
-    session_id: &str,
-) -> Result<Vec<(String, String)>> {
-    let mut entries = git_ref_task_entries(project_root, reference)?
-        .into_iter()
-        .filter(|entry| codex_session_id_from_task_content(&entry.content) != Some(session_id))
-        .map(|entry| (entry.status, entry.content.trim_end().to_string()))
-        .collect::<Vec<_>>();
-    entries.sort();
-    Ok(entries)
 }
 
 pub(super) fn git_commit_matches_agent_staged_manifest(
@@ -2529,19 +2517,22 @@ pub(super) fn git_optional_stdout(
 }
 
 pub(super) fn task_content_has_completed_note(content: &str) -> bool {
-    content.lines().any(|line| {
-        let uppercase = line.to_ascii_uppercase();
-        uppercase
-            .match_indices("COMPLETED ")
-            .any(|(index, matched)| {
-                let has_word_boundary = uppercase[..index]
-                    .chars()
-                    .next_back()
-                    .is_none_or(|ch| !ch.is_ascii_alphanumeric() && ch != '_');
-                has_word_boundary
-                    && starts_with_task_note_date(&uppercase.as_bytes()[index + matched.len()..])
-            })
-    })
+    !task_content_is_blocked(content)
+        && content.lines().any(|line| {
+            let uppercase = line.to_ascii_uppercase();
+            uppercase
+                .match_indices("COMPLETED ")
+                .any(|(index, matched)| {
+                    let has_word_boundary = uppercase[..index]
+                        .chars()
+                        .next_back()
+                        .is_none_or(|ch| !ch.is_ascii_alphanumeric() && ch != '_');
+                    has_word_boundary
+                        && starts_with_task_note_date(
+                            &uppercase.as_bytes()[index + matched.len()..],
+                        )
+                })
+        })
 }
 
 pub(super) fn git_ref_contains_completed_task(

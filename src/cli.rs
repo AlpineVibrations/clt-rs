@@ -70,6 +70,18 @@ enum Commands {
         #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
         task: Vec<String>,
     },
+    /// Records a separate blocked follow-up in Doing without starting another session
+    FollowUp {
+        /// Parent status (doing)
+        status: String,
+        /// Parent task index
+        task_index: String,
+        /// Work remaining independently of the parent's completed implementation
+        description: String,
+        /// Failure evidence, baseline comparison, and what is needed to unblock
+        #[arg(long)]
+        blocked: String,
+    },
     /// Changes the status of a task
     Status {
         /// The source status (e.g., "todo")
@@ -351,6 +363,20 @@ pub(super) fn run() -> Result<()> {
             let (description, metadata) = parse_add_task_args(task)?;
             let msg = add_task(&root, &description, metadata)?;
             println!("{}", msg);
+        }
+        Some(Commands::FollowUp {
+            status,
+            task_index,
+            description,
+            blocked,
+        }) => {
+            ManagedTaskWorkflow::new(&root).add_blocked_follow_up(
+                TaskStatus::parse(&status)?,
+                &task_index,
+                &description,
+                &blocked,
+            )?;
+            println!("Blocked follow-up recorded in Doing; parent task unchanged.");
         }
         Some(Commands::Status {
             from,

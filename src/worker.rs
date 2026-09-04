@@ -26,7 +26,7 @@ use crate::{
     },
     managed_git::{
         cancel_unlinked_working_git_finalization, reconcile_agent_git_finalization,
-        worktree_contains_completed_done_task,
+        task_content_has_completed_note, worktree_contains_completed_done_task,
     },
     platform::{
         AgentServiceEnvironment, agent_codex_path_env, agent_worker_command_arguments,
@@ -45,8 +45,8 @@ use crate::{
     session_control::codex_session_for_task,
     task::{
         TaskEntry, TaskStatus, acquire_board_mutation_lock,
-        attach_codex_session_to_task_after_lock, get_tasks_dir, read_task_entries,
-        task_entry_is_blocked, terminal_task_for_codex_session_in_board,
+        attach_codex_session_to_task_after_lock, durable_task_identity, get_tasks_dir,
+        read_task_entries, task_entry_is_blocked, terminal_task_for_codex_session_in_board,
     },
 };
 
@@ -1600,12 +1600,18 @@ pub(super) fn attach_codex_session_to_active_task(
         AgentTaskSelection::NextTodo => newly_started,
         AgentTaskSelection::ResumeDoing => (tasks.len() == 1).then(|| tasks.first()).flatten(),
         AgentTaskSelection::RecoverBlocked => newly_started.or_else(|| {
-            let task = (tasks.len() == 1).then(|| tasks.first()).flatten()?;
             let snapshot = (blocked_task_snapshots_before.len() == 1)
                 .then(|| blocked_task_snapshots_before.first())
                 .flatten()?;
-            (snapshot.status == TaskStatus::Doing && snapshot.content == task.content.trim_end())
-                .then_some(task)
+            // A sole blocked follow-up is unambiguous even when a human has
+            // unrelated, unblocked work in Doing. Never steal an owned session.
+            (snapshot.status == TaskStatus::Doing).then_some(())?;
+            let mut matching = tasks.iter().filter(|task| {
+                snapshot.content == task.content.trim_end()
+                    && codex_session_for_task(task).is_none()
+            });
+            let task = matching.next()?;
+            matching.next().is_none().then_some(task)
         }),
         AgentTaskSelection::ResumeSession => None,
     };
@@ -1756,6 +1762,20 @@ pub(super) fn newly_added_task_entry<'a>(
 
 pub(super) fn blocked_recovery_made_no_progress(job: &AgentRunJob) -> bool {
     if job.task_selection != AgentTaskSelection::RecoverBlocked {
+        return false;
+    }
+
+    // Completing the original task is progress even if an independent follow-up
+    // leaves the blocked count unchanged. Unrelated Done edits do not qualify.
+    if let Ok(Some(completed)) =
+        newly_completed_task(&job.project.path, &job.done_task_contents_before)
+        && task_content_has_completed_note(&completed.content)
+        && let Some(identity) = durable_task_identity(&completed.content)
+        && job
+            .blocked_task_snapshots_before
+            .iter()
+            .any(|snapshot| durable_task_identity(&snapshot.content).as_ref() == Some(&identity))
+    {
         return false;
     }
 

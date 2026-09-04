@@ -356,6 +356,19 @@ Alternatively, mark a task as done quickly:
 clt done doing 1
 ```
 
+### Recording an independent blocked follow-up
+
+If a task's implementation and acceptance checks are complete but a separate test harness or environment failure remains, establish that independence with a reproduction on the starting revision. Record the revision, failing command, matching failure, and what is needed to unblock the independent work:
+
+```bash
+clt list doing
+clt follow-up doing 1 "Repair GPU test harness" --blocked "Harness fails identically on starting revision abc1234; requires a working GPU runtime"
+```
+
+This appends a blocked Doing task linked to the parent's session, preserves the parent, and starts no new session. Repeating the same command does not create another task. Add the follow-up reference and passing validation to the original task's COMPLETED note. In managed Git mode, stage the follow-up with the implementation and original Doing task before `clt done`, then include the Done transition in the same sealed commit. Unrelated board edits remain unstaged. The follow-up can be recovered later with its own session.
+
+Keep the original task blocked when acceptance is incomplete, a relevant check fails, or the failure's independence is uncertain. A follow-up does not waive task requirements or commit hooks.
+
 ### Deleting Tasks
 Remove a task from a specific list:
 ```bash

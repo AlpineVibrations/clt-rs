@@ -3,3 +3,8 @@ we have another git skill issue probably and our logic in clt also. so when a ta
 │266 tests pass. The GPU harness fails identically on the unchanged starting revision, blocking finalization under your rules.                                                                                                                │
 │                                                                                                                                                                                                                                        
 │Changes are preserved uncommitted. No push or second task started.
+
+Completion note:
+COMPLETED 2026-09-04: Added clt follow-up for independent blocked Doing work, exact Git sealing/resealing of linked follow-ups, separate-session recovery and progress reporting; updated prompts, skills, README and changelog. Checks: cargo fmt --all -- --check; cargo clippy --locked --all-targets --all-features -- -D warnings; cargo test --locked --all-targets --all-features (485 passed); quick_validate.py for both bundled skills; git diff --check.
+
+codex:01a06e92-3294-7782-bd67-b8135ca2c945

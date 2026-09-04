@@ -215,9 +215,13 @@ pub(super) enum TaskBlockingState {
 }
 
 pub(super) fn task_entry_is_blocked(entry: &TaskEntry) -> bool {
+    task_content_is_blocked(&entry.content)
+}
+
+pub(super) fn task_content_is_blocked(content: &str) -> bool {
     let mut state = None;
 
-    for line in entry.content.lines() {
+    for line in content.lines() {
         let heading = line.trim().trim_start_matches(['#', '-', '*', ' ']).trim();
         if heading.eq_ignore_ascii_case("blocked note:") {
             state = Some(TaskBlockingState::Blocked);
@@ -228,6 +232,23 @@ pub(super) fn task_entry_is_blocked(entry: &TaskEntry) -> bool {
     }
 
     state == Some(TaskBlockingState::Blocked)
+}
+
+pub(super) fn blocked_follow_up_session(content: &str) -> Option<&str> {
+    let marker = content.split_whitespace().next_back()?;
+    let session_id = marker.strip_prefix("clt-follow-up:")?;
+    (!session_id.is_empty()
+        && session_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        && content.matches("clt-follow-up:").count() == 1
+        && codex_session_markers_in_task_content(content).is_empty()
+        && content.lines().any(|line| {
+            latest_task_blocking_state_on_line(line) == Some(TaskBlockingState::Blocked)
+        })
+        && durable_task_identity(content).is_some()
+        && task_content_is_blocked(content))
+    .then_some(session_id)
 }
 
 pub(super) fn latest_task_blocking_state_on_line(line: &str) -> Option<TaskBlockingState> {

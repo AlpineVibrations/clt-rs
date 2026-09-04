@@ -10,6 +10,7 @@ Use this section while developing the next release.
 
 ### Added
 
+- Added `clt follow-up` to record an independent blocked Doing task alongside a verified implementation in the same sealed task commit, with prompt and skill guidance to distinguish pre-existing failures from incomplete acceptance criteria.
 - Keep the displayed agent run's model and thinking effort visible in the log footer, using its recorded startup settings for both live and completed output.
 
 ## [0.6.2] - 2026-09-04

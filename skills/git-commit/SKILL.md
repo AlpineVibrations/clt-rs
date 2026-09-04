@@ -191,6 +191,14 @@ If a commit hook changes files or fails after sealing, fix and stage the complet
 
 After creating and inspecting the exact task commit, exit without pushing. In commit-and-push mode CLT proves the local commit, performs publication itself, and retries `PUSH-PENDING` without resuming Codex. A blocked `WORKING` journal may yield to another Todo during blocked-recovery backoff while its history is preserved; `FINALIZING` and `PUSH-PENDING` block later project work.
 
+## Failed checks and completed implementation
+
+Classify a failing command before blocking finalization. When the implementation meets the original task's acceptance criteria and its relevant checks pass, a proven independent pre-existing or environment-only failure should not leave finished code uncommitted. Reproduce the failure on the frozen starting revision in an isolated directory without switching or resetting the active checkout; retain the revision, commands, matching output, passing checks, and unblock requirement.
+
+Use `clt list doing` and `clt follow-up doing <index> "Independent remaining work" --blocked "Evidence, baseline reproduction, and unblock requirement"` to record the separate blocked Doing task. It gets a `clt-follow-up:<parent-session-id>` reference, not the parent's terminal `codex:` marker. Include the reference and validation evidence in the original task's COMPLETED note. Stage the follow-up, verified implementation, and original Doing task before sealing; include the complete Done move and follow-up in the same single task commit. Leave unrelated board edits unstaged. Record the follow-up without starting work on it in this run.
+
+If the original implementation is incomplete, a task-relevant check fails, or independence is unproven, keep the original task blocked and preserve its changes. Never use a follow-up to bypass an acceptance criterion, required signing, or commit hooks. Reseal any corrected payload after a hook failure using the normal CLT contract.
+
 ## Commit Message
 
 Prefer the repo's existing style from recent commits.

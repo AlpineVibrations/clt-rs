@@ -36,14 +36,15 @@ use crate::{
     task::{
         ExpansionSummary, StatusStore, TASK_STATUSES, TaskBoard, TaskEntry, TaskSource, TaskStatus,
         acquire_board_mutation_lock, attach_codex_session_to_task_after_lock,
-        cleanup_clt_atomic_task_temporaries, codex_session_id_from_task_content,
-        convert_archive_to_directory, durable_task_identity, ensure_existing_board,
-        expand_status_for_command, get_or_create_archive_status_store, get_tasks_dir,
-        insert_content_into_directory, insert_content_into_markdown, move_path_into_directory,
-        move_task_without_reordering_after_lock, normalize_status_arg, parse_one_based_task_index,
-        read_markdown_entries, recoverable_codex_session_id_from_task_content, remove_task_entry,
-        reorder_directory_task, reorder_markdown_task, task_content_with_codex_session,
-        task_entry_at,
+        blocked_follow_up_session, cleanup_clt_atomic_task_temporaries,
+        codex_session_id_from_task_content, convert_archive_to_directory, durable_task_identity,
+        ensure_existing_board, expand_status_for_command, get_or_create_archive_status_store,
+        get_tasks_dir, insert_content_into_directory,
+        insert_content_into_directory_without_reordering, insert_content_into_markdown,
+        move_path_into_directory, move_task_without_reordering_after_lock, normalize_status_arg,
+        parse_one_based_task_index, read_markdown_entries,
+        recoverable_codex_session_id_from_task_content, remove_task_entry, reorder_directory_task,
+        reorder_markdown_task, task_content_with_codex_session, task_entry_at,
     },
     tui::{
         format_agent_daemon_runtime_status, load_task_agent_session_states,
@@ -809,6 +810,61 @@ impl ManagedTaskWorkflow {
         task_index: &str,
     ) -> Result<TaskDoneOutcome> {
         move_task_to_done(&self.root, from, task_index)
+    }
+
+    pub(super) fn add_blocked_follow_up(
+        &self,
+        from: TaskStatus,
+        task_index: &str,
+        description: &str,
+        reason: &str,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            from == TaskStatus::Doing,
+            "Follow-ups require a Doing parent task"
+        );
+        let description = description.split_whitespace().collect::<Vec<_>>().join(" ");
+        let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+        anyhow::ensure!(
+            !description.is_empty() && !reason.is_empty(),
+            "Follow-up description and blocked reason must be non-empty"
+        );
+        let _mutation_lock = acquire_board_mutation_lock(self.board.path())?;
+        let parent = self
+            .board
+            .entry(from, parse_one_based_task_index(task_index)?)?;
+        let session_id = codex_session_id_from_task_content(&parent.content)
+            .context("Follow-ups require the parent task's terminal codex:<session-id> marker")?;
+        ensure_managed_git_task_mutation_allowed(
+            self.board.path(),
+            &parent,
+            true,
+            Some(&parent.content),
+        )?;
+        let content = format!(
+            "{description} — BLOCKED {}: {reason} clt-follow-up:{session_id}",
+            chrono::Utc::now().format("%Y-%m-%d")
+        );
+        anyhow::ensure!(
+            blocked_follow_up_session(&content) == Some(session_id),
+            "Follow-up text must keep its blocked state and must not contain session or follow-up markers"
+        );
+        for entry in self.board.entries(TaskStatus::Doing)? {
+            if blocked_follow_up_session(&entry.content) == Some(session_id) {
+                anyhow::ensure!(
+                    entry.content.trim() == content,
+                    "This task already has a blocked follow-up; update that entry instead of creating another"
+                );
+                return Ok(());
+            }
+        }
+        match self.board.status_store(TaskStatus::Doing)? {
+            StatusStore::MarkdownFile(path) => insert_content_into_markdown(&path, None, &content)?,
+            StatusStore::Directory(path) => {
+                insert_content_into_directory_without_reordering(&path, &content)?;
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn reseal_completed_task(&self, task_index: &str) -> Result<bool> {

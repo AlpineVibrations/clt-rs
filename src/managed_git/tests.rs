@@ -3,6 +3,7 @@ use crate::test_support::prelude::*;
 use crate::test_support::*;
 use crate::worker::tests::reserve_test_worker;
 
+mod follow_up;
 mod orphan;
 
 #[test]

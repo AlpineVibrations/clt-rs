@@ -549,7 +549,9 @@ Safety rules:
 - Stop for Git overlap only when the required edits genuinely conflict and the correct combined result cannot be determined safely.
 - During normal TODO selection, skip tasks whose latest dated state note is `BLOCKED YYYY-MM-DD:`.
 - Inspect task details when needed; a folder-backed task's list summary may not show its blocker notes.
-- If the task is blocked or cannot be completed safely, update it with a concise `BLOCKED YYYY-MM-DD:` note instead of forcing it.
+- Classify failed checks before deciding the task is blocked. If the implementation satisfies the task's acceptance criteria and its relevant checks pass, an independently evidenced pre-existing or environment-only failure may be recorded as a separate blocked follow-up. Reproduce it on the frozen starting revision in an isolated directory without switching or resetting this checkout; record the revision, commands, matching failure, and what is needed to unblock it. If independence or acceptance remains uncertain, keep the original task blocked.
+- For that independent failure, run `clt list doing`, then `clt follow-up doing <index> "Follow-up description" --blocked "Failure evidence, baseline comparison, and unblock requirement"`. This records one linked blocked Doing task without starting another session or changing the parent's identity. Do not copy the parent's codex marker onto it. Do not work on the follow-up in this run. Record its reference and the validation evidence in the parent's COMPLETED note and finish the original task.
+- If the implementation is incomplete, a task-relevant check fails, or the task cannot be completed safely, update the original task with a concise `BLOCKED YYYY-MM-DD:` note instead of forcing it. A follow-up must not hide unfinished acceptance criteria or an unproven regression.
 "#;
 pub(super) const AGENT_GIT_COMMIT_PROMPT_APPENDIX: &str = r#"
 
@@ -557,17 +559,17 @@ Git commit:
 - This finalization contract is authoritative for the automated run and overrides older installed skill guidance when they differ.
 - Before this process was released, CLT completed the scheduler-owned startup preparation, using a safe fast-forward-only sync only when no older WORKING journal required preserving its history, then froze HEAD, the worktree baseline, branch, and upstream state and persisted that launch record. The selected task must already be committed exactly once on the board. Do not pull, fetch or otherwise synchronize, merge, rebase, switch branches, reset history, or reconfigure Git after release.
 - Move the selected Todo task to Doing before implementation. CLT rechecks the frozen launch record and binds it to the session's durable WORKING journal at that transition; do not edit or commit implementation first.
-- After completing and verifying the task, run all formatting, lint, signing, and hook checks that can mutate files before sealing. Add its dated COMPLETED note. Stage the implementation and the active Doing task, including its terminal `codex:<session-id>` marker, then inspect the staged diff.
+- After completing and verifying the task, run all formatting, lint, signing, and hook checks that can mutate files before sealing. Add its dated COMPLETED note. Stage the implementation, any linked blocked follow-up created for an independent failure, and the active Doing task, including its terminal `codex:<session-id>` marker, then inspect the staged diff.
 - Run `clt done` only after that staged diff is complete. CLT seals its durable task manifest and makes the board move provisionally; it is not terminal completion by itself.
-- Stage only the resulting board transition, inspect the complete staged diff again, then use the $git-commit skill to create exactly one normal git commit containing the sealed implementation, completion note, and complete task-board move.
+- Stage only the resulting board transition, inspect the complete staged diff again, then use the $git-commit skill to create exactly one normal git commit containing the sealed implementation, completion note, and complete task-board move, plus any linked blocked follow-up.
 - Give that commit one exact final message paragraph: `CLT-Task: codex:<session-id>`.
 - If a commit hook changes files or fails after the seal, fix and stage the complete corrected payload, run `clt done done <index>` to reseal that provisional Done entry, inspect it, and retry the one commit.
 - Pre-existing unstaged changes do not prevent a commit. Stage only this task's paths or hunks, verify the staged diff, and leave unrelated changes untouched.
-- A Todo or other task-board edit added during the run may also remain unstaged. Preserve it and stage only the selected task's board transition; CLT's exact staged-tree proof keeps the concurrent edit outside the sealed commit.
+- A Todo or other task-board edit added during the run may also remain unstaged. Preserve it and stage only the selected task's board transition and its explicitly linked blocked follow-up; CLT's exact staged-tree proof keeps the concurrent edit outside the sealed commit.
 - Do not require the worktree to be clean before committing.
 - The scheduler supplies the isolated Git identity `CLT Agent <clt-agent@localhost>` for clear automated-commit attribution; do not change Git configuration.
 - Do not exit merely because the task appears in Done. Inspect the created commit and keep working until CLT can prove the task-specific commit. If this is a resumed finalization, inspect existing Git state before committing and never duplicate an already-created task commit.
-- Do not commit when there are no tasks left, the task is blocked, checks fail, or the work cannot be completed safely.
+- Do not commit when there are no tasks left, the original task is still blocked, task-relevant checks fail, or the work cannot be completed safely. A proven independent failure recorded with `clt follow-up` does not prevent committing the verified original task; include that follow-up in the same sealed commit.
 "#;
 pub(super) const AGENT_GIT_PUSH_PROMPT_APPENDIX: &str = r#"
 
@@ -594,7 +596,7 @@ Blocked-task monitor:
 - Re-evaluate whether the recorded blocking conditions still exist instead of assuming the task remains blocked.
 - If the selected task is in todo, move it to doing before working on it.
 - Try to resolve that task's blocker and finish the task, including the relevant checks.
-- Update the existing task; do not create a replacement task.
+- Update the existing task; do not create a replacement task. The independent-failure follow-up procedure above is allowed only when this original task satisfies its acceptance criteria.
 - If the task is completed, add its completion note and move it to done.
 - If its blocker is resolved but the task should be retried through the normal workflow, add a newer `UNBLOCKED YYYY-MM-DD:` note and move that same task back to todo.
 - If it still cannot be completed safely, update its blocked note with what you tried and what is still needed, and leave it in doing.

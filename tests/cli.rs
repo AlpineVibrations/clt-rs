@@ -639,3 +639,95 @@ fn agent_unregister_preserves_registration_and_bound_or_sealed_git_proof() {
         assert_eq!(controls[0]["run_token"], "clt-git-finalization:0");
     }
 }
+
+#[test]
+fn follow_up_records_one_blocked_doing_task_without_reusing_parent_session() {
+    for folders in [false, true] {
+        let workspace = TestWorkspace::new("follow-up");
+        assert_success(&workspace.run(if folders {
+            &["init", "--folders"]
+        } else {
+            &["init"]
+        }));
+        assert_success(&workspace.run(&["add", "Implement feature. codex:parent-session"]));
+        assert_success(&workspace.run(&["status", "todo", "1", "doing"]));
+        let parent_path = if folders {
+            fs::read_dir(workspace.path().join("tasks/doing"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path()
+        } else {
+            workspace.path().join("tasks/doing.md")
+        };
+        let parent_before = fs::read_to_string(&parent_path).unwrap();
+        let arguments = [
+            "follow-up",
+            "doing",
+            "1",
+            "Repair GPU harness.",
+            "--blocked",
+            "Fails identically on starting revision abc123; requires GPU runtime",
+        ];
+        assert_success(&workspace.run(&arguments));
+        assert_success(&workspace.run(&arguments));
+        let (doing, _) = assert_success(&workspace.run(&["list", "doing"]));
+        assert!(doing.contains("1. Implement feature."));
+        assert!(doing.contains("2. Repair GPU harness."));
+        assert!(!doing.contains("3."));
+        let follow_up_content = if folders {
+            assert_eq!(fs::read_to_string(&parent_path).unwrap(), parent_before);
+            let path = fs::read_dir(workspace.path().join("tasks/doing"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| *path != parent_path)
+                .unwrap();
+            fs::read_to_string(path).unwrap()
+        } else {
+            let content = fs::read_to_string(&parent_path).unwrap();
+            assert!(content.starts_with(&parent_before));
+            content[parent_before.len()..].to_string()
+        };
+        assert!(follow_up_content.contains("BLOCKED "));
+        assert!(follow_up_content.contains("starting revision abc123"));
+        assert!(
+            follow_up_content
+                .trim_end()
+                .ends_with("clt-follow-up:parent-session")
+        );
+        assert!(!follow_up_content.contains("codex:"));
+        for arguments in [
+            vec![
+                "follow-up",
+                "todo",
+                "1",
+                "Wrong status",
+                "--blocked",
+                "reason",
+            ],
+            vec!["follow-up", "doing", "1", " ", "--blocked", "reason"],
+            vec!["follow-up", "doing", "1", "Empty reason", "--blocked", " "],
+            vec![
+                "follow-up",
+                "doing",
+                "1",
+                "Bad codex:duplicate",
+                "--blocked",
+                "reason",
+            ],
+            vec![
+                "follow-up",
+                "doing",
+                "1",
+                "Second follow-up",
+                "--blocked",
+                "reason",
+            ],
+        ] {
+            assert!(!workspace.run(&arguments).status.success());
+        }
+        let (doing_after, _) = assert_success(&workspace.run(&["list", "doing"]));
+        assert_eq!(doing_after, doing);
+    }
+}
