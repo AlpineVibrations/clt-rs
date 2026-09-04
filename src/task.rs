@@ -521,12 +521,7 @@ pub(super) fn read_markdown_entries(path: &Path) -> Result<Vec<TaskEntry>> {
 }
 
 pub(super) fn read_directory_entries(path: &Path) -> Result<Vec<TaskEntry>> {
-    let mut paths = directory_task_paths(path)?;
-    paths.sort_by_key(|path| {
-        path.file_name()
-            .map(|name| name.to_string_lossy().to_lowercase())
-            .unwrap_or_default()
-    });
+    let paths = directory_task_paths(path)?;
 
     paths
         .into_iter()
@@ -605,9 +600,12 @@ pub(super) fn directory_task_paths(path: &Path) -> Result<Vec<PathBuf>> {
     }
 
     paths.sort_by_key(|path| {
-        path.file_name()
+        let name = path
+            .file_name()
             .map(|name| name.to_string_lossy().to_lowercase())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // Managed completions prepend without renaming any existing task.
+        (front_order_rank(&name).is_none(), name)
     });
 
     Ok(paths)
@@ -648,12 +646,42 @@ pub(super) fn title_from_path(path: &Path) -> String {
 }
 
 pub(super) fn strip_order_prefix(name: &str) -> &str {
+    if front_order_rank(name).is_some() {
+        return &name[26..];
+    }
     let bytes = name.as_bytes();
     if bytes.len() > 5 && bytes[..4].iter().all(|byte| byte.is_ascii_digit()) && bytes[4] == b'-' {
         &name[5..]
     } else {
         name
     }
+}
+
+fn front_order_rank(name: &str) -> Option<u64> {
+    let bytes = name.as_bytes();
+    (bytes.len() > 26
+        && bytes.starts_with(b"0000-")
+        && bytes[5..25].iter().all(u8::is_ascii_digit)
+        && bytes[25] == b'-')
+        .then(|| name[5..25].parse().ok())
+        .flatten()
+}
+
+fn task_name_without_reordering(path: &Path, name: &str, prepend: bool) -> Result<String> {
+    let paths = directory_task_paths(path)?;
+    if !prepend {
+        return Ok(format!("{:04}-{name}", paths.len() + 1));
+    }
+    // Reserve a descending rank ahead of legacy four-digit order prefixes.
+    // Only the new task changes; sealed Git manifests retain every other path.
+    let rank = paths
+        .iter()
+        .filter_map(|path| path.file_name()?.to_str().and_then(front_order_rank))
+        .min()
+        .unwrap_or(u64::MAX)
+        .checked_sub(1)
+        .context("No remaining space to prepend a task without reordering")?;
+    Ok(format!("0000-{rank:020}-{name}"))
 }
 
 pub(super) fn first_sentence(content: &str) -> Option<String> {
@@ -1195,12 +1223,20 @@ pub(super) fn insert_content_into_directory_without_reordering(
     path: &Path,
     content: &str,
 ) -> Result<PathBuf> {
+    insert_content_into_directory_without_reordering_at(path, content, false)
+}
+
+fn insert_content_into_directory_without_reordering_at(
+    path: &Path,
+    content: &str,
+    prepend: bool,
+) -> Result<PathBuf> {
     fs::create_dir_all(path).with_context(|| format!("Failed to create directory {:?}", path))?;
-    let preferred_name = format!(
-        "{:04}-{}.md",
-        directory_task_paths(path)?.len() + 1,
+    let name = format!(
+        "{}.md",
         slugify(&first_sentence(content).unwrap_or_else(|| "task".to_string()))
     );
+    let preferred_name = task_name_without_reordering(path, &name, prepend)?;
     let task_path = unique_child_path(path, &preferred_name);
     write_new_task_file_atomically(
         &task_path,
@@ -1487,6 +1523,7 @@ pub(super) fn move_path_into_directory(
 pub(super) fn move_path_into_directory_without_reordering(
     source_path: &Path,
     dest_dir: &Path,
+    prepend: bool,
 ) -> Result<PathBuf> {
     fs::create_dir_all(dest_dir)
         .with_context(|| format!("Failed to create destination directory {:?}", dest_dir))?;
@@ -1494,11 +1531,8 @@ pub(super) fn move_path_into_directory_without_reordering(
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("task.md");
-    let preferred_name = format!(
-        "{:04}-{}",
-        directory_task_paths(dest_dir)?.len() + 1,
-        strip_order_prefix(original_name)
-    );
+    let preferred_name =
+        task_name_without_reordering(dest_dir, strip_order_prefix(original_name), prepend)?;
     let dest_path = unique_child_path(dest_dir, &preferred_name);
     fs::rename(source_path, &dest_path).with_context(|| {
         format!(
@@ -1631,11 +1665,6 @@ pub(super) fn reorder_markdown_task(path: &Path, from_idx: usize, to_idx: usize)
 
 pub(super) fn reorder_directory_task(path: &Path, from_idx: usize, to_idx: usize) -> Result<()> {
     let mut paths = directory_task_paths(path)?;
-    paths.sort_by_key(|path| {
-        path.file_name()
-            .map(|name| name.to_string_lossy().to_lowercase())
-            .unwrap_or_default()
-    });
 
     if from_idx >= paths.len() {
         anyhow::bail!("Task index out of range");
@@ -1955,7 +1984,7 @@ pub(super) fn move_task_without_reordering_with_after_destination(
     let entry = task_entry_at(board_dir, from, task_index)?;
     match (&entry.source, get_status_store(board_dir, to)?) {
         (TaskSource::Path { path, .. }, StatusStore::Directory(dest_dir)) => {
-            move_path_into_directory_without_reordering(path, &dest_dir)?;
+            move_path_into_directory_without_reordering(path, &dest_dir, to == TaskStatus::Done)?;
             after_destination()?;
         }
         (TaskSource::Path { .. }, StatusStore::MarkdownFile(_)) => {
@@ -1964,7 +1993,11 @@ pub(super) fn move_task_without_reordering_with_after_destination(
             );
         }
         (TaskSource::MarkdownLine { .. }, StatusStore::Directory(dest_dir)) => {
-            insert_content_into_directory_without_reordering(&dest_dir, &entry.content)?;
+            insert_content_into_directory_without_reordering_at(
+                &dest_dir,
+                &entry.content,
+                to == TaskStatus::Done,
+            )?;
             after_destination()?;
             remove_task_entry_without_reordering(board_dir, from, &entry)?;
         }

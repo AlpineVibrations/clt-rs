@@ -8,10 +8,17 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 Use this section while developing the next release.
 
+## [0.6.3] - 2026-09-04
+
 ### Added
 
 - Added `clt follow-up` to record an independent blocked Doing task alongside a verified implementation in the same sealed task commit, with prompt and skill guidance to distinguish pre-existing failures from incomplete acceptance criteria.
 - Keep the displayed agent run's model and thinking effort visible in the log footer, using its recorded startup settings for both live and completed output.
+
+### Fixed
+
+- Refresh the matching remote-tracking ref after verifying an automated push, so Git no longer reports already-published task commits as unpushed. Separate fetch/push repositories and concurrent fetches retain their own tracking state.
+- Place managed Git completions at the top of folder-backed Done lists without renaming unrelated tasks or invalidating their sealed Git proof. Repeated completions, interrupted moves, and manual reordering preserve the displayed order.
 
 ## [0.6.2] - 2026-09-04
 

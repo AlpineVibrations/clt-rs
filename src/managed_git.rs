@@ -3185,6 +3185,75 @@ pub(super) fn push_agent_git_commit_to_frozen_destination(
     Ok(())
 }
 
+fn tracking_tip_for_push_destination(
+    project_root: &Path,
+    branch_ref: Option<&str>,
+    upstream_ref: Option<&str>,
+    destination: &AgentGitUpstreamDestination,
+) -> Result<Option<String>> {
+    let Some(branch) = branch_ref.and_then(|value| value.strip_prefix("refs/heads/")) else {
+        return Ok(None);
+    };
+    let Some(upstream_ref) = upstream_ref.filter(|value| value.starts_with("refs/remotes/")) else {
+        return Ok(None);
+    };
+    // The branch can fetch from one repository and push to another. Only
+    // refresh its tracking ref when it represents this exact destination.
+    let remote = git_optional_stdout(
+        project_root,
+        &["config", "--get", &format!("branch.{branch}.remote")],
+        &[1],
+        "resolve the upstream fetch remote",
+    )?;
+    if remote.as_deref() != Some(destination.remote.as_str()) {
+        return Ok(None);
+    }
+    let urls = git_stdout(
+        project_root,
+        &["remote", "get-url", "--all", &destination.remote],
+        "resolve the upstream fetch URL",
+    )?;
+    if Some(urls.as_str()) != destination.push_url.as_deref() {
+        return Ok(None);
+    }
+    git_optional_stdout(
+        project_root,
+        &["rev-parse", "--verify", upstream_ref],
+        &[1, 128],
+        "read the upstream tracking ref before publication proof",
+    )
+}
+
+fn refresh_agent_git_tracking_ref(
+    project_root: &Path,
+    upstream_ref: &str,
+    previous_tip: &str,
+    verified_tip: &str,
+) {
+    // Explicit-URL pushes/fetches do not maintain the named remote's cache.
+    // Compare-and-swap so a concurrent fetch cannot be overwritten. A cache
+    // update failure must not turn a proven publication into a failed task.
+    if previous_tip != verified_tip
+        && let Err(error) = git_stdout(
+            project_root,
+            &[
+                "update-ref",
+                "--no-deref",
+                "-m",
+                "clt: verified task publication",
+                upstream_ref,
+                verified_tip,
+                previous_tip,
+            ],
+            "refresh the upstream tracking ref",
+        )
+    {
+        eprintln!(
+            "CLT verified the remote publication but could not refresh {upstream_ref}: {error:#}"
+        );
+    }
+}
+
 pub(super) fn fetch_agent_git_upstream_tip(
     project_root: &Path,
     branch_ref: Option<&str>,
@@ -3226,6 +3295,12 @@ pub(super) fn fetch_agent_git_upstream_tip(
     let Some(push_url) = expected_destination.push_url.as_deref() else {
         return Ok(None);
     };
+    let previous_tracking_tip = tracking_tip_for_push_destination(
+        project_root,
+        branch_ref,
+        expected_upstream_ref,
+        &expected_destination,
+    )?;
 
     let read_remote_tip = || -> Result<Option<String>> {
         ensure_agent_git_finalization_fence(finalization_lease)?;
@@ -3310,10 +3385,25 @@ pub(super) fn fetch_agent_git_upstream_tip(
         return Ok(None);
     }
     ensure_agent_git_finalization_fence(finalization_lease)?;
-    Ok(
-        (Some(fetched_tip.clone()) == rechecked_tip && fetched_tip == observed_tip)
-            .then_some(fetched_tip),
-    )
+    if Some(fetched_tip.clone()) != rechecked_tip || fetched_tip != observed_tip {
+        return Ok(None);
+    }
+    if let (Some(upstream_ref), Some(previous_tip)) =
+        (expected_upstream_ref, previous_tracking_tip.as_deref())
+        && tracking_tip_for_push_destination(
+            project_root,
+            branch_ref,
+            expected_upstream_ref,
+            &expected_destination,
+        )?
+        .as_deref()
+            == Some(previous_tip)
+    {
+        ensure_agent_git_finalization_fence(finalization_lease)?;
+        refresh_agent_git_tracking_ref(project_root, upstream_ref, previous_tip, &fetched_tip);
+    }
+    ensure_agent_git_finalization_fence(finalization_lease)?;
+    Ok(Some(fetched_tip))
 }
 
 pub(super) fn worktree_contains_completed_done_task(

@@ -2603,7 +2603,16 @@ fn managed_directory_move_crash_never_reorders_or_hides_unrelated_tasks() {
     );
     assert!(read_tasks(&root, "doing").unwrap().is_empty());
     assert_eq!(read_tasks(&root, "done").unwrap().len(), 2);
-    assert!(unrelated.is_file());
+    assert_eq!(
+        read_task_entries(&root.join("tasks"), TaskStatus::Done).unwrap()[0]
+            .content
+            .trim_end(),
+        content
+    );
+    assert_eq!(
+        fs::read_to_string(&unrelated).unwrap(),
+        "Unrelated completed task\n"
+    );
 
     fs::remove_dir_all(root).unwrap();
 }
@@ -2665,133 +2674,172 @@ fn managed_git_recovery_sweeps_only_exact_orphaned_atomic_temp_files() {
 
 #[test]
 fn push_mode_uses_the_frozen_push_remote_and_one_exact_refspec() {
-    let root = temp_root("automated-git-exact-push-finalization");
-    let state_dir = root.join("state/clt");
-    let project_root = root.join("project");
-    let origin_root = root.join("origin.git");
-    let publish_root = root.join("publish.git");
-    init_tasks(&project_root, false).unwrap();
-    fs::write(
-            project_root.join("tasks/doing.md"),
-            "# Doing Tasks\n- Publish feature — COMPLETED 2026-09-02: cargo test passed codex:session-push\n",
+    for separate_push_remote in [false, true] {
+        let root = temp_root("automated-git-exact-push-finalization");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        let origin_root = root.join("origin.git");
+        let publish_root = root.join("publish.git");
+        init_tasks(&project_root, true).unwrap();
+        fs::write(
+            project_root.join("tasks/doing/0001-publish-feature.md"),
+            "Publish feature — COMPLETED 2026-09-02: cargo test passed codex:session-push\n",
         )
         .unwrap();
-    let initial_head = initialize_test_git_repository(&project_root);
-    fs::create_dir_all(&origin_root).unwrap();
-    fs::create_dir_all(&publish_root).unwrap();
-    run_test_git(&origin_root, &["init", "--bare"]);
-    run_test_git(&publish_root, &["init", "--bare"]);
-    run_test_git(
-        &project_root,
-        &["remote", "add", "origin", origin_root.to_str().unwrap()],
-    );
-    run_test_git(&project_root, &["push", "-u", "origin", "HEAD"]);
-    run_test_git(
-        &project_root,
-        &["remote", "add", "publish", publish_root.to_str().unwrap()],
-    );
-    let branch = run_test_git(&project_root, &["branch", "--show-current"]);
-    let branch_ref = format!("refs/heads/{branch}");
-    run_test_git(&project_root, &["branch", "side"]);
-    run_test_git(
-        &project_root,
-        &["push", "publish", &format!("HEAD:{branch_ref}")],
-    );
-    run_test_git(&project_root, &["push", "publish", "side:refs/heads/side"]);
-    run_test_git(
-        &project_root,
-        &["config", &format!("branch.{branch}.pushRemote"), "publish"],
-    );
-    run_test_git(
-        &project_root,
-        &["config", "remote.publish.push", "refs/heads/*:refs/heads/*"],
-    );
+        let old_done_path = project_root.join("tasks/done/0007-previous.md");
+        fs::write(&old_done_path, "Previous completion\n").unwrap();
+        let initial_head = initialize_test_git_repository(&project_root);
+        fs::create_dir_all(&origin_root).unwrap();
+        fs::create_dir_all(&publish_root).unwrap();
+        run_test_git(&origin_root, &["init", "--bare"]);
+        run_test_git(&publish_root, &["init", "--bare"]);
+        run_test_git(
+            &project_root,
+            &["remote", "add", "origin", origin_root.to_str().unwrap()],
+        );
+        run_test_git(&project_root, &["push", "-u", "origin", "HEAD"]);
+        run_test_git(
+            &project_root,
+            &["remote", "add", "publish", publish_root.to_str().unwrap()],
+        );
+        let branch = run_test_git(&project_root, &["branch", "--show-current"]);
+        let branch_ref = format!("refs/heads/{branch}");
+        run_test_git(&project_root, &["branch", "side"]);
+        run_test_git(
+            &project_root,
+            &["push", "publish", &format!("HEAD:{branch_ref}")],
+        );
+        run_test_git(&project_root, &["push", "publish", "side:refs/heads/side"]);
+        if separate_push_remote {
+            run_test_git(
+                &project_root,
+                &["config", &format!("branch.{branch}.pushRemote"), "publish"],
+            );
+        }
+        run_test_git(
+            &project_root,
+            &["config", "remote.publish.push", "refs/heads/*:refs/heads/*"],
+        );
 
-    let project_root = fs::canonicalize(project_root).unwrap();
-    let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
-    store
-        .register_project_blocking(&project_root, "project")
-        .unwrap();
-    assert!(
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
         store
-            .set_project_git_mode_for_path_blocking(&project_root, AgentGitMode::CommitAndPush,)
-            .unwrap()
-    );
-    let project = store.list_projects_blocking().unwrap().remove(0);
-    store
-        .mark_session_running_blocking(
-            project.id,
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        assert!(
+            store
+                .set_project_git_mode_for_path_blocking(&project_root, AgentGitMode::CommitAndPush,)
+                .unwrap()
+        );
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        store
+            .mark_session_running_blocking(
+                project.id,
+                "session-push",
+                123,
+                "run-push",
+                &root.join("push.out"),
+                &root.join("push.err"),
+            )
+            .unwrap();
+        let git_start =
+            capture_agent_git_start_state(&project_root, AgentGitMode::CommitAndPush).unwrap();
+        ensure_agent_git_working_record(
+            &store,
+            &project,
             "session-push",
-            123,
             "run-push",
-            &root.join("push.out"),
-            &root.join("push.err"),
+            Some(&git_start),
         )
         .unwrap();
-    let git_start =
-        capture_agent_git_start_state(&project_root, AgentGitMode::CommitAndPush).unwrap();
-    ensure_agent_git_working_record(
-        &store,
-        &project,
-        "session-push",
-        "run-push",
-        Some(&git_start),
-    )
-    .unwrap();
-    assert!(
-        bind_agent_git_working_task_identity(&store, &project, "session-push", "run-push",)
-            .unwrap()
-    );
-    fs::write(project_root.join("publish.txt"), "implemented\n").unwrap();
-    run_test_git(&project_root, &["add", "publish.txt"]);
-    move_task_to_done_with_agent_store(
-        &project_root,
-        TaskStatus::Doing,
-        "1",
-        &AutomatedAgentChildContext {
-            project_id: project.id,
-            run_token: "run-push".to_string(),
-        },
-        &store,
-    )
-    .unwrap();
-
-    run_test_git(&project_root, &["add", "--all"]);
-    run_test_agent_git(
-        &project_root,
-        &[
-            "commit",
-            "-m",
-            "Publish feature",
-            "-m",
-            "CLT-Task: codex:session-push",
-        ],
-    );
-    let task_commit = run_test_git(&project_root, &["rev-parse", "HEAD"]);
-    run_test_git(&project_root, &["branch", "-f", "side", &task_commit]);
-    let pending = store
-        .git_finalization_blocking(project.id, "session-push")
-        .unwrap()
+        assert!(
+            bind_agent_git_working_task_identity(&store, &project, "session-push", "run-push",)
+                .unwrap()
+        );
+        fs::write(project_root.join("publish.txt"), "implemented\n").unwrap();
+        run_test_git(&project_root, &["add", "publish.txt"]);
+        move_task_to_done_with_agent_store(
+            &project_root,
+            TaskStatus::Doing,
+            "1",
+            &AutomatedAgentChildContext {
+                project_id: project.id,
+                run_token: "run-push".to_string(),
+            },
+            &store,
+        )
         .unwrap();
-    let completed =
-        reconcile_agent_git_finalization(&store, &project_root, pending, Some("run-push"), None)
-            .unwrap();
-    assert_eq!(completed.state, GitFinalizationState::Completed);
-    assert_eq!(completed.commit_oid.as_deref(), Some(task_commit.as_str()));
-    assert_eq!(
-        run_test_git(&publish_root, &["rev-parse", &branch_ref]),
-        task_commit
-    );
-    assert_eq!(
-        run_test_git(&publish_root, &["rev-parse", "refs/heads/side"]),
-        initial_head
-    );
-    assert_eq!(
-        run_test_git(&origin_root, &["rev-parse", &branch_ref]),
-        initial_head
-    );
 
-    fs::remove_dir_all(root).unwrap();
+        let done = read_task_entries(&project_root.join("tasks"), TaskStatus::Done).unwrap();
+        assert!(done[0].content.starts_with("Publish feature"));
+        assert_eq!(
+            fs::read_to_string(&old_done_path).unwrap(),
+            "Previous completion\n"
+        );
+        run_test_git(&project_root, &["add", "--all"]);
+        run_test_agent_git(
+            &project_root,
+            &[
+                "commit",
+                "-m",
+                "Publish feature",
+                "-m",
+                "CLT-Task: codex:session-push",
+            ],
+        );
+        let task_commit = run_test_git(&project_root, &["rev-parse", "HEAD"]);
+        run_test_git(&project_root, &["branch", "-f", "side", &task_commit]);
+        let pending = store
+            .git_finalization_blocking(project.id, "session-push")
+            .unwrap()
+            .unwrap();
+        let completed = reconcile_agent_git_finalization(
+            &store,
+            &project_root,
+            pending,
+            Some("run-push"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(completed.state, GitFinalizationState::Completed);
+        assert_eq!(completed.commit_oid.as_deref(), Some(task_commit.as_str()));
+        assert_eq!(
+            run_test_git(&publish_root, &["rev-parse", &branch_ref]),
+            if separate_push_remote {
+                &task_commit
+            } else {
+                &initial_head
+            }
+            .as_str()
+        );
+        assert_eq!(
+            run_test_git(&publish_root, &["rev-parse", "refs/heads/side"]),
+            initial_head
+        );
+        assert_eq!(
+            run_test_git(&origin_root, &["rev-parse", &branch_ref]),
+            if separate_push_remote {
+                &initial_head
+            } else {
+                &task_commit
+            }
+            .as_str()
+        );
+        assert_eq!(
+            run_test_git(
+                &project_root,
+                &["rev-parse", &format!("refs/remotes/origin/{branch}")]
+            ),
+            if separate_push_remote {
+                &initial_head
+            } else {
+                &task_commit
+            }
+            .as_str()
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[cfg(unix)]
@@ -2850,6 +2898,107 @@ fn sealed_commit_push_runs_the_repository_pre_push_hook() {
         initial_head
     );
 
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn publication_proof_refreshes_only_a_matching_fetch_destination() {
+    for separate_push_url in [false, true] {
+        let root = temp_root("git-publication-tracking-ref");
+        let project_root = root.join("project");
+        let remote_root = root.join("remote.git");
+        let publish_root = root.join("publish.git");
+        init_tasks(&project_root, false).unwrap();
+        let initial_head = initialize_test_git_repository(&project_root);
+        for remote in [&remote_root, &publish_root] {
+            fs::create_dir_all(remote).unwrap();
+            run_test_git(remote, &["init", "--bare"]);
+        }
+        run_test_git(
+            &project_root,
+            &["remote", "add", "origin", remote_root.to_str().unwrap()],
+        );
+        run_test_git(&project_root, &["push", "-u", "origin", "HEAD"]);
+        if separate_push_url {
+            run_test_git(
+                &project_root,
+                &["push", publish_root.to_str().unwrap(), "HEAD"],
+            );
+            run_test_git(
+                &project_root,
+                &[
+                    "remote",
+                    "set-url",
+                    "--push",
+                    "origin",
+                    publish_root.to_str().unwrap(),
+                ],
+            );
+        }
+        let start =
+            capture_agent_git_start_state(&project_root, AgentGitMode::CommitAndPush).unwrap();
+        let baseline = AgentGitWorktreeBaseline::from_json(&start.worktree_baseline).unwrap();
+        run_test_git(
+            &project_root,
+            &["commit", "--allow-empty", "-m", "Published task"],
+        );
+        let commit_oid = run_test_git(&project_root, &["rev-parse", "HEAD"]);
+        push_agent_git_commit_to_frozen_destination(
+            &project_root,
+            start.branch_ref.as_deref(),
+            start.upstream_ref.as_deref(),
+            &baseline,
+            &commit_oid,
+            None,
+        )
+        .unwrap();
+        let upstream = start.upstream_ref.as_deref().unwrap();
+        // The URL push has already succeeded, but Git's named tracking ref is stale.
+        assert_eq!(
+            run_test_git(&project_root, &["rev-parse", upstream]),
+            initial_head
+        );
+        assert_eq!(
+            fetch_agent_git_upstream_tip(
+                &project_root,
+                start.branch_ref.as_deref(),
+                start.upstream_ref.as_deref(),
+                &baseline,
+                None,
+            )
+            .unwrap()
+            .as_deref(),
+            Some(commit_oid.as_str())
+        );
+        assert_eq!(
+            run_test_git(&project_root, &["rev-parse", upstream]),
+            if separate_push_url {
+                &initial_head
+            } else {
+                &commit_oid
+            }
+            .as_str()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn tracking_ref_refresh_preserves_a_concurrent_fetch() {
+    let root = temp_root("git-tracking-ref-concurrent-fetch");
+    init_tasks(&root, false).unwrap();
+    let initial_head = initialize_test_git_repository(&root);
+    run_test_git(&root, &["commit", "--allow-empty", "-m", "Published task"]);
+    let published = run_test_git(&root, &["rev-parse", "HEAD"]);
+    run_test_git(
+        &root,
+        &["commit", "--allow-empty", "-m", "Concurrent fetch"],
+    );
+    let newer = run_test_git(&root, &["rev-parse", "HEAD"]);
+    let tracking_ref = "refs/remotes/origin/main";
+    run_test_git(&root, &["update-ref", tracking_ref, &newer]);
+    super::refresh_agent_git_tracking_ref(&root, tracking_ref, &initial_head, &published);
+    assert_eq!(run_test_git(&root, &["rev-parse", tracking_ref]), newer);
     fs::remove_dir_all(root).unwrap();
 }
 

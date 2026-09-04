@@ -385,6 +385,72 @@ fn move_task_to_done_adds_to_top() {
 }
 
 #[test]
+fn managed_done_moves_prepend_without_changing_existing_task_paths() {
+    for markdown_source in [false, true] {
+        let root = temp_root("managed-done-top");
+        init_tasks(&root, !markdown_source).unwrap();
+        let board = root.join("tasks");
+        let done_dir = board.join("done");
+        if markdown_source {
+            fs::remove_file(board.join("done.md")).unwrap();
+            fs::create_dir(&done_dir).unwrap();
+            fs::write(
+                board.join("doing.md"),
+                "# Doing Tasks\n- First completion\n- Latest completion\n- Still working\n",
+            )
+            .unwrap();
+        } else {
+            fs::write(board.join("doing/0001-first.md"), "First completion\n").unwrap();
+            // Folder tasks without a detail file use the ordered filename as their title.
+            fs::create_dir(board.join("doing/0002-Latest-completion")).unwrap();
+            fs::write(board.join("doing/0003-working.md"), "Still working\n").unwrap();
+        }
+        let historical = done_dir.join("0000-!historical.md");
+        fs::write(&historical, "Historical completion\n").unwrap();
+        move_task_without_reordering_after_lock(&board, TaskStatus::Doing, TaskStatus::Done, 1)
+            .unwrap();
+        let first_path = directory_task_paths(&done_dir).unwrap()[0].clone();
+        move_task_without_reordering_after_lock(&board, TaskStatus::Doing, TaskStatus::Done, 1)
+            .unwrap();
+
+        assert_eq!(
+            read_tasks(&root, "done").unwrap(),
+            [
+                "- Latest completion",
+                "- First completion",
+                "- Historical completion"
+            ]
+        );
+        assert_eq!(directory_task_paths(&done_dir).unwrap()[1], first_path);
+        assert_eq!(
+            fs::read_to_string(&historical).unwrap(),
+            "Historical completion\n"
+        );
+        assert_eq!(read_tasks(&root, "doing").unwrap(), ["- Still working"]);
+        if !markdown_source {
+            assert!(board.join("doing/0003-working.md").is_file());
+            assert!(directory_task_paths(&done_dir).unwrap()[0].is_dir());
+        }
+
+        // Manual reordering must use the displayed order and remove the special prefix.
+        reorder_directory_task(&done_dir, 0, 2).unwrap();
+        assert_eq!(
+            read_tasks(&root, "done").unwrap(),
+            [
+                "- First completion",
+                "- Historical completion",
+                "- Latest completion"
+            ]
+        );
+        assert!(done_dir.join("0003-Latest-completion").is_dir() || markdown_source);
+        move_task(&root, TaskStatus::Done, TaskStatus::Todo, "3").unwrap();
+        move_task(&root, TaskStatus::Todo, TaskStatus::Done, "1").unwrap();
+        assert_eq!(read_tasks(&root, "done").unwrap()[0], "- Latest completion");
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
 fn folder_backed_status_reads_task_files_as_first_sentence() {
     let root = temp_root("folder-read");
     let todo_dir = root.join("tasks/todo");
