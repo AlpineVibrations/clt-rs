@@ -10,9 +10,10 @@ use anyhow::{Context, Result};
 
 use crate::{
     agent::{
-        self, AGENT_DB_FILE, AGENT_GIT_FINALIZATION_RESUME_TOKEN_PREFIX,
-        AGENT_WORKERS_ACTIVE_PROJECT_INDEX, AgentSessionControlState, GitFinalizationState,
-        current_agent_platform, ensure_agent_state_dir, open_agent_store_at, with_agent_store_at,
+        self, AGENT_DB_FILE, AGENT_EXTERNAL_COMPLETION_REASON,
+        AGENT_GIT_FINALIZATION_RESUME_TOKEN_PREFIX, AGENT_WORKERS_ACTIVE_PROJECT_INDEX,
+        AgentSessionControlState, GitFinalizationState, current_agent_platform,
+        ensure_agent_state_dir, open_agent_store_at, with_agent_store_at,
     },
     application::{
         AGENT_DAEMON_CHECKIN_STALE_SECONDS, AGENT_DAEMON_DATABASE_LOCK_RETRY_ATTEMPTS,
@@ -44,7 +45,8 @@ use crate::{
     },
     session_control::InteractiveGuardianDisposition,
     task::{
-        TaskStatus, ensure_existing_board, get_tasks_dir, read_task_entries, task_entry_is_blocked,
+        TaskStatus, ensure_existing_board, get_tasks_dir, read_task_entries,
+        recoverable_codex_session_id_from_task_content, task_entry_is_blocked,
         task_status_for_codex_session_in_board, terminal_task_for_codex_session_in_board,
     },
     tui::TUI_SESSION_HANDOFF_TIMEOUT_SECONDS,
@@ -335,8 +337,16 @@ pub(super) async fn run_agent_daemon_loop_async(
     let mut active_passes: Vec<tokio::task::JoinHandle<Result<AgentSchedulerStart>>> = Vec::new();
     let mut active_runs: Vec<AgentDaemonRun> = Vec::new();
     let mut next_sleep = poll_interval;
+    let mut recovery_error = None;
 
     loop {
+        if recovery_error.is_none()
+            && let Err(error) = agent::recovery::check_required(&state_dir)
+        {
+            eprintln!("{error:#}; stopping the scheduler without further database retries");
+            recovery_error = Some(error);
+            shutdown.store(true, Ordering::SeqCst);
+        }
         let mut run_index = 0;
         while run_index < active_runs.len() {
             if !active_runs[run_index].handle.is_finished() {
@@ -370,6 +380,11 @@ pub(super) async fn run_agent_daemon_loop_async(
             let start = match handle.await {
                 Ok(Ok(start)) => start,
                 Ok(Err(error)) => {
+                    if agent::recovery::check_required(&state_dir).is_err() {
+                        recovery_error = Some(error);
+                        shutdown.store(true, Ordering::SeqCst);
+                        continue;
+                    }
                     eprintln!("Agent scheduler pass failed; the daemon will retry: {error:#}");
                     next_sleep = poll_interval;
                     continue;
@@ -433,6 +448,9 @@ pub(super) async fn run_agent_daemon_loop_async(
         let scheduling_stopped = shutdown.load(Ordering::SeqCst)
             || max_passes.is_some_and(|max_passes| scheduled_passes >= max_passes);
         if scheduling_stopped && active_passes.is_empty() && active_runs.is_empty() {
+            if let Some(error) = recovery_error {
+                return Err(error);
+            }
             clear_agent_daemon_checkin_best_effort(&state_dir, &daemon_checkin.holder).await;
             return Ok(());
         }
@@ -588,11 +606,11 @@ pub(super) fn run_agent_daemon_database_operation_with_recovery<T>(
                 let original_error = format!("{err:#}");
                 rebuild_active_worker_index().with_context(|| {
                     format!(
-                        "Failed to rebuild {AGENT_WORKERS_ACTIVE_PROJECT_INDEX} after scheduler error: {original_error}"
+                        "Failed to rebuild {AGENT_WORKERS_ACTIVE_PROJECT_INDEX} after agent database error: {original_error}"
                     )
                 })?;
                 eprintln!(
-                    "Scheduler pass recovery: rebuilt index={AGENT_WORKERS_ACTIVE_PROJECT_INDEX}; retrying"
+                    "Agent database recovery: rebuilt index={AGENT_WORKERS_ACTIVE_PROJECT_INDEX}; retrying"
                 );
             }
             Err(err)
@@ -615,8 +633,13 @@ pub(super) fn run_agent_daemon_database_operation_with_recovery<T>(
 
 pub(super) fn agent_error_indicates_damaged_active_worker_index(err: &anyhow::Error) -> bool {
     let rendered = format!("{err:#}");
-    rendered.contains("IdxDelete: no matching index entry found for key")
-        && rendered.contains("worker")
+    (rendered.contains("IdxDelete: no matching index entry found for key")
+        && rendered.contains("worker"))
+        // SQLite accepts double-quoted string literals in partial-index predicates,
+        // but Turso reads them as identifiers when maintaining the restored index.
+        || ["dispatching", "running", "finalizing"]
+            .iter()
+            .any(|state| rendered.contains(&format!("Parse error: no such column: {state}")))
 }
 
 pub(super) fn agent_error_is_database_locked(err: &anyhow::Error) -> bool {
@@ -787,12 +810,11 @@ pub(super) fn run_agent_scheduler_pass_with_max_global_jobs(
             store.list_pending_git_finalizations_blocking(Some(project.id))
         })?;
         if !finalizations_before_reconcile.is_empty() {
+            // An abandoned WORKING session can still carry its dead worker token.
+            // Restore the exact journal generation before the guarded lease checks it.
             for finalization in finalizations_before_reconcile
                 .iter()
-                .filter(|finalization| {
-                    finalization.state.is_finalizing()
-                        && finalization.state != GitFinalizationState::PushPending
-                })
+                .filter(|finalization| finalization.state != GitFinalizationState::PushPending)
             {
                 with_agent_store_at(state_dir, |store| {
                     store
@@ -1025,9 +1047,11 @@ pub(super) fn run_agent_scheduler_pass_with_max_global_jobs(
             );
             continue;
         }
+        let has_resumable_doing_task =
+            scan.doing_count > 0 && project_has_resumable_doing_task(state_dir, &project)?;
         let resume_abandoned_worker =
-            scan.doing_count > 0 && abandoned_project_ids.contains(&project.id);
-        let resume_interrupted_task = scan.doing_count > 0
+            has_resumable_doing_task && abandoned_project_ids.contains(&project.id);
+        let resume_interrupted_task = has_resumable_doing_task
             && (resume_abandoned_worker
                 || existing_lease.as_ref().is_some_and(|lease| {
                     agent_lease_is_reclaimable(lease, reclaim_current_process_leases, now)
@@ -1417,6 +1441,36 @@ pub(super) fn task_status_for_codex_session(
     session_id: &str,
 ) -> Result<Option<TaskStatus>> {
     task_status_for_codex_session_in_board(&get_tasks_dir(project_root), session_id)
+}
+
+pub(super) fn project_has_resumable_doing_task(
+    state_dir: &Path,
+    project: &agent::AgentProject,
+) -> Result<bool> {
+    let doing = read_task_entries(&get_tasks_dir(&project.path), TaskStatus::Doing)?;
+    with_agent_store_at(state_dir, |store| {
+        for task in doing {
+            let externally_completed =
+                recoverable_codex_session_id_from_task_content(&task.content)
+                    .map(|session_id| {
+                        store
+                            .git_finalization_blocking(project.id, session_id)
+                            .map(|journal| {
+                                journal.is_some_and(|journal| {
+                                    journal.state == GitFinalizationState::Cancelled
+                                        && journal.last_error.as_deref()
+                                            == Some(AGENT_EXTERNAL_COMPLETION_REASON)
+                                })
+                            })
+                    })
+                    .transpose()?
+                    .unwrap_or(false);
+            if !externally_completed {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    })
 }
 
 pub(super) fn resumable_codex_session_for_project(

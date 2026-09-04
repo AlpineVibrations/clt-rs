@@ -105,8 +105,12 @@ impl TursoAgentStore {
         acquired_at: &str,
         expires_at: &str,
     ) -> Result<bool> {
-        self.blocking
-            .block_on(self.try_acquire_lease(project_id, holder, acquired_at, expires_at))
+        self.blocking.block_on_persist(self.try_acquire_lease(
+            project_id,
+            holder,
+            acquired_at,
+            expires_at,
+        ))
     }
 
     async fn try_acquire_lease(
@@ -154,7 +158,7 @@ impl TursoAgentStore {
         reclaim_holder: Option<&str>,
     ) -> Result<bool> {
         self.blocking
-            .block_on(self.try_acquire_git_finalization_lease(
+            .block_on_persist(self.try_acquire_git_finalization_lease(
                 project_id,
                 holder,
                 acquired_at,
@@ -302,7 +306,7 @@ impl TursoAgentStore {
         holder: &str,
         expires_at: &str,
     ) -> Result<bool> {
-        self.blocking.block_on(async {
+        self.blocking.block_on_persist(async {
                 let conn = self.repositories.workers_leases.connect().await?;
                 let changed = conn
                     .execute(
@@ -403,7 +407,7 @@ impl TursoAgentStore {
         expires_at: &str,
     ) -> Result<bool> {
         self.blocking
-            .block_on(self.renew_lease(project_id, holder, expires_at))
+            .block_on_persist(self.renew_lease(project_id, holder, expires_at))
     }
 
     async fn renew_lease(&self, project_id: i64, holder: &str, expires_at: &str) -> Result<bool> {
@@ -431,7 +435,7 @@ impl TursoAgentStore {
 
     pub(crate) fn release_lease_blocking(&self, project_id: i64, holder: &str) -> Result<bool> {
         self.blocking
-            .block_on(self.release_lease(project_id, holder))
+            .block_on_persist(self.release_lease(project_id, holder))
     }
 
     async fn release_lease(&self, project_id: i64, holder: &str) -> Result<bool> {
@@ -452,7 +456,7 @@ impl TursoAgentStore {
         reservation: AgentWorkerReservation<'_>,
     ) -> Result<bool> {
         self.blocking
-            .block_on(self.reserve_worker(reservation, None))
+            .block_on_persist(self.reserve_worker(reservation, None))
     }
 
     pub(crate) fn reserve_and_claim_worker_blocking(
@@ -462,7 +466,7 @@ impl TursoAgentStore {
         started_at: &str,
     ) -> Result<bool> {
         self.blocking
-            .block_on(self.reserve_worker(reservation, Some((worker_pid, started_at))))
+            .block_on_persist(self.reserve_worker(reservation, Some((worker_pid, started_at))))
     }
 
     async fn reserve_worker(
@@ -608,7 +612,7 @@ impl TursoAgentStore {
         started_at: &str,
     ) -> Result<bool> {
         self.blocking
-            .block_on(self.claim_worker(worker_token, worker_pid, started_at))
+            .block_on_persist(self.claim_worker(worker_token, worker_pid, started_at))
     }
 
     async fn claim_worker(
@@ -670,7 +674,7 @@ impl TursoAgentStore {
         heartbeat_at: &str,
         lease_expires_at: &str,
     ) -> Result<bool> {
-        self.blocking.block_on(self.renew_worker(
+        self.blocking.block_on_persist(self.renew_worker(
             worker_token,
             worker_pid,
             heartbeat_at,
@@ -850,7 +854,7 @@ impl TursoAgentStore {
         project_id: i64,
         expected_lease_holder: &str,
     ) -> Result<u64> {
-        self.blocking.block_on(async {
+        self.blocking.block_on_persist(async {
             let conn = self.repositories.workers_leases.connect().await?;
             conn.execute(
                 "UPDATE agent_workers
@@ -880,7 +884,7 @@ impl TursoAgentStore {
         worker_token: &str,
         cleaned_at: &str,
     ) -> Result<bool> {
-        self.blocking.block_on(async {
+        self.blocking.block_on_persist(async {
             let conn = self.repositories.workers_leases.connect().await?;
             let changed = conn
                 .execute(
@@ -968,7 +972,8 @@ impl TursoAgentStore {
         &self,
         abandonment: AgentWorkerAbandonment<'_>,
     ) -> Result<bool> {
-        self.blocking.block_on(self.abandon_worker(abandonment))
+        self.blocking
+            .block_on_persist(self.abandon_worker(abandonment))
     }
 
     async fn abandon_worker(&self, abandonment: AgentWorkerAbandonment<'_>) -> Result<bool> {
@@ -1142,7 +1147,8 @@ impl TursoAgentStore {
         &self,
         finalization: AgentWorkerFinalization<'_>,
     ) -> Result<Option<i64>> {
-        self.blocking.block_on(self.finalize_worker(finalization))
+        self.blocking
+            .block_on_persist(self.finalize_worker(finalization))
     }
 
     async fn finalize_worker(

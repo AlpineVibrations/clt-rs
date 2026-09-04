@@ -20,6 +20,7 @@ use crate::platform::AgentPlatform;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 
+pub(crate) mod recovery;
 mod repositories;
 mod runtime;
 
@@ -150,6 +151,7 @@ pub(super) const AGENT_CODEX_REASONING_EFFORTS: [&str; 7] =
     ["", "low", "medium", "high", "xhigh", "max", "ultra"];
 pub(super) const AGENT_STATE_DIR_ENV: &str = "CLT_AGENT_STATE_DIR";
 pub(super) const AGENT_GIT_FINALIZATION_RESUME_TOKEN_PREFIX: &str = "clt-git-finalization:";
+pub(super) const AGENT_EXTERNAL_COMPLETION_REASON: &str = "Managed Git proof was cancelled because a user explicitly moved the task to Done as an external completion";
 pub(super) const AGENT_DB_FILE: &str = "agent.db";
 const AGENT_DATABASE_OPEN_RETRY_ATTEMPTS: usize = 100;
 const AGENT_DATABASE_OPEN_RETRY_MILLIS: u64 = 10;
@@ -1056,6 +1058,8 @@ pub(super) struct TursoAgentStore {
     pending_migration_version: Option<i64>,
     checkpoint_pin: Option<Connection>,
     blocking: AgentStoreBlockingAdapter,
+    recovery_db: Database,
+    _registry_access: Option<recovery::RegistryAccess>,
 }
 
 struct OpenedAgentDatabase {
@@ -1295,14 +1299,47 @@ pub(super) struct AgentDaemonCheckin {
 
 impl TursoAgentStore {
     pub(crate) fn open_blocking(state_dir: &Path) -> Result<Self> {
-        let blocking = AgentStoreBlockingAdapter::new()?;
+        let access = recovery::RegistryAccess::shared(state_dir)?;
+        let _writer = recovery::write_lock(state_dir)?;
+        recovery::check_clean(state_dir)?;
+        if state_dir.join(recovery::SNAPSHOT_FILE).exists()
+            && !state_dir.join(AGENT_DB_FILE).exists()
+        {
+            recovery::mark_required(
+                state_dir,
+                "The agent database is missing but its external registry snapshot still exists",
+            )?;
+            recovery::check_required(state_dir)?;
+        }
+        let store = Self::open_with_access(state_dir, Some(access), false)?;
+        if !state_dir.join(recovery::SNAPSHOT_FILE).exists() {
+            store
+                .blocking
+                .block_on(recovery::snapshot(&store.recovery_db, state_dir))?;
+        }
+        Ok(store)
+    }
+
+    fn open_for_recovery(state_dir: &Path) -> Result<Self> {
+        Self::open_with_access(state_dir, None, true)
+    }
+
+    fn open_with_access(
+        state_dir: &Path,
+        access: Option<recovery::RegistryAccess>,
+        recovering: bool,
+    ) -> Result<Self> {
+        let mut blocking = AgentStoreBlockingAdapter::new(state_dir, recovering)?;
         let opened = blocking.block_on(Self::open_database(state_dir))?;
+        blocking.attach(&opened.db);
         Ok(Self {
             db_path: opened.db_path,
             repositories: AgentRepositories::new(&opened.db),
             pending_migration_version: opened.pending_migration_version,
             checkpoint_pin: Some(opened.checkpoint_pin),
             blocking,
+            recovery_db: opened.db,
+            _registry_access: access,
         })
     }
 
@@ -1602,15 +1639,26 @@ impl Drop for TursoAgentStore {
         // drive Turso's async state machine without nesting runtimes or leaving
         // a shared read mark.
         let runtime = self.blocking.handle();
+        let state_dir = self.db_path.parent().map(Path::to_path_buf);
         let rollback = thread::Builder::new()
             .name("clt-agent-wal-pin-release".to_string())
-            .spawn(move || {
-                runtime
-                    .block_on(checkpoint_pin.execute("ROLLBACK", ()))
-                    .ok()
-            });
-        if let Ok(handle) = rollback {
-            let _ = handle.join();
+            .spawn(move || runtime.block_on(checkpoint_pin.execute("ROLLBACK", ())));
+        let problem = match rollback {
+            Ok(handle) => match handle.join() {
+                Ok(Ok(_)) => None,
+                Ok(Err(error)) => Some(error.to_string()),
+                Err(payload) => payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| payload.downcast_ref::<&str>().map(|text| text.to_string())),
+            },
+            Err(_) => None,
+        };
+        if let Some(problem) = problem
+            && recovery::shared_wal_failure(&problem)
+            && let Some(state_dir) = state_dir
+        {
+            let _ = recovery::mark_required(&state_dir, &problem);
         }
     }
 }

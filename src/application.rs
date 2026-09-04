@@ -8,7 +8,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64},
     },
     thread,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
@@ -26,10 +26,10 @@ use crate::{
     },
     platform::{AgentServiceEnvironment, agent_service_status, truncate_agent_service_logs},
     runner::{
-        AgentRunner, AutomatedAgentChildContext, agent_timestamp, agent_timestamp_seconds,
-        automated_agent_child_context, canonicalize_existing_path, format_agent_run_line,
-        format_agent_timestamp, format_optional_agent_timestamp, print_agent_log_tail,
-        resolve_agent_project_root,
+        AgentRunner, AutomatedAgentChildContext, agent_timestamp, agent_timestamp_after,
+        agent_timestamp_seconds, automated_agent_child_context, canonicalize_existing_path,
+        format_agent_run_line, format_agent_timestamp, format_optional_agent_timestamp,
+        print_agent_log_tail, resolve_agent_project_root,
     },
     scheduler::{agent_lease_holder_liveness, scan_agent_project},
     task::{
@@ -54,6 +54,37 @@ use crate::{
 use crate::task::acquire_board_mutation_lock_with_contention_callback;
 #[cfg(not(test))]
 use crate::worker::cleanup_terminal_agent_worker_services;
+
+pub(super) fn recover_agent_state() -> Result<()> {
+    let state_dir = agent::ensure_agent_state_dir()?;
+    anyhow::ensure!(
+        state_dir.join(agent::recovery::SNAPSHOT_FILE).exists(),
+        "No external agent registry snapshot exists at {}. Stop the scheduler with clt agent stop and preserve agent.db together with agent.db-wal; automatic reconstruction requires a snapshot from this version of CLT.",
+        state_dir.display()
+    );
+    let report = agent::recovery::recover_registry_with(&state_dir, |manifest| {
+        crate::platform::stop_agent_services_for_recovery(&state_dir, manifest)
+    })?;
+    println!(
+        "Recovered agent registry by {}. Original database bundle retained at {}. Agents remain stopped; use clt agent start when ready.",
+        if report.rebuilt_registry {
+            "rebuilding it from external configuration and Git journals"
+        } else {
+            "rebuilding Turso coordination files"
+        },
+        report.quarantine.display()
+    );
+    Ok(())
+}
+
+const AGENT_EXTERNAL_COMPLETION_LEASE_SECONDS: u64 = 60;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum TaskDoneOutcome {
+    Normal,
+    Provisional,
+    ExternalCompletion(String),
+}
 
 pub(super) const AGENT_PROJECT_ID_ENV: &str = "CLT_AGENT_PROJECT_ID";
 pub(super) const AGENT_RUN_TOKEN_ENV: &str = "CLT_AGENT_RUN_TOKEN";
@@ -732,7 +763,11 @@ impl ManagedTaskWorkflow {
         move_task(&self.root, from, to, task_index)
     }
 
-    pub(super) fn complete_task(&self, from: TaskStatus, task_index: &str) -> Result<bool> {
+    pub(super) fn complete_task(
+        &self,
+        from: TaskStatus,
+        task_index: &str,
+    ) -> Result<TaskDoneOutcome> {
         move_task_to_done(&self.root, from, task_index)
     }
 
@@ -1002,7 +1037,7 @@ pub(super) fn move_task(
             );
         }
     }
-    move_task_in_board(&get_tasks_dir(root), from, to, task_index_str)
+    move_task_in_board(&get_tasks_dir(root), from, to, task_index_str).map(|_| ())
 }
 
 pub(super) fn running_session_for_automated_child(
@@ -1129,36 +1164,23 @@ pub(super) fn move_task_to_done(
     root: &Path,
     from: TaskStatus,
     task_index_str: &str,
-) -> Result<bool> {
+) -> Result<TaskDoneOutcome> {
     let Some(context) = automated_agent_child_context()? else {
-        let task_index = parse_one_based_task_index(task_index_str)?;
-        let board_dir = get_tasks_dir(root);
-        let _mutation_lock = acquire_board_mutation_lock(&board_dir)?;
-        let entry = task_entry_at(&board_dir, from, task_index)?;
-        if let Some(session_id) = recoverable_codex_session_id_from_task_content(&entry.content) {
-            let state_dir = agent_state_dir()?;
-            if state_dir.join(AGENT_DB_FILE).is_file() {
-                let root = canonicalize_existing_path(root)?;
-                let store = open_agent_store_at(&state_dir)?;
-                if let Some(project) = store
-                    .list_projects_blocking()?
-                    .into_iter()
-                    .find(|project| project.path == root)
-                    && let Some(finalization) =
-                        store.git_finalization_blocking(project.id, session_id)?
-                    && !finalization.state.is_terminal()
-                {
-                    anyhow::bail!(
-                        "Task {session_id} has a managed Git journal in {}; resume that exact agent session so CLT can prove its commit before Done",
-                        finalization.state.status_label()
-                    );
-                }
-            }
-        }
-        move_task_in_board_after_lock(&board_dir, from, TaskStatus::Done, task_index)?;
-        return Ok(false);
+        return Ok(
+            match move_task_in_board(&get_tasks_dir(root), from, TaskStatus::Done, task_index_str)?
+            {
+                Some(session_id) => TaskDoneOutcome::ExternalCompletion(session_id),
+                None => TaskDoneOutcome::Normal,
+            },
+        );
     };
-    move_task_to_done_with_agent_context(root, from, task_index_str, &context)
+    Ok(
+        if move_task_to_done_with_agent_context(root, from, task_index_str, &context)? {
+            TaskDoneOutcome::Provisional
+        } else {
+            TaskDoneOutcome::Normal
+        },
+    )
 }
 
 pub(super) fn move_task_to_done_with_agent_context(
@@ -1336,23 +1358,164 @@ pub(super) fn move_task_to_done_with_agent_store(
     Ok(true)
 }
 
+fn external_completion_lease_holder() -> String {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("clt-external-completion-{}-{nonce}", std::process::id())
+}
+
+fn agent_project_for_board(
+    store: &agent::TursoAgentStore,
+    board_dir: &Path,
+) -> Result<Option<agent::AgentProject>> {
+    let canonical_board = fs::canonicalize(board_dir).unwrap_or_else(|_| board_dir.to_path_buf());
+    Ok(store
+        .list_projects_blocking()?
+        .into_iter()
+        .filter(|project| canonical_board.starts_with(project.path.join("tasks")))
+        .max_by_key(|project| project.path.as_os_str().len()))
+}
+
+fn move_user_task_to_done_with_store_after_lock(
+    board_dir: &Path,
+    from: TaskStatus,
+    task_index: usize,
+    entry: &TaskEntry,
+    store: &agent::TursoAgentStore,
+) -> Result<Option<String>> {
+    let Some(session_id) = recoverable_codex_session_id_from_task_content(&entry.content) else {
+        move_task_in_board_after_lock(board_dir, from, TaskStatus::Done, task_index)?;
+        return Ok(None);
+    };
+    let Some(project) = agent_project_for_board(store, board_dir)? else {
+        move_task_in_board_after_lock(board_dir, from, TaskStatus::Done, task_index)?;
+        return Ok(None);
+    };
+    let Some(finalization) = store.git_finalization_blocking(project.id, session_id)? else {
+        move_task_in_board_after_lock(board_dir, from, TaskStatus::Done, task_index)?;
+        return Ok(None);
+    };
+    if finalization.state.is_terminal() {
+        move_task_in_board_after_lock(board_dir, from, TaskStatus::Done, task_index)?;
+        return Ok(None);
+    }
+    if finalization.state != GitFinalizationState::Working {
+        anyhow::bail!(
+            "Task {session_id} has a managed Git journal in {}; its commit proof is already sealed and cannot be replaced by an external completion",
+            finalization.state.status_label()
+        );
+    }
+    let bound_identity = finalization
+        .task_identity
+        .as_deref()
+        .context("The Working Git journal has no durable task identity")?;
+    if durable_task_identity(&entry.content).as_deref() != Some(bound_identity) {
+        anyhow::bail!(
+            "Task {session_id} no longer matches its Working Git journal; restore its durable task payload before accepting external completion"
+        );
+    }
+
+    let acquired_at = agent_timestamp();
+    let expires_at = agent_timestamp_after(AGENT_EXTERNAL_COMPLETION_LEASE_SECONDS);
+    let lease_holder = external_completion_lease_holder();
+    if !store.accept_external_git_completion_blocking(
+        project.id,
+        session_id,
+        finalization.generation,
+        bound_identity,
+        &lease_holder,
+        &acquired_at,
+        &expires_at,
+    )? {
+        let current = store.git_finalization_blocking(project.id, session_id)?;
+        let state = current
+            .as_ref()
+            .map(|journal| journal.state.status_label())
+            .unwrap_or("MISSING");
+        anyhow::bail!(
+            "Task {session_id} changed while CLT was accepting external completion (journal: {state}); retry the Done move"
+        );
+    }
+
+    let move_result = move_task_in_board_after_lock(board_dir, from, TaskStatus::Done, task_index);
+    let release_result = store.release_lease_blocking(project.id, &lease_holder);
+    if let Err(release_error) = release_result {
+        return match move_result {
+            Ok(()) => Err(release_error).with_context(|| {
+                format!(
+                    "Task {session_id} moved to Done, but CLT could not release its external-completion fence"
+                )
+            }),
+            Err(move_error) => Err(move_error).with_context(|| {
+                format!(
+                    "CLT also could not release the external-completion fence: {release_error:#}"
+                )
+            }),
+        };
+    }
+    move_result?;
+    Ok(Some(session_id.to_string()))
+}
+
+fn move_user_task_to_done_after_lock(
+    board_dir: &Path,
+    from: TaskStatus,
+    task_index: usize,
+    entry: &TaskEntry,
+) -> Result<Option<String>> {
+    let Some(_session_id) = recoverable_codex_session_id_from_task_content(&entry.content) else {
+        move_task_in_board_after_lock(board_dir, from, TaskStatus::Done, task_index)?;
+        return Ok(None);
+    };
+    let state_dir = agent_state_dir()?;
+    if !state_dir.join(AGENT_DB_FILE).is_file() {
+        move_task_in_board_after_lock(board_dir, from, TaskStatus::Done, task_index)?;
+        return Ok(None);
+    }
+    let store = open_agent_store_at(&state_dir)?;
+    if store.pending_migration_version().is_some() {
+        move_task_in_board_after_lock(board_dir, from, TaskStatus::Done, task_index)?;
+        return Ok(None);
+    }
+    move_user_task_to_done_with_store_after_lock(board_dir, from, task_index, entry, &store)
+}
+
 pub(super) fn move_task_in_board(
     board_dir: &Path,
     from: TaskStatus,
     to: TaskStatus,
     task_index_str: &str,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let task_index = parse_one_based_task_index(task_index_str)?;
     let _mutation_lock = acquire_board_mutation_lock(board_dir)?;
     let board = TaskBoard::new(board_dir);
     let entry = board.entry(from, task_index)?;
+    if to == TaskStatus::Done {
+        return move_user_task_to_done_after_lock(board_dir, from, task_index, &entry);
+    }
     ensure_managed_git_task_mutation_allowed(
         board_dir,
         &entry,
         from.is_active() && to.is_active(),
         None,
     )?;
-    move_task_in_board_after_lock(board_dir, from, to, task_index)
+    move_task_in_board_after_lock(board_dir, from, to, task_index)?;
+    Ok(None)
+}
+
+#[cfg(test)]
+pub(super) fn move_task_to_done_in_board_with_store(
+    board_dir: &Path,
+    from: TaskStatus,
+    task_index_str: &str,
+    store: &agent::TursoAgentStore,
+) -> Result<Option<String>> {
+    let task_index = parse_one_based_task_index(task_index_str)?;
+    let _mutation_lock = acquire_board_mutation_lock(board_dir)?;
+    let entry = task_entry_at(board_dir, from, task_index)?;
+    move_user_task_to_done_with_store_after_lock(board_dir, from, task_index, &entry, store)
 }
 
 #[cfg(test)]

@@ -34,7 +34,7 @@ impl TursoAgentStore {
         enabled: bool,
     ) -> Result<bool> {
         self.blocking
-            .block_on(self.set_project_enabled(project_id, enabled))
+            .block_on_persist(self.set_project_enabled(project_id, enabled))
     }
 
     async fn set_project_enabled(&self, project_id: i64, enabled: bool) -> Result<bool> {
@@ -60,7 +60,7 @@ impl TursoAgentStore {
         enabled: bool,
     ) -> Result<bool> {
         self.blocking
-            .block_on(self.set_project_enabled_for_path(project_root, enabled))
+            .block_on_persist(self.set_project_enabled_for_path(project_root, enabled))
     }
 
     async fn set_project_enabled_for_path(
@@ -89,7 +89,7 @@ impl TursoAgentStore {
         &self,
         project_root: &Path,
     ) -> Result<bool> {
-        self.blocking.block_on(async {
+        self.blocking.block_on_persist(async {
             let mut conn = self.repositories.projects_models.connect().await?;
             let path = project_root.display().to_string();
             let transaction = conn
@@ -140,7 +140,7 @@ impl TursoAgentStore {
         mode: AgentGitMode,
     ) -> Result<bool> {
         self.blocking
-            .block_on(self.set_project_git_mode(project_id, mode))
+            .block_on_persist(self.set_project_git_mode(project_id, mode))
     }
 
     async fn set_project_git_mode(&self, project_id: i64, mode: AgentGitMode) -> Result<bool> {
@@ -200,7 +200,7 @@ impl TursoAgentStore {
         mode: AgentGitMode,
     ) -> Result<bool> {
         self.blocking
-            .block_on(self.set_project_git_mode_for_path(project_root, mode))
+            .block_on_persist(self.set_project_git_mode_for_path(project_root, mode))
     }
 
     async fn set_project_git_mode_for_path(
@@ -268,13 +268,14 @@ impl TursoAgentStore {
         reasoning_effort: Option<&str>,
         fast_enabled: bool,
     ) -> Result<bool> {
-        self.blocking.block_on(self.set_project_codex_settings(
-            project_id,
-            provider,
-            model,
-            reasoning_effort,
-            fast_enabled,
-        ))
+        self.blocking
+            .block_on_persist(self.set_project_codex_settings(
+                project_id,
+                provider,
+                model,
+                reasoning_effort,
+                fast_enabled,
+            ))
     }
 
     async fn set_project_codex_settings(
@@ -470,7 +471,7 @@ impl TursoAgentStore {
         &self,
         provider: &AgentModelProvider,
     ) -> Result<()> {
-        self.blocking.block_on(async {
+        self.blocking.block_on_persist(async {
             let conn = self.repositories.projects_models.connect().await?;
             conn.execute(
                 "INSERT INTO model_providers (
@@ -500,7 +501,7 @@ impl TursoAgentStore {
     }
 
     pub(crate) fn delete_model_provider_blocking(&self, provider_id: &str) -> Result<bool> {
-        self.blocking.block_on(async {
+        self.blocking.block_on_persist(async {
             let mut conn = self.repositories.projects_models.connect().await?;
             let transaction = conn
                 .transaction()
@@ -553,7 +554,7 @@ impl TursoAgentStore {
     }
 
     pub(crate) fn upsert_model_target_blocking(&self, target: &AgentModelTarget) -> Result<()> {
-        self.blocking.block_on(async {
+        self.blocking.block_on_persist(async {
             let conn = self.repositories.projects_models.connect().await?;
             conn.execute(
                 "INSERT INTO model_targets (
@@ -591,7 +592,7 @@ impl TursoAgentStore {
         provider_id: &str,
         enabled: bool,
     ) -> Result<bool> {
-        self.blocking.block_on(async {
+        self.blocking.block_on_persist(async {
             let conn = self.repositories.projects_models.connect().await?;
             let changed = conn
                 .execute(
@@ -612,7 +613,7 @@ impl TursoAgentStore {
         enabled: bool,
         favorite: bool,
     ) -> Result<bool> {
-        self.blocking.block_on(async {
+        self.blocking.block_on_persist(async {
             let conn = self.repositories.projects_models.connect().await?;
             let changed = conn
                 .execute(
@@ -638,7 +639,7 @@ impl TursoAgentStore {
         model_id: &str,
         reasoning_effort: Option<&str>,
     ) -> Result<bool> {
-        self.blocking.block_on(async {
+        self.blocking.block_on_persist(async {
             let conn = self.repositories.projects_models.connect().await?;
             let changed = conn
                 .execute(
@@ -660,7 +661,7 @@ impl TursoAgentStore {
         provider_id: &str,
         model_id: &str,
     ) -> Result<()> {
-        self.blocking.block_on(async {
+        self.blocking.block_on_persist(async {
             let conn = self.repositories.projects_models.connect().await?;
             conn.execute(
                 "UPDATE agent_settings
@@ -677,7 +678,8 @@ impl TursoAgentStore {
 
 impl TursoAgentStore {
     pub(crate) fn record_project_scan_blocking(&self, project_id: i64) -> Result<String> {
-        self.blocking.block_on(self.record_project_scan(project_id))
+        self.blocking
+            .block_on_persist(self.record_project_scan(project_id))
     }
 
     async fn record_project_scan(&self, project_id: i64) -> Result<String> {
@@ -703,7 +705,7 @@ impl TursoAgentStore {
         error: Option<&str>,
     ) -> Result<String> {
         self.blocking
-            .block_on(self.record_project_daemon_scan(project_id, status, error))
+            .block_on_persist(self.record_project_daemon_scan(project_id, status, error))
     }
 
     async fn record_project_daemon_scan(
@@ -738,7 +740,7 @@ impl TursoAgentStore {
         name: &str,
     ) -> Result<bool> {
         self.blocking
-            .block_on(self.register_project(project_root, name))
+            .block_on_persist(self.register_project(project_root, name))
     }
 
     async fn register_project(&self, project_root: &Path, name: &str) -> Result<bool> {
@@ -776,7 +778,7 @@ impl TursoAgentStore {
 
     pub(crate) fn unregister_project_blocking(&self, project_root: &Path) -> Result<bool> {
         self.blocking
-            .block_on(self.unregister_project(project_root))
+            .block_on_persist(self.unregister_project(project_root))
     }
 
     async fn unregister_project(&self, project_root: &Path) -> Result<bool> {

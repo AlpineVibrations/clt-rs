@@ -274,3 +274,133 @@ fn invalid_inputs_fail_on_stderr_without_mutating_the_board() {
         todo_before
     );
 }
+
+#[test]
+fn user_done_commands_report_external_completion_for_an_idle_managed_journal() {
+    for arguments in [
+        vec!["done", "doing", "1"],
+        vec!["status", "doing", "1", "done"],
+    ] {
+        let workspace = TestWorkspace::new("external-completion");
+        assert_success(&workspace.run(&["init"]));
+        assert_success(&workspace.run(&["agent", "register"]));
+        fs::write(
+            workspace.path().join("tasks/doing.md"),
+            "# Doing Tasks\n- Externally completed work codex:cli-external-completion\n",
+        )
+        .unwrap();
+        // Seed the durable state left by a stopped managed run. Exercise the
+        // public CLI for the acceptance, including its user-visible outcome.
+        let database_path = workspace.path().join("agent-state/agent.db");
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let database = turso::Builder::new_local(database_path.to_str().unwrap())
+                .experimental_multiprocess_wal(true).build().await.unwrap();
+            let connection = database.connect().unwrap();
+            connection.execute(
+                "INSERT INTO git_finalizations (
+                    project_id,codex_session_id,state,git_mode,starting_head,branch_ref,
+                    worktree_baseline,task_identity,owner_run_token,generation,created_at,updated_at
+                 ) SELECT id,'cli-external-completion','working','commit',
+                    '1111111111111111111111111111111111111111','refs/heads/main',
+                    '{}','v2' || char(10) || 'Externally completed work','dead-worker',0,'100','100'
+                   FROM projects",
+                (),
+            ).await.unwrap();
+            connection.execute(
+                "INSERT INTO session_controls (project_id,codex_session_id,state,run_token,updated_at)
+                 SELECT id,'cli-external-completion','resume_requested','dead-worker','100' FROM projects",
+                (),
+            ).await.unwrap();
+        });
+
+        let (stdout, stderr) = assert_success(&workspace.run(&arguments));
+        assert!(
+            stdout.contains("marked as externally completed"),
+            "{stdout}"
+        );
+        assert!(stdout.contains(
+            "cancelled idle managed Git journal for Codex session cli-external-completion"
+        ));
+        assert!(stderr.is_empty(), "{stderr}");
+        assert!(
+            !fs::read_to_string(workspace.path().join("tasks/doing.md"))
+                .unwrap()
+                .contains("Externally completed work")
+        );
+        assert!(
+            fs::read_to_string(workspace.path().join("tasks/done.md"))
+                .unwrap()
+                .contains("codex:cli-external-completion")
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn agent_recover_rebuilds_a_damaged_registry_and_preserves_its_bundle() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let workspace = TestWorkspace::new("agent-recover");
+    assert_success(&workspace.run(&["init"]));
+    assert_success(&workspace.run(&["agent", "register"]));
+    let state_dir = workspace.path().join("agent-state");
+    let damaged = b"damaged registry header";
+    fs::write(state_dir.join("agent.db"), damaged).unwrap();
+    let original_wal = fs::read(state_dir.join("agent.db-wal")).unwrap();
+
+    // Exercise the real command without touching the user's service manager.
+    let fake_bin = workspace.path().join("bin");
+    fs::create_dir(&fake_bin).unwrap();
+    let systemctl = fake_bin.join("systemctl");
+    fs::write(&systemctl, "#!/bin/sh\nprintf 'not-found\\n'\n").unwrap();
+    fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut paths = vec![fake_bin];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let output = Command::new(env!("CARGO_BIN_EXE_clt"))
+        .current_dir(workspace.path())
+        .args(["--local", "agent", "recover"])
+        .env("CLT_AGENT_STATE_DIR", &state_dir)
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .env_remove("CLT_AGENT_PROJECT_ID")
+        .env_remove("CLT_AGENT_RUN_TOKEN")
+        .output()
+        .unwrap();
+    let (stdout, _) = assert_success(&output);
+    assert!(stdout.contains("rebuilding it from external configuration and Git journals"));
+    assert!(stdout.contains("Agents remain stopped"));
+    let archives = fs::read_dir(state_dir.join("quarantine"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(archives.len(), 1);
+    assert_eq!(fs::read(archives[0].join("agent.db")).unwrap(), damaged);
+    assert_eq!(
+        fs::read(archives[0].join("agent.db-wal")).unwrap(),
+        original_wal
+    );
+    let (projects, _) = assert_success(&workspace.run(&["agent", "projects"]));
+    assert!(projects.contains(workspace.path().to_str().unwrap()));
+}
+
+#[test]
+fn agent_recover_without_a_snapshot_preserves_the_database_and_explains_the_requirement() {
+    let workspace = TestWorkspace::new("agent-recover-no-snapshot");
+    let state_dir = workspace.path().join("agent-state");
+    fs::create_dir(&state_dir).unwrap();
+    fs::write(state_dir.join("agent.db"), b"original database").unwrap();
+    fs::write(state_dir.join("agent.db-wal"), b"committed WAL data").unwrap();
+    let output = workspace.run(&["agent", "recover"]);
+    assert!(!output.status.success());
+    let (_, stderr) = output_text(&output);
+    assert!(stderr.contains("No external agent registry snapshot"));
+    assert_eq!(
+        fs::read(state_dir.join("agent.db")).unwrap(),
+        b"original database"
+    );
+    assert_eq!(
+        fs::read(state_dir.join("agent.db-wal")).unwrap(),
+        b"committed WAL data"
+    );
+}

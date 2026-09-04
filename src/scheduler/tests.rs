@@ -3,6 +3,87 @@ use crate::test_support::prelude::*;
 use crate::test_support::*;
 
 #[test]
+fn agent_daemon_rebuilds_an_active_worker_index_with_quoted_state_names() {
+    for state in ["dispatching", "running", "finalizing"] {
+        let operation_calls = Cell::new(0);
+        let rebuild_calls = Cell::new(0);
+
+        let result = run_agent_daemon_database_operation_with_recovery(
+            || {
+                operation_calls.set(operation_calls.get() + 1);
+                if operation_calls.get() == 1 {
+                    anyhow::bail!(
+                        "Failed to reserve worker token: Parse error: no such column: {state}"
+                    );
+                }
+                Ok("recovered")
+            },
+            || {
+                rebuild_calls.set(rebuild_calls.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result, "recovered");
+        assert_eq!(operation_calls.get(), 2);
+        assert_eq!(rebuild_calls.get(), 1);
+    }
+}
+
+#[test]
+fn agent_daemon_does_not_rebuild_an_unrecoverable_worker_index_twice() {
+    let operation_calls = Cell::new(0);
+    let rebuild_calls = Cell::new(0);
+    let result: Result<()> = run_agent_daemon_database_operation_with_recovery(
+        || {
+            operation_calls.set(operation_calls.get() + 1);
+            anyhow::bail!("Parse error: no such column: dispatching");
+        },
+        || {
+            rebuild_calls.set(rebuild_calls.get() + 1);
+            Ok(())
+        },
+    );
+
+    assert!(result.is_err());
+    assert_eq!(operation_calls.get(), 2);
+    assert_eq!(rebuild_calls.get(), 1);
+}
+
+#[test]
+fn agent_daemon_does_not_retry_after_worker_index_rebuild_fails() {
+    let operation_calls = Cell::new(0);
+    let result: Result<()> = run_agent_daemon_database_operation_with_recovery(
+        || {
+            operation_calls.set(operation_calls.get() + 1);
+            anyhow::bail!("Parse error: no such column: dispatching");
+        },
+        || anyhow::bail!("Agent database integrity check still fails"),
+    );
+
+    let error = format!("{:#}", result.unwrap_err());
+    assert!(error.contains("Parse error: no such column: dispatching"));
+    assert!(error.contains("Agent database integrity check still fails"));
+    assert_eq!(operation_calls.get(), 1);
+}
+
+#[test]
+fn agent_daemon_does_not_rebuild_worker_index_for_an_unrelated_missing_column() {
+    let rebuild_calls = Cell::new(0);
+    let result: Result<()> = run_agent_daemon_database_operation_with_recovery(
+        || anyhow::bail!("Failed to reserve worker token: Parse error: no such column: project_id"),
+        || {
+            rebuild_calls.set(rebuild_calls.get() + 1);
+            Ok(())
+        },
+    );
+
+    assert!(result.is_err());
+    assert_eq!(rebuild_calls.get(), 0);
+}
+
+#[test]
 fn agent_scheduling_decision_stage_is_pure_and_prioritized() {
     let decide = |has_resume_session,
                   resume_interrupted_task,
@@ -1415,4 +1496,23 @@ fn blocked_task_recovery_uses_failure_backoff_without_delaying_todo_work() {
         ),
         None
     );
+}
+
+#[test]
+fn daemon_stops_without_database_retries_when_registry_recovery_is_required() {
+    let root = temp_root("daemon-recovery-required");
+    let state_dir = root.join("state/clt");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        state_dir.join("recovery-required"),
+        "shared WAL ownership failure",
+    )
+    .unwrap();
+    let runner = Arc::new(FakeAgentRunner::new(&state_dir, "success"));
+    let daemon_runner: Arc<dyn AgentRunner> = runner.clone();
+    let error = run_agent_daemon_loop(&state_dir, daemon_runner, Duration::ZERO, None).unwrap_err();
+    assert!(error.to_string().contains("recovery required"));
+    assert_eq!(runner.ran_project_count(), 0);
+    assert!(!state_dir.join(AGENT_DB_FILE).exists());
+    fs::remove_dir_all(root).unwrap();
 }

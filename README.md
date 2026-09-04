@@ -37,6 +37,12 @@ Ensure you have Rust and Cargo installed.
 cargo install clt-rs
 ```
 
+To test this refactor checkout, install from the repository directory so the build includes its pinned database fix:
+
+```bash
+cargo install --path . --locked
+```
+
 After upgrading `clt`, restart the background scheduler so new work uses the newly installed binary:
 
 ```bash
@@ -202,6 +208,8 @@ clt agent git-commit disable ~/code/project-a
 
 Commit-and-push additionally requires one configured upstream and exactly one push URL. At launch, CLT resolves the effective push remote in Git's normal precedence order—`branch.<name>.pushRemote`, then `remote.pushDefault`, then the branch's upstream remote—and freezes that choice, the concrete push URL, and the upstream merge ref. This resolution honors the configured overrides once; later publication does not use implicit `git push` routing, default refspecs, or a newly changed configuration.
 
+A person can add or edit another Todo while an agent is completing its Doing task. Leave those concurrent board edits unstaged and stage only the selected task's transition and code; CLT verifies the exact staged tree and preserves the other board edits outside the commit.
+
 An unconsumed pre-registration launch boundary is immutable. CLT never overwrites it or recaptures it from a later checkout. Even when Codex exits before announcing a session ID, CLT first proves the exact child reaped and leaves that launch record for the normal recovery check. It is reclaimed automatically only when its exact worker is terminal, no session record owns its run token, and the checkout and Git mode still match the frozen snapshot; otherwise the project fails closed. Both `clt agent unregister` and `clt agent clean` refuse to erase such a boundary.
 
 The released agent treats this prepared checkout as immutable launch state. It may inspect Git, implement the task, and create the one sealed task commit, but it never pushes in either Git mode. It must not run a startup pull, fetch or otherwise synchronize, merge, rebase, switch branches, reset history, or reconfigure the upstream. Those operations would move a boundary CLT owns and invalidate proof.
@@ -229,6 +237,8 @@ clt agent run --once
 ```
 
 The scheduler scans enabled projects, picks projects with pending unblocked `todo` tasks, takes an agent lease, and starts one Codex run at a time. A foreground `run --once` owns its run directly through a unique durable inline-worker generation, so its crash and pre-session launch boundaries use the same fencing model. On macOS and Linux, the continuous daemon instead hands each run to a unique launchd job or transient systemd user service. That worker owns lease renewal, the Codex process, task/session finalization, and the run record; the scheduler is free to stop immediately after dispatch. Each normal Codex run is prompted to inspect the board, move one available task to `doing`, complete it, run relevant checks, update the task through `clt`, and stop after that single task.
+
+When a human moves an idle session-linked task to Done while its journal is still `WORKING`, CLT treats that move as explicit acceptance of externally completed work. It checks the task identity, journal generation and ownership under a short project fence, cancels the obsolete working journal, and reports external completion. A live worker, session or lease prevents the override. Sealed `FINALIZING` and `PUSH-PENDING` proof must still complete normally; a user move cannot discard it. If the board move is interrupted after cancellation, the scheduler preserves that decision and does not resume the old session.
 
 `FINALIZING` local-commit work takes priority over all queued work and resumes the exact linked Codex session. `PUSH-PENDING` also blocks every later project task, but it is retried entirely by CLT without launching or resuming Codex. A `WORKING` journal is earlier and more permissive: if its linked task is durably blocked and its blocked-recovery backoff is active, CLT preserves that journal and history while allowing another ready Todo to run. It deliberately skips startup synchronization for the later task so the blocked proof boundary remains reachable; after backoff, the exact blocked session is eligible for recovery again. If a crashed worker instead left an ordinary task in `doing`, the scheduler uses its durable worker record to resume that task. When exactly one interrupted or blocked task carries a session marker, recovery uses `codex exec resume` for that session instead of opening a new one. Explicit stop and interactive-handoff states suppress ordinary scheduling; an interactive `i` handback is prioritized as an exact-session resume before any Todo selection.
 
@@ -264,6 +274,16 @@ The first upgrade from a CLT release that predates independent workers cannot de
 Worker startup and heartbeat records are fenced and bounded. If a worker fails before claiming its service or later stops checking in, the scheduler first drains and verifies that worker's exact launchd/systemd service, records one crash outcome, and only then releases its lease for recovery. This prevents a replacement Codex process from overlapping the old process group.
 
 Worker launch contracts are versioned. A newer scheduler can recover older persisted contracts, while an older scheduler leaves an unknown newer worker untouched. If a future database migration cannot safely coexist with pinned workers, it is deferred: status and task controls remain available, and the scheduler continues crash recovery in compatibility mode until those workers finish.
+
+`clt agent stop` does not open the database, so it remains available when Turso is unhealthy. For a shared-WAL ownership or frame-index failure, CLT records a recovery-required state and stops scheduling database retries. Close other CLT TUIs and foreground sessions, then run:
+
+```bash
+clt agent recover
+```
+
+Recovery stops the scheduler and verified worker services, checks recorded worker/session processes have exited, and refuses to change database files while any CLT or legacy Turso/SQLite client still holds access. It publishes a durable quarantine directory containing the original `agent.db`, `agent.db-wal`, and coordination files together. It first rebuilds only `agent.db-tshm`/`agent.db-shm` and checks database integrity. If that fails, it restores registered projects and preferences, worker identities, and exact Git launch/finalization journals from the atomically written `registry.json`. Run history, leases, scan timestamps and backoff may be discarded; task boards, Git repositories and filesystem logs remain authoritative. The existing WAL checkpoint pin remains enabled.
+
+A `registry-dirty` marker identifies an interrupted database-to-snapshot update. If the original DB/WAL cannot be repaired, recovery refuses to guess which Git transition completed and retains the quarantine for manual reconciliation. A missing or invalid external snapshot also prevents automatic reconstruction. Recovery does not restart agents; review the result and use `clt agent start` when ready. Never delete live coordination files or separate the database from its WAL.
 
 Run `clt agent start` and `clt agent stop` as your normal user, not with `sudo`; these commands manage per-user services.
 

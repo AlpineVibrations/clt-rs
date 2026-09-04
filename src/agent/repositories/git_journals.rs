@@ -4,10 +4,10 @@ use turso::{Connection, Database, params, transaction::TransactionBehavior};
 use super::RepositoryDatabase;
 use crate::{
     agent::{
-        AGENT_GIT_FINALIZATION_RESUME_TOKEN_PREFIX, AgentGitMode, AgentRunOutcome,
-        GitFinalizationRecord, GitFinalizationState, NewGitFinalization, TursoAgentStore,
-        git_finalization_record_from_row, query_count, row_integer, row_optional_integer,
-        row_optional_text, row_text, update_project_after_run,
+        AGENT_EXTERNAL_COMPLETION_REASON, AGENT_GIT_FINALIZATION_RESUME_TOKEN_PREFIX, AgentGitMode,
+        AgentRunOutcome, GitFinalizationRecord, GitFinalizationState, NewGitFinalization,
+        TursoAgentStore, git_finalization_record_from_row, query_count, row_integer,
+        row_optional_integer, row_optional_text, row_text, update_project_after_run,
     },
     managed_git::AgentGitStartState,
     runner::agent_timestamp,
@@ -27,6 +27,194 @@ impl GitJournalsRepository {
 }
 
 impl TursoAgentStore {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn accept_external_git_completion_blocking(
+        &self,
+        project_id: i64,
+        codex_session_id: &str,
+        expected_generation: i64,
+        task_identity: &str,
+        lease_holder: &str,
+        acquired_at: &str,
+        expires_at: &str,
+    ) -> Result<bool> {
+        self.blocking
+            .block_on_persist(self.accept_external_git_completion(
+                project_id,
+                codex_session_id,
+                expected_generation,
+                task_identity,
+                lease_holder,
+                acquired_at,
+                expires_at,
+            ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn accept_external_git_completion(
+        &self,
+        project_id: i64,
+        codex_session_id: &str,
+        expected_generation: i64,
+        task_identity: &str,
+        lease_holder: &str,
+        acquired_at: &str,
+        expires_at: &str,
+    ) -> Result<bool> {
+        let mut conn = self.repositories.git_journals.connect().await?;
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to begin accepting external completion for Codex session {codex_session_id}"
+                )
+            })?;
+
+        if query_count(
+            &transaction,
+            "SELECT COUNT(*) FROM agent_workers
+              WHERE project_id = ?1
+                AND state IN ('dispatching', 'running', 'finalizing')",
+            [project_id],
+        )
+        .await?
+            > 0
+        {
+            anyhow::bail!(
+                "Task {codex_session_id} still has an active agent worker; stop it before moving the task to Done as an external completion"
+            );
+        }
+
+        if query_count(
+            &transaction,
+            "SELECT COUNT(*) FROM session_controls
+              WHERE project_id = ?1 AND codex_session_id = ?2
+                AND NOT (
+                    state IN ('stopped', 'resume_requested')
+                    AND child_pid IS NULL
+                    AND interactive_holder IS NULL
+                    AND interactive_launch_token IS NULL
+                )",
+            params![project_id, codex_session_id],
+        )
+        .await?
+            > 0
+        {
+            anyhow::bail!(
+                "Codex session {codex_session_id} is still active; stop it before moving the task to Done as an external completion"
+            );
+        }
+
+        transaction
+            .execute(
+                "DELETE FROM leases
+                  WHERE project_id = ?1
+                    AND CAST(expires_at AS INTEGER) <= CAST(?2 AS INTEGER)",
+                params![project_id, acquired_at],
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to clear an expired project lease before accepting external completion for {codex_session_id}"
+                )
+            })?;
+        if query_count(
+            &transaction,
+            "SELECT COUNT(*) FROM leases WHERE project_id = ?1",
+            [project_id],
+        )
+        .await?
+            > 0
+        {
+            anyhow::bail!(
+                "Task {codex_session_id} still has an active project lease; stop its agent session before moving the task to Done as an external completion"
+            );
+        }
+        let lease_inserted = transaction
+            .execute(
+                "INSERT OR IGNORE INTO leases (project_id, holder, acquired_at, expires_at)
+                 SELECT ?1, ?2, ?3, ?4
+                  WHERE EXISTS (
+                      SELECT 1 FROM git_finalizations
+                       WHERE project_id = ?1 AND codex_session_id = ?5
+                         AND state = 'working' AND generation = ?6
+                         AND task_identity = ?7
+                  )",
+                params![
+                    project_id,
+                    lease_holder,
+                    acquired_at,
+                    expires_at,
+                    codex_session_id,
+                    expected_generation,
+                    task_identity,
+                ],
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to fence the project while accepting external completion for {codex_session_id}"
+                )
+            })?;
+        if lease_inserted != 1 {
+            transaction.commit().await.with_context(|| {
+                format!("Failed to finish a rejected external completion for {codex_session_id}")
+            })?;
+            return Ok(false);
+        }
+
+        let changed = transaction
+            .execute(
+                "UPDATE git_finalizations
+                    SET state = 'cancelled', owner_run_token = NULL,
+                        generation = generation + 1, last_error = ?1,
+                        updated_at = ?2, completed_at = ?2
+                  WHERE project_id = ?3 AND codex_session_id = ?4
+                    AND state = 'working' AND generation = ?5
+                    AND task_identity = ?6",
+                params![
+                    AGENT_EXTERNAL_COMPLETION_REASON,
+                    acquired_at,
+                    project_id,
+                    codex_session_id,
+                    expected_generation,
+                    task_identity,
+                ],
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to cancel the managed Git journal for externally completed task {codex_session_id}"
+                )
+            })?;
+        if changed != 1 {
+            return Ok(false);
+        }
+
+        transaction
+            .execute(
+                "DELETE FROM session_controls
+                  WHERE project_id = ?1 AND codex_session_id = ?2
+                    AND state IN ('stopped', 'resume_requested')
+                    AND child_pid IS NULL
+                    AND interactive_holder IS NULL
+                    AND interactive_launch_token IS NULL",
+                params![project_id, codex_session_id],
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to clear the idle resume state for externally completed task {codex_session_id}"
+                )
+            })?;
+
+        transaction.commit().await.with_context(|| {
+            format!("Failed to commit external completion for Codex session {codex_session_id}")
+        })?;
+        Ok(true)
+    }
+
     pub(crate) fn record_git_launch_state_blocking(
         &self,
         project_id: i64,
@@ -35,7 +223,7 @@ impl TursoAgentStore {
         start: &AgentGitStartState,
         created_at: &str,
     ) -> Result<bool> {
-        self.blocking.block_on(async {
+        self.blocking.block_on_persist(async {
                 if git_mode == AgentGitMode::Off {
                     anyhow::bail!("A Git launch state cannot use Git mode off");
                 }
@@ -182,7 +370,7 @@ impl TursoAgentStore {
         git_mode: AgentGitMode,
         start: &AgentGitStartState,
     ) -> Result<bool> {
-        self.blocking.block_on(async {
+        self.blocking.block_on_persist(async {
             let mut conn = self.repositories.git_journals.connect().await?;
             let transaction = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -281,7 +469,7 @@ impl TursoAgentStore {
         project_id: i64,
         run_token: &str,
     ) -> Result<bool> {
-        self.blocking.block_on(async {
+        self.blocking.block_on_persist(async {
             let conn = self.repositories.git_journals.connect().await?;
             Ok(conn
                 .execute(
@@ -300,7 +488,7 @@ impl TursoAgentStore {
         finalization: NewGitFinalization<'_>,
     ) -> Result<bool> {
         self.blocking
-            .block_on(self.create_git_finalization(finalization))
+            .block_on_persist(self.create_git_finalization(finalization))
     }
 
     async fn create_git_finalization(&self, finalization: NewGitFinalization<'_>) -> Result<bool> {
@@ -515,7 +703,7 @@ impl TursoAgentStore {
         updated_at: &str,
     ) -> Result<bool> {
         self.blocking
-            .block_on(self.compare_and_set_git_finalization(
+            .block_on_persist(self.compare_and_set_git_finalization(
                 project_id,
                 codex_session_id,
                 expected_generation,
@@ -543,7 +731,7 @@ impl TursoAgentStore {
         updated_at: &str,
     ) -> Result<bool> {
         self.blocking
-            .block_on(self.compare_and_set_git_finalization(
+            .block_on_persist(self.compare_and_set_git_finalization(
                 project_id,
                 codex_session_id,
                 expected_generation,
@@ -570,7 +758,7 @@ impl TursoAgentStore {
         updated_at: &str,
     ) -> Result<bool> {
         self.blocking
-            .block_on(self.compare_and_set_git_finalization(
+            .block_on_persist(self.compare_and_set_git_finalization(
                 project_id,
                 codex_session_id,
                 expected_generation,
@@ -597,7 +785,7 @@ impl TursoAgentStore {
         updated_at: &str,
     ) -> Result<bool> {
         self.blocking
-            .block_on(self.compare_and_set_git_finalization(
+            .block_on_persist(self.compare_and_set_git_finalization(
                 project_id,
                 codex_session_id,
                 expected_generation,
@@ -624,7 +812,7 @@ impl TursoAgentStore {
         updated_at: &str,
     ) -> Result<bool> {
         self.blocking
-            .block_on(self.compare_and_set_git_finalization(
+            .block_on_persist(self.compare_and_set_git_finalization(
                 project_id,
                 codex_session_id,
                 expected_generation,
@@ -650,7 +838,7 @@ impl TursoAgentStore {
         updated_at: &str,
     ) -> Result<bool> {
         self.blocking
-            .block_on(self.compare_and_set_git_finalization(
+            .block_on_persist(self.compare_and_set_git_finalization(
                 project_id,
                 codex_session_id,
                 expected_generation,
@@ -901,7 +1089,7 @@ impl TursoAgentStore {
         project_id: i64,
         codex_session_id: &str,
     ) -> Result<bool> {
-        self.blocking.block_on(async {
+        self.blocking.block_on_persist(async {
                 let conn = self.repositories.git_journals.connect().await?;
                 let removed = conn
                     .execute(
@@ -925,7 +1113,7 @@ impl TursoAgentStore {
         project_id: i64,
         codex_session_id: &str,
     ) -> Result<bool> {
-        self.blocking.block_on(async {
+        self.blocking.block_on_persist(async {
                 let mut conn = self.repositories.git_journals.connect().await?;
                 let acknowledged_at = agent_timestamp();
                 let transaction = conn

@@ -39,7 +39,8 @@ use crate::{
     },
     scheduler::{
         agent_heartbeat_tail_enabled, agent_lease_timeout, agent_max_global_jobs,
-        scan_agent_project, task_status_for_codex_session,
+        run_agent_daemon_database_operation_with_recovery, scan_agent_project,
+        task_status_for_codex_session,
     },
     session_control::codex_session_for_task,
     task::{
@@ -598,23 +599,32 @@ pub(super) fn dispatch_independent_agent_worker_with(
     let command_arguments = serde_json::to_string(&command_arguments)
         .context("Failed to serialize independent worker launch arguments")?;
     let created_at = agent_timestamp();
-    let reservation_result = with_agent_store_at(state_dir, |store| {
-        store.reserve_worker_blocking(agent::AgentWorkerReservation {
-            project_id: job.project.id,
-            worker_token: &spec.worker_token,
-            expected_lease_holder: &job.holder,
-            max_active_workers: job.max_global_jobs,
-            protocol_version: AGENT_WORKER_PROTOCOL_VERSION,
-            service_label: &spec.service_label,
-            binary_path: &spec.executable,
-            command_arguments: &command_arguments,
-            path_env: &spec.service_env.path,
-            codex_path: spec.service_env.codex_path_override.as_deref(),
-            task_selection: spec.task_selection.label(),
-            resume_session_id: spec.resume_session_id.as_deref(),
-            created_at: &created_at,
-        })
-    });
+    let reservation_result = run_agent_daemon_database_operation_with_recovery(
+        || {
+            with_agent_store_at(state_dir, |store| {
+                store.reserve_worker_blocking(agent::AgentWorkerReservation {
+                    project_id: job.project.id,
+                    worker_token: &spec.worker_token,
+                    expected_lease_holder: &job.holder,
+                    max_active_workers: job.max_global_jobs,
+                    protocol_version: AGENT_WORKER_PROTOCOL_VERSION,
+                    service_label: &spec.service_label,
+                    binary_path: &spec.executable,
+                    command_arguments: &command_arguments,
+                    path_env: &spec.service_env.path,
+                    codex_path: spec.service_env.codex_path_override.as_deref(),
+                    task_selection: spec.task_selection.label(),
+                    resume_session_id: spec.resume_session_id.as_deref(),
+                    created_at: &created_at,
+                })
+            })
+        },
+        || {
+            with_agent_store_at(state_dir, |store| {
+                store.rebuild_active_worker_project_index_blocking()
+            })
+        },
+    );
     let reserved = match reservation_result {
         Ok(reserved) => reserved,
         Err(error) => {

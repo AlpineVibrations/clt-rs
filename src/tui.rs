@@ -743,13 +743,19 @@ pub(super) fn move_selected_tui_task_between_boards(
     let to = statuses[to_board];
 
     match move_task_in_board(board_dir, from, to, &(idx + 1).to_string()) {
-        Ok(_) => {
+        Ok(external_completion) => {
             *selected_board = to_board;
             for state in board_states.iter_mut() {
                 state.select(None);
             }
             select_last_task_if_present_in_board(board_dir, to, &mut board_states[*selected_board]);
-            format!("Moved task to {to}")
+            if let Some(session_id) = external_completion {
+                format!(
+                    "Moved task to Done as external completion; cancelled idle managed Git journal for {session_id}"
+                )
+            } else {
+                format!("Moved task to {to}")
+            }
         }
         Err(error) => format!("Error: {error}"),
     }
@@ -2563,7 +2569,9 @@ pub(super) fn load_tui_agent_panel_snapshot_inner(
             let daemon_scan_problem = tui_agent_daemon_scan_problem(&project);
             let latest_run = if project.enabled
                 && project.failure_count > 0
-                && (scan.todo_count > 0 || scan.doing_count > 0)
+                && (scan.todo_count > 0
+                    || scan.doing_count > 0
+                    || pending_git_finalizations.contains_key(&project.id))
             {
                 store.latest_run_for_project_blocking(project.id)?
             } else {
@@ -2571,38 +2579,13 @@ pub(super) fn load_tui_agent_panel_snapshot_inner(
             };
             let failure_problem =
                 tui_agent_failure_problem(&project, latest_run.as_ref(), now, failure_backoff);
-            let mut runtime_state = tui_agent_runtime_state(project.id, &active_leases);
-            if matches!(
-                runtime_state,
-                TuiAgentRuntimeState::Idle | TuiAgentRuntimeState::Fenced
-            ) && interactive_session_projects.contains(&project.id)
-            {
-                runtime_state = TuiAgentRuntimeState::Interactive;
-            }
-            if runtime_state == TuiAgentRuntimeState::Idle
-                && suspending_session_projects.contains(&project.id)
-            {
-                runtime_state = TuiAgentRuntimeState::Fenced;
-            }
-            if matches!(
-                runtime_state,
-                TuiAgentRuntimeState::Idle
-                    | TuiAgentRuntimeState::Fenced
-                    | TuiAgentRuntimeState::Error
-            ) && let Some(finalization_state) =
-                pending_git_finalizations.get(&project.id).copied()
-            {
-                runtime_state = if finalization_state == GitFinalizationState::PushPending {
-                    TuiAgentRuntimeState::PushPending
-                } else {
-                    TuiAgentRuntimeState::Finalizing
-                };
-            }
-            if runtime_state == TuiAgentRuntimeState::Idle
-                && (daemon_scan_problem.is_some() || failure_problem.is_some())
-            {
-                runtime_state = TuiAgentRuntimeState::Error;
-            }
+            let runtime_state = resolve_tui_agent_runtime_state(
+                tui_agent_runtime_state(project.id, &active_leases),
+                interactive_session_projects.contains(&project.id),
+                suspending_session_projects.contains(&project.id),
+                pending_git_finalizations.get(&project.id).copied(),
+                daemon_scan_problem.is_some() || failure_problem.is_some(),
+            );
             Ok(TuiAgentProject {
                 project,
                 scan,
@@ -2617,6 +2600,44 @@ pub(super) fn load_tui_agent_panel_snapshot_inner(
         projects,
         daemon_status,
     })
+}
+
+pub(super) fn resolve_tui_agent_runtime_state(
+    mut runtime_state: TuiAgentRuntimeState,
+    has_interactive_session: bool,
+    has_suspending_session: bool,
+    pending_git_finalization: Option<GitFinalizationState>,
+    has_problem: bool,
+) -> TuiAgentRuntimeState {
+    if matches!(
+        runtime_state,
+        TuiAgentRuntimeState::Idle | TuiAgentRuntimeState::Fenced
+    ) && has_interactive_session
+    {
+        runtime_state = TuiAgentRuntimeState::Interactive;
+    }
+    if runtime_state == TuiAgentRuntimeState::Idle && has_suspending_session {
+        runtime_state = TuiAgentRuntimeState::Fenced;
+    }
+    if matches!(
+        runtime_state,
+        TuiAgentRuntimeState::Idle | TuiAgentRuntimeState::Fenced
+    ) && has_problem
+    {
+        return TuiAgentRuntimeState::Error;
+    }
+    if matches!(
+        runtime_state,
+        TuiAgentRuntimeState::Idle | TuiAgentRuntimeState::Fenced
+    ) && let Some(finalization_state) = pending_git_finalization
+    {
+        runtime_state = if finalization_state == GitFinalizationState::PushPending {
+            TuiAgentRuntimeState::PushPending
+        } else {
+            TuiAgentRuntimeState::Finalizing
+        };
+    }
+    runtime_state
 }
 
 pub(super) fn tui_agent_daemon_scan_problem(project: &agent::AgentProject) -> Option<String> {

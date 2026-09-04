@@ -1179,6 +1179,69 @@ fn tui_agent_runtime_state_distinguishes_running_from_doing_tasks() {
 }
 
 #[test]
+fn tui_agent_runtime_state_surfaces_failed_recovery_over_pending_finalization() {
+    for finalization in [
+        GitFinalizationState::Working,
+        GitFinalizationState::Tracking,
+        GitFinalizationState::CommitPending,
+        GitFinalizationState::PushPending,
+    ] {
+        for runtime_state in [TuiAgentRuntimeState::Idle, TuiAgentRuntimeState::Fenced] {
+            assert_eq!(
+                resolve_tui_agent_runtime_state(
+                    runtime_state,
+                    false,
+                    false,
+                    Some(finalization),
+                    true,
+                ),
+                TuiAgentRuntimeState::Error
+            );
+        }
+    }
+    assert_eq!(
+        resolve_tui_agent_runtime_state(
+            TuiAgentRuntimeState::Idle,
+            false,
+            true,
+            Some(GitFinalizationState::Working),
+            true,
+        ),
+        TuiAgentRuntimeState::Error
+    );
+    assert_eq!(
+        resolve_tui_agent_runtime_state(
+            TuiAgentRuntimeState::Idle,
+            false,
+            true,
+            Some(GitFinalizationState::Working),
+            false,
+        ),
+        TuiAgentRuntimeState::Finalizing
+    );
+    assert_eq!(
+        resolve_tui_agent_runtime_state(
+            TuiAgentRuntimeState::Idle,
+            false,
+            false,
+            Some(GitFinalizationState::PushPending),
+            false,
+        ),
+        TuiAgentRuntimeState::PushPending
+    );
+    assert_eq!(
+        resolve_tui_agent_runtime_state(
+            TuiAgentRuntimeState::Running,
+            false,
+            false,
+            Some(GitFinalizationState::Working),
+            true,
+        ),
+        TuiAgentRuntimeState::Running
+    );
+}
+
+#[test]
 fn agent_project_table_surfaces_external_daemon_scan_errors() {
     let mut item = tui_agent_project_for_test(1, "fishdome");
     item.project.path = PathBuf::from("/Volumes/External/FISHDOME");
@@ -1239,7 +1302,13 @@ fn agent_project_table_surfaces_failed_run_reason_and_retry_guidance() {
         250,
         Duration::from_secs(300),
     );
-    item.runtime_state = TuiAgentRuntimeState::Error;
+    item.runtime_state = resolve_tui_agent_runtime_state(
+        TuiAgentRuntimeState::Idle,
+        false,
+        true,
+        Some(GitFinalizationState::Working),
+        item.failure_problem.is_some(),
+    );
 
     let codex_width = agent_codex_column_width(std::slice::from_ref(&item), false);
     let project_width =

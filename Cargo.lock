@@ -464,7 +464,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "clt-rs"
-version = "0.5.4"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2922,8 +2922,6 @@ dependencies = [
 [[package]]
 name = "turso_core"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a77f2106de5a3014261be18283999fde0d06c24ae5d4cb85a6eff1aaeaff453d"
 dependencies = [
  "aegis",
  "aes",

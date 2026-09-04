@@ -2274,6 +2274,7 @@ fn legacy_guardian_without_a_launch_token_remains_fail_closed() {
     // PID in that generation is not proof that Codex was never launched.
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let db = turso::Builder::new_local(db_path.to_string_lossy().as_ref())
+            .experimental_multiprocess_wal(true)
             .build()
             .await
             .unwrap();

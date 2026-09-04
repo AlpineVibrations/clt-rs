@@ -8,7 +8,17 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 Use this section while developing the next release.
 
+## [0.6.1] - 2026-09-04
+
+### Fixed
+
+- Fixed registry reader ownership failures when opening an existing database from the TUI or CLI, including after a partial checkpoint or interrupted WAL write and before the agent service has started.
+
+## [0.6.0] - 2026-09-04
+
 ### Added
+
+- Added external registry snapshots and `clt agent recover` with exclusive service drain, preserved DB/WAL quarantine, coordination repair, and fail-closed reconstruction of Git journals.
 
 - Added persisted daemon project-scan errors to the Agent Projects pane, with red `ERROR` rows and actionable macOS Full Disk Access guidance for inaccessible external drives.
 - Added `n` and `+` TUI shortcuts that create a Todo subtask under the selected task, automatically expand Markdown-backed parent storage, and open the resulting nested board.
@@ -59,6 +69,11 @@ Use this section while developing the next release.
 - Automated Codex agent runs now use `danger-full-access` with approvals disabled so non-interactive tasks can update Git metadata.
 
 ### Fixed
+
+- Allowed explicit user Done moves to accept idle externally completed `WORKING` tasks without discarding sealed Git proof.
+- Recovered malformed active-worker indexes during independent reservation and scheduler scanning with one guarded retry.
+- Retagged abandoned `WORKING` sessions before finalization lease acquisition and kept idle recovery failures visible as `ERROR`.
+- Made `clt agent stop` independent of database health and stopped database retries after shared-WAL ownership/frame-index failures.
 
 - Fixed managed Git sealing so a Todo or other task-board edit added during an agent run can remain unstaged and survive outside the exact task commit, while staged unrelated board changes and non-task baseline drift are still rejected.
 
@@ -116,5 +131,7 @@ Use this section while developing the next release.
 - Fixed task moves so destination write failures do not remove the source task.
 - Fixed TUI navigation on empty boards.
 
-[Unreleased]: https://github.com/AlpineVibrations/clt-rs/compare/v0.1.10...HEAD
+[Unreleased]: https://github.com/AlpineVibrations/clt-rs/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/AlpineVibrations/clt-rs/releases/tag/v0.6.1
+[0.6.0]: https://github.com/AlpineVibrations/clt-rs/releases/tag/v0.6.0
 [0.1.10]: https://github.com/AlpineVibrations/clt-rs/releases/tag/v0.1.10

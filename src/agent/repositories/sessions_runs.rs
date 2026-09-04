@@ -34,7 +34,8 @@ impl SessionsRunsRepository {
 
 impl TursoAgentStore {
     pub(crate) fn record_run_outcome_blocking(&self, outcome: AgentRunOutcome<'_>) -> Result<i64> {
-        self.blocking.block_on(self.record_run_outcome(outcome))
+        self.blocking
+            .block_on_persist(self.record_run_outcome(outcome))
     }
 
     async fn record_run_outcome(&self, outcome: AgentRunOutcome<'_>) -> Result<i64> {
@@ -224,7 +225,7 @@ impl TursoAgentStore {
         checked_in_at: &str,
         expires_at: &str,
     ) -> Result<()> {
-        self.blocking.block_on(self.record_daemon_checkin(
+        self.blocking.block_on_persist(self.record_daemon_checkin(
             holder,
             mode,
             started_at,
@@ -260,7 +261,8 @@ impl TursoAgentStore {
     }
 
     pub(crate) fn clear_daemon_checkin_blocking(&self, holder: &str) -> Result<bool> {
-        self.blocking.block_on(self.clear_daemon_checkin(holder))
+        self.blocking
+            .block_on_persist(self.clear_daemon_checkin(holder))
     }
 
     async fn clear_daemon_checkin(&self, holder: &str) -> Result<bool> {
@@ -311,7 +313,8 @@ impl TursoAgentStore {
         &self,
         cleaned_at: &str,
     ) -> Result<AgentCleanSummary> {
-        self.blocking.block_on(self.clean_agent_history(cleaned_at))
+        self.blocking
+            .block_on_persist(self.clean_agent_history(cleaned_at))
     }
 
     async fn clean_agent_history(&self, cleaned_at: &str) -> Result<AgentCleanSummary> {
@@ -430,7 +433,7 @@ impl TursoAgentStore {
         stdout_path: &Path,
         stderr_path: &Path,
     ) -> Result<()> {
-        self.blocking.block_on(self.mark_session_running(
+        self.blocking.block_on_persist(self.mark_session_running(
             project_id,
             codex_session_id,
             child_pid,
@@ -452,7 +455,7 @@ impl TursoAgentStore {
         stderr_path: &Path,
         git_mode: AgentGitMode,
     ) -> Result<()> {
-        self.blocking.block_on(self.mark_session_running(
+        self.blocking.block_on_persist(self.mark_session_running(
             project_id,
             codex_session_id,
             child_pid,
@@ -683,7 +686,7 @@ impl TursoAgentStore {
         state: AgentSessionControlState,
     ) -> Result<()> {
         self.blocking
-            .block_on(self.set_session_control_state(project_id, codex_session_id, state))
+            .block_on_persist(self.set_session_control_state(project_id, codex_session_id, state))
     }
 
     #[cfg(test)]
@@ -725,7 +728,7 @@ impl TursoAgentStore {
         codex_session_id: &str,
         run_token: &str,
     ) -> Result<()> {
-        self.blocking.block_on(async {
+        self.blocking.block_on_persist(async {
                 let conn = self.repositories.sessions_runs.connect().await?;
                 conn.execute(
                     "INSERT INTO session_controls (
@@ -756,7 +759,7 @@ impl TursoAgentStore {
         expected_run_token: &str,
         interactive_holder: &str,
     ) -> Result<bool> {
-        self.blocking.block_on(async {
+        self.blocking.block_on_persist(async {
         let conn = self.repositories.sessions_runs.connect().await?;
                 let changed = conn.execute(
                     "UPDATE session_controls
@@ -791,7 +794,7 @@ impl TursoAgentStore {
         codex_session_id: &str,
         interactive_holder: &str,
     ) -> Result<bool> {
-        self.blocking.block_on(async {
+        self.blocking.block_on_persist(async {
             let conn = self.repositories.sessions_runs.connect().await?;
             let changed = conn
                 .execute(
@@ -834,7 +837,7 @@ impl TursoAgentStore {
         interactive_holder: &str,
         expected_stopped_run_token: Option<&str>,
     ) -> Result<bool> {
-        self.blocking.block_on(async {
+        self.blocking.block_on_persist(async {
             let conn = self.repositories.sessions_runs.connect().await?;
             let restore_stopped = interactive_holder.starts_with("clt-stopped-interactive-");
             let changed = if restore_stopped {
@@ -905,7 +908,7 @@ impl TursoAgentStore {
         interactive_holder: &str,
         expected_stopped_run_token: Option<&str>,
     ) -> Result<bool> {
-        self.blocking.block_on(async {
+        self.blocking.block_on_persist(async {
                 let mut conn = self.repositories.sessions_runs.connect().await?;
                 let transaction = conn
                     .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1036,7 +1039,7 @@ impl TursoAgentStore {
         codex_session_id: &str,
         interactive_holder: &str,
     ) -> Result<bool> {
-        self.blocking.block_on(async {
+        self.blocking.block_on_persist(async {
                 let conn = self.repositories.sessions_runs.connect().await?;
                 let restore_stopped = interactive_holder
                     .starts_with("clt-stopped-interactive-")
@@ -1084,7 +1087,7 @@ impl TursoAgentStore {
         expected_child_pid: u32,
         expected_run_token: &str,
     ) -> Result<bool> {
-        self.blocking.block_on(async {
+        self.blocking.block_on_persist(async {
             let conn = self.repositories.sessions_runs.connect().await?;
             let changed = conn
                 .execute(
@@ -1116,7 +1119,7 @@ impl TursoAgentStore {
         expected_child_pid: u32,
         expected_interactive_holder: &str,
     ) -> Result<bool> {
-        self.blocking.block_on(async {
+        self.blocking.block_on_persist(async {
             let conn = self.repositories.sessions_runs.connect().await?;
             let changed = conn
                 .execute(
@@ -1150,7 +1153,7 @@ impl TursoAgentStore {
         codex_session_id: &str,
         expected_run_token: Option<&str>,
     ) -> Result<bool> {
-        self.blocking.block_on(async {
+        self.blocking.block_on_persist(async {
             let conn = self.repositories.sessions_runs.connect().await?;
             let changed = conn
                 .execute(
@@ -1186,7 +1189,7 @@ impl TursoAgentStore {
         from: AgentSessionControlState,
         to: AgentSessionControlState,
     ) -> Result<bool> {
-        self.blocking.block_on(async {
+        self.blocking.block_on_persist(async {
             let conn = self.repositories.sessions_runs.connect().await?;
             let changed = conn
                 .execute(
@@ -1225,7 +1228,7 @@ impl TursoAgentStore {
         expected_child_pid: u32,
         expected_run_token: Option<&str>,
     ) -> Result<bool> {
-        self.blocking.block_on(async {
+        self.blocking.block_on_persist(async {
             let conn = self.repositories.sessions_runs.connect().await?;
             let changed = conn
                 .execute(
@@ -1269,7 +1272,7 @@ impl TursoAgentStore {
         lease_holder: &str,
         lease_timeout_seconds: u64,
     ) -> Result<bool> {
-        self.blocking.block_on(async {
+        self.blocking.block_on_persist(async {
                 let mut conn = self.repositories.sessions_runs.connect().await?;
                 let transaction = conn.transaction().await.with_context(|| {
                     format!(
@@ -1447,7 +1450,7 @@ impl TursoAgentStore {
         to: AgentSessionControlState,
         expected_interactive_holder: Option<&str>,
     ) -> Result<bool> {
-        self.blocking.block_on(async {
+        self.blocking.block_on_persist(async {
                 let conn = self.repositories.sessions_runs.connect().await?;
                 let changed = conn
                     .execute(
@@ -1489,7 +1492,7 @@ impl TursoAgentStore {
         interactive_holder: &str,
         expected_run_token: Option<&str>,
     ) -> Result<bool> {
-        self.blocking.block_on(async {
+        self.blocking.block_on_persist(async {
             let conn = self.repositories.sessions_runs.connect().await?;
             let changed = conn
                 .execute(
@@ -1527,7 +1530,7 @@ impl TursoAgentStore {
         guardian_holder: &str,
         lease_timeout_seconds: u64,
     ) -> Result<bool> {
-        self.blocking.block_on(async {
+        self.blocking.block_on_persist(async {
                 let disposition = InteractiveGuardianDisposition::from_guardian_holder(
                     guardian_holder,
                 )
@@ -1607,7 +1610,7 @@ impl TursoAgentStore {
         child_pid: u32,
         lease_timeout_seconds: u64,
     ) -> Result<bool> {
-        self.blocking.block_on(async {
+        self.blocking.block_on_persist(async {
                 let disposition = InteractiveGuardianDisposition::from_guardian_holder(
                     guardian_holder,
                 )
@@ -1685,7 +1688,7 @@ impl TursoAgentStore {
         guardian_holder: &str,
         disposition: InteractiveGuardianDisposition,
     ) -> Result<bool> {
-        self.blocking.block_on(async {
+        self.blocking.block_on_persist(async {
                 let mut conn = self.repositories.sessions_runs.connect().await?;
                 let transaction = conn.transaction().await.with_context(|| {
                     format!("Failed to finish interactive guardian for project {project_id}")
@@ -1781,7 +1784,7 @@ impl TursoAgentStore {
         expected_child_pid: Option<u32>,
         disposition: InteractiveGuardianDisposition,
     ) -> Result<bool> {
-        self.blocking.block_on(async {
+        self.blocking.block_on_persist(async {
                 let mut conn = self.repositories.sessions_runs.connect().await?;
                 let transaction = conn.transaction().await.with_context(|| {
                     format!(
@@ -1880,7 +1883,7 @@ impl TursoAgentStore {
         codex_session_id: &str,
         run_token: &str,
     ) -> Result<bool> {
-        self.blocking.block_on(async {
+        self.blocking.block_on_persist(async {
             let conn = self.repositories.sessions_runs.connect().await?;
             let changed = conn
                 .execute(
@@ -1920,7 +1923,7 @@ impl TursoAgentStore {
         from_holder: &str,
         lease_timeout_seconds: u64,
     ) -> Result<Option<String>> {
-        self.blocking.block_on(async {
+        self.blocking.block_on_persist(async {
                 let mut conn = self.repositories.sessions_runs.connect().await?;
                 let transaction = conn.transaction().await.with_context(|| {
                     format!(
@@ -2174,7 +2177,7 @@ impl TursoAgentStore {
         project_id: i64,
         codex_session_id: &str,
     ) -> Result<bool> {
-        self.blocking.block_on(async {
+        self.blocking.block_on_persist(async {
                 let mut conn = self.repositories.sessions_runs.connect().await?;
                 let transaction = conn
                     .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -2279,7 +2282,7 @@ impl TursoAgentStore {
         codex_session_id: &str,
         now: u64,
     ) -> Result<bool> {
-        self.blocking.block_on(async {
+        self.blocking.block_on_persist(async {
                 let mut conn = self.repositories.sessions_runs.connect().await?;
                 let transaction = conn
                     .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -2348,7 +2351,7 @@ impl TursoAgentStore {
             lease_timeout_seconds,
             claim_requested_resume,
         } = registration;
-        self.blocking.block_on(async {
+        self.blocking.block_on_persist(async {
             let mut conn = self.repositories.sessions_runs.connect().await?;
             let now = agent_timestamp();
             let fresh_expiry = agent_timestamp_after(lease_timeout_seconds);
@@ -2433,7 +2436,7 @@ impl TursoAgentStore {
         codex_session_id: &str,
         run_token: Option<&str>,
     ) -> Result<bool> {
-        self.blocking.block_on(async {
+        self.blocking.block_on_persist(async {
                 let mut conn = self.repositories.sessions_runs.connect().await?;
                 let transaction = conn
                     .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -2506,7 +2509,7 @@ impl TursoAgentStore {
         project_id: i64,
         codex_session_id: &str,
     ) -> Result<bool> {
-        self.blocking.block_on(async {
+        self.blocking.block_on_persist(async {
                 let conn = self.repositories.sessions_runs.connect().await?;
                 let removed = conn
                     .execute(

@@ -18,9 +18,10 @@ use crate::{
         open_agent_store_at,
     },
     application::{
-        AGENT_CODEX_PATH_ENV, AGENT_DAEMON_MODE_ENV, AGENT_LAUNCHD_LABEL, AGENT_SYSTEMD_UNIT,
-        AGENT_WORKER_GENERATION, AGENT_WORKER_LAUNCHD_LABEL_PREFIX,
-        AGENT_WORKER_SYSTEMD_UNIT_PREFIX, AgentWorkerLaunchSpec, XDG_RUNTIME_DIR_ENV,
+        AGENT_CODEX_PATH_ENV, AGENT_DAEMON_MODE_ENV, AGENT_INLINE_WORKER_SERVICE_LABEL_PREFIX,
+        AGENT_LAUNCHD_LABEL, AGENT_SYSTEMD_UNIT, AGENT_WORKER_GENERATION,
+        AGENT_WORKER_LAUNCHD_LABEL_PREFIX, AGENT_WORKER_SYSTEMD_UNIT_PREFIX, AgentWorkerLaunchSpec,
+        XDG_RUNTIME_DIR_ENV,
     },
     runner::{agent_timestamp, agent_timestamp_after, agent_timestamp_seconds},
     scheduler::{agent_lease_is_reclaimable, agent_lease_renew_interval},
@@ -71,32 +72,216 @@ pub(super) fn truncate_agent_service_logs(state_dir: &Path) -> Result<u64> {
 
 pub(super) fn manage_agent_service(action: AgentServiceAction) -> Result<()> {
     let state_dir = ensure_agent_state_dir()?;
-    let store = open_agent_store_at(&state_dir)?;
-    if agent_scheduler_service_is_loaded()? {
-        ensure_no_live_legacy_agent_runs(&store)?;
-    }
+    manage_agent_service_at_with(action, &state_dir, |action, state_dir, executable| {
+        match current_agent_platform() {
+            AgentPlatform::Macos => manage_launchd_agent(action, state_dir, executable),
+            AgentPlatform::Linux => manage_systemd_agent(action, state_dir, executable),
+            AgentPlatform::Other => anyhow::bail!(
+                "clt agent start/stop is only supported on macOS launchd and Linux user systemd."
+            ),
+        }
+    })
+}
+
+fn manage_agent_service_at_with(
+    action: AgentServiceAction,
+    state_dir: &Path,
+    manage_service: impl FnOnce(AgentServiceAction, &Path, &Path) -> Result<()>,
+) -> Result<()> {
+    // Stopping must work even when opening Turso requires registry recovery.
+    let store = if action == AgentServiceAction::Start {
+        let store = open_agent_store_at(state_dir)?;
+        if agent_scheduler_service_is_loaded()? {
+            ensure_no_live_legacy_agent_runs(&store)?;
+        }
+        Some(store)
+    } else {
+        None
+    };
     let current_executable =
         std::env::current_exe().context("Failed to resolve current clt executable")?;
     let executable = if action == AgentServiceAction::Start {
-        snapshot_agent_service_binary(&state_dir, &current_executable)?
+        snapshot_agent_service_binary(state_dir, &current_executable)?
     } else {
         current_executable
     };
 
-    match current_agent_platform() {
-        AgentPlatform::Macos => manage_launchd_agent(action, &state_dir, &executable),
-        AgentPlatform::Linux => manage_systemd_agent(action, &state_dir, &executable),
-        AgentPlatform::Other => anyhow::bail!(
-            "clt agent start/stop is only supported on macOS launchd and Linux user systemd."
-        ),
-    }?;
+    manage_service(action, state_dir, &executable)?;
 
-    if action == AgentServiceAction::Start {
+    if let Some(store) = store {
         #[cfg(not(test))]
-        cleanup_terminal_agent_worker_services(&state_dir, &store, None)?;
-        garbage_collect_agent_binary_generations(&state_dir, &store, &executable)?;
+        cleanup_terminal_agent_worker_services(state_dir, &store, None)?;
+        garbage_collect_agent_binary_generations(state_dir, &store, &executable)?;
     }
     Ok(())
+}
+
+pub(super) fn stop_agent_services_for_recovery(
+    state_dir: &Path,
+    manifest: &serde_json::Value,
+) -> Result<()> {
+    let platform = current_agent_platform();
+    let launchd_domain = if platform == AgentPlatform::Macos {
+        Some(launchd_user_domain()?)
+    } else {
+        None
+    };
+    stop_agent_services_for_recovery_with(
+        state_dir,
+        manifest,
+        platform,
+        launchd_domain.as_deref(),
+        |program, args| {
+            let output = service_command(program, args)?.output().with_context(|| {
+                format!("Failed to run {}", service_command_display(program, args))
+            })?;
+            Ok((
+                output.status.success(),
+                String::from_utf8_lossy(&output.stdout).into_owned(),
+            ))
+        },
+        local_process_is_running,
+    )
+}
+
+fn stop_agent_services_for_recovery_with(
+    state_dir: &Path,
+    manifest: &serde_json::Value,
+    platform: AgentPlatform,
+    launchd_domain: Option<&str>,
+    mut service_command: impl FnMut(&str, &[&str]) -> Result<(bool, String)>,
+    mut process_is_running: impl FnMut(u32) -> Option<bool>,
+) -> Result<()> {
+    if manifest.get("version").and_then(serde_json::Value::as_u64) != Some(1) {
+        anyhow::bail!(
+            "Unsupported agent recovery manifest in {}",
+            state_dir.display()
+        );
+    }
+    let tables = manifest
+        .get("tables")
+        .and_then(serde_json::Value::as_object)
+        .context("Agent recovery manifest has no runtime tables")?;
+    let workers = tables
+        .get("agent_workers")
+        .and_then(serde_json::Value::as_array)
+        .context("Agent recovery manifest has no worker identities")?;
+    let controls = tables
+        .get("session_controls")
+        .and_then(serde_json::Value::as_array)
+        .context("Agent recovery manifest has no session control identities")?;
+    let mut service_labels = Vec::new();
+    let mut process_ids = HashSet::new();
+    // Validate the complete manifest before issuing any service commands.
+    for worker in workers {
+        let state = worker
+            .get("state")
+            .and_then(serde_json::Value::as_str)
+            .context("Agent recovery worker has no state")?;
+        match state {
+            "completed" | "abandoned" | "superseded" => continue,
+            "dispatching" | "running" | "finalizing" => {}
+            _ => anyhow::bail!("Agent recovery worker has unknown state {state:?}"),
+        }
+        let token = worker
+            .get("worker_token")
+            .and_then(serde_json::Value::as_str)
+            .context("Agent recovery worker has no generation token")?;
+        if token.is_empty()
+            || !token
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            anyhow::bail!("Agent recovery worker has an invalid generation token");
+        }
+        let label = worker
+            .get("service_label")
+            .and_then(serde_json::Value::as_str)
+            .context("Agent recovery worker has no service identity")?;
+        if label != format!("{AGENT_INLINE_WORKER_SERVICE_LABEL_PREFIX}{token}") {
+            if label != agent_worker_service_label(platform, token)? {
+                anyhow::bail!(
+                    "Refusing to stop unverified service {label:?} for agent worker {token}"
+                );
+            }
+            service_labels.push(label);
+        }
+        if let Some(pid) = recovery_manifest_pid(worker, "worker_pid")? {
+            process_ids.insert(pid);
+        }
+    }
+    for control in controls {
+        if let Some(pid) = recovery_manifest_pid(control, "child_pid")? {
+            process_ids.insert(pid);
+        }
+    }
+
+    let mut stop_service = |label: &str| -> Result<()> {
+        match platform {
+            AgentPlatform::Macos => {
+                let domain = launchd_domain.context("Missing launchd recovery service domain")?;
+                let target = format!("{domain}/{label}");
+                if service_command("launchctl", &["print", &target])?.0
+                    && (!service_command("launchctl", &["bootout", &target])?.0
+                        || service_command("launchctl", &["print", &target])?.0)
+                {
+                    anyhow::bail!("Agent recovery could not stop service {label}");
+                }
+            }
+            AgentPlatform::Linux => {
+                let (success, load_state) = service_command(
+                    "systemctl",
+                    &["--user", "show", "--property=LoadState", "--value", label],
+                )?;
+                match load_state.trim() {
+                    "not-found" => return Ok(()),
+                    "loaded" | "masked" if success => {}
+                    _ => anyhow::bail!("Agent recovery could not inspect service {label}"),
+                }
+                // Stop loaded units even when inactive so a scheduled restart
+                // cannot race the registry's exclusive recovery lock.
+                if !service_command("systemctl", &["--user", "stop", label])?.0
+                    || service_command("systemctl", &["--user", "is-active", "--quiet", label])?.0
+                {
+                    anyhow::bail!("Agent recovery could not stop service {label}");
+                }
+            }
+            AgentPlatform::Other => {}
+        }
+        Ok(())
+    };
+    stop_service(match platform {
+        AgentPlatform::Macos => AGENT_LAUNCHD_LABEL,
+        AgentPlatform::Linux => AGENT_SYSTEMD_UNIT,
+        AgentPlatform::Other => "",
+    })?;
+    for label in service_labels {
+        stop_service(label)?;
+    }
+    for pid in process_ids {
+        if process_is_running(pid) != Some(false) {
+            anyhow::bail!(
+                "Agent recovery requires worker/session process {pid} to exit. Stop its owning CLT session or wait for it to finish, then retry; registry at {} is unchanged.",
+                state_dir.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn recovery_manifest_pid(record: &serde_json::Value, field: &str) -> Result<Option<u32>> {
+    let value = record
+        .get(field)
+        .with_context(|| format!("Agent recovery manifest is missing {field}"))?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    value
+        .as_u64()
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid != 0)
+        .map(Some)
+        .with_context(|| format!("Agent recovery manifest has invalid {field}"))
 }
 
 #[cfg(test)]

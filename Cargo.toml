@@ -1,6 +1,6 @@
 [package]
 name = "clt-rs"
-version = "0.5.4"
+version = "0.6.1"
 edition = "2024"
 description = "File-backed task manager with a TUI Kanban board and multi-project Codex agent registry"
 license = "MIT"
@@ -26,3 +26,6 @@ turso = { version = "=0.7.0", default-features = false }
 toml_edit = "0.23"
 serde_json = "1.0"
 ureq = { version = "3.4", default-features = false, features = ["json", "rustls"] }
+
+[patch.crates-io]
+turso_core = { path = "vendor/turso_core" }

@@ -11,10 +11,10 @@ use crate::runner::{AutomatedSupervisorSpec, run_automated_session_supervisor};
 use crate::{
     agent::{AgentGitMode, ensure_agent_state_dir, open_agent_store, open_agent_store_at},
     application::{
-        AgentTaskSelection, ManagedTaskWorkflow, clean_agent_state, expand_tasks, get_task_root,
-        list_agent_projects, list_tasks, register_agent_project, retry_agent_project,
-        set_agent_project_enabled, set_agent_project_git_mode, show_agent_logs, show_agent_status,
-        unregister_agent_project,
+        AgentTaskSelection, ManagedTaskWorkflow, TaskDoneOutcome, clean_agent_state, expand_tasks,
+        get_task_root, list_agent_projects, list_tasks, recover_agent_state,
+        register_agent_project, retry_agent_project, set_agent_project_enabled,
+        set_agent_project_git_mode, show_agent_logs, show_agent_status, unregister_agent_project,
     },
     platform::{AgentServiceAction, manage_agent_service},
     runner::run_automated_exec_gate,
@@ -226,6 +226,8 @@ enum AgentCommands {
     Start,
     /// Stops the background agent service
     Stop,
+    /// Recovers the agent registry after stopping services and preserving its database bundle
+    Recover,
     /// Shows agent service and project status
     Status,
     /// Shows recent agent logs
@@ -353,7 +355,13 @@ pub(super) fn run() -> Result<()> {
             let to_status = TaskStatus::parse(&to)?;
             let workflow = ManagedTaskWorkflow::new(&root);
             if to_status == TaskStatus::Done {
-                workflow.complete_task(from_status, &task_index)?;
+                if let TaskDoneOutcome::ExternalCompletion(session_id) =
+                    workflow.complete_task(from_status, &task_index)?
+                {
+                    println!(
+                        "Task {task_index} from {from} marked as externally completed; cancelled idle managed Git journal for Codex session {session_id}."
+                    );
+                }
             } else {
                 workflow.move_task(from_status, to_status, &task_index)?;
             }
@@ -371,14 +379,21 @@ pub(super) fn run() -> Result<()> {
                     println!("Task is already done.");
                 }
             } else {
-                let provisional = workflow.complete_task(task_status, &task_index)?;
-                if provisional {
-                    println!(
-                        "Task {} from {} moved provisionally; Git finalization is pending.",
-                        task_index, status
-                    );
-                } else {
-                    println!("Task {} from {} marked as done.", task_index, status);
+                match workflow.complete_task(task_status, &task_index)? {
+                    TaskDoneOutcome::Normal => {
+                        println!("Task {} from {} marked as done.", task_index, status);
+                    }
+                    TaskDoneOutcome::Provisional => {
+                        println!(
+                            "Task {} from {} moved provisionally; Git finalization is pending.",
+                            task_index, status
+                        );
+                    }
+                    TaskDoneOutcome::ExternalCompletion(session_id) => {
+                        println!(
+                            "Task {task_index} from {status} marked as externally completed; cancelled idle managed Git journal for Codex session {session_id}."
+                        );
+                    }
                 }
             }
         }
@@ -450,6 +465,7 @@ fn handle_agent_command(command: AgentCommands, local: bool, default_root: &Path
     match &command {
         AgentCommands::Start => return manage_agent_service(AgentServiceAction::Start),
         AgentCommands::Stop => return manage_agent_service(AgentServiceAction::Stop),
+        AgentCommands::Recover => return recover_agent_state(),
         _ => {}
     }
 
@@ -570,7 +586,9 @@ fn handle_agent_command(command: AgentCommands, local: bool, default_root: &Path
             let store = open_agent_store_at(&state_dir)?;
             clean_agent_state(&store, &state_dir)?;
         }
-        AgentCommands::Start | AgentCommands::Stop => unreachable!("handled before store open"),
+        AgentCommands::Start | AgentCommands::Stop | AgentCommands::Recover => {
+            unreachable!("handled before store open")
+        }
     }
 
     Ok(())

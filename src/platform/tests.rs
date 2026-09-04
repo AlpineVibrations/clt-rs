@@ -1,5 +1,199 @@
+use super::{manage_agent_service_at_with, stop_agent_services_for_recovery_with};
 use crate::test_support::prelude::*;
 use crate::test_support::*;
+
+#[test]
+fn scheduler_service_stop_does_not_open_a_damaged_database() {
+    let root = temp_root("agent-stop-damaged-registry");
+    fs::create_dir_all(&root).unwrap();
+    let database = root.join("agent.db");
+    fs::write(&database, b"damaged agent registry").unwrap();
+    let stopped = Cell::new(false);
+
+    manage_agent_service_at_with(AgentServiceAction::Stop, &root, |action, state_dir, _| {
+        assert_eq!(action, AgentServiceAction::Stop);
+        assert_eq!(state_dir, root);
+        stopped.set(true);
+        Ok(())
+    })
+    .unwrap();
+
+    assert!(stopped.get());
+    assert_eq!(fs::read(database).unwrap(), b"damaged agent registry");
+    assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+    fs::remove_dir_all(root).unwrap();
+}
+
+fn recovery_service_test_manifest(platform: AgentPlatform) -> serde_json::Value {
+    serde_json::json!({
+        "version": 1,
+        "tables": {
+            "agent_workers": [{
+                "state": "running",
+                "worker_token": "worker-123",
+                "service_label": agent_worker_service_label(platform, "worker-123").unwrap(),
+                "worker_pid": 123
+            }],
+            "session_controls": [{"child_pid": 456}]
+        }
+    })
+}
+
+#[test]
+fn recovery_stops_loaded_linux_services_before_checking_processes_without_a_database() {
+    let root = temp_root("agent-recovery-services-damaged-registry");
+    fs::create_dir_all(&root).unwrap();
+    let database = root.join("agent.db");
+    fs::write(&database, b"damaged agent registry").unwrap();
+    let manifest = recovery_service_test_manifest(AgentPlatform::Linux);
+    let stopped = std::cell::RefCell::new(Vec::new());
+    let mut checked = HashSet::new();
+
+    stop_agent_services_for_recovery_with(
+        &root,
+        &manifest,
+        AgentPlatform::Linux,
+        None,
+        |program, args| {
+            assert_eq!(program, "systemctl");
+            match args[1] {
+                "show" => Ok((true, "loaded\n".to_string())),
+                "stop" => {
+                    stopped.borrow_mut().push(args[2].to_string());
+                    Ok((true, String::new()))
+                }
+                "is-active" => Ok((false, String::new())),
+                _ => panic!("unexpected service command: {args:?}"),
+            }
+        },
+        |pid| {
+            assert_eq!(stopped.borrow().len(), 2);
+            checked.insert(pid);
+            Some(false)
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        stopped.into_inner(),
+        vec![
+            AGENT_SYSTEMD_UNIT.to_string(),
+            agent_worker_service_label(AgentPlatform::Linux, "worker-123").unwrap()
+        ]
+    );
+    assert_eq!(checked, HashSet::from([123, 456]));
+    assert_eq!(fs::read(database).unwrap(), b"damaged agent registry");
+    assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn recovery_stops_verified_launchd_services() {
+    let manifest = recovery_service_test_manifest(AgentPlatform::Macos);
+    let mut stopped = HashSet::new();
+    stop_agent_services_for_recovery_with(
+        Path::new("/unused-agent-state"),
+        &manifest,
+        AgentPlatform::Macos,
+        Some("gui/501"),
+        |program, args| {
+            assert_eq!(program, "launchctl");
+            assert!(args[1].starts_with("gui/501/"));
+            match args[0] {
+                "print" => Ok((!stopped.contains(args[1]), String::new())),
+                "bootout" => {
+                    stopped.insert(args[1].to_string());
+                    Ok((true, String::new()))
+                }
+                _ => panic!("unexpected service command: {args:?}"),
+            }
+        },
+        |_| Some(false),
+    )
+    .unwrap();
+    assert_eq!(stopped.len(), 2);
+    assert!(stopped.contains(&format!("gui/501/{AGENT_LAUNCHD_LABEL}")));
+}
+
+#[test]
+fn recovery_rejects_unverified_worker_identities_before_stopping_services() {
+    for (field, value) in [
+        ("service_label", serde_json::json!("unrelated.service")),
+        ("worker_token", serde_json::json!("../worker-123")),
+        ("worker_pid", serde_json::json!(-1)),
+        ("worker_pid", serde_json::json!(0)),
+        ("worker_pid", serde_json::json!("123")),
+    ] {
+        let mut manifest = recovery_service_test_manifest(AgentPlatform::Linux);
+        manifest["tables"]["agent_workers"][0][field] = value;
+        let result = stop_agent_services_for_recovery_with(
+            Path::new("/unused-agent-state"),
+            &manifest,
+            AgentPlatform::Linux,
+            None,
+            |_, _| panic!("invalid identity must not reach the service manager"),
+            |_| panic!("invalid identity must not reach process checks"),
+        );
+        assert!(result.is_err(), "invalid {field} was accepted");
+    }
+}
+
+#[test]
+fn recovery_requires_live_or_unknown_inline_workers_and_session_children_to_exit() {
+    for process_state in [Some(true), None] {
+        for live_pid in [123, 456] {
+            let mut manifest = recovery_service_test_manifest(AgentPlatform::Linux);
+            manifest["tables"]["agent_workers"][0]["service_label"] = serde_json::json!(format!(
+                "{AGENT_INLINE_WORKER_SERVICE_LABEL_PREFIX}worker-123"
+            ));
+            let error = stop_agent_services_for_recovery_with(
+                Path::new("/unused-agent-state"),
+                &manifest,
+                AgentPlatform::Linux,
+                None,
+                |_, args| {
+                    assert_eq!(args.last(), Some(&AGENT_SYSTEMD_UNIT));
+                    assert_eq!(args[1], "show");
+                    Ok((false, "not-found\n".to_string()))
+                },
+                |pid| {
+                    if pid == live_pid {
+                        process_state
+                    } else {
+                        Some(false)
+                    }
+                },
+            )
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("process {live_pid} to exit"))
+            );
+        }
+    }
+}
+
+#[test]
+fn recovery_refuses_to_continue_when_service_inspection_or_stop_fails() {
+    let manifest = recovery_service_test_manifest(AgentPlatform::Linux);
+    for load_state in ["", "loaded\n"] {
+        let error = stop_agent_services_for_recovery_with(
+            Path::new("/unused-agent-state"),
+            &manifest,
+            AgentPlatform::Linux,
+            None,
+            |_, args| match args[1] {
+                "show" => Ok((!load_state.is_empty(), load_state.to_string())),
+                "stop" => Ok((false, String::new())),
+                _ => panic!("unexpected service command: {args:?}"),
+            },
+            |_| panic!("failed service shutdown must stop recovery"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("Agent recovery could not"));
+    }
+}
 
 #[cfg(unix)]
 #[test]
