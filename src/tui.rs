@@ -1064,6 +1064,16 @@ pub(super) fn tui_models_return_pane(opened_from: TuiPane) -> TuiPane {
     }
 }
 
+fn tui_toggles_models(key: &KeyEvent) -> bool {
+    // Enhanced keyboard reporting can send the unshifted character plus Shift.
+    key.modifiers.difference(KeyModifiers::SHIFT).is_empty()
+        && match key.code {
+            KeyCode::Char('M') => true,
+            KeyCode::Char('m') => key.modifiers.contains(KeyModifiers::SHIFT),
+            _ => false,
+        }
+}
+
 pub(super) struct TuiStartState {
     pub(super) active_board: bool,
     pub(super) current_pane: TuiPane,
@@ -5716,7 +5726,7 @@ pub(super) fn update_tui_pane(app: &mut TuiApp, key: KeyEvent) -> Option<Vec<Tui
 
 pub(super) fn update_tui_models_pane(app: &mut TuiApp, key: KeyEvent) -> Option<Vec<TuiEffect>> {
     match key.code {
-        KeyCode::Esc | KeyCode::Char('M') => {
+        _ if key.code == KeyCode::Esc || tui_toggles_models(&key) => {
             app.current_pane = app.models_return_pane;
             app.feedback_buffer = if app.current_pane == TuiPane::AgentProjects {
                 tui_agent_panel_instructions()
@@ -5820,7 +5830,7 @@ pub(super) fn update_tui_agent_projects_pane(
             app.feedback_buffer = TUI_NO_ACTIVE_BOARD_MESSAGE.to_string();
             Some(Vec::new())
         }
-        KeyCode::Char('M') => {
+        _ if tui_toggles_models(&key) => {
             app.models_return_pane = tui_models_return_pane(app.current_pane);
             app.current_pane = TuiPane::Models;
             app.feedback_buffer = tui_models_instructions().to_string();
@@ -5860,7 +5870,7 @@ pub(super) fn update_tui_tasks_pane(app: &mut TuiApp, key: KeyEvent) -> Option<V
         };
     }
 
-    if key.code != KeyCode::Char('M')
+    if !tui_toggles_models(&key)
         && key
             .modifiers
             .intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT)
@@ -5869,7 +5879,7 @@ pub(super) fn update_tui_tasks_pane(app: &mut TuiApp, key: KeyEvent) -> Option<V
     }
 
     match key.code {
-        KeyCode::Char('M') => {
+        _ if tui_toggles_models(&key) => {
             app.models_return_pane = tui_models_return_pane(app.current_pane);
             app.current_pane = TuiPane::Models;
             app.feedback_buffer = tui_models_instructions().to_string();
@@ -6648,7 +6658,7 @@ pub(super) fn execute_tui_key_effect(
                 app.feedback_buffer = "Closed agent output log".to_string();
             } else if app.current_pane == TuiPane::Models {
                 match key.code {
-                    KeyCode::Esc | KeyCode::Char('M') => {
+                    _ if key.code == KeyCode::Esc || tui_toggles_models(&key) => {
                         app.current_pane = app.models_return_pane;
                         app.feedback_buffer = if app.current_pane == TuiPane::AgentProjects {
                             tui_agent_panel_instructions().to_string()
@@ -6930,6 +6940,12 @@ pub(super) fn execute_tui_key_effect(
                             Err(e) => app.feedback_buffer = format!("Error: {}", e),
                         }
                     }
+                    _ if tui_toggles_models(&key) => {
+                        app.models_return_pane = tui_models_return_pane(app.current_pane);
+                        app.models_panel.refresh();
+                        app.current_pane = TuiPane::Models;
+                        app.feedback_buffer = tui_models_instructions().to_string();
+                    }
                     KeyCode::Char('m') => {
                         if app
                             .agent_panel
@@ -6952,12 +6968,6 @@ pub(super) fn execute_tui_key_effect(
                             }
                             Err(e) => app.feedback_buffer = format!("Error: {}", e),
                         }
-                    }
-                    KeyCode::Char('M') => {
-                        app.models_return_pane = tui_models_return_pane(app.current_pane);
-                        app.models_panel.refresh();
-                        app.current_pane = TuiPane::Models;
-                        app.feedback_buffer = tui_models_instructions().to_string();
                     }
                     KeyCode::Char('f') | KeyCode::Char('F') => {
                         if app
@@ -7242,7 +7252,7 @@ pub(super) fn execute_tui_key_effect(
                             "Archive view is read-only. Press A again to leave.".to_string();
                     }
                 }
-            } else if matches!(key.code, KeyCode::Char('M')) {
+            } else if tui_toggles_models(&key) {
                 app.models_return_pane = tui_models_return_pane(app.current_pane);
                 app.models_panel.refresh();
                 app.current_pane = TuiPane::Models;

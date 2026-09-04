@@ -1955,6 +1955,72 @@ fn tui_reducer_owns_pane_transitions_and_returns_effects() {
 }
 
 #[test]
+fn tui_models_shortcut_supports_terminal_shift_encodings() {
+    let root = temp_root("tui-models-shortcut");
+    for (pane, active_board) in [
+        (TuiPane::Tasks, true),
+        (TuiPane::AgentProjects, true),
+        (TuiPane::AgentProjects, false),
+    ] {
+        for key in [
+            KeyEvent::new(KeyCode::Char('M'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('M'), KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::SHIFT),
+        ] {
+            let mut app = TuiApp::new(&root, active_board);
+            app.current_pane = pane;
+
+            let effects = update_tui_pane(&mut app, key).unwrap();
+            assert_eq!(app.current_pane, TuiPane::Models, "{pane:?}: {key:?}");
+            assert_eq!(app.models_return_pane, pane);
+            assert_eq!(effects, vec![TuiEffect::RefreshModels]);
+            assert_eq!(app.feedback_buffer, tui_models_instructions());
+
+            let effects = update_tui_pane(&mut app, key).unwrap();
+            assert_eq!(app.current_pane, pane, "{pane:?}: {key:?}");
+            assert!(effects.is_empty());
+            assert_eq!(
+                app.feedback_buffer,
+                if pane == TuiPane::Tasks {
+                    tui_task_board_instructions()
+                } else {
+                    tui_agent_panel_instructions()
+                }
+            );
+        }
+    }
+}
+
+#[test]
+fn tui_models_shortcut_preserves_lowercase_m_and_task_input() {
+    let root = temp_root("tui-models-shortcut-input");
+    for pane in [TuiPane::Tasks, TuiPane::AgentProjects, TuiPane::Models] {
+        let mut app = TuiApp::new(&root, true);
+        app.current_pane = pane;
+        let key = KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE);
+
+        assert_eq!(
+            update_tui_pane(&mut app, key).unwrap(),
+            vec![TuiEffect::PaneKey(key)]
+        );
+        assert_eq!(app.current_pane, pane);
+    }
+
+    for mode in [Mode::Input, Mode::Edit] {
+        let mut app = TuiApp::new(&root, true);
+        app.current_mode = mode;
+        let key = KeyEvent::new(KeyCode::Char('m'), KeyModifiers::SHIFT);
+
+        assert_eq!(
+            update_tui_pane(&mut app, key).unwrap(),
+            vec![TuiEffect::PaneKey(key)]
+        );
+        assert_eq!(app.current_pane, TuiPane::Tasks);
+        assert_eq!(app.current_mode, mode);
+    }
+}
+
+#[test]
 fn tui_task_reducer_navigates_cached_entries_without_storage_access() {
     let root = temp_root("tui-reducer-tasks");
     let mut app = TuiApp::new(&root, true);

@@ -8,6 +8,10 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 Use this section while developing the next release.
 
+### Fixed
+
+- Recognize Shift+M when terminals report lowercase `m` with a Shift modifier, so the Models page opens and closes consistently from Tasks and Agent Projects while plain `m` still cycles the project model.
+
 ## [0.6.3] - 2026-09-04
 
 ### Added
