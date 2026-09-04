@@ -2342,6 +2342,52 @@ pub(super) fn agent_codex_session_id_from_log(path: &Path) -> Result<Option<Stri
     Ok(None)
 }
 
+#[derive(Debug, Default, Eq, PartialEq)]
+pub(super) struct AgentRunSettings {
+    pub(super) model: Option<String>,
+    pub(super) reasoning_effort: Option<String>,
+}
+
+pub(super) fn agent_run_settings_from_log(path: &Path) -> Result<AgentRunSettings> {
+    let file = fs::File::open(path)
+        .with_context(|| format!("Failed to open recorded agent output {path:?}"))?;
+    let mut settings = AgentRunSettings::default();
+    let mut saw_banner = false;
+    let mut in_header = false;
+
+    // Only trust Codex's startup header, never similarly named fields in task/output text.
+    // Bound reads even when a live or older log has no complete header.
+    for line in BufReader::new(file.take(16 * 1024)).lines().take(100) {
+        let line = line?;
+        let line = line.trim();
+        if !saw_banner {
+            saw_banner = line.starts_with("OpenAI Codex v");
+            continue;
+        }
+        if line == "--------" {
+            if in_header {
+                return Ok(settings);
+            }
+            in_header = true;
+        } else if in_header {
+            let Some((key, value)) = line.split_once(':') else {
+                continue;
+            };
+            let value = value.trim();
+            if value.is_empty() {
+                continue;
+            }
+            match key {
+                "model" => settings.model = Some(value.to_string()),
+                "reasoning effort" => settings.reasoning_effort = Some(value.to_string()),
+                _ => {}
+            }
+        }
+    }
+
+    Ok(AgentRunSettings::default())
+}
+
 pub(super) fn latest_agent_log_path(log_dir: &Path, extension: &str) -> Result<Option<PathBuf>> {
     if !log_dir.exists() {
         return Ok(None);

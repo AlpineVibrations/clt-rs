@@ -8,6 +8,10 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 Use this section while developing the next release.
 
+### Added
+
+- Keep the displayed agent run's model and thinking effort visible in the log footer, using its recorded startup settings for both live and completed output.
+
 ## [0.6.2] - 2026-09-04
 
 ### Fixed

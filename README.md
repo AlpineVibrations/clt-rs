@@ -140,6 +140,8 @@ Provider API keys remain ordinary environment variables. The Models page shows w
 
 Each registered project has persisted Codex launch settings in the `CODEX` column. Overrides are shown compactly as `provider:model/thinking/fast`; `default` means the project follows the CLT-wide default, which in turn falls back to the user's Codex config when unset. Press lowercase `m` to cycle through the CLT default and currently enabled provider/model targets, `f` to toggle Fast mode, and `t` to cycle through the default, low, medium, high, extra-high, max, and ultra reasoning levels. Settings are resolved when a new run launches; an already running process is unchanged.
 
+The agent log footer shows `Model` and `Thinking` from the displayed run's recorded startup header, including when viewing a completed task's final response. These values stay visible as output scrolls and follow the selected task or project. Settings that were not recorded or whose log is unavailable appear as `unknown`.
+
 ### Codex Agent
 `clt agent` can run Codex against enabled registered projects that have unblocked `todo` tasks. It can also recover a task left in `doing` when a previous agent lease belongs to a crashed process or has expired. Before starting fresh Todo work, the scheduler starts a blocked-task monitor run when a Todo or Doing task has a current blocker note and its recovery backoff has elapsed. Backlog tasks are deliberately ignored until they are promoted to Todo. Each project keeps its own repo-local `tasks/` board, while the agent stores cross-project runtime state in one central state directory.
 

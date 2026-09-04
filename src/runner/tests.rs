@@ -3,6 +3,43 @@ use crate::test_support::*;
 use crate::tui::tests::tui_agent_project_for_test;
 use crate::worker::tests::reserve_test_inline_worker;
 
+#[test]
+fn agent_run_settings_only_read_the_complete_startup_header() {
+    let root = temp_root("agent-run-settings");
+    fs::create_dir_all(&root).unwrap();
+    let path = root.join("run.err");
+    fs::write(
+        &path,
+        "Reading additional input from stdin...\r\nOpenAI Codex v0.153.3\r\n--------\r\nworkdir: /tmp/project\r\nmodel: local/model:latest  \r\nreasoning effort: xhigh\r\nsession id: session-one\r\n--------\r\nuser\r\nmodel: unrelated\r\nreasoning effort: low\r\n",
+    )
+    .unwrap();
+    let settings = agent_run_settings_from_log(&path).unwrap();
+    assert_eq!(settings.model.as_deref(), Some("local/model:latest"));
+    assert_eq!(settings.reasoning_effort.as_deref(), Some("xhigh"));
+
+    for content in [
+        "",
+        "model: task text\nreasoning effort: high\n",
+        "OpenAI Codex v0.153.3\n--------\nmodel: partial",
+        "OpenAI Codex v0.153.3\n--------\nmodel: \nreasoning effort: \n--------\nmodel: task text\n",
+    ] {
+        fs::write(&path, content).unwrap();
+        assert_eq!(
+            agent_run_settings_from_log(&path).unwrap(),
+            AgentRunSettings::default()
+        );
+    }
+    fs::write(
+        &path,
+        "OpenAI Codex v0.153.3\n--------\nmodel: older-model\n--------\n",
+    )
+    .unwrap();
+    let settings = agent_run_settings_from_log(&path).unwrap();
+    assert_eq!(settings.model.as_deref(), Some("older-model"));
+    assert_eq!(settings.reasoning_effort, None);
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[cfg(unix)]
 #[test]
 fn interactive_terminal_event_source_process_entry() {

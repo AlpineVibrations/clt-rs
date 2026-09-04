@@ -960,12 +960,15 @@ fn running_agent_log_view_streams_the_current_output_file() {
     let state_dir = root.join("state/clt");
     let mut project = tui_agent_project_for_test(1, "alpha");
     project.runtime_state = TuiAgentRuntimeState::Running;
+    project.project.codex_model = Some("new-project-default".to_string());
+    project.project.codex_reasoning_effort = Some("low".to_string());
     let log_dir = agent_project_run_log_dir(&state_dir, &project.project).unwrap();
     fs::create_dir_all(&log_dir).unwrap();
     let stdout_path = log_dir.join("200-000-p1-1.out");
     let stderr_path = log_dir.join("200-000-p1-1.err");
     fs::write(&stdout_path, "").unwrap();
-    fs::write(&stderr_path, "session id: session-live\nstarted\n").unwrap();
+    let header = "Reading additional input from stdin...\nOpenAI Codex v0.153.3\n--------\nmodel: gpt-6-astra\nreasoning effort: xhigh\nsession id: session-live\n";
+    fs::write(&stderr_path, header).unwrap();
 
     let mut panel = TuiAgentPanel {
         projects: vec![project],
@@ -983,7 +986,11 @@ fn running_agent_log_view_streams_the_current_output_file() {
     assert!(log_view.is_live);
     assert!(tui_agent_log_title(&log_view).contains("[LIVE]"));
     assert!(tui_agent_log_title(&log_view).contains("s/i/c controls"));
-    assert_eq!(log_view.content, "session id: session-live\nstarted\n");
+    assert_eq!(log_view.content, header);
+    assert_eq!(
+        log_view.settings_label(),
+        " Model: unknown | Thinking: unknown "
+    );
     assert_eq!(
         viewed_tui_codex_session_target(Some(&log_view)).unwrap(),
         TuiCodexSessionTarget {
@@ -993,9 +1000,13 @@ fn running_agent_log_view_streams_the_current_output_file() {
         }
     );
 
-    append_agent_log_line(&stderr_path, "still working").unwrap();
+    append_agent_log_line(&stderr_path, "--------\nstarted\nstill working").unwrap();
     log_view.refresh().unwrap();
     assert!(log_view.content.contains("still working"));
+    assert_eq!(
+        log_view.settings_label(),
+        " Model: gpt-6-astra | Thinking: xhigh "
+    );
 
     fs::remove_dir_all(root).unwrap();
 }
@@ -1185,11 +1196,23 @@ fn open_kanban_agent_log_follows_the_selected_task() {
 
     let first_stdout = root.join("first.out");
     let second_stdout = root.join("second.out");
+    let first_stderr = root.join("first-metadata.log");
+    let second_stderr = root.join("second-metadata.log");
     fs::write(&first_stdout, "first task output").unwrap();
     fs::write(&second_stdout, "second task output").unwrap();
-    for (started_at, session_id, stdout_path) in [
-        ("100", "session-one", &first_stdout),
-        ("200", "session-two", &second_stdout),
+    fs::write(
+        &first_stderr,
+        "OpenAI Codex v0.153.3\n--------\nmodel: gpt-6-astra\nreasoning effort: high\n--------\n",
+    )
+    .unwrap();
+    fs::write(
+        &second_stderr,
+        "OpenAI Codex v0.153.3\n--------\nmodel: gpt-5.6-sol\nreasoning effort: medium\n--------\n",
+    )
+    .unwrap();
+    for (started_at, session_id, stdout_path, stderr_path) in [
+        ("100", "session-one", &first_stdout, &first_stderr),
+        ("200", "session-two", &second_stdout, &second_stderr),
     ] {
         store
             .record_run_outcome_blocking(agent::AgentRunOutcome {
@@ -1200,7 +1223,7 @@ fn open_kanban_agent_log_follows_the_selected_task() {
                 exit_code: Some(0),
                 log_dir: Some(root.to_str().unwrap()),
                 stdout_path: Some(stdout_path.to_str().unwrap()),
-                stderr_path: None,
+                stderr_path: Some(stderr_path.to_str().unwrap()),
                 summary: Some("completed"),
                 codex_session_id: Some(session_id),
             })
@@ -1244,6 +1267,10 @@ fn open_kanban_agent_log_follows_the_selected_task() {
     )
     .unwrap();
     assert_eq!(log_view.as_ref().unwrap().content, "first task output");
+    assert_eq!(
+        log_view.as_ref().unwrap().settings_label(),
+        " Model: gpt-6-astra | Thinking: high "
+    );
 
     sync_open_tui_task_log_view_at(
         &mut panel,
@@ -1255,6 +1282,10 @@ fn open_kanban_agent_log_follows_the_selected_task() {
     );
 
     assert_eq!(log_view.as_ref().unwrap().content, "second task output");
+    assert_eq!(
+        log_view.as_ref().unwrap().settings_label(),
+        " Model: gpt-5.6-sol | Thinking: medium "
+    );
 
     sync_open_tui_task_log_view_at(
         &mut panel,
@@ -1267,6 +1298,10 @@ fn open_kanban_agent_log_follows_the_selected_task() {
 
     let project_log_view = log_view.unwrap();
     assert_eq!(project_log_view.content, "second task output");
+    assert_eq!(
+        project_log_view.settings_label(),
+        " Model: gpt-5.6-sol | Thinking: medium "
+    );
     assert!(!project_log_view.is_live);
     assert_eq!(
         project_log_view
@@ -1276,6 +1311,60 @@ fn open_kanban_agent_log_follows_the_selected_task() {
         Some("session-two")
     );
 
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn agent_log_settings_remain_visible_while_output_scrolls() {
+    let root = temp_root("agent-log-settings-footer");
+    fs::create_dir_all(&root).unwrap();
+    let output_path = root.join("run.out");
+    let settings_path = root.join("run.err");
+    fs::write(
+        &output_path,
+        format!("{}last output line\n", "old output\n".repeat(100)),
+    )
+    .unwrap();
+    fs::write(
+        &settings_path,
+        "OpenAI Codex v0.153.3\n--------\nmodel: gpt-6-astra\nreasoning effort: xhigh\n--------\n",
+    )
+    .unwrap();
+    let mut app = TuiApp::new(&root, true);
+    app.agent_log_view = Some(
+        TuiAgentLogView::new(
+            "alpha".to_string(),
+            output_path,
+            Some(settings_path.clone()),
+            false,
+            None,
+        )
+        .unwrap(),
+    );
+    let backend = ratatui::backend::TestBackend::new(60, 24);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    for pane in [TuiPane::Tasks, TuiPane::AgentProjects] {
+        app.current_pane = pane;
+        terminal.draw(|frame| render_tui(frame, &app)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Model: gpt-6-astra | Thinking: xhigh"));
+        assert!(rendered.contains("last output line"));
+    }
+
+    fs::remove_file(settings_path).unwrap();
+    let view = app.agent_log_view.as_mut().unwrap();
+    view.refresh().unwrap();
+    assert_eq!(
+        view.settings_label(),
+        " Model: unknown | Thinking: unknown "
+    );
+    assert!(view.content.contains("last output line"));
     fs::remove_dir_all(root).unwrap();
 }
 

@@ -48,8 +48,9 @@ use crate::{
     },
     platform::{agent_service_status, restart_running_agent_service},
     runner::{
-        agent_codex_session_id_from_log, agent_project_run_log_dir, agent_timestamp,
-        agent_timestamp_seconds, latest_agent_log_path, preferred_recorded_agent_output_path,
+        AgentRunSettings, agent_codex_session_id_from_log, agent_project_run_log_dir,
+        agent_run_settings_from_log, agent_timestamp, agent_timestamp_seconds,
+        latest_agent_log_path, preferred_recorded_agent_output_path,
     },
     scheduler::{
         agent_failure_backoff, agent_lease_holder_liveness, interactive_lease_holder_liveness,
@@ -1374,6 +1375,8 @@ impl TuiCodexSessionTarget {
 pub(super) struct TuiAgentLogView {
     pub(super) project_name: String,
     pub(super) path: Option<PathBuf>,
+    pub(super) settings_path: Option<PathBuf>,
+    pub(super) settings: AgentRunSettings,
     pub(super) content: String,
     pub(super) is_live: bool,
     pub(super) session_target: Option<TuiCodexSessionTarget>,
@@ -1383,12 +1386,15 @@ impl TuiAgentLogView {
     pub(super) fn new(
         project_name: String,
         path: PathBuf,
+        settings_path: Option<PathBuf>,
         is_live: bool,
         session_target: Option<TuiCodexSessionTarget>,
     ) -> Result<Self> {
         let mut view = Self {
             project_name,
             path: Some(path),
+            settings_path,
+            settings: AgentRunSettings::default(),
             content: String::new(),
             is_live,
             session_target,
@@ -1401,6 +1407,8 @@ impl TuiAgentLogView {
         Self {
             project_name,
             path: None,
+            settings_path: None,
+            settings: AgentRunSettings::default(),
             content,
             is_live: false,
             session_target: None,
@@ -1418,7 +1426,23 @@ impl TuiAgentLogView {
         } else {
             String::from_utf8_lossy(&bytes).into_owned()
         };
+        self.settings = self
+            .settings_path
+            .as_deref()
+            .and_then(|path| agent_run_settings_from_log(path).ok())
+            .unwrap_or_default();
         Ok(())
+    }
+
+    pub(super) fn settings_label(&self) -> String {
+        format!(
+            " Model: {} | Thinking: {} ",
+            self.settings.model.as_deref().unwrap_or("unknown"),
+            self.settings
+                .reasoning_effort
+                .as_deref()
+                .unwrap_or("unknown"),
+        )
     }
 }
 
@@ -3262,22 +3286,30 @@ pub(super) fn selected_tui_task_log_view_at(
         None
     };
 
-    let (path, is_live) = match live_path {
-        Some(path) => (Some(path), true),
+    let (path, settings_path, is_live) = match live_path {
+        Some(path) => (Some(path.clone()), Some(path), true),
         None => {
             let store = open_agent_store_at(state_dir)?;
+            let run =
+                store.latest_run_for_codex_session_blocking(selected.project.id, &session_id)?;
             (
-                store
-                    .latest_run_for_codex_session_blocking(selected.project.id, &session_id)?
-                    .as_ref()
-                    .and_then(preferred_recorded_agent_output_path),
+                run.as_ref().and_then(preferred_recorded_agent_output_path),
+                run.as_ref()
+                    .and_then(|run| run.stderr_path.as_ref())
+                    .map(PathBuf::from),
                 false,
             )
         }
     };
 
     path.map(|path| {
-        TuiAgentLogView::new(selected.project.name.clone(), path, is_live, session_target)
+        TuiAgentLogView::new(
+            selected.project.name.clone(),
+            path,
+            settings_path,
+            is_live,
+            session_target,
+        )
     })
     .transpose()
 }
@@ -3411,8 +3443,9 @@ pub(super) fn selected_tui_agent_log_view_at(
         None
     };
 
-    let (path, is_live, session_target) = match fenced_session {
+    let (path, settings_path, is_live, session_target) = match fenced_session {
         Some((path, session_id)) => (
+            Some(path.clone()),
             Some(path),
             true,
             Some(TuiCodexSessionTarget::new(&selected.project, session_id)),
@@ -3421,7 +3454,7 @@ pub(super) fn selected_tui_agent_log_view_at(
             Some(path) => {
                 let session_target = agent_codex_session_id_from_log(&path)?
                     .map(|session_id| TuiCodexSessionTarget::new(&selected.project, session_id));
-                (Some(path), true, session_target)
+                (Some(path.clone()), Some(path), true, session_target)
             }
             None => {
                 let store = open_agent_store_at(state_dir)?;
@@ -3431,13 +3464,23 @@ pub(super) fn selected_tui_agent_log_view_at(
                     .and_then(|run| run.codex_session_id.clone())
                     .map(|session_id| TuiCodexSessionTarget::new(&selected.project, session_id));
                 let path = run.as_ref().and_then(preferred_recorded_agent_output_path);
-                (path, false, session_target)
+                let settings_path = run
+                    .as_ref()
+                    .and_then(|run| run.stderr_path.as_ref())
+                    .map(PathBuf::from);
+                (path, settings_path, false, session_target)
             }
         },
     };
 
     path.map(|path| {
-        TuiAgentLogView::new(selected.project.name.clone(), path, is_live, session_target)
+        TuiAgentLogView::new(
+            selected.project.name.clone(),
+            path,
+            settings_path,
+            is_live,
+            session_target,
+        )
     })
     .transpose()
 }
@@ -6360,11 +6403,17 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
         console_content,
         feedback_area.width.saturating_sub(2) as usize,
     );
+    let mut console_block =
+        tui_console_block(console_title.as_str(), console_right_title.as_deref());
+    if let Some(log_view) = app
+        .agent_log_view
+        .as_ref()
+        .filter(|view| view.path.is_some())
+    {
+        console_block = console_block.title_bottom(log_view.settings_label());
+    }
     let feedback_paragraph = Paragraph::new(wrapped_console_content.as_str())
-        .block(tui_console_block(
-            console_title.as_str(),
-            console_right_title.as_deref(),
-        ))
+        .block(console_block)
         .style(Style::default().fg(console_color))
         .scroll((
             tui_log_scroll_offset(
