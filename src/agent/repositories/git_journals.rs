@@ -13,6 +13,10 @@ use crate::{
     runner::agent_timestamp,
 };
 
+#[cfg(test)]
+#[path = "tests/git_journals.rs"]
+mod tests;
+
 /// Persistence for launch boundaries and managed Git finalization journals.
 pub(in crate::agent) struct GitJournalsRepository(RepositoryDatabase);
 
@@ -27,6 +31,177 @@ impl GitJournalsRepository {
 }
 
 impl TursoAgentStore {
+    /// Cancel an unbound journal only after the caller has locked the board and
+    /// proved that no task or nested board still references its exact session.
+    pub(crate) fn cancel_orphaned_working_git_finalization_blocking(
+        &self,
+        expected: &GitFinalizationRecord,
+        finalizer_holder: &str,
+        reason: &str,
+        updated_at: &str,
+    ) -> Result<bool> {
+        self.blocking.block_on_persist(async {
+            let mut conn = self.repositories.git_journals.connect().await?;
+            let transaction = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .await
+                .context("Failed to begin cancelling an abandoned unbound Git journal")?;
+            let current = {
+                let mut rows = transaction
+                    .query(
+                        "SELECT project_id, codex_session_id, state, git_mode, starting_head,
+                                branch_ref, upstream_ref, worktree_baseline, task_identity,
+                                owner_run_token, commit_oid, generation, last_error, created_at,
+                                updated_at, completed_at, acknowledged_at, acknowledged_run_id
+                           FROM git_finalizations
+                          WHERE project_id = ?1 AND codex_session_id = ?2",
+                        params![expected.project_id, expected.codex_session_id.as_str()],
+                    )
+                    .await
+                    .context("Failed to recheck the exact abandoned Git journal")?;
+                rows.next()
+                    .await
+                    .context("Failed to read the abandoned Git journal snapshot")?
+                    .map(|row| git_finalization_record_from_row(&row))
+                    .transpose()?
+            };
+            let Some(current) = current else {
+                transaction
+                    .rollback()
+                    .await
+                    .context("Failed to finish inspecting an absent orphaned Git journal")?;
+                return Ok(false);
+            };
+            if current != *expected
+                || current.state != GitFinalizationState::Working
+                || current.task_identity.is_some()
+                || current.commit_oid.is_some()
+                || current.owner_run_token.is_some()
+                || current.completed_at.is_some()
+                || current.acknowledged_at.is_some()
+                || current.acknowledged_run_id.is_some()
+            {
+                transaction
+                    .rollback()
+                    .await
+                    .context("Failed to finish rejecting a changed or bound Git journal")?;
+                return Ok(false);
+            }
+            let recovery_token = format!(
+                "{AGENT_GIT_FINALIZATION_RESUME_TOKEN_PREFIX}{}",
+                expected.generation
+            );
+            let now = agent_timestamp();
+            let owns_idle_project = query_count(
+                &transaction,
+                "SELECT COUNT(*) FROM leases l
+                  WHERE l.project_id = ?1 AND l.holder = ?2
+                    AND CAST(l.expires_at AS INTEGER) > CAST(?3 AS INTEGER)
+                    AND NOT EXISTS (
+                        SELECT 1 FROM agent_workers w
+                         WHERE w.project_id = ?1
+                           AND w.state IN ('dispatching', 'running', 'finalizing')
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM session_controls sc
+                         WHERE sc.project_id = ?1
+                           AND NOT (
+                               sc.child_pid IS NULL
+                               AND sc.interactive_holder IS NULL
+                               AND sc.interactive_launch_token IS NULL
+                               AND (sc.state = 'stopped'
+                                    OR (sc.state = 'resume_requested'
+                                        AND EXISTS (
+                                            SELECT 1 FROM git_finalizations g
+                                             WHERE g.project_id = sc.project_id
+                                               AND g.codex_session_id = sc.codex_session_id
+                                               AND g.state IN ('working', 'tracking', 'commit_pending', 'push_pending')
+                                               AND sc.run_token = ?4 || CAST(g.generation AS TEXT)
+                                        )))
+                           )
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM session_controls sc
+                         WHERE sc.project_id = ?1 AND sc.codex_session_id = ?5
+                           AND NOT COALESCE((
+                               (sc.state = 'resume_requested' AND sc.run_token = ?6)
+                               OR (sc.state = 'stopped' AND (sc.run_token IS NULL OR sc.run_token = ?6))
+                           ), 0)
+                    )",
+                params![
+                    expected.project_id,
+                    finalizer_holder,
+                    now.as_str(),
+                    AGENT_GIT_FINALIZATION_RESUME_TOKEN_PREFIX,
+                    expected.codex_session_id.as_str(),
+                    recovery_token.as_str(),
+                ],
+            )
+            .await?
+                == 1;
+            if !owns_idle_project {
+                transaction
+                    .rollback()
+                    .await
+                    .context("Failed to finish rejecting an orphaned Git journal without its idle fence")?;
+                return Ok(false);
+            }
+            expected
+                .generation
+                .checked_add(1)
+                .context("Abandoned Git journal generation overflowed")?;
+            let changed = transaction
+                .execute(
+                    "UPDATE git_finalizations
+                        SET state = 'cancelled', owner_run_token = NULL,
+                            generation = generation + 1, last_error = ?1,
+                            updated_at = ?2, completed_at = ?2
+                      WHERE project_id = ?3 AND codex_session_id = ?4
+                        AND state = 'working' AND generation = ?5
+                        AND task_identity IS NULL AND commit_oid IS NULL
+                        AND owner_run_token IS NULL",
+                    params![
+                        reason,
+                        updated_at,
+                        expected.project_id,
+                        expected.codex_session_id.as_str(),
+                        expected.generation,
+                    ],
+                )
+                .await
+                .context("Failed to cancel the exact abandoned Git journal")?;
+            if changed != 1 {
+                transaction
+                    .rollback()
+                    .await
+                    .context("Failed to roll back a rejected orphaned Git journal cancellation")?;
+                return Ok(false);
+            }
+            transaction
+                .execute(
+                    "DELETE FROM session_controls
+                      WHERE project_id = ?1 AND codex_session_id = ?2
+                        AND child_pid IS NULL
+                        AND interactive_holder IS NULL
+                        AND interactive_launch_token IS NULL
+                        AND ((state = 'resume_requested' AND run_token = ?3)
+                             OR (state = 'stopped' AND (run_token IS NULL OR run_token = ?3)))",
+                    params![
+                        expected.project_id,
+                        expected.codex_session_id.as_str(),
+                        recovery_token.as_str(),
+                    ],
+                )
+                .await
+                .context("Failed to clear the abandoned journal's exact idle session control")?;
+            transaction
+                .commit()
+                .await
+                .context("Failed to durably cancel the abandoned unbound Git journal")?;
+            Ok(true)
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn accept_external_git_completion_blocking(
         &self,

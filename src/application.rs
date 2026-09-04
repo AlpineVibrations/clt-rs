@@ -21,7 +21,8 @@ use crate::{
     managed_git::{
         AgentGitProofContext, AgentGitStartState, capture_agent_git_resealed_manifest,
         capture_agent_git_staged_manifest, git_commit_is_ancestor, git_optional_stdout,
-        require_agent_git_start_task_identity, resolve_git_commit, task_content_has_completed_note,
+        reconcile_orphaned_agent_git_journals, require_agent_git_start_task_identity,
+        resolve_git_commit, task_content_has_completed_note,
         verify_agent_git_start_state_unchanged,
     },
     platform::{AgentServiceEnvironment, agent_service_status, truncate_agent_service_logs},
@@ -73,6 +74,28 @@ pub(super) fn recover_agent_state() -> Result<()> {
             "rebuilding Turso coordination files"
         },
         report.quarantine.display()
+    );
+    Ok(())
+}
+
+pub(super) fn reconcile_agent_project(
+    state_dir: &Path,
+    path: Option<&Path>,
+    local: bool,
+    default_root: &Path,
+) -> Result<()> {
+    let project_root = resolve_agent_project_root(path, local, default_root)?;
+    let project = agent::with_agent_store_at(state_dir, |store| {
+        store
+            .list_projects_blocking()?
+            .into_iter()
+            .find(|project| project.path == project_root)
+            .with_context(|| format!("Project is not registered: {}", project_root.display()))
+    })?;
+    let retired = reconcile_orphaned_agent_git_journals(state_dir, &project)?;
+    println!(
+        "Retired {retired} unused Git journal(s) for {}. Project scheduling settings are unchanged.",
+        project.path.display()
     );
     Ok(())
 }
@@ -329,13 +352,30 @@ pub(super) fn unregister_agent_project(
     cleanup_terminal_agent_worker_services(state_dir, store, Some(&project_root))?;
     #[cfg(test)]
     let _ = state_dir;
-    if store.unregister_project_blocking(&project_root)? {
+    if unregister_agent_project_with_recovery(store, state_dir, &project_root)? {
         println!("Unregistered project: {}", project_root.display());
     } else {
         println!("Project was not registered: {}", project_root.display());
     }
 
     Ok(())
+}
+
+pub(super) fn unregister_agent_project_with_recovery(
+    store: &agent::TursoAgentStore,
+    state_dir: &Path,
+    project_root: &Path,
+) -> Result<bool> {
+    if let Some(project) = store
+        .list_projects_blocking()?
+        .into_iter()
+        .find(|project| project.path == project_root)
+    {
+        reconcile_orphaned_agent_git_journals(state_dir, &project)?;
+    }
+    // Unregistration rechecks all ownership and pending-proof guards after the
+    // recovery lease is released, so a new claim cannot slip through this gap.
+    store.unregister_project_blocking(project_root)
 }
 
 pub(super) fn set_agent_project_enabled(

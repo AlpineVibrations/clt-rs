@@ -3,6 +3,8 @@ use crate::test_support::prelude::*;
 use crate::test_support::*;
 use crate::worker::tests::reserve_test_worker;
 
+mod orphan;
+
 #[test]
 fn agent_store_git_finalization_crud_is_idempotent_and_generation_fenced() {
     let root = temp_root("agent-store-git-finalization");

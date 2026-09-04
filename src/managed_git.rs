@@ -30,7 +30,8 @@ use crate::{
         durable_task_identity, get_status_store, get_tasks_dir,
         move_task_without_reordering_after_lock, read_task_entries,
         remove_task_entry_without_reordering, starts_with_task_note_date, task_entry_is_blocked,
-        terminal_task_for_codex_session_in_board, title_from_path,
+        task_tree_contains_session_marker, terminal_task_for_codex_session_in_board,
+        title_from_path,
     },
 };
 
@@ -334,6 +335,110 @@ pub(super) fn exact_working_git_finalization_snapshot(
         && current.worktree_baseline == expected.worktree_baseline
         && current.commit_oid == expected.commit_oid
         && current.created_at == expected.created_at
+}
+
+pub(super) fn cancel_orphaned_working_git_finalization(
+    store: &agent::TursoAgentStore,
+    project_root: &Path,
+    expected: &agent::GitFinalizationRecord,
+    lease: &AgentGitFinalizationLease,
+) -> Result<bool> {
+    cancel_orphaned_working_git_finalization_with_before_lock(
+        store,
+        project_root,
+        expected,
+        lease,
+        || {},
+    )
+}
+
+pub(super) fn cancel_orphaned_working_git_finalization_with_before_lock(
+    store: &agent::TursoAgentStore,
+    project_root: &Path,
+    expected: &agent::GitFinalizationRecord,
+    lease: &AgentGitFinalizationLease,
+    before_lock: impl FnOnce(),
+) -> Result<bool> {
+    if expected.state != GitFinalizationState::Working
+        || expected.task_identity.is_some()
+        || expected.commit_oid.is_some()
+        || expected.owner_run_token.is_some()
+    {
+        return Ok(false);
+    }
+    // Validate the baseline, and reject every non-null sealed field even if its
+    // type is malformed. Retirement must never discard saved commit proof.
+    if AgentGitWorktreeBaseline::from_json(&expected.worktree_baseline).is_err() {
+        return Ok(false);
+    }
+    let baseline: serde_json::Value = serde_json::from_str(&expected.worktree_baseline)?;
+    if [
+        "staged_non_task_patch_ids",
+        "staged_index_tree",
+        "manifest_parent_head",
+    ]
+    .iter()
+    .any(|field| baseline.get(field).is_some_and(|value| !value.is_null()))
+    {
+        return Ok(false);
+    }
+    anyhow::ensure!(
+        lease.project_id() == expected.project_id,
+        "Orphan journal recovery requires the matching project lease"
+    );
+    let registered_root = store
+        .list_projects_blocking()?
+        .into_iter()
+        .find(|project| project.id == expected.project_id)
+        .context("Orphan journal project is no longer registered")?
+        .path;
+    anyhow::ensure!(
+        fs::canonicalize(project_root)? == registered_root,
+        "Orphan journal recovery requires the registered project directory"
+    );
+    lease.ensure_owned()?;
+    before_lock();
+    let board_dir = get_tasks_dir(project_root);
+    let _mutation_lock = acquire_board_mutation_lock(&board_dir)?;
+    if task_tree_contains_session_marker(&board_dir, &expected.codex_session_id)? {
+        return Ok(false);
+    }
+    lease.ensure_owned()?;
+    store.cancel_orphaned_working_git_finalization_blocking(
+        expected,
+        &lease.holder,
+        "Abandoned unbound Git journal: no task identity or board marker remains",
+        &agent_timestamp(),
+    )
+}
+
+/// Retire only unbound orphan journals; this does not finalize or publish work.
+pub(super) fn reconcile_orphaned_agent_git_journals(
+    state_dir: &Path,
+    project: &agent::AgentProject,
+) -> Result<usize> {
+    let pending = with_agent_store_at(state_dir, |store| {
+        store.list_pending_git_finalizations_blocking(Some(project.id))
+    })?;
+    if pending.is_empty() {
+        return Ok(0);
+    }
+    let lease = try_acquire_agent_git_finalization_lease(state_dir, project, false)?
+        .context("Project is still owned by an agent or interactive session; retry reconciliation after it stops")?;
+    let result: Result<usize> = (|| {
+        let store = open_agent_store_at(state_dir)?;
+        let mut retired = 0;
+        for journal in store.list_pending_git_finalizations_blocking(Some(project.id))? {
+            if cancel_orphaned_working_git_finalization(&store, &project.path, &journal, &lease)? {
+                retired += 1;
+            }
+        }
+        Ok(retired)
+    })();
+    let released = lease.release();
+    let retired = result?;
+    released?;
+    Ok(retired)
 }
 
 pub(super) fn cancel_unlinked_working_git_finalization(
@@ -3431,6 +3536,21 @@ pub(super) fn reconcile_agent_git_finalization(
         let effective_owner = owner_run_token.or(finalization.owner_run_token.as_deref());
         match finalization.state {
             GitFinalizationState::Working => {
+                if let Some(lease) = finalization_lease
+                    && cancel_orphaned_working_git_finalization(
+                        store,
+                        project_root,
+                        &finalization,
+                        lease,
+                    )?
+                {
+                    return store
+                        .git_finalization_blocking(
+                            finalization.project_id,
+                            &finalization.codex_session_id,
+                        )?
+                        .context("Retired orphan Git journal disappeared");
+                }
                 let Some(task_identity) = finalization.task_identity.as_deref() else {
                     return Ok(finalization);
                 };

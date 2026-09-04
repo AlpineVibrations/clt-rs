@@ -814,7 +814,13 @@ pub(super) fn run_agent_scheduler_pass_with_max_global_jobs(
             // Restore the exact journal generation before the guarded lease checks it.
             for finalization in finalizations_before_reconcile
                 .iter()
-                .filter(|finalization| finalization.state != GitFinalizationState::PushPending)
+                .filter(|finalization| {
+                    finalization.state != GitFinalizationState::PushPending
+                        // An unbound journal may be retired, but an unrelated
+                        // resume token must not be promoted into recovery proof.
+                        && !(finalization.state == GitFinalizationState::Working
+                            && finalization.task_identity.is_none())
+                })
             {
                 with_agent_store_at(state_dir, |store| {
                     store

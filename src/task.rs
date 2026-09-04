@@ -1745,6 +1745,36 @@ pub(super) fn task_for_codex_session_in_board(
     task_for_codex_session_in_board_matching(board_dir, session_id, true)
 }
 
+/// Orphan retirement must retain even displaced, ambiguous, or archived markers.
+/// Scan the complete task tree rather than selecting one marker from active tasks.
+pub(super) fn task_tree_contains_session_marker(
+    board_dir: &Path,
+    session_id: &str,
+) -> Result<bool> {
+    fn contains_marker(path: &Path, marker: &[u8]) -> Result<bool> {
+        let metadata = fs::symlink_metadata(path)
+            .with_context(|| format!("Failed to inspect task evidence at {}", path.display()))?;
+        if metadata.is_dir() {
+            for entry in fs::read_dir(path)? {
+                if contains_marker(&entry?.path(), marker)? {
+                    return Ok(true);
+                }
+            }
+            return Ok(false);
+        }
+        anyhow::ensure!(
+            metadata.is_file(),
+            "Cannot rule out a task session marker in non-regular task evidence at {}",
+            path.display()
+        );
+        Ok(fs::read(path)?
+            .windows(marker.len())
+            .any(|bytes| bytes == marker))
+    }
+
+    contains_marker(board_dir, format!("codex:{session_id}").as_bytes())
+}
+
 pub(super) fn terminal_task_for_codex_session_in_board(
     board_dir: &Path,
     session_id: &str,

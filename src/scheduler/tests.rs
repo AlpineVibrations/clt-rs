@@ -2,6 +2,346 @@ use crate::runner::tests::FakeAgentRunner;
 use crate::test_support::prelude::*;
 use crate::test_support::*;
 
+struct OrphanWorkingJournalFixture {
+    root: PathBuf,
+    state_dir: PathBuf,
+    project: agent::AgentProject,
+    journal: agent::GitFinalizationRecord,
+    current_head: String,
+}
+
+fn orphan_working_journal_fixture(name: &str, task_bound: bool) -> OrphanWorkingJournalFixture {
+    let root = temp_root(name);
+    let state_dir = root.join("state/clt");
+    let project_root = root.join("project");
+    add_task(&project_root, "Fresh orphan replacement", None).unwrap();
+    fs::write(project_root.join("work.txt"), "Initial committed work\n").unwrap();
+    let starting_head = initialize_test_git_repository(&project_root);
+    fs::write(project_root.join("work.txt"), "Old uncommitted baseline\n").unwrap();
+    let start = capture_agent_git_start_state(&project_root, AgentGitMode::Commit).unwrap();
+    assert_eq!(start.starting_head, starting_head);
+    let baseline: serde_json::Value = serde_json::from_str(&start.worktree_baseline).unwrap();
+    assert!(
+        !baseline["tracked_patch_ids"]
+            .as_object()
+            .unwrap()
+            .is_empty()
+    );
+
+    let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
+    store
+        .register_project_blocking(&project_root, "project")
+        .unwrap();
+    assert!(
+        store
+            .set_project_git_mode_for_path_blocking(&project_root, AgentGitMode::Commit)
+            .unwrap()
+    );
+    let project = store.list_projects_blocking().unwrap().remove(0);
+    let task_identity =
+        task_bound.then(|| durable_task_identity("Fresh orphan replacement").unwrap());
+    assert!(
+        store
+            .create_git_finalization_blocking(agent::NewGitFinalization {
+                project_id: project.id,
+                codex_session_id: "session-orphan-working",
+                git_mode: AgentGitMode::Commit,
+                starting_head: Some(&start.starting_head),
+                branch_ref: start.branch_ref.as_deref(),
+                upstream_ref: start.upstream_ref.as_deref(),
+                worktree_baseline: &start.worktree_baseline,
+                task_identity: task_identity.as_deref(),
+                owner_run_token: None,
+                created_at: "100",
+            })
+            .unwrap()
+    );
+    store
+        .set_session_control_recovery_token_blocking(
+            project.id,
+            "session-orphan-working",
+            if task_bound {
+                "dead-worker-token"
+            } else {
+                "clt-git-finalization:0"
+            },
+        )
+        .unwrap();
+    let journal = store
+        .git_finalization_blocking(project.id, "session-orphan-working")
+        .unwrap()
+        .unwrap();
+    assert_eq!(journal.state, GitFinalizationState::Working);
+    assert_eq!(journal.generation, 0);
+    drop(store);
+
+    fs::write(
+        project_root.join("work.txt"),
+        "New independently committed work\n",
+    )
+    .unwrap();
+    run_test_git(&project_root, &["add", "--all"]);
+    run_test_git(&project_root, &["commit", "-m", "Later independent work"]);
+    let current_head = run_test_git(&project_root, &["rev-parse", "HEAD"]);
+    assert_ne!(current_head, starting_head);
+    assert!(run_test_git(&project_root, &["status", "--porcelain"]).is_empty());
+
+    OrphanWorkingJournalFixture {
+        root,
+        state_dir,
+        project,
+        journal,
+        current_head,
+    }
+}
+
+#[test]
+fn scheduler_cancels_orphan_working_journal_and_schedules_fresh_todo_without_git_changes() {
+    let fixture = orphan_working_journal_fixture("scheduler-orphan-working-fresh-todo", false);
+    let todo_before = fs::read(fixture.project.path.join("tasks/todo.md")).unwrap();
+    let work_before = fs::read(fixture.project.path.join("work.txt")).unwrap();
+    let start =
+        run_agent_scheduler_pass_with_max_global_jobs(&fixture.state_dir, false, &[], 1, None)
+            .unwrap();
+
+    assert_eq!(start.jobs.len(), 1);
+    assert_eq!(start.pass.skipped_active_lease, 0);
+    assert_eq!(start.jobs[0].task_selection, AgentTaskSelection::NextTodo);
+    assert_eq!(start.jobs[0].resume_session_id, None);
+    let store = agent::TursoAgentStore::open_blocking(&fixture.state_dir).unwrap();
+    let cancelled = store
+        .git_finalization_blocking(fixture.project.id, &fixture.journal.codex_session_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(cancelled.state, GitFinalizationState::Cancelled);
+    assert_eq!(cancelled.generation, fixture.journal.generation + 1);
+    assert_eq!(cancelled.owner_run_token, None);
+    assert_eq!(cancelled.git_mode, fixture.journal.git_mode);
+    assert_eq!(cancelled.starting_head, fixture.journal.starting_head);
+    assert_eq!(cancelled.branch_ref, fixture.journal.branch_ref);
+    assert_eq!(cancelled.upstream_ref, fixture.journal.upstream_ref);
+    assert_eq!(
+        cancelled.worktree_baseline,
+        fixture.journal.worktree_baseline
+    );
+    assert_eq!(cancelled.task_identity, fixture.journal.task_identity);
+    assert_eq!(cancelled.commit_oid, fixture.journal.commit_oid);
+    assert_eq!(cancelled.created_at, fixture.journal.created_at);
+    assert!(
+        store
+            .session_control_blocking(fixture.project.id, &fixture.journal.codex_session_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .list_pending_git_finalizations_blocking(Some(fixture.project.id))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        run_test_git(&fixture.project.path, &["rev-parse", "HEAD"]),
+        fixture.current_head
+    );
+    assert!(run_test_git(&fixture.project.path, &["status", "--porcelain"]).is_empty());
+    assert_eq!(
+        fs::read(fixture.project.path.join("tasks/todo.md")).unwrap(),
+        todo_before
+    );
+    assert_eq!(
+        fs::read(fixture.project.path.join("work.txt")).unwrap(),
+        work_before
+    );
+    assert!(
+        store
+            .release_lease_blocking(fixture.project.id, &start.jobs[0].holder)
+            .unwrap()
+    );
+    drop(store);
+    fs::remove_dir_all(fixture.root).unwrap();
+}
+
+#[test]
+fn scheduler_preserves_task_bound_working_journal_after_head_advances() {
+    let fixture = orphan_working_journal_fixture("scheduler-bound-working-preserved", true);
+    let start =
+        run_agent_scheduler_pass_with_max_global_jobs(&fixture.state_dir, false, &[], 1, None)
+            .unwrap();
+    let store = agent::TursoAgentStore::open_blocking(&fixture.state_dir).unwrap();
+    let current = store
+        .git_finalization_blocking(fixture.project.id, &fixture.journal.codex_session_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.state, GitFinalizationState::Working);
+    assert_eq!(current.generation, fixture.journal.generation);
+    assert_eq!(current.task_identity, fixture.journal.task_identity);
+    assert_eq!(current.starting_head, fixture.journal.starting_head);
+    assert_eq!(current.worktree_baseline, fixture.journal.worktree_baseline);
+    assert_eq!(
+        store
+            .session_control_blocking(fixture.project.id, &fixture.journal.codex_session_id)
+            .unwrap()
+            .unwrap()
+            .run_token
+            .as_deref(),
+        Some("clt-git-finalization:0")
+    );
+    assert!(
+        start
+            .jobs
+            .iter()
+            .all(|job| job.task_selection != AgentTaskSelection::NextTodo)
+    );
+    for job in &start.jobs {
+        assert!(
+            store
+                .release_lease_blocking(fixture.project.id, &job.holder)
+                .unwrap()
+        );
+    }
+    drop(store);
+    fs::remove_dir_all(fixture.root).unwrap();
+}
+
+#[test]
+fn scheduler_preserves_unbound_working_journal_with_unrelated_idle_resume_token() {
+    let fixture = orphan_working_journal_fixture("scheduler-orphan-unrelated-resume-token", false);
+    let store = agent::TursoAgentStore::open_blocking(&fixture.state_dir).unwrap();
+    store
+        .set_session_control_recovery_token_blocking(
+            fixture.project.id,
+            &fixture.journal.codex_session_id,
+            "unrelated-idle-session-owner",
+        )
+        .unwrap();
+    drop(store);
+
+    let start =
+        run_agent_scheduler_pass_with_max_global_jobs(&fixture.state_dir, false, &[], 1, None)
+            .unwrap();
+    assert!(start.jobs.is_empty());
+    let store = agent::TursoAgentStore::open_blocking(&fixture.state_dir).unwrap();
+    let current = store
+        .git_finalization_blocking(fixture.project.id, &fixture.journal.codex_session_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(current, fixture.journal);
+    let control = store
+        .session_control_blocking(fixture.project.id, &fixture.journal.codex_session_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(control.state, AgentSessionControlState::ResumeRequested);
+    assert_eq!(control.child_pid, None);
+    assert_eq!(
+        control.run_token.as_deref(),
+        Some("unrelated-idle-session-owner")
+    );
+    assert_eq!(
+        run_test_git(&fixture.project.path, &["rev-parse", "HEAD"]),
+        fixture.current_head
+    );
+    assert!(run_test_git(&fixture.project.path, &["status", "--porcelain"]).is_empty());
+    assert!(
+        store
+            .lease_for_project_blocking(fixture.project.id)
+            .unwrap()
+            .is_none()
+    );
+    drop(store);
+    fs::remove_dir_all(fixture.root).unwrap();
+}
+
+#[test]
+fn scheduler_preserves_orphan_working_journal_while_live_ownership_remains() {
+    for ownership in ["lease", "session", "worker"] {
+        let fixture = orphan_working_journal_fixture(
+            &format!("scheduler-orphan-working-live-{ownership}"),
+            false,
+        );
+        let store = agent::TursoAgentStore::open_blocking(&fixture.state_dir).unwrap();
+        let holder = format!("clt-agent-{}", std::process::id());
+        let mut inline_generation = None;
+        match ownership {
+            "lease" => assert!(
+                store
+                    .try_acquire_lease_blocking(
+                        fixture.project.id,
+                        &holder,
+                        &agent_timestamp(),
+                        &agent_timestamp_after(60)
+                    )
+                    .unwrap()
+            ),
+            "session" => store
+                .mark_session_running_blocking(
+                    fixture.project.id,
+                    &fixture.journal.codex_session_id,
+                    std::process::id(),
+                    "live-session-token",
+                    &fixture.root.join("session.out"),
+                    &fixture.root.join("session.err"),
+                )
+                .unwrap(),
+            "worker" => {
+                assert!(
+                    store
+                        .try_acquire_lease_blocking(
+                            fixture.project.id,
+                            &holder,
+                            &agent_timestamp(),
+                            &agent_timestamp_after(60),
+                        )
+                        .unwrap()
+                );
+                let worker_token = "live-orphan-protection-worker";
+                inline_generation = Some(InlineAgentWorkerGeneration::register(worker_token));
+                assert!(crate::worker::tests::reserve_test_inline_worker(
+                    &store,
+                    fixture.project.id,
+                    worker_token,
+                    &holder,
+                    std::process::id(),
+                    &agent_timestamp(),
+                ));
+            }
+            _ => unreachable!(),
+        }
+        drop(store);
+
+        let start =
+            run_agent_scheduler_pass_with_max_global_jobs(&fixture.state_dir, false, &[], 1, None)
+                .unwrap();
+        assert!(start.jobs.is_empty(), "ownership={ownership}");
+        let store = agent::TursoAgentStore::open_blocking(&fixture.state_dir).unwrap();
+        let current = store
+            .git_finalization_blocking(fixture.project.id, &fixture.journal.codex_session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            current.state,
+            GitFinalizationState::Working,
+            "ownership={ownership}"
+        );
+        assert_eq!(current.generation, fixture.journal.generation);
+        assert_eq!(current.starting_head, fixture.journal.starting_head);
+        assert_eq!(current.worktree_baseline, fixture.journal.worktree_baseline);
+        assert!(
+            store
+                .session_control_blocking(fixture.project.id, &fixture.journal.codex_session_id,)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            run_test_git(&fixture.project.path, &["rev-parse", "HEAD"]),
+            fixture.current_head
+        );
+        assert!(run_test_git(&fixture.project.path, &["status", "--porcelain"]).is_empty());
+        drop(store);
+        drop(inline_generation);
+        fs::remove_dir_all(fixture.root).unwrap();
+    }
+}
+
 #[test]
 fn agent_daemon_rebuilds_an_active_worker_index_with_quoted_state_names() {
     for state in ["dispatching", "running", "finalizing"] {

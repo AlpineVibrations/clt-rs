@@ -43,7 +43,8 @@ use crate::{
     application::{
         AgentLeaseHolderLiveness, AgentProjectScan, delete_task_in_board,
         ensure_status_conversion_allowed, move_task_in_board, move_task_to_archive_in_board,
-        project_display_name, reorder_task_in_board, update_task_in_board,
+        project_display_name, reorder_task_in_board, unregister_agent_project_with_recovery,
+        update_task_in_board,
     },
     platform::{agent_service_status, restart_running_agent_service},
     runner::{
@@ -2903,7 +2904,7 @@ pub(super) fn remove_tui_agent_project(
     let store = open_agent_store_at(&state_dir)?;
     #[cfg(not(test))]
     cleanup_terminal_agent_worker_services(&state_dir, &store, Some(&removal.path))?;
-    remove_tui_agent_project_with_store(panel, active_root, removal, &store)
+    remove_tui_agent_project_with_store(panel, active_root, removal, &store, &state_dir)
 }
 
 pub(super) fn remove_tui_agent_project_with_store(
@@ -2911,9 +2912,10 @@ pub(super) fn remove_tui_agent_project_with_store(
     active_root: &Path,
     removal: &TuiAgentProjectRemoval,
     store: &agent::TursoAgentStore,
+    state_dir: &Path,
 ) -> Result<String> {
     let selected_idx = panel.state.selected().unwrap_or(0);
-    let removed = store.unregister_project_blocking(&removal.path)?;
+    let removed = unregister_agent_project_with_recovery(store, state_dir, &removal.path)?;
 
     if removed {
         panel

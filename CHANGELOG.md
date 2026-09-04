@@ -8,6 +8,14 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 Use this section while developing the next release.
 
+## [0.6.2] - 2026-09-04
+
+### Fixed
+
+- Retire idle, unbound Git journals with no task marker or sealed proof before scheduling, so an older project's abandoned session cannot repeatedly block new work after the checkout advances.
+- Added `clt agent reconcile [PATH]` to apply the same guarded cleanup to a registered project, including while it is paused.
+- Apply orphan cleanup before CLI and TUI project removal so unused journals do not prevent unregistering a project; linked tasks and sealed Git proof remain protected.
+
 ## [0.6.1] - 2026-09-04
 
 ### Fixed
@@ -131,7 +139,8 @@ Use this section while developing the next release.
 - Fixed task moves so destination write failures do not remove the source task.
 - Fixed TUI navigation on empty boards.
 
-[Unreleased]: https://github.com/AlpineVibrations/clt-rs/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/AlpineVibrations/clt-rs/compare/v0.6.2...HEAD
+[0.6.2]: https://github.com/AlpineVibrations/clt-rs/releases/tag/v0.6.2
 [0.6.1]: https://github.com/AlpineVibrations/clt-rs/releases/tag/v0.6.1
 [0.6.0]: https://github.com/AlpineVibrations/clt-rs/releases/tag/v0.6.0
 [0.1.10]: https://github.com/AlpineVibrations/clt-rs/releases/tag/v0.1.10

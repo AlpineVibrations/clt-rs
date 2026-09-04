@@ -12,9 +12,10 @@ use crate::{
     agent::{AgentGitMode, ensure_agent_state_dir, open_agent_store, open_agent_store_at},
     application::{
         AgentTaskSelection, ManagedTaskWorkflow, TaskDoneOutcome, clean_agent_state, expand_tasks,
-        get_task_root, list_agent_projects, list_tasks, recover_agent_state,
-        register_agent_project, retry_agent_project, set_agent_project_enabled,
-        set_agent_project_git_mode, show_agent_logs, show_agent_status, unregister_agent_project,
+        get_task_root, list_agent_projects, list_tasks, reconcile_agent_project,
+        recover_agent_state, register_agent_project, retry_agent_project,
+        set_agent_project_enabled, set_agent_project_git_mode, show_agent_logs, show_agent_status,
+        unregister_agent_project,
     },
     platform::{AgentServiceAction, manage_agent_service},
     runner::run_automated_exec_gate,
@@ -132,6 +133,11 @@ enum AgentCommands {
     /// Clears a registered project's failure cooldown for an immediate retry
     Retry {
         /// Project path to retry. Defaults to the current directory.
+        path: Option<PathBuf>,
+    },
+    /// Retires unused Git journals with no linked task or commit proof
+    Reconcile {
+        /// Project path to reconcile. Defaults to the current directory.
         path: Option<PathBuf>,
     },
     /// Configures the git-commit skill for a registered project
@@ -490,6 +496,10 @@ fn handle_agent_command(command: AgentCommands, local: bool, default_root: &Path
         AgentCommands::Retry { path } => {
             let store = open_agent_store()?;
             retry_agent_project(&store, path.as_deref(), local, default_root)?;
+        }
+        AgentCommands::Reconcile { path } => {
+            let state_dir = ensure_agent_state_dir()?;
+            reconcile_agent_project(&state_dir, path.as_deref(), local, default_root)?;
         }
         AgentCommands::GitCommit { command } => {
             let store = open_agent_store()?;
