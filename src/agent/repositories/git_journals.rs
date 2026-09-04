@@ -1,8 +1,17 @@
-use anyhow::Result;
-use turso::{Connection, Database};
+use anyhow::{Context, Result};
+use turso::{Connection, Database, params, transaction::TransactionBehavior};
 
-use super::super::*;
 use super::RepositoryDatabase;
+use crate::{
+    agent::{
+        AGENT_GIT_FINALIZATION_RESUME_TOKEN_PREFIX, AgentGitMode, AgentRunOutcome,
+        GitFinalizationRecord, GitFinalizationState, NewGitFinalization, TursoAgentStore,
+        git_finalization_record_from_row, query_count, row_integer, row_optional_integer,
+        row_optional_text, row_text, update_project_after_run,
+    },
+    managed_git::AgentGitStartState,
+    runner::agent_timestamp,
+};
 
 /// Persistence for launch boundaries and managed Git finalization journals.
 pub(in crate::agent) struct GitJournalsRepository(RepositoryDatabase);

@@ -2066,3 +2066,6 @@ pub(super) fn ensure_subtask_board_after_lock(
     ensure_board_store(&task_dir)?;
     Ok(task_dir)
 }
+
+#[cfg(test)]
+mod tests;

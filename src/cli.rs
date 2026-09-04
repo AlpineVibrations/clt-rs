@@ -6,23 +6,30 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::{
-    AgentGitMode, AgentServiceAction, AgentTaskSelection, InteractiveCodexResumeMode,
-    ManagedTaskWorkflow, TaskStatus, add_task, clean_agent_state, ensure_agent_state_dir,
-    ensure_existing_board, expand_tasks, get_task_root, init_tasks, list_agent_projects,
-    list_tasks, manage_agent_service, open_agent_store, open_agent_store_at, parse_add_task_args,
-    print_agent_scheduler_pass, prompt_to_initialize_tasks, register_agent_project,
-    retry_agent_project, run_agent_daemon, run_agent_interactive_session_worker, run_agent_once,
-    run_agent_session_resume_worker, run_automated_exec_gate, run_independent_agent_worker,
-    run_interactive_exec_gate, set_agent_project_enabled, set_agent_project_git_mode,
-    show_agent_logs, show_agent_status, tui_view, tui_view_without_active_board,
-    unregister_agent_project,
-};
 #[cfg(unix)]
-use crate::{AutomatedSupervisorSpec, run_automated_session_supervisor};
+use crate::runner::{AutomatedSupervisorSpec, run_automated_session_supervisor};
+use crate::{
+    agent::{AgentGitMode, ensure_agent_state_dir, open_agent_store, open_agent_store_at},
+    application::{
+        AgentTaskSelection, ManagedTaskWorkflow, clean_agent_state, expand_tasks, get_task_root,
+        list_agent_projects, list_tasks, register_agent_project, retry_agent_project,
+        set_agent_project_enabled, set_agent_project_git_mode, show_agent_logs, show_agent_status,
+        unregister_agent_project,
+    },
+    platform::{AgentServiceAction, manage_agent_service},
+    runner::run_automated_exec_gate,
+    scheduler::{print_agent_scheduler_pass, run_agent_daemon, run_agent_once},
+    session_control::{
+        InteractiveCodexResumeMode, run_agent_interactive_session_worker,
+        run_agent_session_resume_worker, run_interactive_exec_gate,
+    },
+    task::{TaskStatus, add_task, ensure_existing_board, init_tasks, parse_add_task_args},
+    tui::{prompt_to_initialize_tasks, tui_view, tui_view_without_active_board},
+    worker::run_independent_agent_worker,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub(crate) enum ShellKind {
+enum ShellKind {
     Bash,
     Zsh,
 }
@@ -30,21 +37,21 @@ pub(crate) enum ShellKind {
 #[derive(Parser)]
 #[command(name = "lls-cli-task")]
 #[command(about = "A simple file-system-backed task management system", long_about = None)]
-pub(crate) struct Cli {
+struct Cli {
     /// Force use of current directory instead of git root
     #[arg(long, default_value_t = false)]
-    pub(crate) local: bool,
+    local: bool,
 
     /// Write the TUI's final project directory for a shell wrapper
     #[arg(long, global = true, hide = true)]
-    pub(crate) cwd_file: Option<PathBuf>,
+    cwd_file: Option<PathBuf>,
 
     #[command(subcommand)]
-    pub(crate) command: Option<Commands>,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
-pub(crate) enum Commands {
+enum Commands {
     /// Initializes the tasks directory and status stores
     Init {
         /// Create backlog/todo/doing/done folders instead of markdown files
@@ -101,7 +108,7 @@ pub(crate) enum Commands {
 }
 
 #[derive(Subcommand)]
-pub(crate) enum AgentCommands {
+enum AgentCommands {
     /// Registers a project for agent runs
     Register {
         /// Project path to register. Defaults to the current directory.
@@ -228,7 +235,7 @@ pub(crate) enum AgentCommands {
 }
 
 #[derive(Subcommand)]
-pub(crate) enum AgentGitCommitCommands {
+enum AgentGitCommitCommands {
     /// Adds a git-commit skill instruction to this project's agent prompt
     Enable {
         /// Project path to update. Defaults to the current directory.
@@ -246,7 +253,7 @@ pub(crate) enum AgentGitCommitCommands {
     },
 }
 
-pub(crate) fn run() -> Result<()> {
+pub(super) fn run() -> Result<()> {
     let cli = Cli::parse();
     if let Some(Commands::ShellInit { shell }) = cli.command.as_ref() {
         print!("{}", shell_init_script(*shell));
@@ -405,7 +412,10 @@ pub(crate) fn run() -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn shell_init_script(shell: ShellKind) -> &'static str {
+#[cfg(test)]
+mod tests;
+
+fn shell_init_script(shell: ShellKind) -> &'static str {
     match shell {
         ShellKind::Bash | ShellKind::Zsh => {
             r#"clt() {
@@ -427,7 +437,7 @@ pub(crate) fn shell_init_script(shell: ShellKind) -> &'static str {
     }
 }
 
-pub(crate) fn write_tui_cwd_file(cwd_file: Option<&Path>, active_root: &Path) -> Result<()> {
+fn write_tui_cwd_file(cwd_file: Option<&Path>, active_root: &Path) -> Result<()> {
     let Some(cwd_file) = cwd_file else {
         return Ok(());
     };

@@ -1,4 +1,38 @@
-use super::*;
+use std::{
+    collections::BTreeMap,
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    sync::{Arc, Mutex, mpsc},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+use anyhow::{Context, Result};
+
+use crate::{
+    agent::{self, AgentGitMode, GitFinalizationState, open_agent_store_at, with_agent_store_at},
+    application::{AgentLeaseHolderLiveness, AgentTaskSelection},
+    platform::{configure_agent_child_command, stop_agent_child_process},
+    runner::{agent_timestamp, agent_timestamp_after},
+    scheduler::{
+        agent_lease_for_project, agent_lease_holder_liveness, agent_lease_renew_interval,
+        remaining_agent_delay,
+    },
+    session_control::InteractiveAgentLease,
+    task::{
+        CODEX_TASK_SESSION_PREFIX, StatusStore, TASK_DETAIL_FILES, TASK_STATUSES, TaskBoard,
+        TaskEntry, TaskSource, TaskStatus, acquire_board_mutation_lock,
+        acquire_board_mutation_lock_with_contention_callback,
+        attach_codex_session_to_task_after_lock, cleanup_clt_atomic_task_temporaries,
+        codex_session_id_from_task_content, codex_session_markers_in_task_content,
+        durable_task_identity, get_status_store, get_tasks_dir,
+        move_task_without_reordering_after_lock, read_task_entries,
+        remove_task_entry_without_reordering, starts_with_task_note_date, task_entry_is_blocked,
+        terminal_task_for_codex_session_in_board, title_from_path,
+    },
+};
 
 const AGENT_GIT_REMOTE_TIMEOUT_SECONDS: u64 = 30;
 // A commit-and-push reconciliation can perform two three-step remote proofs
@@ -1109,6 +1143,9 @@ pub(super) fn git_nul_separated_paths(
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests;
 
 pub(super) fn git_hash_stdin(project_root: &Path, bytes: &[u8], operation: &str) -> Result<String> {
     let mut child = Command::new("git")

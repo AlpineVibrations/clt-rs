@@ -1,8 +1,23 @@
-use anyhow::Result;
-use turso::{Connection, Database};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
 
-use super::super::*;
+use anyhow::{Context, Result};
+use turso::{Connection, Database, params, transaction::TransactionBehavior};
+
 use super::RepositoryDatabase;
+use crate::{
+    agent::{
+        AGENT_GIT_FINALIZATION_RESUME_TOKEN_PREFIX, AgentDaemonCheckin, AgentGitMode,
+        AgentKnownSessionRegistration, AgentRunOutcome, AgentRunRecord, AgentSessionControlRecord,
+        AgentSessionControlState, TursoAgentStore, query_count, row_integer, row_optional_integer,
+        row_optional_text, row_text, update_project_after_run,
+    },
+    application::AgentCleanSummary,
+    runner::{agent_timestamp, agent_timestamp_after},
+    session_control::{InteractiveGuardianDisposition, is_stopped_shared_interactive_holder},
+};
 
 /// Persistence for Codex session controls, runs, and daemon check-ins.
 pub(in crate::agent) struct SessionsRunsRepository(RepositoryDatabase);

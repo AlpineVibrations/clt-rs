@@ -1,9 +1,5 @@
 # Feature Ideas
 
-## Codebase Architecture
-
-- Execute the staged [CLT codebase refactor plan](refactor-plan.md) to split the monolithic binary into tested task, agent, CLI, and TUI modules.
-
 ## Quality of Life
 
 - Task search/filter on the CLI (`clt list --search "bug"`) and a `/` filter in the TUI.

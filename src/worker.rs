@@ -1,4 +1,56 @@
-use super::*;
+use std::{
+    collections::HashSet,
+    ffi::OsString,
+    fs,
+    io::{self},
+    path::Path,
+    sync::{Arc, Mutex, atomic::Ordering},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use anyhow::{Context, Result};
+
+use crate::{
+    agent::{
+        self, AGENT_GIT_FINALIZATION_RESUME_TOKEN_PREFIX, AgentGitMode, AgentSessionControlAction,
+        AgentSessionControlState, GitFinalizationState, current_agent_platform,
+        open_agent_store_at, with_agent_store_at,
+    },
+    application::{
+        ACTIVE_INLINE_AGENT_WORKERS, AGENT_INLINE_WORKER_SERVICE_LABEL_PREFIX,
+        AGENT_WORKER_GENERATION, AGENT_WORKER_HEARTBEAT_TIMEOUT_SECONDS,
+        AGENT_WORKER_PROTOCOL_VERSION, AGENT_WORKER_STARTUP_TIMEOUT_SECONDS,
+        AGENT_WORKER_STATE_DISPATCHING, AGENT_WORKER_STATE_FINALIZING, AGENT_WORKER_STATE_RUNNING,
+        AgentDaemonRun, AgentRunCompletion, AgentRunJob, AgentShutdownSignal, AgentTaskSelection,
+        AgentWorkerLaunchSpec, BlockedTaskSnapshot, new_agent_shutdown_signal,
+    },
+    managed_git::{
+        cancel_unlinked_working_git_finalization, reconcile_agent_git_finalization,
+        worktree_contains_completed_done_task,
+    },
+    platform::{
+        AgentServiceEnvironment, agent_codex_path_env, agent_worker_command_arguments,
+        agent_worker_dir, agent_worker_service_label, launch_agent_worker_service,
+        local_process_is_running, prepare_agent_worker_service, resolve_agent_service_environment,
+    },
+    runner::{
+        AgentRunRequest, AgentRunner, CodexAgentRunner, agent_timestamp, agent_timestamp_after,
+        agent_timestamp_seconds, print_agent_log_tail_with_limit, tail_lines,
+    },
+    scheduler::{
+        agent_heartbeat_tail_enabled, agent_lease_timeout, agent_max_global_jobs,
+        scan_agent_project, task_status_for_codex_session,
+    },
+    session_control::codex_session_for_task,
+    task::{
+        TaskEntry, TaskStatus, acquire_board_mutation_lock,
+        attach_codex_session_to_task_after_lock, get_tasks_dir, read_task_entries,
+        task_entry_is_blocked, terminal_task_for_codex_session_in_board,
+    },
+};
+
+#[cfg(not(test))]
+use crate::platform::{AgentPlatform, launchd_user_domain, run_service_command_optional};
 
 pub(super) struct AgentWorkerReconciliationRequest<'a> {
     pub(super) state_dir: &'a Path,
@@ -1819,3 +1871,6 @@ pub(super) fn format_optional_u64(value: Option<u64>) -> String {
         .map(|value| value.to_string())
         .unwrap_or_else(|| "-".to_string())
 }
+
+#[cfg(test)]
+pub(crate) mod tests;

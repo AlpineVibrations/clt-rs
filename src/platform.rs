@@ -1,4 +1,40 @@
-use super::*;
+use std::{
+    collections::HashSet,
+    ffi::{OsStr, OsString},
+    fs,
+    io::{self},
+    path::{Path, PathBuf},
+    process::{Child, Command, ExitStatus, Stdio},
+    sync::atomic::{AtomicBool, Ordering},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+use anyhow::{Context, Result};
+
+use crate::{
+    agent::{
+        self, AGENT_STATE_DIR_ENV, current_agent_platform, ensure_agent_state_dir,
+        open_agent_store_at,
+    },
+    application::{
+        AGENT_CODEX_PATH_ENV, AGENT_DAEMON_MODE_ENV, AGENT_LAUNCHD_LABEL, AGENT_SYSTEMD_UNIT,
+        AGENT_WORKER_GENERATION, AGENT_WORKER_LAUNCHD_LABEL_PREFIX,
+        AGENT_WORKER_SYSTEMD_UNIT_PREFIX, AgentWorkerLaunchSpec, XDG_RUNTIME_DIR_ENV,
+    },
+    runner::{agent_timestamp, agent_timestamp_after, agent_timestamp_seconds},
+    scheduler::{agent_lease_is_reclaimable, agent_lease_renew_interval},
+    session_control::InteractiveGuardianDisposition,
+};
+
+#[cfg(not(test))]
+use crate::worker::cleanup_terminal_agent_worker_services;
+
+#[cfg(unix)]
+use std::{
+    os::fd::{AsRawFd, FromRawFd},
+    os::unix::process::CommandExt,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum AgentPlatform {
@@ -62,6 +98,9 @@ pub(super) fn manage_agent_service(action: AgentServiceAction) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;
 
 pub(super) fn agent_scheduler_service_is_loaded() -> Result<bool> {
     match current_agent_platform() {

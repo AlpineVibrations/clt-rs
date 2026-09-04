@@ -1,6 +1,24 @@
-use super::*;
+use std::{
+    ffi::{OsStr, OsString},
+    fs, io,
+    path::{Path, PathBuf},
+    sync::atomic::Ordering,
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+#[cfg(test)]
+use std::sync::OnceLock;
+
+use anyhow::{Context, Result};
+use toml_edit::{DocumentMut, Item, Table, value};
 use turso::transaction::TransactionBehavior;
 use turso::{Builder, Connection, Database, Value, params};
+
+use crate::platform::AgentPlatform;
+
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 
 mod repositories;
 mod runtime;
@@ -247,7 +265,7 @@ impl AgentGitMode {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum GitFinalizationState {
+pub(super) enum GitFinalizationState {
     Working,
     Tracking,
     CommitPending,
@@ -480,6 +498,9 @@ pub(super) fn upsert_codex_provider_config_at(
     })
 }
 
+#[cfg(test)]
+mod tests;
+
 pub(super) fn remove_codex_provider_config_at(path: &Path, provider_id: &str) -> Result<bool> {
     if !valid_codex_provider_id(provider_id) {
         anyhow::bail!("Provider ID must use only ASCII letters, numbers, hyphens, or underscores");
@@ -591,7 +612,7 @@ pub(super) fn set_codex_model_reasoning_if_default_at(
 // sleeps and retries while a statement reports that the database is busy.
 const AGENT_DB_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
-pub(crate) fn shared_wal_path(db_path: &Path) -> PathBuf {
+fn shared_wal_path(db_path: &Path) -> PathBuf {
     let mut path = db_path.as_os_str().to_os_string();
     path.push("-tshm");
     PathBuf::from(path)
@@ -610,7 +631,7 @@ fn error_indicates_stale_shared_wal_index(error: &turso::Error) -> bool {
 }
 
 #[cfg(unix)]
-pub(crate) fn request_shared_wal_index_rebuild(db_path: &Path) -> Result<bool> {
+fn request_shared_wal_index_rebuild(db_path: &Path) -> Result<bool> {
     let shared_wal_path = shared_wal_path(db_path);
     let file = match fs::OpenOptions::new()
         .read(true)
@@ -1028,7 +1049,7 @@ const AGENT_MIGRATIONS: &[AgentMigration<'static>] = &[
     },
 ];
 
-pub(crate) struct TursoAgentStore {
+pub(super) struct TursoAgentStore {
     #[cfg_attr(not(test), allow(dead_code))]
     db_path: PathBuf,
     repositories: AgentRepositories,
@@ -1045,7 +1066,7 @@ struct OpenedAgentDatabase {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct AgentProject {
+pub(super) struct AgentProject {
     pub(crate) id: i64,
     pub(crate) path: PathBuf,
     pub(crate) name: String,
@@ -1066,7 +1087,7 @@ pub(crate) struct AgentProject {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct AgentModelProvider {
+pub(super) struct AgentModelProvider {
     pub(crate) id: String,
     pub(crate) name: String,
     pub(crate) base_url: Option<String>,
@@ -1076,7 +1097,7 @@ pub(crate) struct AgentModelProvider {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct AgentModelTarget {
+pub(super) struct AgentModelTarget {
     pub(crate) provider_id: String,
     pub(crate) model_id: String,
     pub(crate) label: String,
@@ -1086,12 +1107,12 @@ pub(crate) struct AgentModelTarget {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct AgentModelDefaults {
+pub(super) struct AgentModelDefaults {
     pub(crate) provider_id: Option<String>,
     pub(crate) model_id: Option<String>,
 }
 
-pub(crate) struct AgentRunOutcome<'a> {
+pub(super) struct AgentRunOutcome<'a> {
     pub(crate) project_id: i64,
     pub(crate) status: &'a str,
     pub(crate) started_at: &'a str,
@@ -1104,7 +1125,7 @@ pub(crate) struct AgentRunOutcome<'a> {
     pub(crate) codex_session_id: Option<&'a str>,
 }
 
-pub(crate) struct NewGitFinalization<'a> {
+pub(super) struct NewGitFinalization<'a> {
     pub(crate) project_id: i64,
     pub(crate) codex_session_id: &'a str,
     pub(crate) git_mode: AgentGitMode,
@@ -1118,7 +1139,7 @@ pub(crate) struct NewGitFinalization<'a> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct GitFinalizationRecord {
+pub(super) struct GitFinalizationRecord {
     pub(crate) project_id: i64,
     pub(crate) codex_session_id: String,
     pub(crate) state: GitFinalizationState,
@@ -1139,7 +1160,7 @@ pub(crate) struct GitFinalizationRecord {
     pub(crate) acknowledged_run_id: Option<i64>,
 }
 
-pub(crate) struct AgentWorkerReservation<'a> {
+pub(super) struct AgentWorkerReservation<'a> {
     pub(crate) project_id: i64,
     pub(crate) worker_token: &'a str,
     pub(crate) expected_lease_holder: &'a str,
@@ -1155,7 +1176,7 @@ pub(crate) struct AgentWorkerReservation<'a> {
     pub(crate) created_at: &'a str,
 }
 
-pub(crate) struct AgentWorkerAbandonment<'a> {
+pub(super) struct AgentWorkerAbandonment<'a> {
     pub(crate) worker_token: &'a str,
     pub(crate) expected_state: &'a str,
     pub(crate) expected_worker_pid: Option<u32>,
@@ -1165,7 +1186,7 @@ pub(crate) struct AgentWorkerAbandonment<'a> {
     pub(crate) permitted_successor_holder: Option<&'a str>,
 }
 
-pub(crate) struct AgentWorkerFinalization<'a> {
+pub(super) struct AgentWorkerFinalization<'a> {
     pub(crate) worker_token: &'a str,
     pub(crate) expected_worker_pid: Option<u32>,
     pub(crate) expected_lease_holder: &'a str,
@@ -1181,7 +1202,7 @@ pub(crate) struct AgentWorkerFinalization<'a> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct AgentWorkerRecord {
+pub(super) struct AgentWorkerRecord {
     pub(crate) worker_token: String,
     pub(crate) project_id: i64,
     pub(crate) project_name: String,
@@ -1206,11 +1227,11 @@ pub(crate) struct AgentWorkerRecord {
     pub(crate) service_cleaned_at: Option<String>,
 }
 
-pub(crate) fn worker_lease_holder(worker_token: &str) -> String {
+pub(super) fn worker_lease_holder(worker_token: &str) -> String {
     format!("clt-worker-{worker_token}")
 }
 
-pub(crate) struct AgentKnownSessionRegistration<'a> {
+pub(super) struct AgentKnownSessionRegistration<'a> {
     pub(crate) project_id: i64,
     pub(crate) codex_session_id: &'a str,
     pub(crate) child_pid: u32,
@@ -1222,7 +1243,7 @@ pub(crate) struct AgentKnownSessionRegistration<'a> {
     pub(crate) claim_requested_resume: bool,
 }
 
-pub(crate) struct AgentLeaseRecord {
+pub(super) struct AgentLeaseRecord {
     pub(crate) project_id: i64,
     pub(crate) project_name: String,
     pub(crate) project_path: PathBuf,
@@ -1231,7 +1252,7 @@ pub(crate) struct AgentLeaseRecord {
     pub(crate) expires_at: String,
 }
 
-pub(crate) struct AgentRunRecord {
+pub(super) struct AgentRunRecord {
     pub(crate) id: i64,
     pub(crate) project_id: i64,
     pub(crate) project_name: String,
@@ -1247,7 +1268,7 @@ pub(crate) struct AgentRunRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct AgentSessionControlRecord {
+pub(super) struct AgentSessionControlRecord {
     pub(crate) project_id: i64,
     pub(crate) codex_session_id: String,
     pub(crate) state: AgentSessionControlState,
@@ -1261,7 +1282,7 @@ pub(crate) struct AgentSessionControlRecord {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct AgentDaemonCheckin {
+pub(super) struct AgentDaemonCheckin {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) holder: String,
     pub(crate) mode: String,

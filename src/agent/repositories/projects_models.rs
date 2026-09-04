@@ -1,8 +1,18 @@
-use anyhow::Result;
-use turso::{Connection, Database};
+use std::path::{Path, PathBuf};
 
-use super::super::*;
+use anyhow::{Context, Result};
+use turso::{Connection, Database, params, transaction::TransactionBehavior};
+
 use super::RepositoryDatabase;
+use crate::{
+    agent::{
+        AgentGitMode, AgentModelDefaults, AgentModelProvider, AgentModelTarget, AgentProject,
+        TursoAgentStore, query_count, row_integer, row_optional_text, row_text,
+    },
+    application::AgentLeaseHolderLiveness,
+    runner::{agent_timestamp, agent_timestamp_seconds},
+    scheduler::agent_lease_holder_liveness,
+};
 
 /// Persistence for registered projects, provider configuration, and models.
 pub(in crate::agent) struct ProjectsModelsRepository(RepositoryDatabase);

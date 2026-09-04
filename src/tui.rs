@@ -1,4 +1,82 @@
-use super::*;
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    io::{self, Write, stdout},
+    path::{Path, PathBuf},
+    sync::mpsc::{self, Receiver, TryRecvError},
+    thread,
+    time::{Duration, Instant},
+};
+
+use anyhow::{Context, Result};
+use chrono::{DateTime, Local, Utc};
+use crossterm::{
+    ExecutableCommand,
+    event::{
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
+    },
+    terminal::{
+        EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode,
+    },
+};
+use ratatui::{
+    Terminal,
+    backend::CrosstermBackend,
+    layout::{Alignment, Constraint, Direction, Layout, Position, Rect},
+    style::{Color, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, ListItem, ListState, Paragraph},
+};
+use tui_input::{Input, InputRequest};
+
+use crate::{
+    agent::{
+        self, AGENT_CODEX_REASONING_EFFORTS, AGENT_DB_FILE, AGENT_PROVIDER_PRESETS,
+        AgentSessionControlState, GitFinalizationState, agent_state_dir, codex_config_path,
+        ensure_agent_state_dir, open_agent_store, open_agent_store_at,
+        read_codex_default_config_at, remove_codex_provider_config_at, set_codex_default_config_at,
+        set_codex_model_reasoning_if_default_at, upsert_codex_provider_config_at,
+        valid_environment_variable_name,
+    },
+    application::{
+        AgentLeaseHolderLiveness, AgentProjectScan, delete_task_in_board,
+        ensure_status_conversion_allowed, move_task_in_board, move_task_to_archive_in_board,
+        project_display_name, reorder_task_in_board, update_task_in_board,
+    },
+    platform::{agent_service_status, restart_running_agent_service},
+    runner::{
+        agent_codex_session_id_from_log, agent_project_run_log_dir, agent_timestamp,
+        agent_timestamp_seconds, latest_agent_log_path, preferred_recorded_agent_output_path,
+    },
+    scheduler::{
+        agent_failure_backoff, agent_lease_holder_liveness, interactive_lease_holder_liveness,
+        remaining_agent_delay, scan_agent_project,
+    },
+    session_control::{
+        InteractiveAgentLease, InteractiveCodexResumeMode, InteractiveGuardianDisposition,
+        agent_session_resume_worker_log_path, cancel_tui_idle_codex_session_interactive,
+        codex_session_for_task, codex_session_task_supports_interactive_resume,
+        prepare_tui_codex_session_interrupt, queue_tui_codex_session_exec_resume,
+        reserve_tui_idle_codex_session_interactive, reserve_tui_shared_codex_session_interactive,
+        resume_codex_session_interactively, spawn_agent_session_resume_worker,
+        task_supports_interactive_codex_resume, toggle_tui_codex_session_stop,
+        tui_stopped_codex_session_control,
+    },
+    task::{
+        TASK_STATUSES, TaskBoard, TaskEntry, TaskSource, TaskStatus, acquire_board_mutation_lock,
+        content_with_metadata, ensure_board_store, ensure_existing_board,
+        ensure_subtask_board_after_lock, get_tasks_dir, insert_task_in_board,
+        read_archived_task_entries, read_task_entries, read_tasks_in_board,
+        recoverable_codex_session_id_from_task_content, strip_order_prefix,
+        task_content_without_recoverable_codex_session, task_display_text, task_entry_at,
+        task_full_display_text, title_from_path,
+    },
+};
+
+#[cfg(not(test))]
+use crate::worker::cleanup_terminal_agent_worker_services;
 
 pub(super) const TODO_BOARD_INDEX: usize = 0;
 pub(super) const DONE_BOARD_INDEX: usize = 2;
@@ -7981,3 +8059,6 @@ pub(super) fn tui_view_with_active_board(
 
     Ok(app.active_root)
 }
+
+#[cfg(test)]
+pub(crate) mod tests;

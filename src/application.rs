@@ -1,4 +1,59 @@
-use super::*;
+use std::{
+    collections::HashSet,
+    ffi::OsString,
+    fs,
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, AtomicU64},
+    },
+    thread,
+    time::Duration,
+};
+
+use anyhow::{Context, Result};
+
+use crate::{
+    agent::{
+        self, AGENT_DB_FILE, AgentGitMode, AgentSessionControlState, GitFinalizationState,
+        agent_state_dir, open_agent_store, open_agent_store_at,
+    },
+    managed_git::{
+        AgentGitProofContext, AgentGitStartState, capture_agent_git_resealed_manifest,
+        capture_agent_git_staged_manifest, git_commit_is_ancestor, git_optional_stdout,
+        require_agent_git_start_task_identity, resolve_git_commit, task_content_has_completed_note,
+        verify_agent_git_start_state_unchanged,
+    },
+    platform::{AgentServiceEnvironment, agent_service_status, truncate_agent_service_logs},
+    runner::{
+        AgentRunner, AutomatedAgentChildContext, agent_timestamp, agent_timestamp_seconds,
+        automated_agent_child_context, canonicalize_existing_path, format_agent_run_line,
+        format_agent_timestamp, format_optional_agent_timestamp, print_agent_log_tail,
+        resolve_agent_project_root,
+    },
+    scheduler::{agent_lease_holder_liveness, scan_agent_project},
+    task::{
+        ExpansionSummary, StatusStore, TASK_STATUSES, TaskBoard, TaskEntry, TaskSource, TaskStatus,
+        acquire_board_mutation_lock, attach_codex_session_to_task_after_lock,
+        cleanup_clt_atomic_task_temporaries, codex_session_id_from_task_content,
+        convert_archive_to_directory, durable_task_identity, ensure_existing_board,
+        expand_status_for_command, get_or_create_archive_status_store, get_tasks_dir,
+        insert_content_into_directory, insert_content_into_markdown, move_path_into_directory,
+        move_task_without_reordering_after_lock, normalize_status_arg, parse_one_based_task_index,
+        read_markdown_entries, recoverable_codex_session_id_from_task_content, remove_task_entry,
+        reorder_directory_task, reorder_markdown_task, task_content_with_codex_session,
+        task_entry_at,
+    },
+    tui::{
+        format_agent_daemon_runtime_status, load_task_agent_session_states,
+        task_display_text_with_agent_flag,
+    },
+};
+
+#[cfg(test)]
+use crate::task::acquire_board_mutation_lock_with_contention_callback;
+#[cfg(not(test))]
+use crate::worker::cleanup_terminal_agent_worker_services;
 
 pub(super) const AGENT_PROJECT_ID_ENV: &str = "CLT_AGENT_PROJECT_ID";
 pub(super) const AGENT_RUN_TOKEN_ENV: &str = "CLT_AGENT_RUN_TOKEN";
@@ -227,6 +282,9 @@ pub(super) fn register_agent_project(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;
 
 pub(super) fn unregister_agent_project(
     store: &agent::TursoAgentStore,
@@ -1155,7 +1213,7 @@ pub(super) fn move_task_to_done_with_agent_store(
     }
     let Some(mut finalization) = store.git_finalization_blocking(project.id, session_id)? else {
         if project.git_mode == AgentGitMode::Off {
-            board.move_task_after_lock(from, TaskStatus::Done, task_index)?;
+            move_task_in_board_after_lock(&board_dir, from, TaskStatus::Done, task_index)?;
             return Ok(false);
         }
         anyhow::bail!(
@@ -1294,7 +1352,7 @@ pub(super) fn move_task_in_board(
         from.is_active() && to.is_active(),
         None,
     )?;
-    board.move_task_after_lock(from, to, task_index)
+    move_task_in_board_after_lock(board_dir, from, to, task_index)
 }
 
 #[cfg(test)]
@@ -1318,7 +1376,7 @@ pub(super) fn move_task_in_board_after_lock(
     task_index: usize,
 ) -> Result<()> {
     ensure_status_conversion_allowed(board_dir, to)?;
-    task::move_task_in_board_after_lock(board_dir, from, to, task_index)
+    TaskBoard::new(board_dir).move_task_after_lock(from, to, task_index)
 }
 
 pub(super) fn move_task_to_archive_in_board(

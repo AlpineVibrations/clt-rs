@@ -1,8 +1,15 @@
-use anyhow::Result;
-use turso::{Connection, Database};
+use std::{ffi::OsString, path::PathBuf};
 
-use super::super::*;
+use anyhow::{Context, Result};
+use turso::{Connection, Database, params, transaction::TransactionBehavior};
+
 use super::RepositoryDatabase;
+use crate::agent::{
+    AGENT_GIT_FINALIZATION_RESUME_TOKEN_PREFIX, AgentLeaseRecord, AgentRunOutcome,
+    AgentWorkerAbandonment, AgentWorkerFinalization, AgentWorkerRecord, AgentWorkerReservation,
+    TursoAgentStore, query_count, row_integer, row_optional_integer, row_optional_text, row_text,
+    update_project_after_run, worker_lease_holder,
+};
 
 /// Persistence for independent workers and project leases.
 pub(in crate::agent) struct WorkersLeasesRepository(RepositoryDatabase);

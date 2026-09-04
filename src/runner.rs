@@ -1,4 +1,60 @@
-use super::*;
+use std::{
+    cell::Cell,
+    ffi::{OsStr, OsString},
+    fs,
+    io::{self, BufRead, BufReader, Read, Write, stdout},
+    path::{Path, PathBuf},
+    process::{Child, Command, ExitStatus, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+use anyhow::{Context, Result};
+use chrono::{DateTime, Local, Utc};
+
+use crate::{
+    agent::{
+        self, AGENT_STATE_DIR_ENV, AgentGitMode, AgentSessionControlAction, open_agent_store_at,
+        with_agent_store_at,
+    },
+    application::{
+        AGENT_PROJECT_ID_ENV, AGENT_RUN_TOKEN_ENV, AGENT_SESSION_CONTROL_POLL_MILLIS,
+        AgentShutdownSignal, AgentTaskSelection, get_task_root_at,
+    },
+    managed_git::{
+        AgentGitStartState, bind_agent_git_working_task_identity, configure_agent_git_identity,
+        ensure_agent_git_index_preflight, ensure_agent_git_working_record,
+        prepare_agent_git_start_state_for_run, verify_agent_git_start_state_unchanged,
+    },
+    platform::{
+        agent_codex_path_env, agent_process_group_exists, configure_agent_child_command,
+        interactive_child_exited_without_reaping, stop_agent_child_process,
+    },
+    scheduler::{
+        agent_lease_renew_interval, agent_lease_timeout, agent_poll_interval, agent_run_timeout,
+    },
+    session_control::automated_session_control_action_for_generation,
+    task::TaskStatus,
+    worker::{
+        attach_codex_session_to_active_task, automated_codex_session_to_resume,
+        blocked_task_snapshots, print_agent_run_heartbeat, task_contents_for_status,
+    },
+};
+
+#[cfg(test)]
+use crate::application::AGENT_DEFAULT_POLL_INTERVAL_SECONDS;
+#[cfg(unix)]
+use crate::application::AGENT_SUPERVISOR_READY_TIMEOUT_SECONDS;
+#[cfg(all(unix, test))]
+use crate::application::TEST_AUTOMATED_SUPERVISOR_ENV;
+#[cfg(not(test))]
+use crate::worker::validate_agent_worker_token;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct AutomatedAgentChildContext {
@@ -74,6 +130,9 @@ impl std::fmt::Display for AgentChildTerminationUnproven {
         formatter.write_str(&self.0)
     }
 }
+
+#[cfg(test)]
+pub(crate) mod tests;
 
 impl std::error::Error for AgentChildTerminationUnproven {}
 
@@ -750,7 +809,7 @@ pub(super) fn automated_session_supervisor_command(
     let mut supervisor = Command::new(executable);
     supervisor
         .arg("--exact")
-        .arg("tests::automated_session_supervisor_process_entry")
+        .arg("runner::tests::automated_session_supervisor_process_entry")
         .arg("--nocapture")
         .env(TEST_AUTOMATED_SUPERVISOR_ENV, "1")
         .env("CLT_TEST_SUPERVISOR_STATE_DIR", spec.state_dir)

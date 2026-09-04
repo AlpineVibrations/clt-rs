@@ -8,10 +8,10 @@ mod projects_models;
 mod sessions_runs;
 mod workers_leases;
 
-pub(super) use git_journals::GitJournalsRepository;
-pub(super) use projects_models::ProjectsModelsRepository;
-pub(super) use sessions_runs::SessionsRunsRepository;
-pub(super) use workers_leases::WorkersLeasesRepository;
+use git_journals::GitJournalsRepository;
+use projects_models::ProjectsModelsRepository;
+use sessions_runs::SessionsRunsRepository;
+use workers_leases::WorkersLeasesRepository;
 
 #[derive(Clone)]
 struct RepositoryDatabase(Database);

@@ -1,4 +1,59 @@
-use super::*;
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+    sync::{Arc, atomic::Ordering},
+    thread,
+    time::Duration,
+};
+
+use anyhow::{Context, Result};
+
+use crate::{
+    agent::{
+        self, AGENT_DB_FILE, AGENT_GIT_FINALIZATION_RESUME_TOKEN_PREFIX,
+        AGENT_WORKERS_ACTIVE_PROJECT_INDEX, AgentSessionControlState, GitFinalizationState,
+        current_agent_platform, ensure_agent_state_dir, open_agent_store_at, with_agent_store_at,
+    },
+    application::{
+        AGENT_DAEMON_CHECKIN_STALE_SECONDS, AGENT_DAEMON_DATABASE_LOCK_RETRY_ATTEMPTS,
+        AGENT_DAEMON_DATABASE_LOCK_RETRY_MILLIS, AGENT_DAEMON_MODE_ENV,
+        AGENT_DEFAULT_FAILURE_BACKOFF_SECONDS, AGENT_DEFAULT_LEASE_TIMEOUT_SECONDS,
+        AGENT_DEFAULT_MAX_GLOBAL_JOBS, AGENT_DEFAULT_POLL_INTERVAL_SECONDS,
+        AGENT_DEFAULT_RUN_TIMEOUT_SECONDS, AGENT_DEFAULT_SUCCESS_COOLDOWN_SECONDS,
+        AGENT_EMPTY_REGISTRY_POLL_INTERVAL_SECONDS, AGENT_FAILURE_BACKOFF_SECONDS_ENV,
+        AGENT_HEARTBEAT_TAIL_ENV, AGENT_LEASE_RENEW_MAX_INTERVAL_MILLIS,
+        AGENT_LEASE_TIMEOUT_SECONDS_ENV, AGENT_MAX_GLOBAL_JOBS_ENV,
+        AGENT_POLL_INTERVAL_SECONDS_ENV, AGENT_RUN_TIMEOUT_SECONDS_ENV,
+        AGENT_SUCCESS_COOLDOWN_SECONDS_ENV, AgentDaemonCheckinSource, AgentDaemonExecutor,
+        AgentDaemonRun, AgentLeaseHolderLiveness, AgentProjectScan, AgentProjectScanStatus,
+        AgentRunJob, AgentSchedulerPass, AgentSchedulerStart, AgentShutdownSignal,
+        AgentTaskSelection, new_agent_shutdown_signal,
+    },
+    managed_git::{
+        agent_git_push_retry_backoff_remaining, reconcile_pending_agent_git_finalizations,
+        record_agent_git_push_retry_error, record_agent_git_push_retry_error_message,
+        repair_working_git_task_link, try_acquire_agent_git_finalization_lease,
+    },
+    platform::{
+        AgentPlatform, automated_agent_process_group_is_running, local_process_is_running,
+        snapshot_agent_service_binary,
+    },
+    runner::{
+        AgentRunner, CodexAgentRunner, agent_timestamp, agent_timestamp_after,
+        agent_timestamp_seconds, format_agent_timestamp,
+    },
+    session_control::InteractiveGuardianDisposition,
+    task::{
+        TaskStatus, ensure_existing_board, get_tasks_dir, read_task_entries, task_entry_is_blocked,
+        task_status_for_codex_session_in_board, terminal_task_for_codex_session_in_board,
+    },
+    tui::TUI_SESSION_HANDOFF_TIMEOUT_SECONDS,
+    worker::{
+        blocked_task_snapshots, completed_task_contents, dispatch_independent_agent_worker,
+        print_agent_run_completion, reconcile_independent_agent_workers,
+        release_agent_job_lease_for_shutdown, run_agent_job, spawn_agent_daemon_run,
+    },
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct AgentSchedulingDecisionRequest {
@@ -196,6 +251,9 @@ pub(super) fn wait_for_deferred_agent_migrations(
         thread::sleep(retry_interval);
     }
 }
+
+#[cfg(test)]
+mod tests;
 
 #[cfg(test)]
 pub(super) fn run_agent_daemon_loop(

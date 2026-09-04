@@ -14,6 +14,8 @@
 
 A file-system-backed task manager written in Rust. `clt` stores work in Markdown files or task folders, gives humans a fast CLI and TUI Kanban board, and can coordinate Codex agent runs across multiple registered projects.
 
+For the internal crate boundaries and module ownership map, see [ARCHITECTURE.md](ARCHITECTURE.md).
+
 ## Features
 
 - **File-based Persistence**: Tasks are stored in `tasks/backlog.md`, `tasks/todo.md`, `tasks/doing.md`, and `tasks/done.md`, or in status folders such as `tasks/todo/`.

@@ -1,6 +1,6 @@
 # CLT Refactor Design/Build Plan
 
-Status: Stage A and Phases 10–13 are complete; Phase 14 remains queued
+Status: Complete. Stage A and Phases 10–14 have been implemented.
 
 ## Early work already present
 
@@ -146,6 +146,9 @@ Introduce `TuiApp`, route pane events through update handlers that return explic
 #### Phase 14: Final architecture cleanup
 
 Move unit tests beside their owners, retain true cross-module behavior as integration tests, narrow visibility, remove transitional re-exports and wildcard imports, record the final module map, and close the stale feature entry.
+
+Completed 2026-09-04. The final module map and maintained boundary rules are recorded in
+[`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## Verification gates
 

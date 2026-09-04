@@ -1,4 +1,64 @@
-use super::*;
+use std::{
+    ffi::OsString,
+    fs,
+    io::{self, Read, Write},
+    path::{Path, PathBuf},
+    process::{Child, Command, ExitStatus, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+use anyhow::{Context, Result};
+
+use crate::{
+    agent::{
+        self, AgentSessionControlAction, AgentSessionControlState, ensure_agent_state_dir,
+        ensure_agent_state_dir_at, open_agent_store_at, with_agent_store_at,
+    },
+    application::{
+        AgentRunJob, AgentTaskSelection, INTERACTIVE_LEASE_GENERATION, new_agent_shutdown_signal,
+    },
+    platform::{
+        InteractiveTerminalForeground, agent_process_group_exists,
+        automated_agent_process_group_is_running, configure_agent_child_command,
+        configure_interactive_child_command, interactive_child_exited_without_reaping,
+        interactive_terminal_input, local_process_is_running,
+        restore_interactive_terminal_before_handoff,
+        restore_parent_terminal_after_interactive_guardian, stop_interactive_child_process,
+    },
+    runner::{
+        CodexAgentRunner, agent_codex_command, agent_timestamp, agent_timestamp_after,
+        agent_timestamp_seconds, automated_exec_gate_is_released,
+        configure_automated_exec_gate_inheritance,
+    },
+    scheduler::{
+        agent_failure_backoff, agent_lease_holder, agent_lease_is_reclaimable,
+        agent_lease_renew_interval, agent_lease_timeout, agent_max_global_jobs, scan_agent_project,
+    },
+    task::{
+        TaskEntry, TaskSource, TaskStatus, get_tasks_dir, read_task_entries,
+        recoverable_codex_session_id_from_task_content, task_entry_is_blocked,
+    },
+    tui::{
+        TUI_LEASE_RELEASE_ATTEMPTS, TUI_LEASE_RELEASE_RETRY_MILLIS,
+        TUI_SESSION_HANDOFF_TIMEOUT_SECONDS, TUI_SESSION_RESUME_WORKER_RETRY_MILLIS,
+    },
+    worker::{
+        blocked_task_snapshots, completed_task_contents, print_agent_run_completion, run_agent_job,
+    },
+};
+
+#[cfg(all(unix, test))]
+use crate::application::TEST_INTERACTIVE_EXEC_GATE_ENV;
+#[cfg(unix)]
+use std::{
+    os::fd::{AsRawFd, FromRawFd},
+    os::unix::{net::UnixStream, process::CommandExt},
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum InteractiveCodexResumeMode {
@@ -231,6 +291,9 @@ pub(super) fn run_interactive_exec_gate(
     })
 }
 
+#[cfg(test)]
+mod tests;
+
 #[cfg(not(unix))]
 pub(super) fn run_interactive_exec_gate(
     _control_fd: Option<i32>,
@@ -327,7 +390,7 @@ pub(super) fn interactive_exec_gate_command(
     gate.stdin(Stdio::inherit());
     let (control_fd, launch_gate) = configure_inherited_child_control(&mut gate)?;
     gate.arg("--exact")
-        .arg("tests::interactive_exec_gate_process_entry")
+        .arg("runner::tests::interactive_exec_gate_process_entry")
         .arg("--nocapture")
         .env(TEST_INTERACTIVE_EXEC_GATE_ENV, "1")
         .env(
