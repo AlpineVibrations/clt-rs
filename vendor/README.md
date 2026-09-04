@@ -1,15 +1,15 @@
 # Vendored Turso core
 
-`turso_core/` contains the published `turso_core` **0.7.0** crate, copied from
+`turso_core/` contains the published `turso_core` **0.7.2** crate, copied from
 Cargo's crates.io source cache. The package's `.cargo_vcs_info.json` identifies
-upstream revision `e7cb62a8bd2f3655a661a621ee389365c1a1e43e`, directory `core`, in
-[tursodatabase/turso](https://github.com/tursodatabase/turso/tree/e7cb62a8bd2f3655a661a621ee389365c1a1e43e/core).
+upstream revision `046e9cbf67d22491e8ecc941ec2891b02a9f3cad`, directory `core`, in
+[tursodatabase/turso](https://github.com/tursodatabase/turso/tree/046e9cbf67d22491e8ecc941ec2891b02a9f3cad/core).
 The original crates.io archive checksum is
-`a77f2106de5a3014261be18283999fde0d06c24ae5d4cb85a6eff1aaeaff453d`.
+`7a833cc3bf8d4e6c101c504fa470f8ab4270c2202ff2591b61b2e373b4f20d9b`.
 
 The published source, manifests, build script, benchmarks and tests are retained.
 Only Cargo's local `.cargo-ok` extraction marker was omitted. `LICENSE` contains
-the upstream [MIT license at that same revision](https://github.com/tursodatabase/turso/blob/e7cb62a8bd2f3655a661a621ee389365c1a1e43e/LICENSE.md),
+the upstream [MIT license retained from 0.7.0](https://github.com/tursodatabase/turso/blob/e7cb62a8bd2f3655a661a621ee389365c1a1e43e/LICENSE.md),
 which was not included in the published crate's extracted files.
 
 CLT's root `[patch.crates-io]` selects this local package, including for
@@ -17,6 +17,10 @@ CLT's root `[patch.crates-io]` selects this local package, including for
 by the root `Cargo.lock`.
 
 ## Local change
+
+The published 0.7.2 shared-WAL coordination source is unchanged from 0.7.0, so
+CLT retains the same reader ownership fix and checkpoint pin. The versioned
+shared-WAL header layout used by CLT's recovery workaround is also unchanged.
 
 `storage/shared_wal_coordination.rs` fixes
 `repair_transient_state_for_exclusive_open`: repair holds the local reader mutex

@@ -12,7 +12,7 @@
 [package]
 edition = "2021"
 name = "turso_core"
-version = "0.7.0"
+version = "0.7.2"
 authors = ["the Turso authors"]
 build = "build.rs"
 autolib = false
@@ -319,14 +319,14 @@ version = "0.1.41"
 version = "0.3.20"
 
 [dependencies.turso_ext]
-version = "0.7.0"
+version = "0.7.2"
 features = ["core_only"]
 
 [dependencies.turso_macros]
-version = "0.7.0"
+version = "0.7.2"
 
 [dependencies.turso_parser]
-version = "0.7.0"
+version = "0.7.2"
 
 [dependencies.twox-hash]
 version = "2.1.1"
