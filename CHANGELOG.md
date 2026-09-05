@@ -10,6 +10,7 @@ Use this section while developing the next release.
 
 ### Fixed
 
+- Resolve both registered and requested project paths during orphan Git journal recovery, so macOS path aliases do not block cleanup or scheduling the next task.
 - Select and reveal the newly completed task at the top of Done when moving it in the TUI, including when the Done list was scrolled down.
 - Recognize Shift+M when terminals report lowercase `m` with a Shift modifier, so the Models page opens and closes consistently from Tasks and Agent Projects while plain `m` still cycles the project model.
 

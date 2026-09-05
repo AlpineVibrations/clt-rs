@@ -392,8 +392,9 @@ pub(super) fn cancel_orphaned_working_git_finalization_with_before_lock(
         .find(|project| project.id == expected.project_id)
         .context("Orphan journal project is no longer registered")?
         .path;
+    // Registered paths may retain aliases such as macOS /var -> /private/var.
     anyhow::ensure!(
-        fs::canonicalize(project_root)? == registered_root,
+        fs::canonicalize(project_root)? == fs::canonicalize(&registered_root)?,
         "Orphan journal recovery requires the registered project directory"
     );
     lease.ensure_owned()?;

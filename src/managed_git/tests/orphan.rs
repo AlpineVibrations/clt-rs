@@ -13,6 +13,14 @@ struct OrphanFixture {
 
 impl OrphanFixture {
     fn new(label: &str, change_baseline: impl FnOnce(&mut serde_json::Value)) -> Self {
+        Self::with_registered_path(label, Path::to_path_buf, change_baseline)
+    }
+
+    fn with_registered_path(
+        label: &str,
+        registered_path: impl FnOnce(&Path) -> PathBuf,
+        change_baseline: impl FnOnce(&mut serde_json::Value),
+    ) -> Self {
         let root = temp_root(label);
         let state_dir = root.join("state/clt");
         let project_root = root.join("project");
@@ -25,7 +33,7 @@ impl OrphanFixture {
         let baseline = serde_json::to_string(&baseline).unwrap();
         let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
         store
-            .register_project_blocking(&project_root, "project")
+            .register_project_blocking(&registered_path(&project_root), "project")
             .unwrap();
         let project = store.list_projects_blocking().unwrap().remove(0);
         assert!(
@@ -97,6 +105,60 @@ impl OrphanFixture {
         drop(lease);
         drop(self.store);
         fs::remove_dir_all(self.root).unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn orphan_cancellation_accepts_equivalent_registered_project_paths() {
+    for register_alias in [false, true] {
+        let fixture = OrphanFixture::with_registered_path(
+            "orphan-project-alias",
+            |project_root| {
+                let canonical = fs::canonicalize(project_root).unwrap();
+                let alias = project_root.with_file_name("project-alias");
+                std::os::unix::fs::symlink(&canonical, &alias).unwrap();
+                if register_alias { alias } else { canonical }
+            },
+            |_| {},
+        );
+        let lease = fixture.lease();
+        let recovery_root = if register_alias {
+            fs::canonicalize(&fixture.project_root).unwrap()
+        } else {
+            fixture.root.join("project-alias")
+        };
+        assert_ne!(recovery_root, fixture.project.path);
+        assert!(
+            cancel_orphaned_working_git_finalization(
+                &fixture.store,
+                &recovery_root,
+                &fixture.journal,
+                &lease,
+            )
+            .unwrap()
+        );
+        let cancelled = fixture.current_journal();
+        assert_eq!(cancelled.state, GitFinalizationState::Cancelled);
+        assert_eq!(cancelled.generation, fixture.journal.generation + 1);
+        assert_eq!(cancelled.starting_head, fixture.journal.starting_head);
+        assert_eq!(
+            cancelled.worktree_baseline,
+            fixture.journal.worktree_baseline
+        );
+        assert!(
+            fixture
+                .store
+                .session_control_blocking(fixture.project.id, ORPHAN_SESSION_ID)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            run_test_git(&recovery_root, &["rev-parse", "HEAD"]),
+            fixture.journal.starting_head.as_deref().unwrap()
+        );
+        assert!(run_test_git(&recovery_root, &["status", "--porcelain"]).is_empty());
+        fixture.cleanup(lease);
     }
 }
 
