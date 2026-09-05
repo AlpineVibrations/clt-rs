@@ -34,7 +34,15 @@ pub(super) fn open_agent_store() -> Result<TursoAgentStore> {
 
 pub(super) fn open_agent_store_at(state_dir: &Path) -> Result<TursoAgentStore> {
     ensure_agent_state_dir_at(state_dir)?;
-    TursoAgentStore::open_blocking(state_dir)
+    match TursoAgentStore::open_blocking(state_dir) {
+        Ok(store) => Ok(store),
+        Err(error) if recovery::check_required(state_dir).is_err() => {
+            recovery::recover_registry_automatically(state_dir)
+                .with_context(|| format!("{error:#}; automatic recovery could not proceed"))?;
+            TursoAgentStore::open_blocking(state_dir)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 pub(super) fn with_agent_store_at<T>(
@@ -1298,6 +1306,14 @@ pub(super) struct AgentDaemonCheckin {
 }
 
 impl TursoAgentStore {
+    pub(crate) fn check_recovery_required(&self) -> Result<()> {
+        recovery::check_required(
+            self.db_path
+                .parent()
+                .context("Agent database has no state directory")?,
+        )
+    }
+
     pub(crate) fn open_blocking(state_dir: &Path) -> Result<Self> {
         let access = recovery::RegistryAccess::shared(state_dir)?;
         let _writer = recovery::write_lock(state_dir)?;

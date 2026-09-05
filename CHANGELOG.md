@@ -8,6 +8,17 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 Use this section while developing the next release.
 
+## [0.6.6] - 2026-09-05
+
+### Added
+
+- Automatically repair idle agent registry coordination on the next open, preserving the original database bundle and requiring exclusive access, stopped workers and sessions, and a successful integrity check. Interrupted updates and repairs requiring database reconstruction retain explicit recovery guidance.
+
+### Fixed
+
+- Clear Turso shared-WAL reader metadata before releasing its OS lock, preventing another process from reclaiming the slot during cleanup and triggering an ownership panic or losing its reader metadata.
+- Exit interactive guardians and disconnected automated supervisors after reaping Codex when registry recovery is required, releasing database access instead of retrying finalization indefinitely.
+
 ## [0.6.5] - 2026-09-05
 
 ### Fixed

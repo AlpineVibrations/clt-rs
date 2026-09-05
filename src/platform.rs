@@ -284,6 +284,46 @@ fn recovery_manifest_pid(record: &serde_json::Value, field: &str) -> Result<Opti
         .with_context(|| format!("Agent recovery manifest has invalid {field}"))
 }
 
+pub(super) fn ensure_agent_processes_stopped_for_recovery(
+    state_dir: &Path,
+    manifest: &serde_json::Value,
+) -> Result<()> {
+    for (table, field) in [
+        ("agent_workers", "worker_pid"),
+        ("session_controls", "child_pid"),
+    ] {
+        let records = manifest["tables"][table]
+            .as_array()
+            .with_context(|| format!("Agent recovery manifest has no {table}"))?;
+        for record in records {
+            if table == "agent_workers" {
+                match record["state"].as_str() {
+                    Some("completed" | "abandoned" | "superseded") => continue,
+                    Some("dispatching" | "running" | "finalizing") => {}
+                    _ => anyhow::bail!("Agent recovery worker has unknown state"),
+                }
+                anyhow::ensure!(
+                    recovery_manifest_pid(record, field)?.is_some(),
+                    "Automatic registry recovery cannot verify a worker that has not registered its PID; run clt agent recover"
+                );
+            } else if let Some(holder) = record["interactive_holder"].as_str() {
+                anyhow::ensure!(
+                    InteractiveGuardianDisposition::guardian_process_is_proven_dead(holder),
+                    "Automatic registry recovery is waiting for interactive guardian {holder} to exit"
+                );
+            }
+            if let Some(pid) = recovery_manifest_pid(record, field)? {
+                anyhow::ensure!(
+                    local_process_is_running(pid) == Some(false),
+                    "Automatic registry recovery is waiting for worker/session process {pid} to exit (state: {})",
+                    state_dir.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests;
 

@@ -18,6 +18,111 @@ const CHECKPOINT_CHILD_STATE: &str = "CLT_REGISTRY_RECOVERY_CHECKPOINT_TEST_STAT
 const REOPEN_CHILD_STATE: &str = "CLT_REGISTRY_RECOVERY_REOPEN_TEST_STATE";
 
 #[test]
+fn registry_open_automatically_repairs_idle_coordination_and_preserves_records() {
+    let (root, state_dir, store, project) = registered_store("registry-auto-recovery");
+    store
+        .try_acquire_lease_blocking(project.id, "preserved-lease", "100", "9999999999")
+        .unwrap();
+    drop(store);
+    mark_required(&state_dir, "shared owner slot released by non-owner").unwrap();
+    let original = bundle_contents(&state_dir);
+
+    let reopened = crate::agent::open_agent_store_at(&state_dir).unwrap();
+
+    assert_eq!(reopened.list_projects_blocking().unwrap()[0].id, project.id);
+    assert_eq!(
+        reopened
+            .lease_for_project_blocking(project.id)
+            .unwrap()
+            .unwrap()
+            .holder,
+        "preserved-lease"
+    );
+    assert!(!state_dir.join(REQUIRED_FILE).exists());
+    let archives = fs::read_dir(state_dir.join("quarantine"))
+        .unwrap()
+        .collect::<std::io::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(archives.len(), 1);
+    assert_eq!(bundle_contents(&archives[0].path()), original);
+    drop(reopened);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn registry_auto_recovery_waits_for_live_store_and_session_process() {
+    let (root, state_dir, store, project) = registered_store("registry-auto-recovery-live");
+    mark_required(&state_dir, "shared WAL ownership failure").unwrap();
+    let original = bundle_contents(&state_dir);
+    assert!(recover_registry_automatically(&state_dir).is_err());
+    assert_eq!(bundle_contents(&state_dir), original);
+    assert!(!state_dir.join("quarantine").exists());
+    fs::remove_file(state_dir.join(REQUIRED_FILE)).unwrap();
+    store
+        .mark_session_running_blocking(
+            project.id,
+            "live-session",
+            std::process::id(),
+            "live-run",
+            &root.join("out"),
+            &root.join("err"),
+        )
+        .unwrap();
+    drop(store);
+    mark_required(&state_dir, "shared WAL ownership failure").unwrap();
+    let original = bundle_contents(&state_dir);
+
+    let error = recover_registry_automatically(&state_dir).unwrap_err();
+
+    assert!(format!("{error:#}").contains("waiting for worker/session process"));
+    assert_eq!(bundle_contents(&state_dir), original);
+    assert!(!state_dir.join("quarantine").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn registry_auto_recovery_refuses_interrupted_updates_and_repairs() {
+    for marker in [DIRTY_FILE, "recovery-in-progress.json"] {
+        let (root, state_dir, store, _) = registered_store("registry-auto-recovery-interrupted");
+        drop(store);
+        mark_required(&state_dir, "shared WAL ownership failure").unwrap();
+        fs::write(state_dir.join(marker), "interrupted").unwrap();
+        let original = bundle_contents(&state_dir);
+        assert!(recover_registry_automatically(&state_dir).is_err());
+        assert_eq!(bundle_contents(&state_dir), original);
+        assert!(!state_dir.join("quarantine").exists());
+        assert_eq!(
+            fs::read_to_string(state_dir.join(marker)).unwrap(),
+            "interrupted"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn registry_auto_recovery_preserves_corrupt_database_and_does_not_repeat_reconstruction() {
+    let (root, state_dir, store, _) = registered_store("registry-auto-recovery-corrupt");
+    drop(store);
+    corrupt_database(&state_dir);
+    mark_required(&state_dir, "shared WAL ownership failure").unwrap();
+    let original = bundle_contents(&state_dir);
+
+    let error = recover_registry_automatically(&state_dir).unwrap_err();
+
+    assert!(format!("{error:#}").contains("Automatic coordination repair failed"));
+    assert_eq!(bundle_contents(&state_dir), original);
+    assert!(state_dir.join(REQUIRED_FILE).exists());
+    assert!(recover_registry_automatically(&state_dir).is_err());
+    assert_eq!(
+        fs::read_dir(state_dir.join("quarantine")).unwrap().count(),
+        1
+    );
+    // Explicit recovery can still complete from the preserved snapshot.
+    assert!(recover_registry(&state_dir).unwrap().rebuilt_registry);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn registry_open_after_partial_checkpoint_preserves_pin_ownership() {
     let (root, state_dir, store, project) = registered_store("registry-partial-checkpoint");
     store

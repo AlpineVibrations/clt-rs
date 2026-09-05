@@ -16,7 +16,7 @@ CLT's root `[patch.crates-io]` selects this local package, including for
 `cargo install --path . --locked`. All other dependency versions remain pinned
 by the root `Cargo.lock`.
 
-## Local change
+## Local changes
 
 The published 0.7.2 shared-WAL coordination source is unchanged from 0.7.0, so
 CLT retains the same reader ownership fix and checkpoint pin. The versioned
@@ -38,6 +38,14 @@ snapshot references, an older pinned frame and normal reader release, using both
 native and process-scoped mappings. CLT's integration regressions cover trailing
 WAL data and overlapping registry users.
 
+Reader release also keeps the OS byte lock until shared owner, frame and bitmap
+cleanup is complete. The upstream release unlocked first; a peer could reclaim
+the slot before the old owner cleared it, causing `shared owner slot released by
+non-owner` on macOS or overwriting a successor reader's metadata on Linux. The
+same-process ownership reservation remains held through the unlock. A deterministic
+regression inserts a successor at the unlock boundary and verifies that the old
+release cannot erase it, using native and process-scoped mappings.
+
 Remove the patch only after a released upstream version contains the equivalent
-reader ownership fix and passes these regressions. Do not replace it by removing
+reader ownership fixes and passes these regressions. Do not replace it by removing
 CLT's checkpoint pin or discarding the WAL.

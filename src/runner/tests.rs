@@ -3,6 +3,31 @@ use crate::test_support::*;
 use crate::tui::tests::tui_agent_project_for_test;
 use crate::worker::tests::reserve_test_inline_worker;
 
+#[cfg(unix)]
+#[test]
+fn reaped_automated_supervisor_exits_when_registry_recovery_is_required() {
+    for marker in ["recovery-required", "recovery-in-progress.json"] {
+        let root = temp_root("automated-supervisor-recovery-required");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join(marker), "recovery required").unwrap();
+        let state_dir = root.clone();
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            finalize_disconnected_automated_supervisor(&state_dir, 1, u32::MAX, "run", "holder");
+            tx.send(()).unwrap();
+        });
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("supervisor must exit instead of retrying recovery forever");
+        handle.join().unwrap();
+        assert!(!root.join(AGENT_DB_FILE).exists());
+        assert_eq!(
+            fs::read_to_string(root.join(marker)).unwrap(),
+            "recovery required"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
 #[test]
 fn agent_run_settings_only_read_the_complete_startup_header() {
     let root = temp_root("agent-run-settings");

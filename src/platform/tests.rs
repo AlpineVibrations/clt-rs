@@ -40,6 +40,35 @@ fn recovery_service_test_manifest(platform: AgentPlatform) -> serde_json::Value 
 }
 
 #[test]
+fn automatic_recovery_requires_known_dead_workers_and_guardians() {
+    let root = temp_root("agent-auto-recovery-processes");
+    let mut manifest = recovery_service_test_manifest(AgentPlatform::Macos);
+    manifest["tables"]["agent_workers"][0]["worker_pid"] = serde_json::json!(std::process::id());
+    assert!(ensure_agent_processes_stopped_for_recovery(&root, &manifest).is_err());
+    manifest["tables"]["agent_workers"][0]["worker_pid"] = serde_json::Value::Null;
+    assert!(
+        ensure_agent_processes_stopped_for_recovery(&root, &manifest)
+            .unwrap_err()
+            .to_string()
+            .contains("has not registered its PID")
+    );
+    manifest["tables"]["agent_workers"][0]["state"] = serde_json::json!("completed");
+    manifest["tables"]["session_controls"][0]["child_pid"] = serde_json::Value::Null;
+    manifest["tables"]["session_controls"][0]["interactive_holder"] = serde_json::json!(
+        interactive_guardian_holder(InteractiveGuardianDisposition::PreserveIdleSession)
+    );
+    assert!(
+        ensure_agent_processes_stopped_for_recovery(&root, &manifest)
+            .unwrap_err()
+            .to_string()
+            .contains("waiting for interactive guardian")
+    );
+    manifest["tables"]["session_controls"][0]["interactive_holder"] = serde_json::Value::Null;
+    ensure_agent_processes_stopped_for_recovery(&root, &manifest).unwrap();
+    assert!(!root.exists());
+}
+
+#[test]
 fn recovery_stops_loaded_linux_services_before_checking_processes_without_a_database() {
     let root = temp_root("agent-recovery-services-damaged-registry");
     fs::create_dir_all(&root).unwrap();

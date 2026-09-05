@@ -1310,56 +1310,48 @@ pub(super) fn finalize_disconnected_automated_supervisor(
 ) {
     let mut last_warning: Option<Instant> = None;
     loop {
-        let result = with_agent_store_at(state_dir, |store| {
-            store.finalize_reaped_automated_session_blocking(
-                project_id,
-                child_pid,
-                run_token,
-                lease_holder,
-                agent_lease_timeout()?.as_secs().max(60),
-            )
-        });
+        // The exact child group is already gone. A recovery marker requires
+        // exclusive maintenance, so leave its durable fences for recovery.
+        if let Err(error) = agent::recovery::check_required(state_dir) {
+            eprintln!("Automated supervisor stopped post-reap finalization: {error:#}");
+            return;
+        }
+        let result = (|| -> Result<bool> {
+            if with_agent_store_at(state_dir, |store| {
+                store.finalize_reaped_automated_session_blocking(
+                    project_id,
+                    child_pid,
+                    run_token,
+                    lease_holder,
+                    agent_lease_timeout()?.as_secs().max(60),
+                )
+            })? {
+                return Ok(true);
+            }
+            if with_agent_store_at(state_dir, |store| {
+                supervised_session_control(store, project_id, child_pid, run_token)
+            })?
+            .is_some()
+            {
+                return Ok(false);
+            }
+            with_agent_store_at(state_dir, |store| {
+                finalize_reaped_unregistered_agent_worker(
+                    store,
+                    project_id,
+                    run_token,
+                    lease_holder,
+                )
+            })
+        })();
         match result {
             Ok(true) => return,
-            Ok(false) => match with_agent_store_at(state_dir, |store| {
-                supervised_session_control(store, project_id, child_pid, run_token)
-            }) {
-                Ok(None) => {
-                    match with_agent_store_at(state_dir, |store| {
-                        finalize_reaped_unregistered_agent_worker(
-                            store,
-                            project_id,
-                            run_token,
-                            lease_holder,
-                        )
-                    }) {
-                        Ok(true) => return,
-                        Ok(false) => {}
-                        Err(error) => {
-                            let should_warn = last_warning
-                                .is_none_or(|warning| warning.elapsed() >= Duration::from_secs(5));
-                            if should_warn {
-                                eprintln!(
-                                    "Automated supervisor is retrying exact worker finalization after reaping Codex: {error:#}"
-                                );
-                                last_warning = Some(Instant::now());
-                            }
-                        }
-                    }
-                }
-                Ok(Some(_)) => {}
-                Err(error) => {
-                    let should_warn = last_warning
-                        .is_none_or(|warning| warning.elapsed() >= Duration::from_secs(5));
-                    if should_warn {
-                        eprintln!(
-                            "Automated supervisor is retrying its post-reap state check: {error:#}"
-                        );
-                        last_warning = Some(Instant::now());
-                    }
-                }
-            },
+            Ok(false) => {}
             Err(error) => {
+                if agent::recovery::check_required(state_dir).is_err() {
+                    eprintln!("Automated supervisor stopped post-reap finalization: {error:#}");
+                    return;
+                }
                 let should_warn =
                     last_warning.is_none_or(|warning| warning.elapsed() >= Duration::from_secs(5));
                 if should_warn {

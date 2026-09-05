@@ -972,6 +972,9 @@ pub(super) fn finish_interactive_guardian_after_reap(
     let mut last_warning: Option<Instant> = None;
 
     loop {
+        // The child has been reaped and terminal ownership restored. Exit so
+        // this store releases its access lock and exclusive recovery can run.
+        store.check_recovery_required()?;
         match store.finish_interactive_guardian_blocking(
             project_id,
             session_id,
@@ -988,6 +991,7 @@ pub(super) fn finish_interactive_guardian_after_reap(
                                 );
                             }
                             Err(error) => {
+                                store.check_recovery_required()?;
                                 let should_warn = last_warning.is_none_or(|warning| {
                                     warning.elapsed() >= Duration::from_secs(5)
                                 });
@@ -1038,6 +1042,7 @@ pub(super) fn finish_interactive_guardian_after_reap(
                     );
                 }
                 Err(error) => {
+                    store.check_recovery_required()?;
                     let should_warn = last_warning
                         .is_none_or(|warning| warning.elapsed() >= Duration::from_secs(5));
                     if should_warn {
@@ -1049,6 +1054,7 @@ pub(super) fn finish_interactive_guardian_after_reap(
                 }
             },
             Err(error) => {
+                store.check_recovery_required()?;
                 let should_warn =
                     last_warning.is_none_or(|warning| warning.elapsed() >= Duration::from_secs(5));
                 if should_warn {

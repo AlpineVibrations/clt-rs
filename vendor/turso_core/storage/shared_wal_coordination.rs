@@ -2141,6 +2141,17 @@ impl MappedSharedWalCoordination {
     /// thought we held it, which is a correctness bug in the coordination
     /// layer (see `repair_transient_state_for_exclusive_open`).
     pub(crate) fn unregister_reader(&self, slot: SharedReaderSlot) {
+        self.unregister_reader_with_unlock(slot, || {
+            self.file
+                .shared_wal_unlock_byte(
+                    Self::process_lock_offset_for_reader(slot.slot_index),
+                    self.lock_kind(),
+                )
+                .expect("failed to release shared WAL reader slot lock");
+        });
+    }
+
+    fn unregister_reader_with_unlock(&self, slot: SharedReaderSlot, unlock: impl FnOnce()) {
         let mut local = self.local_lock_state.lock();
         turso_assert!(
             local.reader_locks[slot.slot_index as usize] > 0,
@@ -2152,34 +2163,25 @@ impl MappedSharedWalCoordination {
             "reader slot released by non-owner",
             { "slot_index": slot.slot_index, "expected_owner": slot.owner.raw(), "current_owner": current_owner, "local_reader_count": local.reader_locks[slot.slot_index as usize] }
         );
-        if self.uses_linux_ofd_locking() {
-            self.file
-                .shared_wal_unlock_byte(
-                    Self::process_lock_offset_for_reader(slot.slot_index),
-                    self.lock_kind(),
-                )
-                .expect("failed to release shared WAL reader slot lock");
-        } else {
-            self.with_process_local_ownership(|entry| {
-                entry.unregister_reader(slot.slot_index, slot.owner)
-            });
-            self.release_supplemental_byte_lock(Self::process_lock_offset_for_reader(
-                slot.slot_index,
-            ));
-            Self::release_shared_owner_slot(
-                &self.reader_owners()[slot.slot_index as usize],
-                slot.owner,
-            );
-        }
-        local.reader_locks[slot.slot_index as usize] -= 1;
+        // Keep the byte lock until every shared field is retired. Otherwise a
+        // peer can reclaim and reuse this slot between unlock and cleanup,
+        // causing a non-owner panic or erasing the new reader's frame/bitmap.
+        Self::release_shared_owner_slot(
+            &self.reader_owners()[slot.slot_index as usize],
+            slot.owner,
+        );
         self.reader_frames()[slot.slot_index as usize]
             .store(UNUSED_READER_FRAME, Ordering::Release);
-        if self.uses_linux_ofd_locking() {
-            self.reader_owners()[slot.slot_index as usize].store(UNOWNED_LOCK, Ordering::Release);
-        }
         let word_idx = (slot.slot_index >> 6) as usize;
         let bit = slot.slot_index & 63;
         self.reader_bitmap_words()[word_idx].fetch_or(1u64 << bit, Ordering::Release);
+        unlock();
+        if !self.uses_linux_ofd_locking() {
+            self.with_process_local_ownership(|entry| {
+                entry.unregister_reader(slot.slot_index, slot.owner)
+            });
+        }
+        local.reader_locks[slot.slot_index as usize] -= 1;
     }
 
     /// Drop one snapshot-scoped reader reference, releasing the slot on the final ref.
@@ -3331,6 +3333,52 @@ mod tests {
             assert_eq!(mapped.min_active_reader_frame(), None);
             assert_eq!(mapped.find_frame(7, 0, 4, None), Some(2));
             assert_eq!(mapped.find_frame(9, 0, 4, None), Some(4));
+        }
+    }
+
+    #[test]
+    fn mapped_shared_wal_reader_release_preserves_a_peer_reusing_the_unlocked_slot() {
+        for process_scoped in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("coordination.tshm");
+            let mapped = if process_scoped {
+                create_process_scoped_mapping(&path)
+            } else {
+                create_mapping(&path)
+            };
+            let reader = mapped.register_reader(mapped.owner_record(), 4).unwrap();
+            let index = reader.slot_index as usize;
+            let mask = 1u64 << (reader.slot_index & 63);
+            let word = &mapped.reader_bitmap_words()[index >> 6];
+            let successor = SharedOwnerRecord::new(17, 23);
+
+            mapped.unregister_reader_with_unlock(reader, || {
+                // This is the last instant at which our OS lock excludes peers.
+                assert_eq!(mapped.reader_owner(reader.slot_index), None);
+                assert_eq!(
+                    mapped.reader_frames()[index].load(Ordering::Acquire),
+                    UNUSED_READER_FRAME
+                );
+                assert_ne!(word.load(Ordering::Acquire) & mask, 0);
+                mapped
+                    .file
+                    .shared_wal_unlock_byte(
+                        MappedSharedWalCoordination::process_lock_offset_for_reader(
+                            reader.slot_index,
+                        ),
+                        mapped.lock_kind(),
+                    )
+                    .unwrap();
+                // Deterministically model a different process reclaiming and
+                // registering the same slot immediately after the byte unlock.
+                word.fetch_and(!mask, Ordering::AcqRel);
+                mapped.reader_owners()[index].store(successor.raw(), Ordering::Release);
+                mapped.reader_frames()[index].store(9, Ordering::Release);
+            });
+
+            assert_eq!(mapped.reader_owner(reader.slot_index), Some(successor));
+            assert_eq!(mapped.reader_frames()[index].load(Ordering::Acquire), 9);
+            assert_eq!(word.load(Ordering::Acquire) & mask, 0);
         }
     }
 

@@ -1873,6 +1873,95 @@ fn reaped_guardian_releases_its_lease_when_the_session_row_disappeared() {
 }
 
 #[test]
+fn reaped_guardian_exits_for_registry_recovery_and_releases_database_access() {
+    for marker in ["recovery-required", "registry-dirty"] {
+        let root = temp_root("interactive-guardian-recovery-required");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project_id = store.list_projects_blocking().unwrap().remove(0).id;
+        let requester = InteractiveAgentLease::holder_for_idle_session();
+        let guardian =
+            interactive_guardian_holder(InteractiveGuardianDisposition::PreserveIdleSession);
+        assert!(
+            store
+                .try_acquire_lease_blocking(project_id, &requester, "100", "9999999999")
+                .unwrap()
+        );
+        assert!(
+            store
+                .reserve_idle_session_interactive_blocking(
+                    project_id,
+                    "session-123",
+                    &requester,
+                    None
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .adopt_interactive_guardian_blocking(
+                    project_id,
+                    Some("session-123"),
+                    &requester,
+                    &guardian,
+                    60
+                )
+                .unwrap()
+        );
+        let snapshot = fs::read(state_dir.join("registry.json")).unwrap();
+        fs::write(state_dir.join(marker), "shared WAL ownership failure").unwrap();
+        let expected_guardian = guardian.clone();
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let result = finish_interactive_guardian_after_reap(
+                &store,
+                project_id,
+                "session-123",
+                &guardian,
+                Duration::from_secs(60),
+                InteractiveGuardianDisposition::PreserveIdleSession,
+            );
+            drop(store);
+            tx.send(result).unwrap();
+        });
+        let error = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("guardian must exit instead of retrying recovery forever")
+            .unwrap_err();
+        handle.join().unwrap();
+        assert!(format!("{error:#}").contains("recovery required"));
+        assert_eq!(fs::read(state_dir.join("registry.json")).unwrap(), snapshot);
+        // Exclusive repair now succeeds, proving the guardian dropped its store.
+        agent::recovery::recover_registry(&state_dir).unwrap();
+        let reopened = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        let control = reopened
+            .session_control_blocking(project_id, "session-123")
+            .unwrap()
+            .unwrap();
+        assert_eq!(control.state, AgentSessionControlState::Interactive);
+        assert_eq!(
+            control.interactive_holder.as_deref(),
+            Some(expected_guardian.as_str())
+        );
+        assert_eq!(
+            reopened
+                .lease_for_project_blocking(project_id)
+                .unwrap()
+                .unwrap()
+                .holder,
+            expected_guardian
+        );
+        drop(reopened);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
 fn stale_stopped_guardian_recovery_restores_the_stopped_generation() {
     let root = temp_root("interactive-guardian-restore-stopped");
     let state_dir = root.join("state/clt");

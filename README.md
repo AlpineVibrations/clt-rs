@@ -281,7 +281,9 @@ Worker startup and heartbeat records are fenced and bounded. If a worker fails b
 
 Worker launch contracts are versioned. A newer scheduler can recover older persisted contracts, while an older scheduler leaves an unknown newer worker untouched. If a future database migration cannot safely coexist with pinned workers, it is deferred: status and task controls remain available, and the scheduler continues crash recovery in compatibility mode until those workers finish.
 
-`clt agent stop` does not open the database, so it remains available when Turso is unhealthy. For a shared-WAL ownership or frame-index failure, CLT records a recovery-required state and stops scheduling database retries. Close other CLT TUIs and foreground sessions, then run:
+`clt agent stop` does not open the database, so it remains available when Turso is unhealthy. For a shared-WAL ownership or frame-index failure, CLT records a recovery-required state and stops scheduling database retries. Once their Codex process groups have been reaped, interactive guardians and disconnected automated supervisors also exit instead of retrying finalization indefinitely; they preserve the session and lease records for recovery.
+
+On the next registry open (including a TUI refresh or service restart), CLT automatically repairs coordination files when it can acquire exclusive database access and prove that recorded workers and session processes have exited. It preserves the original DB/WAL bundle and requires an integrity check before resuming normal access. Automatic repair never stops another process or rebuilds the database from a snapshot. An interrupted registry update, an unfinished repair, or a failed integrity check requires explicit recovery. Close other CLT TUIs and foreground sessions, then run:
 
 ```bash
 clt agent recover

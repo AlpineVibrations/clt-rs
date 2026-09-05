@@ -439,13 +439,66 @@ pub(crate) fn recover_registry_with(
     state_dir: &Path,
     stop_services: impl Fn(&Json) -> Result<()>,
 ) -> Result<RecoveryReport> {
+    recover_registry_with_policy(state_dir, stop_services, false)
+}
+
+/// Opportunistic repair on a fresh open, after all unhealthy handles are gone.
+/// Never stop processes or reconstruct the database from a snapshot here.
+pub(crate) fn recover_registry_automatically(state_dir: &Path) -> Result<()> {
+    if check_required(state_dir).is_ok() {
+        return Ok(());
+    }
+    let result = recover_registry_with_policy(
+        state_dir,
+        |manifest| {
+            crate::platform::ensure_agent_processes_stopped_for_recovery(state_dir, manifest)
+        },
+        true,
+    );
+    match result {
+        Ok(report) => {
+            eprintln!(
+                "Automatically recovered agent registry coordination; integrity check passed. Original database bundle retained at {}",
+                report.quarantine.display()
+            );
+            Ok(())
+        }
+        // Another opener may have finished recovery before we acquired access.
+        Err(_) if check_required(state_dir).is_ok() => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn recover_registry_with_policy(
+    state_dir: &Path,
+    stop_services: impl Fn(&Json) -> Result<()>,
+    automatic: bool,
+) -> Result<RecoveryReport> {
     if let Some(manifest) = read_snapshot(state_dir)? {
         stop_services(&manifest)?;
     }
     let _access = RegistryAccess::exclusive(state_dir)?;
     let _writer = write_lock(state_dir)?;
-    let legacy = lock_legacy_users(state_dir)?;
     let snapshot = read_snapshot(state_dir)?;
+    if automatic {
+        anyhow::ensure!(
+            check_required(state_dir).is_err(),
+            "Registry already recovered"
+        );
+        anyhow::ensure!(
+            snapshot.is_some(),
+            "Automatic recovery requires an external registry snapshot; run clt agent recover"
+        );
+        anyhow::ensure!(
+            !state_dir.join(DIRTY_FILE).exists(),
+            "An interrupted registry update requires manual recovery; run clt agent recover"
+        );
+        anyhow::ensure!(
+            !state_dir.join("recovery-in-progress.json").exists(),
+            "A previous registry repair did not finish; run clt agent recover"
+        );
+    }
+    let legacy = lock_legacy_users(state_dir)?;
     if let Some(manifest) = &snapshot {
         // Reload under the exclusive fence: a worker may have registered during
         // the initial drain, and no new DB user can now race this final check.
@@ -489,6 +542,11 @@ pub(crate) fn recover_registry_with(
     let mut rebuilt_registry = false;
     if let Err(coordination_error) = attempt() {
         restore_bundle(state_dir, &quarantine)?;
+        anyhow::ensure!(
+            !automatic,
+            "Automatic coordination repair failed ({coordination_error:#}); original DB/WAL restored and retained at {}. Run clt agent recover for explicit reconstruction.",
+            quarantine.display()
+        );
         anyhow::ensure!(
             !dirty,
             "Coordination rebuild failed ({coordination_error:#}). The last external snapshot may predate an interrupted Git transition; refusing to reconstruct finalization. Original DB/WAL retained at {}",
