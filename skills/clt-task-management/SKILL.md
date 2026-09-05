@@ -48,7 +48,7 @@ A dirty worktree is expected in shared repositories where a person, an interacti
 
 The shared Git index is different from the shared worktree: it is a cooperative ownership boundary during automated finalization. People, interactive sessions, and parallel tools must not stage or unstage changes while the active automated task owns the index. CLT can detect many unexpected index/baseline changes, but Git cannot identify which actor staged a new clean-file change.
 
-A Todo or other task-board edit added after the automated run starts may remain unstaged. Preserve it and continue finalization: CLT's exact staged-tree proof excludes that concurrent board work from the sealed task commit. Stage only the selected task's status transition, its explicit blocked follow-up, or related hunks; never use a whole-board add when it would absorb the concurrent edit.
+A Todo or other task-board edit added after the automated run starts may remain unstaged. Preserve it and continue finalization: CLT's exact staged-tree proof excludes that concurrent board work from the sealed task commit. Stage only the selected task's status transition, its explicit follow-up, or related hunks; never use a whole-board add when it would absorb the concurrent edit.
 
 ## Core Workflow
 The agent must adhere to the following state transition pipeline:
@@ -134,7 +134,7 @@ clt done doing <index>
 
 In an automated Git-enabled run, use this command only after the implementation and completion note are verified, all file-mutating formatters/hooks have run, and the implementation plus active Doing task have been staged and inspected. CLT projects the selected task's Done move and seals the exact resulting full repository tree, then treats the worktree's Done entry as provisional until Git finalization succeeds. Stage only the resulting board transition and include it in the same task commit. If a later commit hook changes or rejects files, stage the complete correction, list Done to confirm its current index, and run `clt done done <index>` to reseal the provisional entry before retrying that one commit.
 
-### Independent failures and blocked follow-ups
+### Independent failures and follow-ups
 
 A failed command does not automatically mean the implementation is blocked. First establish whether the task's acceptance criteria are satisfied and its relevant checks pass. For a separate pre-existing or environment-only failure, reproduce the same failure on the frozen starting revision in an isolated directory, without switching or resetting the active checkout. Record the revision, commands, matching failure, passing task checks, and what is needed to unblock the independent work. If acceptance or independence is uncertain, keep the original task blocked and do not commit incomplete work.
 
@@ -142,12 +142,14 @@ When the original task is complete, record the independent work with:
 
 ```bash
 clt list doing
-clt follow-up doing <index> "Repair independent test harness" --blocked "Failure evidence; starting revision and reproduction; required environment or fix"
+clt follow-up doing <index> "Fix existing lint warnings" --evidence "Failure evidence; starting revision and reproduction; remaining work"
 ```
 
-The command appends one blocked Doing task with a `clt-follow-up:<parent-session-id>` reference. It preserves the parent and existing board order, does not attach the parent's `codex:` marker, and does not start another task or session. Repeating the same command is safe; edit an existing follow-up instead of creating duplicates. This command requires a session-linked Doing parent. Record only the independent remaining work, never the parent's unfinished acceptance criteria.
+The command queues one actionable Todo task with a `clt-follow-up:<parent-session-id>` reference. It preserves the parent and existing board order, does not attach the parent's `codex:` marker, and does not start another task or session. Repeating the same command is safe; edit an existing follow-up instead of creating duplicates. This command requires a session-linked Doing parent. Record only the independent remaining work, never the parent's unfinished acceptance criteria.
 
-Add a COMPLETED note to the original task with the follow-up reference and validation evidence. In automated Git mode, stage the linked follow-up together with the verified implementation and original Doing task before `clt done`; include all of them and the resulting Done move in the one sealed commit. CLT permits that linked addition while continuing to reject unrelated staged board edits. If a hook requires corrections, include the complete payload when resealing. Stop after finalizing the original task; the blocked follow-up is left for a later recovery run with its own session.
+Add a COMPLETED note to the original task with the follow-up reference and validation evidence. In automated Git mode, stage the linked follow-up together with the verified implementation and original Doing task before `clt done`; include all of them and the resulting Done move in the one sealed commit. CLT permits that linked addition while continuing to reject unrelated staged board edits. If a hook requires corrections, include the complete payload when resealing. Stop after finalizing the original task; the queued follow-up is eligible for a fresh Todo run with its own session and Git start journal. Report the parent as completed with follow-up work queued, not as a failed or blocked run.
+
+Only add `--blocked "Unavailable dependency or input; what restores it"` when an actual obstacle prevents starting the follow-up; this records it as blocked in Doing for later recovery. Ordinary implementation work, pre-existing warnings, and bugs that the follow-up itself should fix are actionable Todo work, not blockers.
 
 ### 5. Deleting Tasks
 Remove a task that is no longer relevant.
@@ -172,7 +174,7 @@ clt delete <status> <index>
 - **Provisional Done Entries**: A task's physical presence in the Done store is not terminal while CLT reports it as `FINALIZING` or `PUSH-PENDING`. Do not move it backward after a successful local commit. Recovery verifies existing Git state and rolls forward, including when the commit was created or CLT's publication succeeded immediately before a crash.
 - **Missing Journals Fail Closed**: If completed-task evidence survives but its frozen start journal is lost, do not reconstruct or commit from memory. CLT refuses to guess the exact-one-commit boundary; preserve the checkout and report the recovery error.
 - **Blocked Working Backoff**: A durably blocked task may retain its `WORKING` journal while recovery backs off. CLT can run another ready Todo during that interval without discarding the blocked task's session or history, and it skips startup sync to keep the older proof boundary reachable. `FINALIZING` and `PUSH-PENDING` never yield to later project work.
-- **Independent Failures**: Use `clt follow-up` when acceptance is satisfied and a separate failure is evidenced as pre-existing or environment-only. Commit the verified original task and linked blocked follow-up together; never leave finished implementation uncommitted solely because that independent failure remains. Do not work on the follow-up in the same run.
+- **Independent Failures**: Use `clt follow-up` when acceptance is satisfied and a separate failure is evidenced as pre-existing or environment-only. Commit the verified original task and linked follow-up together; never leave finished implementation uncommitted solely because that independent failure remains. Do not work on the follow-up in the same run.
 - **Blocked Notes**: If a task cannot be completed safely, add `BLOCKED YYYY-MM-DD:` followed by the blocker, what was attempted, and what is needed to continue. Do not move a blocked task to `done`; preserve its current status unless the user or project policy directs another transition. Normal automated selection skips a blocked task even when it remains in `todo`.
 - **Unblocked Notes**: When a recorded blocker is resolved but the task still needs the normal Todo workflow, add `UNBLOCKED YYYY-MM-DD:` with the resolution and move the same task to `todo`. The automated scheduler treats the latest dated `BLOCKED`, `UNBLOCKED`, or `COMPLETED` state note as current, so blocker history can remain in the task.
 - **Atomic Transitions**: Only move one task to `doing` at a time to maintain focus and clear project state.

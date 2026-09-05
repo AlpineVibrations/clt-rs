@@ -1,6 +1,186 @@
-use crate::task::blocked_follow_up_session;
+use crate::task::follow_up_session;
 use crate::test_support::prelude::*;
 use crate::test_support::*;
+
+#[test]
+fn actionable_follow_up_is_committed_and_can_start_a_fresh_git_run() {
+    for folders in [false, true] {
+        let root = temp_root("git-todo-follow-up");
+        let project_root = root.join("project");
+        let state_dir = root.join("state");
+        init_tasks(&project_root, folders).unwrap();
+        let board = TaskBoard::for_project(&project_root);
+        board
+            .insert_content(
+                TaskStatus::Doing,
+                None,
+                "Implement feature codex:parent-session",
+            )
+            .unwrap();
+        initialize_test_git_repository(&project_root);
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        store
+            .set_project_git_mode_for_path_blocking(&project_root, AgentGitMode::Commit)
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        store
+            .mark_session_running_blocking(
+                project.id,
+                "parent-session",
+                123,
+                "parent-run",
+                &root.join("out"),
+                &root.join("err"),
+            )
+            .unwrap();
+        let start = capture_agent_git_start_state(&project_root, AgentGitMode::Commit).unwrap();
+        ensure_agent_git_working_record(
+            &store,
+            &project,
+            "parent-session",
+            "parent-run",
+            Some(&start),
+        )
+        .unwrap();
+        bind_agent_git_working_task_identity(&store, &project, "parent-session", "parent-run")
+            .unwrap();
+        let workflow = ManagedTaskWorkflow::new(&project_root);
+        for _ in 0..2 {
+            assert_eq!(
+                workflow
+                    .add_follow_up(
+                        TaskStatus::Doing,
+                        "1",
+                        "Fix existing lint warnings.",
+                        "Same failure on starting revision; feature checks pass",
+                        None
+                    )
+                    .unwrap(),
+                TaskStatus::Todo
+            );
+        }
+        assert_eq!(board.entries(TaskStatus::Todo).unwrap().len(), 1);
+        let follow_up = board.entry(TaskStatus::Todo, 1).unwrap();
+        assert_eq!(
+            follow_up_session(&follow_up.content),
+            Some("parent-session")
+        );
+        assert!(!task_entry_is_blocked(&follow_up));
+        assert!(
+            workflow
+                .add_follow_up(
+                    TaskStatus::Doing,
+                    "1",
+                    "Duplicate follow-up.",
+                    "Evidence",
+                    Some("No runtime")
+                )
+                .is_err()
+        );
+
+        let parent = board.entry(TaskStatus::Doing, 1).unwrap();
+        board.write_entry_content(TaskStatus::Doing, &parent, "Implement feature — COMPLETED 2026-09-05: verified; lint cleanup queued codex:parent-session").unwrap();
+        fs::write(project_root.join("feature.txt"), "implemented\n").unwrap();
+        run_test_git(&project_root, &["add", "feature.txt", "tasks"]);
+        // Preserve an unrelated Todo added after the task payload was staged.
+        board
+            .insert_content(TaskStatus::Todo, None, "Concurrent human task")
+            .unwrap();
+        let context = AutomatedAgentChildContext {
+            project_id: project.id,
+            run_token: "parent-run".to_string(),
+        };
+        move_task_to_done_with_agent_store(&project_root, TaskStatus::Doing, "1", &context, &store)
+            .unwrap();
+        let paths = if folders {
+            ["tasks/doing", "tasks/done"]
+        } else {
+            ["tasks/doing.md", "tasks/done.md"]
+        };
+        run_test_git(&project_root, &["add", "--", paths[0], paths[1]]);
+        run_test_agent_git(
+            &project_root,
+            &[
+                "commit",
+                "-m",
+                "Implement feature and queue lint cleanup",
+                "-m",
+                "CLT-Task: codex:parent-session",
+            ],
+        );
+        let sealed = store
+            .git_finalization_blocking(project.id, "parent-session")
+            .unwrap()
+            .unwrap();
+        let completed = reconcile_agent_git_finalization(
+            &store,
+            &project_root,
+            sealed,
+            Some("parent-run"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(completed.state, GitFinalizationState::Completed);
+        let entries = git_ref_task_entries(&project_root, "HEAD").unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.status == "todo"
+                    && follow_up_session(&entry.content) == Some("parent-session"))
+                .count(),
+            1
+        );
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| entry.content.contains("Concurrent human task"))
+        );
+        let scan = scan_agent_project(&project_root);
+        assert_eq!(scan.blocked_task_count(), 0);
+        assert!(scan.has_pending_task());
+        assert_eq!(
+            automated_codex_session_to_resume(&project_root, AgentTaskSelection::NextTodo).unwrap(),
+            None
+        );
+
+        // This previously failed as RecoverBlocked because the new task has no journal.
+        let next_start = prepare_agent_git_start_state_for_run(
+            &store,
+            &project,
+            AgentTaskSelection::NextTodo,
+            false,
+            false,
+            "follow-up-run",
+        )
+        .unwrap()
+        .unwrap();
+        assert_ne!(next_start.starting_head, start.starting_head);
+        move_task(&project_root, TaskStatus::Todo, TaskStatus::Doing, "1").unwrap();
+        assert!(
+            attach_codex_session_to_active_task(
+                &project_root,
+                AgentTaskSelection::NextTodo,
+                &[],
+                &[],
+                "follow-up-session"
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            task_status_for_codex_session(&project_root, "parent-session").unwrap(),
+            Some(TaskStatus::Done)
+        );
+        assert_eq!(
+            task_status_for_codex_session(&project_root, "follow-up-session").unwrap(),
+            Some(TaskStatus::Doing)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+}
 
 #[test]
 fn blocked_follow_up_is_sealed_resealable_and_recoverable_in_both_board_formats() {
@@ -72,11 +252,12 @@ fn blocked_follow_up_is_sealed_resealable_and_recoverable_in_both_board_formats(
         };
         assert!(blocked_recovery_made_no_progress(&recovery_job));
         ManagedTaskWorkflow::new(&project_root)
-            .add_blocked_follow_up(
+            .add_follow_up(
                 TaskStatus::Doing,
                 "1",
                 "Repair GPU harness.",
                 "GPU harness fails identically at starting revision; requires working GPU runtime",
+                Some("GPU harness fails identically at starting revision; requires working GPU runtime"),
             )
             .unwrap();
         let preserved = board.entry(TaskStatus::Doing, 2).unwrap();
@@ -182,7 +363,7 @@ fn blocked_follow_up_is_sealed_resealable_and_recoverable_in_both_board_formats(
             entries
                 .iter()
                 .filter(|entry| entry.status == "doing"
-                    && blocked_follow_up_session(&entry.content) == Some("session-follow-up"))
+                    && follow_up_session(&entry.content) == Some("session-follow-up"))
                 .count(),
             1
         );
@@ -239,132 +420,158 @@ fn blocked_follow_up_is_sealed_resealable_and_recoverable_in_both_board_formats(
 #[test]
 fn follow_up_allowance_preserves_exact_board_scope() {
     for folders in [false, true] {
-        for mutation in [
-            "unrelated",
-            "unblocked",
-            "wrong-parent",
-            "duplicate-session",
-            "header",
-            "existing",
-            "attachment",
-            "symlink",
-        ] {
-            let root = temp_root("follow-up-scope");
-            init_tasks(&root, folders).unwrap();
-            let board = TaskBoard::for_project(&root);
-            board
-                .insert_content(
-                    TaskStatus::Doing,
-                    None,
-                    "Finish feature codex:session-scope",
-                )
-                .unwrap();
-            board
-                .insert_content(TaskStatus::Doing, None, "Existing task")
-                .unwrap();
-            initialize_test_git_repository(&root);
-            let parent = run_test_git(&root, &["rev-parse", "HEAD"]);
-            let identity = durable_task_identity("Finish feature").unwrap();
-            let scope = agent_git_task_scope_without_selected(&root, &parent, &identity).unwrap();
-            let selected = board.entry(TaskStatus::Doing, 1).unwrap();
-            board
-                .write_entry_content(
-                    TaskStatus::Doing,
-                    &selected,
-                    "Finish feature — COMPLETED 2026-09-04: verified codex:session-scope",
-                )
-                .unwrap();
-            ManagedTaskWorkflow::new(&root)
-                .add_blocked_follow_up(
-                    TaskStatus::Doing,
-                    "1",
-                    "Repair harness.",
-                    "baseline failure; requires runtime",
-                )
-                .unwrap();
-            match mutation {
-                "unrelated" => board
-                    .insert_content(TaskStatus::Todo, None, "Unrelated addition")
-                    .unwrap(),
-                "header" => {
-                    fs::write(root.join("tasks/unrelated.txt"), "extra board payload\n").unwrap()
-                }
-                "attachment" if folders => {
-                    let follow_up = board.entry(TaskStatus::Doing, 3).unwrap();
-                    let TaskSource::Path { path, .. } = follow_up.source else {
-                        unreachable!()
-                    };
-                    fs::remove_file(&path).unwrap();
-                    fs::create_dir(&path).unwrap();
-                    fs::write(path.join("task.md"), follow_up.content).unwrap();
-                    fs::write(path.join("attachment.txt"), "unsealed attachment").unwrap();
-                }
-                "attachment" => fs::write(
-                    root.join("tasks/doing.md"),
-                    format!(
-                        "{}\nExtra footer\n",
-                        fs::read_to_string(root.join("tasks/doing.md")).unwrap()
-                    ),
-                )
-                .unwrap(),
-                "symlink" => {
-                    #[cfg(unix)]
-                    if folders {
-                        let follow_up = board.entry(TaskStatus::Doing, 3).unwrap();
+        for blocked in [false, true] {
+            let follow_up_status = if blocked {
+                TaskStatus::Doing
+            } else {
+                TaskStatus::Todo
+            };
+            let follow_up_index = if blocked { 3 } else { 1 };
+            for mutation in [
+                "unrelated",
+                "wrong-state",
+                "second-follow-up",
+                "wrong-parent",
+                "duplicate-session",
+                "header",
+                "existing",
+                "attachment",
+                "symlink",
+            ] {
+                let root = temp_root("follow-up-scope");
+                init_tasks(&root, folders).unwrap();
+                let board = TaskBoard::for_project(&root);
+                board
+                    .insert_content(
+                        TaskStatus::Doing,
+                        None,
+                        "Finish feature codex:session-scope",
+                    )
+                    .unwrap();
+                board
+                    .insert_content(TaskStatus::Doing, None, "Existing task")
+                    .unwrap();
+                initialize_test_git_repository(&root);
+                let parent = run_test_git(&root, &["rev-parse", "HEAD"]);
+                let identity = durable_task_identity("Finish feature").unwrap();
+                let scope =
+                    agent_git_task_scope_without_selected(&root, &parent, &identity).unwrap();
+                let selected = board.entry(TaskStatus::Doing, 1).unwrap();
+                board
+                    .write_entry_content(
+                        TaskStatus::Doing,
+                        &selected,
+                        "Finish feature — COMPLETED 2026-09-04: verified codex:session-scope",
+                    )
+                    .unwrap();
+                ManagedTaskWorkflow::new(&root)
+                    .add_follow_up(
+                        TaskStatus::Doing,
+                        "1",
+                        "Repair harness.",
+                        "baseline failure; requires runtime",
+                        blocked.then_some("baseline failure; requires runtime"),
+                    )
+                    .unwrap();
+                match mutation {
+                    "second-follow-up" => board
+                        .insert_content(
+                            TaskStatus::Todo,
+                            None,
+                            "Another follow-up clt-follow-up:session-scope",
+                        )
+                        .unwrap(),
+                    "unrelated" => board
+                        .insert_content(TaskStatus::Todo, None, "Unrelated addition")
+                        .unwrap(),
+                    "header" => {
+                        fs::write(root.join("tasks/unrelated.txt"), "extra board payload\n")
+                            .unwrap()
+                    }
+                    "attachment" if folders => {
+                        let follow_up = board.entry(follow_up_status, follow_up_index).unwrap();
                         let TaskSource::Path { path, .. } = follow_up.source else {
                             unreachable!()
                         };
-                        // A link to otherwise valid text must not widen the file allowance.
-                        let target = root.join("linked.txt");
-                        fs::write(&target, follow_up.content).unwrap();
                         fs::remove_file(&path).unwrap();
-                        std::os::unix::fs::symlink(target, &path).unwrap();
-                    } else {
+                        fs::create_dir(&path).unwrap();
+                        fs::write(path.join("task.md"), follow_up.content).unwrap();
+                        fs::write(path.join("attachment.txt"), "unsealed attachment").unwrap();
+                    }
+                    "attachment" => fs::write(
+                        root.join("tasks/doing.md"),
+                        format!(
+                            "{}\nExtra footer\n",
+                            fs::read_to_string(root.join("tasks/doing.md")).unwrap()
+                        ),
+                    )
+                    .unwrap(),
+                    "symlink" => {
+                        #[cfg(unix)]
+                        if folders {
+                            let follow_up = board.entry(follow_up_status, follow_up_index).unwrap();
+                            let TaskSource::Path { path, .. } = follow_up.source else {
+                                unreachable!()
+                            };
+                            // A link to otherwise valid text must not widen the file allowance.
+                            let target = root.join("linked.txt");
+                            fs::write(&target, follow_up.content).unwrap();
+                            fs::remove_file(&path).unwrap();
+                            std::os::unix::fs::symlink(target, &path).unwrap();
+                        } else {
+                            board
+                                .insert_content(TaskStatus::Todo, None, "Unrelated task")
+                                .unwrap();
+                        }
+                        #[cfg(not(unix))]
                         board
                             .insert_content(TaskStatus::Todo, None, "Unrelated task")
                             .unwrap();
                     }
-                    #[cfg(not(unix))]
-                    board
-                        .insert_content(TaskStatus::Todo, None, "Unrelated task")
-                        .unwrap();
+                    _ => {
+                        let (status, index) = if mutation == "existing" {
+                            (TaskStatus::Doing, 2)
+                        } else {
+                            (follow_up_status, follow_up_index)
+                        };
+                        let entry = board.entry(status, index).unwrap();
+                        let replacement = match mutation {
+                            "wrong-state" if !blocked => {
+                                "Repair harness — BLOCKED 2026-09-04: failure clt-follow-up:session-scope"
+                            }
+                            "wrong-state" => {
+                                "Repair harness — UNBLOCKED 2026-09-04: ready clt-follow-up:session-scope"
+                            }
+                            "wrong-parent" => {
+                                "Repair harness — BLOCKED 2026-09-04: failure clt-follow-up:other-session"
+                            }
+                            "duplicate-session" => {
+                                "Repair harness — BLOCKED 2026-09-04: failure clt-follow-up:session-scope codex:session-scope"
+                            }
+                            "existing" => "Rewritten existing task",
+                            _ => unreachable!(),
+                        };
+                        board
+                            .write_entry_content(status, &entry, replacement)
+                            .unwrap();
+                    }
                 }
-                _ => {
-                    let index = if mutation == "existing" { 2 } else { 3 };
-                    let entry = board.entry(TaskStatus::Doing, index).unwrap();
-                    let replacement = match mutation {
-                        "unblocked" => {
-                            "Repair harness — UNBLOCKED 2026-09-04: ready clt-follow-up:session-scope"
-                        }
-                        "wrong-parent" => {
-                            "Repair harness — BLOCKED 2026-09-04: failure clt-follow-up:other-session"
-                        }
-                        "duplicate-session" => {
-                            "Repair harness — BLOCKED 2026-09-04: failure clt-follow-up:session-scope codex:session-scope"
-                        }
-                        "existing" => "Rewritten existing task",
-                        _ => unreachable!(),
-                    };
-                    board
-                        .write_entry_content(TaskStatus::Doing, &entry, replacement)
-                        .unwrap();
-                }
+                run_test_git(&root, &["add", "tasks"]);
+                let staged = run_test_git(&root, &["write-tree"]);
+                assert!(
+                    project_agent_git_completed_tree(
+                        &root,
+                        &staged,
+                        "session-scope",
+                        &identity,
+                        &parent,
+                        &scope
+                    )
+                    .is_err(),
+                    "accepted {mutation} with folders={folders}, blocked={blocked}"
+                );
+                fs::remove_dir_all(root).unwrap();
             }
-            run_test_git(&root, &["add", "tasks"]);
-            let staged = run_test_git(&root, &["write-tree"]);
-            assert!(
-                project_agent_git_completed_tree(
-                    &root,
-                    &staged,
-                    "session-scope",
-                    &identity,
-                    &parent,
-                    &scope
-                )
-                .is_err(),
-                "accepted {mutation} with folders={folders}"
-            );
-            fs::remove_dir_all(root).unwrap();
         }
     }
 }

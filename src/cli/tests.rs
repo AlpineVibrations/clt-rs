@@ -47,6 +47,43 @@ fn no_args_still_parse_to_default_tui_path() {
 }
 
 #[test]
+fn follow_up_requires_evidence_and_blocking_is_explicit() {
+    let args = [
+        "clt",
+        "follow-up",
+        "doing",
+        "1",
+        "Fix existing lint warnings",
+    ];
+    assert!(Cli::try_parse_from(args).is_err());
+    let cli = Cli::try_parse_from(
+        args.into_iter()
+            .chain(["--evidence", "Baseline lint failure"]),
+    )
+    .unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Commands::FollowUp {
+            evidence: Some(_),
+            blocked: None,
+            ..
+        })
+    ));
+
+    // Existing agents using --blocked still record an explicit blocked follow-up.
+    let cli =
+        Cli::try_parse_from(args.into_iter().chain(["--blocked", "GPU unavailable"])).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Commands::FollowUp {
+            evidence: None,
+            blocked: Some(_),
+            ..
+        })
+    ));
+}
+
+#[test]
 fn shell_init_command_and_cwd_handoff_flag_parse() {
     let cli =
         Cli::try_parse_from(["clt", "--cwd-file", "/tmp/clt-cwd", "shell-init", "zsh"]).unwrap();

@@ -8,8 +8,12 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 Use this section while developing the next release.
 
+## [0.6.5] - 2026-09-05
+
 ### Fixed
 
+- Queue actionable follow-ups in Todo with clear scheduling guidance, reserving blocked Doing follow-ups for explicit obstacles. Ordinary cleanup work can start with its own Git journal instead of repeatedly failing interrupted-task recovery.
+- Allow a verified task commit to include its linked Todo follow-up, including on an otherwise empty folder-backed board, while preserving unrelated task content and commit checks.
 - Resolve both registered and requested project paths during orphan Git journal recovery, so macOS path aliases do not block cleanup or scheduling the next task.
 - Select and reveal the newly completed task at the top of Done when moving it in the TUI, including when the Done list was scrolled down.
 - Recognize Shift+M when terminals report lowercase `m` with a Shift modifier, so the Models page opens and closes consistently from Tasks and Agent Projects while plain `m` still cycles the project model.
@@ -157,7 +161,8 @@ Use this section while developing the next release.
 - Fixed task moves so destination write failures do not remove the source task.
 - Fixed TUI navigation on empty boards.
 
-[Unreleased]: https://github.com/AlpineVibrations/clt-rs/compare/v0.6.2...HEAD
+[Unreleased]: https://github.com/AlpineVibrations/clt-rs/compare/v0.6.5...HEAD
+[0.6.5]: https://github.com/AlpineVibrations/clt-rs/releases/tag/v0.6.5
 [0.6.2]: https://github.com/AlpineVibrations/clt-rs/releases/tag/v0.6.2
 [0.6.1]: https://github.com/AlpineVibrations/clt-rs/releases/tag/v0.6.1
 [0.6.0]: https://github.com/AlpineVibrations/clt-rs/releases/tag/v0.6.0

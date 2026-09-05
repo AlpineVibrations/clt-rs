@@ -641,6 +641,61 @@ fn agent_unregister_preserves_registration_and_bound_or_sealed_git_proof() {
 }
 
 #[test]
+fn follow_up_queues_actionable_work_and_explains_that_parent_can_finish() {
+    for folders in [false, true] {
+        let workspace = TestWorkspace::new("todo-follow-up");
+        assert_success(&workspace.run(if folders {
+            &["init", "--folders"]
+        } else {
+            &["init"]
+        }));
+        assert_success(&workspace.run(&["add", "Implement feature. codex:parent-session"]));
+        assert_success(&workspace.run(&["status", "todo", "1", "doing"]));
+        let (parent_before, _) = assert_success(&workspace.run(&["list", "doing"]));
+        let arguments = [
+            "follow-up",
+            "doing",
+            "1",
+            "Fix existing lint warnings.",
+            "--evidence",
+            "Same diagnostics on starting revision abc123; feature tests pass",
+        ];
+        for _ in 0..2 {
+            let (stdout, stderr) = assert_success(&workspace.run(&arguments));
+            assert!(
+                stdout.contains("Follow-up queued in Todo for a future run"),
+                "{stdout}"
+            );
+            assert!(
+                stdout.contains("Finish the parent task normally"),
+                "{stdout}"
+            );
+            assert!(stderr.is_empty());
+        }
+        let (doing, _) = assert_success(&workspace.run(&["list", "doing"]));
+        assert_eq!(doing, parent_before);
+        let (todo, _) = assert_success(&workspace.run(&["list", "todo"]));
+        assert!(todo.contains("1. Fix existing lint warnings."));
+        assert!(!todo.contains("2."));
+        let path = if folders {
+            fs::read_dir(workspace.path().join("tasks/todo"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path()
+        } else {
+            workspace.path().join("tasks/todo.md")
+        };
+        let content = fs::read_to_string(path).unwrap();
+        assert!(content.contains("Same diagnostics on starting revision abc123"));
+        assert!(content.trim_end().ends_with("clt-follow-up:parent-session"));
+        assert!(!content.contains("BLOCKED "));
+        assert!(!content.contains("codex:"));
+    }
+}
+
+#[test]
 fn follow_up_records_one_blocked_doing_task_without_reusing_parent_session() {
     for folders in [false, true] {
         let workspace = TestWorkspace::new("follow-up");

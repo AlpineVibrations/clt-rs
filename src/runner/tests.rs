@@ -644,6 +644,13 @@ fn agent_codex_prompt_follows_git_mode() {
     assert!(base_prompt.contains("do not create a goal when `/goal` appears anywhere except"));
     assert!(base_prompt.contains("the goal objective is missing"));
     assert!(base_prompt.contains("skip tasks whose latest dated state note is `BLOCKED"));
+    assert!(
+        base_prompt
+            .contains("--evidence \"Failure evidence, baseline comparison, and remaining work\"")
+    );
+    assert!(base_prompt.contains("queues one linked Todo task for a fresh run"));
+    assert!(base_prompt.contains("Ordinary code fixes are actionable tasks, not blockers"));
+    assert!(base_prompt.contains("creating follow-up work is not a run failure"));
     assert!(!base_prompt.contains("Embedded skill fallback:"));
     assert!(!base_prompt.contains("Interrupted task recovery:"));
     assert!(!base_prompt.contains("$git-commit"));

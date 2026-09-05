@@ -70,7 +70,7 @@ enum Commands {
         #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
         task: Vec<String>,
     },
-    /// Records a separate blocked follow-up in Doing without starting another session
+    /// Queues independent follow-up work in Todo without starting another session
     FollowUp {
         /// Parent status (doing)
         status: String,
@@ -78,9 +78,12 @@ enum Commands {
         task_index: String,
         /// Work remaining independently of the parent's completed implementation
         description: String,
-        /// Failure evidence, baseline comparison, and what is needed to unblock
+        /// Failure evidence, baseline comparison, and remaining work
+        #[arg(long, required_unless_present = "blocked")]
+        evidence: Option<String>,
+        /// Use only when an unavailable dependency or input prevents starting the follow-up
         #[arg(long)]
-        blocked: String,
+        blocked: Option<String>,
     },
     /// Changes the status of a task
     Status {
@@ -368,15 +371,27 @@ pub(super) fn run() -> Result<()> {
             status,
             task_index,
             description,
+            evidence,
             blocked,
         }) => {
-            ManagedTaskWorkflow::new(&root).add_blocked_follow_up(
+            let status = ManagedTaskWorkflow::new(&root).add_follow_up(
                 TaskStatus::parse(&status)?,
                 &task_index,
                 &description,
-                &blocked,
+                evidence
+                    .as_deref()
+                    .or(blocked.as_deref())
+                    .unwrap_or_default(),
+                blocked.as_deref(),
             )?;
-            println!("Blocked follow-up recorded in Doing; parent task unchanged.");
+            match status {
+                TaskStatus::Todo => println!(
+                    "Follow-up queued in Todo for a future run. Finish the parent task normally."
+                ),
+                _ => println!(
+                    "Follow-up blocked by the recorded dependency or input; recorded in Doing for later recovery. Finish the parent task normally."
+                ),
+            }
         }
         Some(Commands::Status {
             from,

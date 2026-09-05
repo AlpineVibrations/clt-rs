@@ -2,6 +2,71 @@ use crate::runner::tests::FakeAgentRunner;
 use crate::test_support::prelude::*;
 use crate::test_support::*;
 
+#[test]
+fn queued_follow_up_keeps_parent_successful_and_scheduler_selects_next_todo() {
+    for folders in [false, true] {
+        let root = temp_root("queued-follow-up-scheduler");
+        let state_dir = root.join("state");
+        let project_root = root.join("project");
+        init_tasks(&project_root, folders).unwrap();
+        add_task(&project_root, "Finish feature", None).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        drop(store);
+        let mut pass = run_agent_scheduler_pass(&state_dir, false, &[]).unwrap();
+        let job = pass.jobs.pop().unwrap();
+        move_task(&project_root, TaskStatus::Todo, TaskStatus::Doing, "1").unwrap();
+        assert!(
+            attach_codex_session_to_active_task(
+                &project_root,
+                AgentTaskSelection::NextTodo,
+                &[],
+                &[],
+                "parent-session"
+            )
+            .unwrap()
+        );
+        ManagedTaskWorkflow::new(&project_root)
+            .add_follow_up(
+                TaskStatus::Doing,
+                "1",
+                "Fix existing lint warnings",
+                "Same failures on the starting revision",
+                None,
+            )
+            .unwrap();
+        move_task(&project_root, TaskStatus::Doing, TaskStatus::Done, "1").unwrap();
+        let mut runner = FakeAgentRunner::new(&state_dir, "success");
+        runner.result.codex_session_id = Some("parent-session".to_string());
+        let completion = run_agent_job(job, &runner, &new_agent_shutdown_signal()).unwrap();
+        assert_eq!(completion.status, "success", "{}", completion.summary);
+        let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert_eq!(project.failure_count, 0);
+        assert_eq!(project.last_failure_at, None);
+        let scan = scan_agent_project(&project_root);
+        let decision = crate::scheduler::decide_agent_scheduling_stage(
+            crate::scheduler::AgentSchedulingDecisionRequest {
+                has_resume_session: false,
+                resume_interrupted_task: false,
+                has_blocked_task: scan.has_blocked_task(),
+                blocked_recovery_backoff_active: false,
+                has_pending_task: scan.has_pending_task(),
+            },
+        );
+        assert_eq!(decision.task_selection, Some(AgentTaskSelection::NextTodo));
+        assert_eq!(
+            automated_codex_session_to_resume(&project_root, AgentTaskSelection::NextTodo).unwrap(),
+            None
+        );
+        assert_eq!(scan.blocked_task_count(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
 pub(crate) fn reserve_test_worker(
     store: &agent::TursoAgentStore,
     project_id: i64,

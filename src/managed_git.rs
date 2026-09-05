@@ -25,9 +25,9 @@ use crate::{
         CODEX_TASK_SESSION_PREFIX, StatusStore, TASK_DETAIL_FILES, TASK_STATUSES, TaskBoard,
         TaskEntry, TaskSource, TaskStatus, acquire_board_mutation_lock,
         acquire_board_mutation_lock_with_contention_callback,
-        attach_codex_session_to_task_after_lock, blocked_follow_up_session,
-        cleanup_clt_atomic_task_temporaries, codex_session_id_from_task_content,
-        codex_session_markers_in_task_content, durable_task_identity, get_status_store,
+        attach_codex_session_to_task_after_lock, cleanup_clt_atomic_task_temporaries,
+        codex_session_id_from_task_content, codex_session_markers_in_task_content,
+        durable_task_identity, follow_up_matches_status, follow_up_session, get_status_store,
         get_tasks_dir, move_task_without_reordering_after_lock, read_task_entries,
         remove_task_entry_without_reordering, starts_with_task_note_date, task_content_is_blocked,
         task_entry_is_blocked, task_tree_contains_session_marker,
@@ -1676,10 +1676,12 @@ pub(super) fn create_agent_git_tree_projection(
 }
 
 pub(super) fn git_task_subtree(project_root: &Path, root_tree: &str) -> Result<String> {
-    let tasks_reference = format!("{root_tree}:tasks");
+    // A folder-backed board may have no tracked entries after removing the
+    // selected task and its follow-up from the private comparison. ls-tree
+    // represents that empty scope without treating the absent directory as an error.
     git_stdout(
         project_root,
-        &["rev-parse", "--verify", &tasks_reference],
+        &["ls-tree", root_tree, "--", "tasks"],
         "resolve the exact task-board tree",
     )
 }
@@ -1785,14 +1787,15 @@ pub(super) fn agent_git_completed_scope_without_selected(
         task_identity,
     )?;
     remove_task_entry_without_reordering(&board_dir, TaskStatus::Done, &entry)?;
-    // Only new, explicitly linked blocked follow-ups may accompany the selected
+    // Only new, explicitly linked follow-ups may accompany the selected
     // task. Removing them from this private projection must restore the exact
     // parent board; edits to existing tasks, headers, paths and attachments still fail.
     let parent_entries = git_ref_task_entries(project_root, parent_tree)?;
-    let follow_ups = read_task_entries(&board_dir, TaskStatus::Doing)?
-        .into_iter()
-        .filter(|entry| {
-            blocked_follow_up_session(&entry.content) == Some(session_id)
+    let mut follow_ups = Vec::new();
+    for status in [TaskStatus::Todo, TaskStatus::Doing] {
+        for entry in read_task_entries(&board_dir, status)? {
+            if follow_up_session(&entry.content) == Some(session_id)
+                && follow_up_matches_status(&entry.content, status)
                 && match &entry.source {
                     TaskSource::MarkdownLine { .. } => true,
                     TaskSource::Path {
@@ -1802,18 +1805,20 @@ pub(super) fn agent_git_completed_scope_without_selected(
                         .is_ok_and(|metadata| metadata.file_type().is_file()),
                     TaskSource::Path { is_dir: true, .. } => false,
                 }
-                && !parent_entries.iter().any(|parent| {
-                    parent.status == "doing"
-                        && parent.content.trim_end() == entry.content.trim_end()
-                })
-        })
-        .collect::<Vec<_>>();
+                && !parent_entries
+                    .iter()
+                    .any(|parent| follow_up_session(&parent.content) == Some(session_id))
+            {
+                follow_ups.push((status, entry));
+            }
+        }
+    }
     anyhow::ensure!(
         follow_ups.len() <= 1,
-        "Only one new blocked follow-up may accompany a task commit"
+        "Only one new follow-up may accompany a task commit"
     );
-    for follow_up in follow_ups.iter().rev() {
-        remove_task_entry_without_reordering(&board_dir, TaskStatus::Doing, follow_up)?;
+    for (status, follow_up) in follow_ups.iter().rev() {
+        remove_task_entry_without_reordering(&board_dir, *status, follow_up)?;
     }
     let sanitized_tree = stage_projected_task_tree(
         project_root,
