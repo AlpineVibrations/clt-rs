@@ -2764,16 +2764,6 @@ pub(super) fn git_ref_contains_active_task_identity(
         }))
 }
 
-pub(super) fn git_commit_has_task_trailer(
-    project_root: &Path,
-    commit_oid: &str,
-    session_id: &str,
-) -> Result<bool> {
-    let values = git_commit_task_trailers(project_root, commit_oid)?;
-    let expected = format!("{CODEX_TASK_SESSION_PREFIX}{session_id}");
-    Ok(values == [expected])
-}
-
 pub(super) fn git_commit_task_trailers(
     project_root: &Path,
     commit_oid: &str,
@@ -2925,8 +2915,15 @@ pub(super) fn find_agent_git_task_commit_with_policy(
         "list task finalization commits",
     )?;
     let mut candidates = Vec::new();
+    let expected_trailer = format!("{CODEX_TASK_SESSION_PREFIX}{session_id}");
+    let mut session_commit_count = 0;
     for commit in revisions.lines().filter(|line| !line.is_empty()) {
-        if !git_commit_has_task_trailer(project_root, commit, session_id)?
+        let trailers = git_commit_task_trailers(project_root, commit)?;
+        if trailers.contains(&expected_trailer) {
+            session_commit_count += 1;
+        }
+        if trailers.len() != 1
+            || trailers[0] != expected_trailer
             || !git_commit_uses_agent_identity(project_root, commit)?
             || git_ref_completed_task_identity(project_root, commit, session_id)?.as_deref()
                 != Some(task_identity)
@@ -2942,6 +2939,7 @@ pub(super) fn find_agent_git_task_commit_with_policy(
         )?;
         let parent_oids = parents.split_whitespace().collect::<Vec<_>>();
         let introduced_completion = parent_oids.len() == 1
+            && parent_oids[0] == starting_head
             && !git_ref_contains_completed_task(project_root, parent_oids[0], session_id)?
             && (!legacy_identity_checks
                 || git_ref_active_task_identity_count(
@@ -2953,16 +2951,13 @@ pub(super) fn find_agent_git_task_commit_with_policy(
             candidates.push(commit.to_string());
         }
     }
-    if candidates.len() != 1 {
+    // Exactly one commit must claim this task and descend directly from its
+    // frozen parent. Unrelated commits may advance the branch afterward; they
+    // do not invalidate the task's immutable tree or completion evidence.
+    if candidates.len() != 1 || session_commit_count != 1 {
         return Ok(None);
     }
     let candidate = candidates.remove(0);
-
-    for commit in revisions.lines().filter(|line| !line.is_empty()) {
-        if commit != candidate {
-            return Ok(None);
-        }
-    }
 
     if resolve_git_commit(project_root, branch_ref, "recheck the finalization tip")? != branch_tip {
         return Ok(None);

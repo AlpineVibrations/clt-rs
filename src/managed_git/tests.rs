@@ -3,6 +3,7 @@ use crate::test_support::prelude::*;
 use crate::test_support::*;
 use crate::worker::tests::reserve_test_worker;
 
+mod advanced_branch;
 mod follow_up;
 mod orphan;
 
@@ -4769,6 +4770,9 @@ fn scheduler_rolls_forward_a_proven_commit_without_resuming_codex() {
             "CLT-Task: codex:session-roll-forward",
         ],
     );
+    fs::write(project_root.join("later.txt"), "Concurrent user work\n").unwrap();
+    run_test_git(&project_root, &["add", "later.txt"]);
+    run_test_git(&project_root, &["commit", "-m", "Continue other work"]);
 
     let project_root = fs::canonicalize(project_root).unwrap();
     let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
