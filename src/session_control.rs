@@ -37,8 +37,10 @@ use crate::{
     },
     scheduler::{
         agent_failure_backoff, agent_lease_holder, agent_lease_is_reclaimable,
-        agent_lease_renew_interval, agent_lease_timeout, agent_max_global_jobs, scan_agent_project,
+        agent_lease_renew_interval, agent_lease_timeout, agent_max_global_jobs,
+        reconcile_stale_agent_session_controls, scan_agent_project,
     },
+    session_recovery::ensure_orphaned_session_supervision,
     task::{
         TaskEntry, TaskSource, TaskStatus, get_tasks_dir, read_task_entries,
         recoverable_codex_session_id_from_task_content, task_entry_is_blocked,
@@ -1549,6 +1551,13 @@ pub(super) fn toggle_tui_codex_session_stop_at(
                 .as_deref()
                 .context("The Codex session is still registering its run; try again")?;
             if store.request_session_stop_blocking(project_id, session_id, child_pid, run_token)? {
+                if let Err(error) =
+                    ensure_orphaned_session_supervision(state_dir, project_id, session_id)
+                {
+                    return Ok(format!(
+                        "Stop requested; CLT could not reattach supervision: {error:#}. The session remains fenced until its process exits."
+                    ));
+                }
                 Ok(
                     "Stopping this Codex task session; press s again once stopped to resume it."
                         .to_string(),
@@ -1558,6 +1567,7 @@ pub(super) fn toggle_tui_codex_session_stop_at(
             }
         }
         AgentSessionControlState::StopRequested => {
+            ensure_orphaned_session_supervision(state_dir, project_id, session_id)?;
             Ok("This Codex task session is already stopping.".to_string())
         }
         AgentSessionControlState::Stopped => {
@@ -1640,6 +1650,9 @@ pub(super) fn prepare_tui_codex_session_interrupt_at(
 
     match control.state {
         AgentSessionControlState::Running => {
+            // Reattach before requesting handoff so failure does not leave a
+            // phantom interrupt request waiting for a nonexistent supervisor.
+            ensure_orphaned_session_supervision(state_dir, project_id, session_id)?;
             let child_pid = control
                 .child_pid
                 .context("The Codex session is still registering its child process; try again")?;
@@ -1711,7 +1724,25 @@ pub(super) fn prepare_tui_codex_session_interrupt_at(
                 pending_handoff.disarm();
                 return Ok(lease);
             }
-            AgentSessionControlState::InterruptRequested => {}
+            AgentSessionControlState::InterruptRequested => {
+                // A session may exit just before c/i is pressed, including
+                // while the scheduler is stopped. Complete the exact handoff
+                // here once the whole group is absent instead of waiting for
+                // a supervisor that no longer needs to be started.
+                if control
+                    .child_pid
+                    .is_some_and(|pid| automated_agent_process_group_is_running(pid) == Some(false))
+                {
+                    let lease = store.lease_for_project_blocking(project_id)?;
+                    reconcile_stale_agent_session_controls(
+                        state_dir,
+                        project_id,
+                        lease.as_ref(),
+                        false,
+                        agent_timestamp_seconds(),
+                    )?;
+                }
+            }
             AgentSessionControlState::ResumeRequested => {
                 anyhow::bail!("The automated runner could not complete the interactive handoff")
             }

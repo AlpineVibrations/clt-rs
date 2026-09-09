@@ -44,6 +44,7 @@ use crate::{
         agent_timestamp_seconds, format_agent_timestamp,
     },
     session_control::InteractiveGuardianDisposition,
+    session_recovery::{ensure_orphaned_session_supervision, recovered_supervisor_pid},
     task::{
         TaskStatus, ensure_existing_board, get_tasks_dir, read_task_entries,
         recoverable_codex_session_id_from_task_content, task_entry_is_blocked,
@@ -1322,6 +1323,25 @@ pub(super) fn reconcile_stale_agent_session_controls(
         let recorded_child_is_gone = control.child_pid.is_some_and(|child_pid| {
             automated_agent_process_group_is_running(child_pid) == Some(false)
         });
+        if !lease_is_active
+            && !recorded_child_is_gone
+            && matches!(
+                control.state,
+                AgentSessionControlState::Running
+                    | AgentSessionControlState::StopRequested
+                    | AgentSessionControlState::InterruptRequested
+            )
+            && let Err(error) = ensure_orphaned_session_supervision(
+                state_dir,
+                project_id,
+                &control.codex_session_id,
+            )
+        {
+            eprintln!(
+                "Project {project_id}: action=supervisor_reattach_wait session={} reason={error:#}",
+                control.codex_session_id
+            );
+        }
         let recovery_state = match control.state {
             AgentSessionControlState::Running if !lease_is_active && recorded_child_is_gone => {
                 Some(AgentSessionControlState::ResumeRequested)
@@ -1614,6 +1634,12 @@ pub(super) fn agent_lease_is_reclaimable(
     reclaim_current_process_leases: bool,
     now: u64,
 ) -> bool {
+    // Replacement supervisors retain generation-bound process handles. An
+    // expired heartbeat alone must not create a second controller while the
+    // first could still deliver a requested stop. A dead owner can be replaced.
+    if recovered_supervisor_pid(&lease.holder).is_some() {
+        return agent_lease_holder_liveness(&lease.holder) == AgentLeaseHolderLiveness::Dead;
+    }
     if lease
         .expires_at
         .parse::<u64>()
@@ -1794,6 +1820,9 @@ pub(super) fn agent_pid_liveness(pid: u32) -> AgentLeaseHolderLiveness {
 }
 
 pub(super) fn agent_lease_holder_pid(holder: &str) -> Option<u32> {
+    if let Some(pid) = recovered_supervisor_pid(holder) {
+        return Some(pid);
+    }
     holder
         .strip_prefix("clt-agent-")
         .or_else(|| holder.strip_prefix("clt-scheduler-"))

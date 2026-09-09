@@ -122,9 +122,13 @@ impl TursoAgentStore {
     ) -> Result<bool> {
         let conn = self.repositories.workers_leases.connect().await?;
 
+        // Replacement supervisors have no worker row. Expiry alone cannot
+        // evict their process ownership; dead-owner reconciliation explicitly
+        // releases the exact holder before ordinary acquisition retries.
         conn.execute(
             "DELETE FROM leases
               WHERE project_id = ?1 AND expires_at <= ?2
+                AND holder NOT LIKE 'clt-reattached-%'
                 AND NOT EXISTS (
                     SELECT 1 FROM agent_workers w
                      WHERE w.project_id = leases.project_id
@@ -241,7 +245,8 @@ impl TursoAgentStore {
                 &format!(
                     "DELETE FROM leases
                       WHERE project_id = ?1
-                        AND (CAST(expires_at AS INTEGER) <= CAST(?2 AS INTEGER)
+                        AND ((holder NOT LIKE 'clt-reattached-%'
+                              AND CAST(expires_at AS INTEGER) <= CAST(?2 AS INTEGER))
                              OR (?3 IS NOT NULL AND holder = ?3))
                         AND NOT EXISTS (
                             SELECT 1 FROM agent_workers w

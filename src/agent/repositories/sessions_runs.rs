@@ -19,6 +19,19 @@ use crate::{
     session_control::{InteractiveGuardianDisposition, is_stopped_shared_interactive_holder},
 };
 
+#[cfg(test)]
+#[path = "tests/sessions_runs.rs"]
+mod tests;
+
+struct AutomatedSessionFinalization<'a> {
+    project_id: i64,
+    expected_child_pid: u32,
+    expected_run_token: &'a str,
+    lease_holder: &'a str,
+    lease_timeout_seconds: u64,
+    reattached_session_id: Option<&'a str>,
+}
+
 /// Persistence for Codex session controls, runs, and daemon check-ins.
 pub(in crate::agent) struct SessionsRunsRepository(RepositoryDatabase);
 
@@ -1264,6 +1277,108 @@ impl TursoAgentStore {
         })
     }
 
+    /// The caller must identify the live process generation before claiming it.
+    /// A persisted session ID alone is not evidence of process ownership.
+    pub(crate) fn claim_orphaned_session_supervision_blocking(
+        &self,
+        expected: &AgentSessionControlRecord,
+        holder: &str,
+        lease_timeout_seconds: u64,
+    ) -> Result<bool> {
+        let (Some(child_pid), Some(run_token)) =
+            (expected.child_pid, expected.run_token.as_deref())
+        else {
+            return Ok(false);
+        };
+        if child_pid == 0
+            || run_token.is_empty()
+            || holder.is_empty()
+            || expected.interactive_launch_token.is_some()
+            || !matches!(
+                expected.state,
+                AgentSessionControlState::Running
+                    | AgentSessionControlState::StopRequested
+                    | AgentSessionControlState::InterruptRequested
+            )
+        {
+            return Ok(false);
+        }
+        self.blocking.block_on_persist(async {
+            let mut conn = self.repositories.sessions_runs.connect().await?;
+            let transaction = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .await
+                .context("Failed to begin orphaned Codex supervision claim")?;
+            let acquired_at = agent_timestamp();
+            let expires_at = agent_timestamp_after(lease_timeout_seconds);
+            // Do not rewrite the control: stop/interrupt requests can arrive
+            // during process identification and must survive the claim.
+            let claimed = transaction
+                .execute(
+                    "INSERT OR IGNORE INTO leases (project_id, holder, acquired_at, expires_at)
+                     SELECT project_id, ?1, ?2, ?3 FROM session_controls
+                      WHERE project_id = ?4 AND codex_session_id = ?5
+                        AND child_pid = ?6 AND run_token = ?7
+                        AND state IN ('running', 'stop_requested', 'interrupt_requested')
+                        AND interactive_launch_token IS NULL
+                        AND NOT EXISTS (SELECT 1 FROM leases WHERE project_id = ?4)
+                        AND NOT EXISTS (
+                            SELECT 1 FROM agent_workers WHERE project_id = ?4
+                              AND state IN ('dispatching', 'running', 'finalizing')
+                        )
+                        AND NOT EXISTS (
+                            SELECT 1 FROM session_controls WHERE project_id = ?4
+                              AND codex_session_id <> ?5 AND state <> 'stopped'
+                        )",
+                    params![
+                        holder,
+                        acquired_at.as_str(),
+                        expires_at.as_str(),
+                        expected.project_id,
+                        expected.codex_session_id.as_str(),
+                        i64::from(child_pid),
+                        run_token
+                    ],
+                )
+                .await
+                .context("Failed to claim orphaned Codex supervision")?;
+            if claimed != 1 {
+                return Ok(false);
+            }
+            transaction
+                .commit()
+                .await
+                .context("Failed to commit orphaned Codex supervision claim")?;
+            Ok(true)
+        })
+    }
+
+    /// Called only after the monitor proves its original process group exited.
+    /// A stale monitor cannot finalize a successor's generation or lease.
+    pub(crate) fn finalize_reattached_automated_session_blocking(
+        &self,
+        expected: &AgentSessionControlRecord,
+        holder: &str,
+        lease_timeout_seconds: u64,
+    ) -> Result<bool> {
+        let (Some(expected_child_pid), Some(expected_run_token)) =
+            (expected.child_pid, expected.run_token.as_deref())
+        else {
+            return Ok(false);
+        };
+        self.blocking
+            .block_on_persist(self.finalize_automated_session_after_exit(
+                AutomatedSessionFinalization {
+                    project_id: expected.project_id,
+                    expected_child_pid,
+                    expected_run_token,
+                    lease_holder: holder,
+                    lease_timeout_seconds,
+                    reattached_session_id: Some(&expected.codex_session_id),
+                },
+            ))
+    }
+
     pub(crate) fn finalize_reaped_automated_session_blocking(
         &self,
         project_id: i64,
@@ -1272,61 +1387,95 @@ impl TursoAgentStore {
         lease_holder: &str,
         lease_timeout_seconds: u64,
     ) -> Result<bool> {
-        self.blocking.block_on_persist(async {
-                let mut conn = self.repositories.sessions_runs.connect().await?;
-                let transaction = conn.transaction().await.with_context(|| {
-                    format!(
-                        "Failed to begin reaped automated-session finalization for project {project_id}"
-                    )
-                })?;
-                let (codex_session_id, state, interactive_holder) = {
-                    let mut rows = transaction
-                        .query(
-                            "SELECT codex_session_id, state, interactive_holder
+        self.blocking
+            .block_on_persist(self.finalize_automated_session_after_exit(
+                AutomatedSessionFinalization {
+                    project_id,
+                    expected_child_pid,
+                    expected_run_token,
+                    lease_holder,
+                    lease_timeout_seconds,
+                    reattached_session_id: None,
+                },
+            ))
+    }
+
+    async fn finalize_automated_session_after_exit(
+        &self,
+        request: AutomatedSessionFinalization<'_>,
+    ) -> Result<bool> {
+        let AutomatedSessionFinalization {
+            project_id,
+            expected_child_pid,
+            expected_run_token,
+            lease_holder,
+            lease_timeout_seconds,
+            reattached_session_id,
+        } = request;
+        let mut conn = self.repositories.sessions_runs.connect().await?;
+        let transaction = conn.transaction().await.with_context(|| {
+            format!(
+                "Failed to begin reaped automated-session finalization for project {project_id}"
+            )
+        })?;
+        if reattached_session_id.is_some()
+            && query_count(
+                &transaction,
+                "SELECT COUNT(*) FROM leases WHERE project_id = ?1 AND holder = ?2",
+                params![project_id, lease_holder],
+            )
+            .await?
+                != 1
+        {
+            return Ok(false);
+        }
+        let (codex_session_id, state, interactive_holder) = {
+            let mut rows = transaction
+                .query(
+                    "SELECT codex_session_id, state, interactive_holder
                                FROM session_controls
-                              WHERE project_id = ?1 AND child_pid = ?2 AND run_token = ?3",
-                            params![
-                                project_id,
-                                i64::from(expected_child_pid),
-                                expected_run_token
-                            ],
-                        )
-                        .await
-                        .context("Failed to read the reaped automated session generation")?;
-                    let Some(row) = rows
-                        .next()
-                        .await
-                        .context("Failed to read the reaped automated session row")?
-                    else {
-                        return Ok(false);
-                    };
-                    (
-                        row_text(&row, 0, "codex_session_id")?,
-                        AgentSessionControlState::from_database(&row_text(&row, 1, "state")?)?,
-                        row_optional_text(&row, 2, "interactive_holder")?,
-                    )
-                };
+                              WHERE project_id = ?1 AND child_pid = ?2 AND run_token = ?3
+                                AND (?4 IS NULL OR (codex_session_id = ?4
+                                     AND interactive_launch_token IS NULL))",
+                    params![
+                        project_id,
+                        i64::from(expected_child_pid),
+                        expected_run_token,
+                        reattached_session_id
+                    ],
+                )
+                .await
+                .context("Failed to read the reaped automated session generation")?;
+            let Some(row) = rows
+                .next()
+                .await
+                .context("Failed to read the reaped automated session row")?
+            else {
+                return Ok(false);
+            };
+            (
+                row_text(&row, 0, "codex_session_id")?,
+                AgentSessionControlState::from_database(&row_text(&row, 1, "state")?)?,
+                row_optional_text(&row, 2, "interactive_holder")?,
+            )
+        };
 
-                let terminal_state = match state {
-                    AgentSessionControlState::Running => {
-                        AgentSessionControlState::ResumeRequested
-                    }
-                    AgentSessionControlState::StopRequested => {
-                        AgentSessionControlState::Stopped
-                    }
-                    AgentSessionControlState::InterruptRequested => {
-                        AgentSessionControlState::ReadyInteractive
-                    }
-                    _ => return Ok(false),
-                };
+        let terminal_state = match state {
+            AgentSessionControlState::Running => AgentSessionControlState::ResumeRequested,
+            AgentSessionControlState::StopRequested => AgentSessionControlState::Stopped,
+            AgentSessionControlState::InterruptRequested => {
+                AgentSessionControlState::ReadyInteractive
+            }
+            _ => return Ok(false),
+        };
 
-                if terminal_state == AgentSessionControlState::ReadyInteractive {
-                    let Some(interactive_holder) = interactive_holder.as_deref() else {
-                        return Ok(false);
-                    };
-                    let acquired_at = agent_timestamp();
-                    let expires_at = agent_timestamp_after(lease_timeout_seconds);
-                    let transferred = transaction
+        if terminal_state == AgentSessionControlState::ReadyInteractive {
+            let Some(interactive_holder) = interactive_holder.as_deref() else {
+                return Ok(false);
+            };
+            let acquired_at = agent_timestamp();
+            let expires_at = agent_timestamp_after(lease_timeout_seconds);
+            let transferred = transaction
                         .execute(
                             "UPDATE leases
                                 SET holder = ?1, acquired_at = ?2, expires_at = ?3
@@ -1345,8 +1494,8 @@ impl TursoAgentStore {
                                 "Failed to transfer the reaped project {project_id} lease for interactive handoff"
                             )
                         })?;
-                    if transferred == 0 {
-                        let inserted = transaction
+            if transferred == 0 {
+                let inserted = transaction
                             .execute(
                                 "INSERT OR IGNORE INTO leases (
                                     project_id, holder, acquired_at, expires_at
@@ -1364,35 +1513,33 @@ impl TursoAgentStore {
                                     "Failed to acquire the reaped project {project_id} lease for interactive handoff"
                                 )
                             })?;
-                        if inserted == 0 {
-                            let existing_holder = {
-                                let mut rows = transaction
-                                    .query(
-                                        "SELECT holder FROM leases WHERE project_id = ?1",
-                                        [project_id],
-                                    )
-                                    .await
-                                    .with_context(|| {
-                                        format!(
-                                            "Failed to inspect the reaped project {project_id} lease"
-                                        )
-                                    })?;
-                                rows.next()
-                                    .await
-                                    .context("Failed to read the reaped project lease")?
-                                    .map(|row| row_text(&row, 0, "holder"))
-                                    .transpose()?
-                            };
-                            if existing_holder.as_deref() != Some(interactive_holder) {
-                                return Ok(false);
-                            }
-                        }
+                if inserted == 0 {
+                    let existing_holder = {
+                        let mut rows = transaction
+                            .query(
+                                "SELECT holder FROM leases WHERE project_id = ?1",
+                                [project_id],
+                            )
+                            .await
+                            .with_context(|| {
+                                format!("Failed to inspect the reaped project {project_id} lease")
+                            })?;
+                        rows.next()
+                            .await
+                            .context("Failed to read the reaped project lease")?
+                            .map(|row| row_text(&row, 0, "holder"))
+                            .transpose()?
+                    };
+                    if existing_holder.as_deref() != Some(interactive_holder) {
+                        return Ok(false);
                     }
                 }
+            }
+        }
 
-                let changed = transaction
-                    .execute(
-                        "UPDATE session_controls
+        let changed = transaction
+            .execute(
+                "UPDATE session_controls
                             SET state = ?1, child_pid = NULL,
                                 interactive_holder = CASE
                                     WHEN ?1 = 'ready_interactive' THEN interactive_holder
@@ -1401,45 +1548,40 @@ impl TursoAgentStore {
                                 updated_at = ?2
                           WHERE project_id = ?3 AND codex_session_id = ?4
                             AND state = ?5 AND child_pid = ?6 AND run_token = ?7",
-                        params![
-                            terminal_state.database_value(),
-                            agent_timestamp(),
-                            project_id,
-                            codex_session_id.as_str(),
-                            state.database_value(),
-                            i64::from(expected_child_pid),
-                            expected_run_token
-                        ],
-                    )
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "Failed to finalize reaped Codex session {codex_session_id}"
-                        )
-                    })?;
-                if changed != 1 {
-                    return Ok(false);
-                }
-                if terminal_state != AgentSessionControlState::ReadyInteractive {
-                    transaction
-                        .execute(
-                            "DELETE FROM leases WHERE project_id = ?1 AND holder = ?2",
-                            params![project_id, lease_holder],
-                        )
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "Failed to release the reaped project {project_id} lease"
-                            )
-                        })?;
-                }
-                transaction.commit().await.with_context(|| {
-                    format!(
-                        "Failed to commit reaped automated-session finalization for project {project_id}"
-                    )
+                params![
+                    terminal_state.database_value(),
+                    agent_timestamp(),
+                    project_id,
+                    codex_session_id.as_str(),
+                    state.database_value(),
+                    i64::from(expected_child_pid),
+                    expected_run_token
+                ],
+            )
+            .await
+            .with_context(|| {
+                format!("Failed to finalize reaped Codex session {codex_session_id}")
+            })?;
+        if changed != 1 {
+            return Ok(false);
+        }
+        if terminal_state != AgentSessionControlState::ReadyInteractive {
+            transaction
+                .execute(
+                    "DELETE FROM leases WHERE project_id = ?1 AND holder = ?2",
+                    params![project_id, lease_holder],
+                )
+                .await
+                .with_context(|| {
+                    format!("Failed to release the reaped project {project_id} lease")
                 })?;
-                Ok(true)
-            })
+        }
+        transaction.commit().await.with_context(|| {
+            format!(
+                "Failed to commit reaped automated-session finalization for project {project_id}"
+            )
+        })?;
+        Ok(true)
     }
 
     pub(crate) fn recover_stale_interactive_session_control_blocking(

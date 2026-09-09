@@ -1118,7 +1118,7 @@ impl TuiTaskSnapshot {
 }
 
 pub(super) fn tui_task_board_instructions() -> &'static str {
-    "Arrows navigate boards and tasks, Enter opens subtasks, e edits, n or + creates a subtask under the selected task, and Space creates a task. Press r to reorganize; use Shift+Arrows to move tasks. Tab opens Agent Projects, M opens Models, and h/? opens Help. Codex: s stops/resumes, i interrupts for interaction, c opens linked idle Doing, completed, or blocked sessions, and l shows logs."
+    "Arrows navigate boards and tasks, Enter opens subtasks, e edits, n or + creates a subtask under the selected task, and Space creates a task. Press r to reorganize; use Shift+Arrows to move tasks. Tab opens Agent Projects, M opens Models, and h/? opens Help. Codex: s stops/resumes, i interrupts for interaction, c opens linked sessions (taking over active runs), and l shows logs."
 }
 
 pub(super) fn tui_start_state(active_board: bool) -> TuiStartState {
@@ -3203,7 +3203,7 @@ pub(super) fn tui_agent_log_refresh_interval() -> Duration {
 }
 
 pub(super) fn tui_agent_panel_instructions() -> &'static str {
-    "Up/Down selects, Enter opens/adds, Space toggles ON/OFF, Delete removes with confirmation, g cycles Git off/commit/push, m cycles the selected target, M opens Models, f toggles fast, t cycles thinking, r retries after fixing an error, l shows output. s directly stops the selected active, interactive, or fenced session; with output open it controls that exact session. With output open: i takes over a live session and c continues an idle session. Tab returns to Kanban."
+    "Up/Down selects, Enter opens/adds, Space toggles ON/OFF, Delete removes with confirmation, g cycles Git off/commit/push, m cycles the selected target, M opens Models, f toggles fast, t cycles thinking, r retries after fixing an error, l shows output. s directly stops the selected active, interactive, or fenced session; with output open it controls that exact session. With output open: i takes over a live session and c opens a session (taking over if active). Tab returns to Kanban."
 }
 
 pub(super) fn tui_agent_log_title(log_view: &TuiAgentLogView) -> String {
@@ -6457,7 +6457,7 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
                                  [g]            - Cycle selected project's Git mode: off/commit/push\n\
                                  [s]            - Stop/resume linked task or displayed Agent Output session\n\
                                  [i]            - Take over linked/displayed live session, then auto-restart exec\n\
-                                 [c]            - Open linked idle Doing, Done/blocked, or displayed session\n\
+                                 [c]            - Open linked/displayed session; take over if active\n\
                                  [l]            - Toggle active/selected project's live/current agent output\n\
                                  [a]            - Move selected task to archive\n\
                                  [A]            - Toggle archive view\n\
@@ -7136,23 +7136,29 @@ pub(super) fn execute_tui_key_effect(
                                 return Ok(false);
                             }
                         };
-                        if availability == TuiCodexSessionAvailability::SelectedSessionBusy {
-                            app.feedback_buffer =
-                                                "The displayed Codex session is active; press i to take it over interactively."
-                                                    .to_string();
-                            return Ok(false);
-                        }
                         let shares_project =
                             availability == TuiCodexSessionAvailability::ProjectBusy;
-                        match run_tui_codex_session_continue(
-                            terminal,
-                            terminal_session,
-                            &app_title(&app.active_root),
-                            &target,
-                            &label,
-                            shares_project,
-                            false,
-                        ) {
+                        let resume_result =
+                            if availability == TuiCodexSessionAvailability::SelectedSessionBusy {
+                                run_tui_codex_session_interrupt(
+                                    terminal,
+                                    terminal_session,
+                                    &app_title(&app.active_root),
+                                    &target,
+                                    &label,
+                                )
+                            } else {
+                                run_tui_codex_session_continue(
+                                    terminal,
+                                    terminal_session,
+                                    &app_title(&app.active_root),
+                                    &target,
+                                    &label,
+                                    shares_project,
+                                    false,
+                                )
+                            };
+                        match resume_result {
                             Ok(message) => {
                                 app.agent_log_view = None;
                                 app.feedback_buffer = message;
@@ -7533,12 +7539,6 @@ pub(super) fn execute_tui_key_effect(
                                 return Ok(false);
                             }
                         };
-                        if availability == TuiCodexSessionAvailability::SelectedSessionBusy {
-                            app.feedback_buffer =
-                                                "This exact Codex session is already running or in an interactive handoff; stop or wait for it before resuming it again."
-                                                    .to_string();
-                            return Ok(false);
-                        }
                         let shares_project =
                             availability == TuiCodexSessionAvailability::ProjectBusy;
                         let Some(project) = app
@@ -7553,15 +7553,27 @@ pub(super) fn execute_tui_key_effect(
                         };
                         let target = TuiCodexSessionTarget::new(&project, session_id);
                         let label = task_display_text(&task);
-                        match run_tui_codex_session_continue(
-                            terminal,
-                            terminal_session,
-                            &app_title(&app.active_root),
-                            &target,
-                            &label,
-                            shares_project,
-                            true,
-                        ) {
+                        let resume_result =
+                            if availability == TuiCodexSessionAvailability::SelectedSessionBusy {
+                                run_tui_codex_session_interrupt(
+                                    terminal,
+                                    terminal_session,
+                                    &app_title(&app.active_root),
+                                    &target,
+                                    &label,
+                                )
+                            } else {
+                                run_tui_codex_session_continue(
+                                    terminal,
+                                    terminal_session,
+                                    &app_title(&app.active_root),
+                                    &target,
+                                    &label,
+                                    shares_project,
+                                    true,
+                                )
+                            };
+                        match resume_result {
                             Ok(message) => {
                                 app.agent_log_view = None;
                                 app.feedback_buffer = message;

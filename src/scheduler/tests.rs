@@ -1999,3 +1999,98 @@ fn daemon_stops_without_database_retries_when_registry_recovery_is_required() {
     assert!(!state_dir.join(AGENT_DB_FILE).exists());
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn recovered_supervisor_lease_cannot_be_stolen_from_a_live_owner_after_expiry() {
+    let holder = format!("clt-reattached-{}-100-000000001-p1-s1", std::process::id());
+    assert_eq!(agent_lease_holder_pid(&holder), Some(std::process::id()));
+    assert_eq!(
+        agent_lease_holder_liveness(&holder),
+        AgentLeaseHolderLiveness::CurrentProcess
+    );
+    let lease = agent::AgentLeaseRecord {
+        project_id: 1,
+        project_name: "project".to_string(),
+        project_path: PathBuf::from("/tmp/project"),
+        holder,
+        acquired_at: "100".to_string(),
+        expires_at: "200".to_string(),
+    };
+
+    for reclaim_current_process_leases in [false, true] {
+        assert!(!agent_lease_is_reclaimable(
+            &lease,
+            reclaim_current_process_leases,
+            201
+        ));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn recovered_supervisor_lease_is_reclaimable_after_owner_death_before_expiry() {
+    // This value cannot name a Unix process, avoiding races with real PID reuse.
+    let dead_pid = u32::MAX;
+    let holder = format!("clt-reattached-{dead_pid}-100-000000001-p1-s1");
+    assert_eq!(agent_lease_holder_pid(&holder), Some(dead_pid));
+    assert_eq!(
+        agent_lease_holder_liveness(&holder),
+        AgentLeaseHolderLiveness::Dead
+    );
+    let lease = agent::AgentLeaseRecord {
+        project_id: 1,
+        project_name: "project".to_string(),
+        project_path: PathBuf::from("/tmp/project"),
+        holder,
+        acquired_at: "100".to_string(),
+        expires_at: "9999999999".to_string(),
+    };
+
+    assert!(agent_lease_is_reclaimable(&lease, false, 101));
+}
+
+#[test]
+fn recovered_supervisor_lease_survives_direct_store_expiry_eviction() {
+    let root = temp_root("recovered-supervisor-store-expiry");
+    let state_dir = root.join("state/clt");
+    let project_root = root.join("project");
+    init_tasks(&project_root, false).unwrap();
+    let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
+    store
+        .register_project_blocking(&fs::canonicalize(&project_root).unwrap(), "project")
+        .unwrap();
+    let project_id = store.list_projects_blocking().unwrap().remove(0).id;
+    let holder = format!("clt-reattached-{}-100-000000001-p1-s1", std::process::id());
+    assert!(
+        store
+            .try_acquire_lease_blocking(project_id, &holder, "100", "101")
+            .unwrap()
+    );
+
+    // Exercise the store directly: interactive acquisition and scheduler
+    // acquisition call it before the higher-level liveness reconciliation.
+    assert!(
+        !store
+            .try_acquire_lease_blocking(project_id, "competing-owner", "102", "200")
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .lease_for_project_blocking(project_id)
+            .unwrap()
+            .unwrap()
+            .holder,
+        holder
+    );
+    assert!(store.list_active_workers_blocking().unwrap().is_empty());
+
+    // Once the exact owner releases its lease (or dead-owner reconciliation
+    // proves it can be released), ordinary acquisition still succeeds.
+    assert!(store.release_lease_blocking(project_id, &holder).unwrap());
+    assert!(
+        store
+            .try_acquire_lease_blocking(project_id, "competing-owner", "102", "200")
+            .unwrap()
+    );
+    fs::remove_dir_all(root).unwrap();
+}

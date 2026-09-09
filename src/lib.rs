@@ -8,6 +8,7 @@ mod platform;
 mod runner;
 mod scheduler;
 mod session_control;
+mod session_recovery;
 mod task;
 #[cfg(test)]
 mod test_support;

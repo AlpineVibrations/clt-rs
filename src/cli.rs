@@ -24,6 +24,7 @@ use crate::{
         InteractiveCodexResumeMode, run_agent_interactive_session_worker,
         run_agent_session_resume_worker, run_interactive_exec_gate,
     },
+    session_recovery::run_orphaned_session_supervisor,
     task::{TaskStatus, add_task, ensure_existing_board, init_tasks, parse_add_task_args},
     tui::{prompt_to_initialize_tasks, tui_view, tui_view_without_active_board},
     worker::run_independent_agent_worker,
@@ -190,6 +191,20 @@ enum AgentCommands {
         #[arg(long)]
         session_id: String,
     },
+    /// Internal replacement supervisor for an already-running orphaned session
+    #[command(hide = true)]
+    SuperviseSession {
+        #[arg(long)]
+        state_dir: PathBuf,
+        #[arg(long)]
+        project_id: i64,
+        #[arg(long)]
+        session_id: String,
+        #[arg(long)]
+        child_pid: u32,
+        #[arg(long)]
+        run_token: String,
+    },
     /// Internal terminal guardian used while Codex is interactive
     #[command(hide = true)]
     InteractiveSessionWorker {
@@ -278,6 +293,25 @@ enum AgentGitCommitCommands {
 
 pub(super) fn run() -> Result<()> {
     let cli = Cli::parse();
+    if let Some(Commands::Agent {
+        command:
+            AgentCommands::SuperviseSession {
+                state_dir,
+                project_id,
+                session_id,
+                child_pid,
+                run_token,
+            },
+    }) = cli.command.as_ref()
+    {
+        return run_orphaned_session_supervisor(
+            state_dir,
+            *project_id,
+            session_id,
+            *child_pid,
+            run_token,
+        );
+    }
     if let Some(Commands::ShellInit { shell }) = cli.command.as_ref() {
         print!("{}", shell_init_script(*shell));
         return Ok(());
@@ -617,6 +651,7 @@ fn handle_agent_command(command: AgentCommands, local: bool, default_root: &Path
         }
         AgentCommands::AutomatedExecGate { .. }
         | AgentCommands::AutomatedSessionSupervisor { .. }
+        | AgentCommands::SuperviseSession { .. }
         | AgentCommands::InteractiveExecGate { .. }
         | AgentCommands::Worker { .. } => {
             unreachable!("Codex exec gate handled before task-root discovery")

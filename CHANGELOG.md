@@ -8,6 +8,13 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 Use this section while developing the next release.
 
+## [0.6.8] - 2026-09-09
+
+### Fixed
+
+- Reattach supervision to surviving automated Codex processes after their worker exits, preserving the session, current work, and output while restoring stop and interactive takeover controls. Replacement supervisors use exact run claims and generation-safe OS signals; unfinished sessions resume only after the prior process group exits.
+- Let `c` take over the selected active automated session using the same guarded handoff as `i`.
+
 ## [0.6.7] - 2026-09-09
 
 ### Fixed
@@ -180,7 +187,10 @@ Use this section while developing the next release.
 - Fixed task moves so destination write failures do not remove the source task.
 - Fixed TUI navigation on empty boards.
 
-[Unreleased]: https://github.com/AlpineVibrations/clt-rs/compare/v0.6.5...HEAD
+[Unreleased]: https://github.com/AlpineVibrations/clt-rs/compare/v0.6.8...HEAD
+[0.6.8]: https://github.com/AlpineVibrations/clt-rs/releases/tag/v0.6.8
+[0.6.7]: https://github.com/AlpineVibrations/clt-rs/releases/tag/v0.6.7
+[0.6.6]: https://github.com/AlpineVibrations/clt-rs/releases/tag/v0.6.6
 [0.6.5]: https://github.com/AlpineVibrations/clt-rs/releases/tag/v0.6.5
 [0.6.2]: https://github.com/AlpineVibrations/clt-rs/releases/tag/v0.6.2
 [0.6.1]: https://github.com/AlpineVibrations/clt-rs/releases/tag/v0.6.1

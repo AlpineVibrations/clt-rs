@@ -1941,7 +1941,7 @@ fn tui_task_board_instructions_only_describe_task_page_controls() {
     assert!(instructions.contains("e edits"));
     assert!(instructions.contains("Codex: s stops/resumes"));
     assert!(instructions.contains("i interrupts for interaction"));
-    assert!(instructions.contains("c opens linked idle Doing, completed, or blocked sessions"));
+    assert!(instructions.contains("c opens linked sessions (taking over active runs)"));
     assert!(instructions.contains("l shows logs"));
     assert!(instructions.contains("Press r to reorganize"));
     assert!(instructions.contains("Tab opens Agent Projects"));

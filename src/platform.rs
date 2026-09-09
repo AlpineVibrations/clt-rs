@@ -12,6 +12,32 @@ use std::{
 
 use anyhow::{Context, Result};
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) mod orphan;
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub(crate) mod orphan {
+    pub(crate) struct OrphanProcess;
+
+    impl OrphanProcess {
+        pub(crate) fn attach(_: u32, _: i64, _: &str) -> anyhow::Result<Option<Self>> {
+            anyhow::bail!("Orphan supervision is only supported on macOS and Linux")
+        }
+
+        pub(crate) fn is_running(&mut self) -> anyhow::Result<bool> {
+            anyhow::bail!("Orphan supervision is unsupported on this platform")
+        }
+
+        pub(crate) fn stop(&mut self) -> anyhow::Result<()> {
+            anyhow::bail!("Orphan supervision is unsupported on this platform")
+        }
+
+        pub(crate) fn kill(&mut self) -> anyhow::Result<()> {
+            self.stop()
+        }
+    }
+}
+
 use crate::{
     agent::{
         self, AGENT_STATE_DIR_ENV, current_agent_platform, ensure_agent_state_dir,
