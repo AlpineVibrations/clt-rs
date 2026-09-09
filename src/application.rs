@@ -129,7 +129,8 @@ pub(super) const AGENT_DEFAULT_POLL_INTERVAL_SECONDS: u64 = 15;
 pub(super) const AGENT_EMPTY_REGISTRY_POLL_INTERVAL_SECONDS: u64 = 5;
 pub(super) const AGENT_DAEMON_DATABASE_LOCK_RETRY_ATTEMPTS: usize = 20;
 pub(super) const AGENT_DAEMON_DATABASE_LOCK_RETRY_MILLIS: u64 = 5;
-pub(super) const AGENT_DEFAULT_RUN_TIMEOUT_SECONDS: u64 = 45 * 60;
+// Zero disables the run deadline. Lease expiry remains a renewable crash fence.
+pub(super) const AGENT_DEFAULT_RUN_TIMEOUT_SECONDS: u64 = 0;
 pub(super) const AGENT_DEFAULT_SUCCESS_COOLDOWN_SECONDS: u64 = 5;
 pub(super) const AGENT_DAEMON_CHECKIN_STALE_SECONDS: u64 = 45;
 pub(super) const AGENT_LEASE_RENEW_MAX_INTERVAL_MILLIS: u64 = 15_000;

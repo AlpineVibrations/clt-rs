@@ -1022,6 +1022,30 @@ pub(super) fn run_agent_job_inner(
                 );
             }
 
+            if result.status == "idle" {
+                let scan = scan_agent_project(&job.project.path);
+                let linked_active_task = result
+                    .codex_session_id
+                    .as_deref()
+                    .or(job.resume_session_id.as_deref())
+                    .map(|session_id| task_status_for_codex_session(&job.project.path, session_id))
+                    .transpose()?
+                    .flatten()
+                    .is_some_and(TaskStatus::is_active);
+                if scan.has_pending_task() || linked_active_task || scan.error_message().is_some() {
+                    result.status = "failure";
+                    result.summary = format!(
+                        "Codex reported no available tasks, but the board still has {} ready Todo task(s) and {} Doing task(s) (scan: {}). No-task report was not accepted; retry after the failure backoff.{}",
+                        scan.available_todo_count(),
+                        scan.doing_count,
+                        scan.status_label(),
+                        scan.error_message()
+                            .map(|error| format!(" {error}"))
+                            .unwrap_or_default()
+                    );
+                }
+            }
+
             if let Some(session_id) = result.codex_session_id.as_deref()
                 && let Err(error) = link_agent_session_after_run_stage(AgentSessionLinkRequest {
                     job: &job,
@@ -1850,7 +1874,11 @@ pub(super) fn print_agent_run_heartbeat(
         "Project {}: action=still_running elapsed_seconds={} timeout_seconds={} stdout_bytes={} stderr_bytes={} stdout={} stderr={} path={}",
         project.name,
         elapsed.as_secs(),
-        timeout.as_secs(),
+        if timeout.is_zero() {
+            "unlimited".to_string()
+        } else {
+            timeout.as_secs().to_string()
+        },
         format_optional_u64(stdout_bytes),
         format_optional_u64(stderr_bytes),
         stdout_path.display(),

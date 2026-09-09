@@ -1053,15 +1053,23 @@ pub(super) fn run_agent_scheduler_pass_with_max_global_jobs(
             );
             continue;
         }
+        // A normal timeout releases the lease and retires the worker. The task's
+        // session marker must still be enough to recover it on a later pass.
+        let interrupted_session_id = if resume_session_id.is_none() {
+            interrupted_codex_session_in_doing(state_dir, &project)?
+        } else {
+            None
+        };
         let has_resumable_doing_task =
             scan.doing_count > 0 && project_has_resumable_doing_task(state_dir, &project)?;
         let resume_abandoned_worker =
             has_resumable_doing_task && abandoned_project_ids.contains(&project.id);
-        let resume_interrupted_task = has_resumable_doing_task
-            && (resume_abandoned_worker
-                || existing_lease.as_ref().is_some_and(|lease| {
-                    agent_lease_is_reclaimable(lease, reclaim_current_process_leases, now)
-                }));
+        let resume_interrupted_task = interrupted_session_id.is_some()
+            || has_resumable_doing_task
+                && (resume_abandoned_worker
+                    || existing_lease.as_ref().is_some_and(|lease| {
+                        agent_lease_is_reclaimable(lease, reclaim_current_process_leases, now)
+                    }));
         let task_selection = decide_agent_scheduling_stage(AgentSchedulingDecisionRequest {
             has_resume_session: resume_session_id.is_some(),
             resume_interrupted_task,
@@ -1070,6 +1078,7 @@ pub(super) fn run_agent_scheduler_pass_with_max_global_jobs(
             has_pending_task: scan.has_pending_task(),
         })
         .task_selection;
+        let resume_session_id = resume_session_id.or(interrupted_session_id);
 
         let Some(task_selection) = task_selection else {
             println!(
@@ -1476,6 +1485,42 @@ pub(super) fn project_has_resumable_doing_task(
             }
         }
         Ok(false)
+    })
+}
+
+fn interrupted_codex_session_in_doing(
+    state_dir: &Path,
+    project: &agent::AgentProject,
+) -> Result<Option<String>> {
+    let doing = read_task_entries(&get_tasks_dir(&project.path), TaskStatus::Doing)?;
+    with_agent_store_at(state_dir, |store| {
+        for task in doing {
+            if task_entry_is_blocked(&task) {
+                continue;
+            }
+            let Some(session_id) = recoverable_codex_session_id_from_task_content(&task.content)
+            else {
+                continue;
+            };
+            // Explicit stop/handoff controls remain authoritative. Active owners
+            // are also fenced by the scheduler lease and launch registration.
+            if store
+                .session_control_blocking(project.id, session_id)?
+                .is_some()
+            {
+                continue;
+            }
+            let externally_completed = store
+                .git_finalization_blocking(project.id, session_id)?
+                .is_some_and(|journal| {
+                    journal.state == GitFinalizationState::Cancelled
+                        && journal.last_error.as_deref() == Some(AGENT_EXTERNAL_COMPLETION_REASON)
+                });
+            if !externally_completed {
+                return Ok(Some(session_id.to_string()));
+            }
+        }
+        Ok(None)
     })
 }
 
@@ -2055,10 +2100,24 @@ pub(super) fn agent_poll_interval() -> Result<Duration> {
 }
 
 pub(super) fn agent_run_timeout() -> Result<Duration> {
-    agent_timeout_from_env(
-        AGENT_RUN_TIMEOUT_SECONDS_ENV,
-        AGENT_DEFAULT_RUN_TIMEOUT_SECONDS,
-    )
+    let raw = match std::env::var(AGENT_RUN_TIMEOUT_SECONDS_ENV) {
+        Ok(raw) => Some(raw),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(err) => anyhow::bail!("Failed to read {AGENT_RUN_TIMEOUT_SECONDS_ENV}: {err}"),
+    };
+    parse_agent_run_timeout(raw.as_deref())
+}
+
+pub(super) fn parse_agent_run_timeout(raw: Option<&str>) -> Result<Duration> {
+    let seconds = raw
+        .map(|raw| {
+            raw.parse::<u64>().with_context(|| {
+                format!("{AGENT_RUN_TIMEOUT_SECONDS_ENV} must be a non-negative integer number of seconds (0 disables the run deadline)")
+            })
+        })
+        .transpose()?
+        .unwrap_or(AGENT_DEFAULT_RUN_TIMEOUT_SECONDS);
+    Ok(Duration::from_secs(seconds))
 }
 
 pub(super) fn agent_success_cooldown() -> Result<Duration> {
@@ -2131,10 +2190,10 @@ pub(super) fn agent_task_cooldown_reason(
     success_cooldown: Duration,
     failure_backoff: Duration,
 ) -> Option<String> {
-    if task_selection == AgentTaskSelection::ResumeDoing {
-        return None;
-    }
-    if task_selection == AgentTaskSelection::ResumeSession {
+    if matches!(
+        task_selection,
+        AgentTaskSelection::ResumeDoing | AgentTaskSelection::ResumeSession
+    ) {
         return (project.failure_count > 0)
             .then(|| {
                 remaining_agent_delay(project.last_failure_at.as_deref(), now, failure_backoff)

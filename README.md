@@ -145,6 +145,8 @@ The agent log footer shows `Model` and `Thinking` from the displayed run's recor
 ### Codex Agent
 `clt agent` can run Codex against enabled registered projects that have unblocked `todo` tasks. It can also recover a task left in `doing` when a previous agent lease belongs to a crashed process or has expired. Before starting fresh Todo work, the scheduler starts a blocked-task monitor run when a Todo or Doing task has a current blocker note and its recovery backoff has elapsed. Backlog tasks are deliberately ignored until they are promoted to Todo. Each project keeps its own repo-local `tasks/` board, while the agent stores cross-project runtime state in one central state directory.
 
+An unfinished, unblocked Doing task with a saved Codex session also resumes after a normal timeout releases its worker and lease. Recovery uses that exact session before starting fresh Todo work, respects failure backoff, and leaves explicitly stopped sessions alone. If Codex reports `NO_TASKS_LEFT` while ready Todo work or its linked active task remains, CLT records the discrepancy as a failure and waits for failure backoff instead of treating the run as idle success.
+
 Before registering a project, initialize its task board and make sure the `codex` CLI is installed and authenticated. With no path, `register` uses the same project root that normal `clt` commands use:
 ```bash
 clt init --folders
@@ -318,7 +320,7 @@ Useful runtime tuning variables are:
 
 - `CLT_AGENT_MAX_GLOBAL_JOBS`: maximum Codex runs active globally, default `12`.
 - `CLT_AGENT_POLL_INTERVAL_SECONDS`: daemon delay between scheduler passes, default `15`.
-- `CLT_AGENT_RUN_TIMEOUT_SECONDS`: Codex process timeout, default `2700`.
+- `CLT_AGENT_RUN_TIMEOUT_SECONDS`: optional Codex run deadline in seconds. Unset or `0` (the default) lets a task run until it finishes or is explicitly stopped; elapsed time alone does not end a run. Set a positive value only when you explicitly want a run deadline.
 - `CLT_AGENT_LEASE_TIMEOUT_SECONDS`: crash-safety deadline for renewable active leases, default `3600`. Healthy workers and interactive guardians renew before this deadline, so it is not a run-duration limit; known dead orphan reservations are reclaimed earlier.
 - `CLT_AGENT_FAILURE_BACKOFF_SECONDS`: delay after a failed project run or an unchanged blocked-task recovery, default `300`.
 - `CLT_AGENT_SUCCESS_COOLDOWN_SECONDS`: delay after a successful project run, default `5`.

@@ -585,6 +585,7 @@ pub(super) const AGENT_RESUME_DOING_PROMPT_APPENDIX: &str = r#"
 Interrupted task recovery:
 - A previous agent run was interrupted after moving a task to doing.
 - Resume and finish exactly one existing doing task.
+- When CLT resumes an existing Codex session, work only on the Doing task carrying that session's marker; preserve other Doing tasks.
 - Do not pick or move a TODO task; this recovery instruction replaces steps 2-4 above.
 - If there is no doing task to resume, say exactly: NO_TASKS_LEFT
 "#;
@@ -2150,7 +2151,7 @@ pub(super) fn wait_for_child_with_timeout_and_heartbeat(
             return Ok(AgentProcessWait::Interrupted(status));
         }
 
-        if started.elapsed() >= timeout {
+        if !timeout.is_zero() && started.elapsed() >= timeout {
             let status = stop_agent_child_process(child)
                 .context("Failed to stop timed out Codex process")?;
             return Ok(AgentProcessWait::TimedOut(status));
@@ -2216,7 +2217,7 @@ pub(super) fn wait_for_automated_supervisor_with_timeout_and_heartbeat(
             return Ok(AgentProcessWait::Interrupted(Some(status)));
         }
 
-        if started.elapsed() >= timeout {
+        if !timeout.is_zero() && started.elapsed() >= timeout {
             request_automated_supervisor_stop(control);
             let status = wait_for_automated_supervisor_reaped(supervisor, proof)?;
             return Ok(AgentProcessWait::TimedOut(Some(status)));

@@ -8,6 +8,14 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 Use this section while developing the next release.
 
+## [0.6.7] - 2026-09-09
+
+### Fixed
+
+- Disable the default elapsed-time cutoff for Codex tasks. Runs continue until completion or explicit stop while renewable leases and process supervision remain active; a positive `CLT_AGENT_RUN_TIMEOUT_SECONDS` is now an opt-in deadline, and `0` means unlimited.
+- Resume the saved Codex session of an unfinished Doing task after a timeout releases its worker and lease, preserving stopped sessions and respecting failure backoff.
+- Validate `NO_TASKS_LEFT` against the board before accepting an idle run. Remaining ready Todo work, an unfinished linked task, or an unreadable board records a failure with backoff instead of repeatedly launching fresh sessions after the success cooldown.
+
 ## [0.6.6] - 2026-09-05
 
 ### Added

@@ -3,6 +3,78 @@ use crate::test_support::prelude::*;
 use crate::test_support::*;
 
 #[test]
+fn idle_run_with_unfinished_tasks_records_failure_and_backs_off() {
+    for remaining_status in [None, Some(TaskStatus::Todo), Some(TaskStatus::Doing)] {
+        let root = temp_root("idle-run-board-validation");
+        let state_dir = root.join("state");
+        let project_root = root.join("project");
+        add_task(&project_root, "Ready task", None).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        drop(store);
+        let mut start = run_agent_scheduler_pass(&state_dir, false, &[]).unwrap();
+        let mut runner = FakeAgentRunner::new(&state_dir, "idle");
+        if remaining_status.is_none() {
+            fs::write(project_root.join("tasks/todo.md"), "# Todo Tasks\n").unwrap();
+        } else if remaining_status == Some(TaskStatus::Doing) {
+            move_task(&project_root, TaskStatus::Todo, TaskStatus::Doing, "1").unwrap();
+            let entry = read_task_entries(&get_tasks_dir(&project_root), TaskStatus::Doing)
+                .unwrap()
+                .remove(0);
+            attach_codex_session_to_task(
+                &project_root,
+                TaskStatus::Doing,
+                &entry,
+                "session-unfinished",
+            )
+            .unwrap();
+            runner.result.codex_session_id = Some("session-unfinished".to_string());
+        }
+        let completion = run_agent_job(
+            start.jobs.pop().unwrap(),
+            &runner,
+            &new_agent_shutdown_signal(),
+        )
+        .unwrap();
+        assert_eq!(
+            completion.status,
+            if remaining_status.is_some() {
+                "failure"
+            } else {
+                "idle"
+            }
+        );
+        let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert_eq!(project.failure_count, i64::from(remaining_status.is_some()));
+        if remaining_status.is_some() {
+            assert!(
+                completion
+                    .summary
+                    .contains(if remaining_status == Some(TaskStatus::Todo) {
+                        "1 ready Todo task(s)"
+                    } else {
+                        "1 Doing task(s)"
+                    })
+            );
+            assert!(completion.summary.contains("failure backoff"));
+            assert!(project.last_success_at.is_none());
+        }
+        drop(store);
+        assert!(
+            run_agent_scheduler_pass(&state_dir, false, &[])
+                .unwrap()
+                .jobs
+                .is_empty()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
 fn queued_follow_up_keeps_parent_successful_and_scheduler_selects_next_todo() {
     for folders in [false, true] {
         let root = temp_root("queued-follow-up-scheduler");
@@ -560,7 +632,12 @@ fn foreground_git_run_uses_one_durable_inline_generation() {
     };
 
     let completion = run_agent_job(job, &runner, &new_agent_shutdown_signal()).unwrap();
-    assert_eq!(completion.status, "idle");
+    assert_eq!(completion.status, "failure");
+    assert!(
+        completion
+            .summary
+            .contains("No-task report was not accepted")
+    );
     let worker_token = runner.observed_run_token.lock().unwrap().clone().unwrap();
     assert!(!inline_agent_worker_generation_is_registered(&worker_token));
     let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
@@ -783,6 +860,15 @@ fn scheduler_resumes_doing_task_after_independent_worker_dies() {
             .claim_worker_blocking("crashed-worker", u32::MAX, "102")
             .unwrap()
     );
+    drop(store);
+
+    let cooling_down = run_agent_scheduler_pass(&state_dir, false, &[]).unwrap();
+    assert!(cooling_down.jobs.is_empty());
+    let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
+    assert!(store.list_active_workers_blocking().unwrap().is_empty());
+    store
+        .clear_project_failure_backoff_for_path_blocking(&project_root)
+        .unwrap();
     drop(store);
 
     let start = run_agent_scheduler_pass(&state_dir, false, &[]).unwrap();

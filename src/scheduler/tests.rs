@@ -1450,6 +1450,136 @@ fn agent_run_once_reclaims_dead_local_process_lease() {
 
 #[cfg(unix)]
 #[test]
+fn agent_scheduler_recovers_timed_out_session_after_worker_and_lease_are_gone() {
+    for folders in [false, true] {
+        let root = temp_root("agent-resume-timeout-without-lease");
+        let state_dir = root.join("state");
+        let project_root = root.join("project");
+        init_tasks(&project_root, folders).unwrap();
+        add_task(&project_root, "FISH-26 runtime backend", None).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        drop(store);
+        let mut start = run_agent_scheduler_pass(&state_dir, false, &[]).unwrap();
+        move_task(&project_root, TaskStatus::Todo, TaskStatus::Doing, "1").unwrap();
+        let entry = read_task_entries(&get_tasks_dir(&project_root), TaskStatus::Doing)
+            .unwrap()
+            .remove(0);
+        attach_codex_session_to_task(&project_root, TaskStatus::Doing, &entry, "session-timeout")
+            .unwrap();
+        add_task(&project_root, "FISH-27 depends on FISH-26", None).unwrap();
+        let mut runner = FakeAgentRunner::new(&state_dir, "timeout");
+        runner.result.codex_session_id = Some("session-timeout".to_string());
+        let completion = run_agent_job(
+            start.jobs.pop().unwrap(),
+            &runner,
+            &new_agent_shutdown_signal(),
+        )
+        .unwrap();
+        assert_eq!(completion.status, "timeout");
+        let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        assert_eq!(store.lease_count_blocking().unwrap(), 0);
+        assert!(store.list_active_workers_blocking().unwrap().is_empty());
+        drop(store);
+        assert!(
+            run_agent_scheduler_pass(&state_dir, false, &[])
+                .unwrap()
+                .jobs
+                .is_empty()
+        );
+        let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .clear_project_failure_backoff_for_path_blocking(&project_root)
+            .unwrap();
+        drop(store);
+
+        let resumed = run_agent_scheduler_pass(&state_dir, false, &[]).unwrap();
+        assert_eq!(resumed.jobs.len(), 1);
+        assert_eq!(
+            resumed.jobs[0].task_selection,
+            AgentTaskSelection::ResumeDoing
+        );
+        assert_eq!(
+            resumed.jobs[0].resume_session_id.as_deref(),
+            Some("session-timeout")
+        );
+        assert_eq!(
+            read_task_entries(&get_tasks_dir(&project_root), TaskStatus::Todo)
+                .unwrap()
+                .len(),
+            1
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn agent_scheduler_only_recovers_uncontrolled_session_marked_doing_tasks() {
+    for (doing, stopped, expected) in [
+        ("- Human work\n", false, None),
+        (
+            "- Agent work codex:session-interrupted\n",
+            false,
+            Some(AgentTaskSelection::ResumeDoing),
+        ),
+        (
+            "- Human work\n- Agent work codex:session-interrupted\n",
+            false,
+            Some(AgentTaskSelection::ResumeDoing),
+        ),
+        ("- Agent work codex:session-interrupted\n", true, None),
+        (
+            "- Agent work — BLOCKED 2026-09-08: missing dependency codex:session-interrupted\n",
+            false,
+            Some(AgentTaskSelection::RecoverBlocked),
+        ),
+    ] {
+        let root = temp_root("agent-resume-marked-doing");
+        let state_dir = root.join("state");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        fs::write(
+            project_root.join("tasks/doing.md"),
+            format!("# Doing\n{doing}"),
+        )
+        .unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        if stopped {
+            store
+                .set_session_control_state_blocking(
+                    project.id,
+                    "session-interrupted",
+                    AgentSessionControlState::Stopped,
+                )
+                .unwrap();
+        }
+        drop(store);
+        let start = run_agent_scheduler_pass(&state_dir, false, &[]).unwrap();
+        assert_eq!(start.jobs.first().map(|job| job.task_selection), expected);
+        if expected == Some(AgentTaskSelection::ResumeDoing) {
+            assert_eq!(
+                start.jobs[0].resume_session_id.as_deref(),
+                Some("session-interrupted")
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(project_root.join("tasks/doing.md")).unwrap(),
+            format!("# Doing\n{doing}")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn agent_scheduler_resumes_doing_task_after_crashed_process() {
     let root = temp_root("agent-resume-doing-dead-lease");
     let state_dir = root.join("state/clt");
@@ -1721,6 +1851,19 @@ fn generated_interactive_holders_are_reclaimed_by_full_token_ttl_not_pid() {
 
         assert!(!agent_lease_is_reclaimable(&lease, true, 199));
         assert!(agent_lease_is_reclaimable(&lease, false, 200));
+    }
+}
+
+#[test]
+fn agent_run_deadline_is_disabled_unless_explicitly_configured() {
+    assert_eq!(parse_agent_run_timeout(None).unwrap(), Duration::ZERO);
+    assert_eq!(parse_agent_run_timeout(Some("0")).unwrap(), Duration::ZERO);
+    assert_eq!(
+        parse_agent_run_timeout(Some("2700")).unwrap(),
+        Duration::from_secs(2700)
+    );
+    for invalid in ["-1", "soon", "", "18446744073709551616"] {
+        assert!(parse_agent_run_timeout(Some(invalid)).is_err());
     }
 }
 

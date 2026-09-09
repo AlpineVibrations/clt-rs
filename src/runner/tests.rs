@@ -122,7 +122,7 @@ fn automated_session_supervisor_process_entry() {
     let lease_holder = std::env::var("CLT_TEST_SUPERVISOR_LEASE_HOLDER").unwrap();
     let stdout_path = PathBuf::from(std::env::var_os("CLT_TEST_SUPERVISOR_STDOUT_PATH").unwrap());
     let stderr_path = PathBuf::from(std::env::var_os("CLT_TEST_SUPERVISOR_STDERR_PATH").unwrap());
-    let exit_code = run_automated_session_supervisor(
+    let exit_result = run_automated_session_supervisor(
         AutomatedSupervisorSpec {
             state_dir: &state_dir,
             project_id: std::env::var("CLT_TEST_SUPERVISOR_PROJECT_ID")
@@ -136,8 +136,11 @@ fn automated_session_supervisor_process_entry() {
         },
         Path::new(&std::env::var_os("CLT_TEST_SUPERVISOR_PROGRAM").unwrap()),
         &arguments,
-    )
-    .unwrap();
+    );
+    if let Some(marker) = std::env::var_os("CLT_TEST_SUPERVISOR_EXIT_MARKER") {
+        fs::write(marker, b"supervisor finished").unwrap();
+    }
+    let exit_code = exit_result.unwrap();
     std::process::exit(exit_code);
 }
 
@@ -216,6 +219,7 @@ fn assert_crashed_automated_owner_control_is_reaped(action: AgentSessionControlA
     );
 
     let launch_marker = root.join("codex-launches");
+    let supervisor_exit_marker = root.join("supervisor-exited");
     let fake_codex = root.join("fake-codex");
     fs::write(
             &fake_codex,
@@ -240,6 +244,7 @@ fn assert_crashed_automated_owner_control_is_reaped(action: AgentSessionControlA
         .env("CLT_TEST_OWNER_CODEX", &fake_codex)
         .env("CLT_TEST_OWNER_SESSION_ID", &session_id)
         .env("CLT_TEST_OWNER_LEASE_HOLDER", &lease_holder)
+        .env("CLT_TEST_SUPERVISOR_EXIT_MARKER", &supervisor_exit_marker)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -335,6 +340,17 @@ fn assert_crashed_automated_owner_control_is_reaped(action: AgentSessionControlA
     if let Some(lease) = interactive_lease {
         lease.release().unwrap();
     }
+    // Session state becomes observable before the supervisor finishes publishing
+    // its registry snapshot. Do not delete its state directory during that write.
+    let started = Instant::now();
+    while !supervisor_exit_marker.exists() {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "supervisor did not finish after reaping Codex"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    drop(store);
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -819,7 +835,7 @@ fn agent_skill_lookup_uses_frontmatter_name() {
 
 #[cfg(unix)]
 #[test]
-fn wait_for_child_with_timeout_emits_heartbeats() {
+fn wait_for_child_without_deadline_emits_heartbeats_until_completion() {
     let mut child = Command::new("sh")
         .arg("-c")
         .arg("sleep 0.2")
@@ -829,7 +845,7 @@ fn wait_for_child_with_timeout_emits_heartbeats() {
 
     let result = wait_for_child_with_timeout_and_heartbeat(
         &mut child,
-        Duration::from_secs(2),
+        Duration::ZERO,
         Duration::from_millis(25),
         |_| {
             heartbeats += 1;
@@ -850,7 +866,27 @@ fn wait_for_child_with_timeout_emits_heartbeats() {
 
 #[cfg(unix)]
 #[test]
-fn wait_for_child_with_timeout_stops_child_on_shutdown() {
+fn wait_for_child_honors_an_explicit_deadline() {
+    let mut command = Command::new("sh");
+    command.arg("-c").arg("sleep 10");
+    configure_agent_child_command(&mut command);
+    let mut child = command.spawn().unwrap();
+    let result = wait_for_child_with_timeout_and_heartbeat(
+        &mut child,
+        Duration::from_millis(25),
+        Duration::from_millis(10),
+        |_| Ok(()),
+        || Ok(()),
+        || false,
+    )
+    .unwrap();
+    assert!(matches!(result, AgentProcessWait::TimedOut(_)));
+    assert!(child.try_wait().unwrap().is_some());
+}
+
+#[cfg(unix)]
+#[test]
+fn wait_for_child_without_deadline_stops_child_on_shutdown() {
     let mut command = Command::new("sh");
     command.arg("-c").arg("sleep 10");
     configure_agent_child_command(&mut command);
@@ -860,7 +896,7 @@ fn wait_for_child_with_timeout_stops_child_on_shutdown() {
 
     let result = wait_for_child_with_timeout_and_heartbeat(
         &mut child,
-        Duration::from_secs(10),
+        Duration::ZERO,
         Duration::from_millis(25),
         |_| Ok(()),
         || Ok(()),
@@ -1909,7 +1945,7 @@ fn codex_runner_registers_a_marker_derived_resume_without_a_session_banner() {
 
 #[cfg(unix)]
 #[test]
-fn codex_runner_renews_its_automated_project_lease_while_running() {
+fn codex_runner_without_deadline_renews_its_automated_project_lease() {
     use std::os::unix::fs::PermissionsExt;
 
     let root = temp_root("agent-codex-lease-renewal");
@@ -1939,8 +1975,7 @@ fn codex_runner_renews_its_automated_project_lease_while_running() {
     permissions.set_mode(0o755);
     fs::set_permissions(&fake_codex, permissions).unwrap();
 
-    let mut runner =
-        CodexAgentRunner::with_command(state_dir.clone(), Duration::from_secs(5), fake_codex);
+    let mut runner = CodexAgentRunner::with_command(state_dir.clone(), Duration::ZERO, fake_codex);
     runner.heartbeat_interval = Duration::from_millis(20);
     runner.lease_timeout = Duration::from_secs(2);
     runner.lease_renew_interval = Duration::from_millis(50);
