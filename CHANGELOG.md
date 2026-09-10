@@ -6,6 +6,10 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+### Added
+
+- Show the current project's agent status after the Kanban console title when its registered agent is enabled.
+
 ### Fixed
 
 - Allow ordinary user commits, including patch-version bumps, and CLT board checkpoints while an agent task is in progress. Preserve the original launch journal and seal or reseal the task against the current branch parent without discarding concurrent work.

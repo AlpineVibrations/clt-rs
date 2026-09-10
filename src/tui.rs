@@ -6078,14 +6078,21 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
         ("Models Console".to_string(), None)
     } else if app.archive_view {
         (format!("{board_title} Archive Console"), None)
-    } else if !app.backlog_visible {
-        let backlog_count = app.task_snapshot.board_entries[BACKLOG_BOARD_INDEX].len();
-        (
-            format!("{board_title} Console"),
-            Some(format!(" Backlog: {backlog_count} [B] ")),
-        )
     } else {
-        (format!("{board_title} Console"), None)
+        let mut title = format!("{board_title} Console");
+        if let Some(project) = app
+            .agent_panel
+            .projects
+            .iter()
+            .find(|project| project.project.path == app.active_root && project.project.enabled)
+        {
+            title.push_str(&format!(" | Agent: {}", project.runtime_state.label()));
+        }
+        let right_title = (!app.backlog_visible).then(|| {
+            let backlog_count = app.task_snapshot.board_entries[BACKLOG_BOARD_INDEX].len();
+            format!(" Backlog: {backlog_count} [B] ")
+        });
+        (title, right_title)
     };
 
     let input_height = tui_input_height(app, size.width);

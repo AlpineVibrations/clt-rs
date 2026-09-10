@@ -1,1 +1,0 @@
-in the kanban view in the tui if the agent is on then it should show agent status in the console title after the project name console text that is there already. if agent is not on or not registered just omit the agent text from the console title
