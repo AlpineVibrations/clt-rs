@@ -2016,7 +2016,7 @@ fn working_link_repair_rechecks_history_after_waiting_for_the_board_lock() {
             || {
                 fs::write(project_root.join("racing-commit.txt"), "unproven\n").unwrap();
                 run_test_git(&project_root, &["add", "racing-commit.txt"]);
-                run_test_git(&project_root, &["commit", "-m", "Unproven racing commit"]);
+                run_test_agent_git(&project_root, &["commit", "-m", "Unproven racing commit"]);
             },
         )
         .unwrap()
@@ -3382,19 +3382,19 @@ fn premanifest_audit_rejects_an_agent_commit_with_an_overridden_author() {
 }
 
 #[test]
-fn premanifest_audit_rejects_a_commit_with_no_agent_identity_or_journal() {
-    let root = temp_root("git-finalization-unproven-non-agent");
+fn premanifest_audit_accepts_a_user_commit_without_a_task_journal() {
+    let root = temp_root("git-finalization-concurrent-user-commit");
     let project_root = root.join("project");
     init_tasks(&project_root, false).unwrap();
     let starting_head = initialize_test_git_repository(&project_root);
-    fs::write(project_root.join("premature.txt"), "premature\n").unwrap();
-    run_test_git(&project_root, &["add", "premature.txt"]);
-    run_test_git(&project_root, &["commit", "-m", "Unproven premature work"]);
+    fs::write(project_root.join("version.txt"), "0.4.1\n").unwrap();
+    run_test_git(&project_root, &["add", "version.txt"]);
+    run_test_git(&project_root, &["commit", "-m", "Bump patch version"]);
     let manifest_parent = run_test_git(&project_root, &["rev-parse", "HEAD"]);
     let store = agent::TursoAgentStore::open_blocking(&root.join("state/clt")).unwrap();
 
     assert!(
-        !agent_git_range_is_safe_before_manifest(
+        agent_git_range_is_safe_before_manifest(
             AgentGitProofContext {
                 store: &store,
                 project_id: 1,

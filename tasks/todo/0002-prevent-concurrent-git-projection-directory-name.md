@@ -1,0 +1,1 @@
+Prevent concurrent Git projection directory name collisions BUG; Parallel managed Git tests reproduced File exists (os error 17) in create_agent_git_tree_projection: process ID plus SystemTime nanoseconds can collide across threads. Use collision-safe temporary directory creation and add concurrent coverage.

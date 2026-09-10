@@ -43,6 +43,7 @@ pub(super) const AGENT_GIT_FINALIZATION_LEASE_SECONDS: u64 =
     AGENT_GIT_REMOTE_TIMEOUT_SECONDS * 8 + 60;
 pub(super) const AGENT_GIT_IDENTITY_NAME: &str = "CLT Agent";
 pub(super) const AGENT_GIT_IDENTITY_EMAIL: &str = "clt-agent@localhost";
+const AGENT_GIT_BOARD_CHECKPOINT_MESSAGE: &str = "Record CLT task board";
 
 pub(super) struct AgentGitFinalizationLease {
     lease: Option<InteractiveAgentLease>,
@@ -1032,7 +1033,7 @@ pub(super) fn checkpoint_agent_git_task_board_before_launch(
             "-p",
             starting_head.as_str(),
             "-m",
-            "Record CLT task board",
+            AGENT_GIT_BOARD_CHECKPOINT_MESSAGE,
         ])
         .output()
         .with_context(|| {
@@ -2119,6 +2120,9 @@ pub(super) fn agent_git_range_is_safe_before_manifest(
         "audit commits created before the task manifest",
     )?;
     for commit in revisions.lines().filter(|commit| !commit.is_empty()) {
+        if git_commit_is_compatible_concurrent_work(project_root, commit, current_session_id)? {
+            continue;
+        }
         let is_proven_completed_task = git_commit_is_proven_completed_other_session(
             proof,
             project_root,
@@ -2130,6 +2134,76 @@ pub(super) fn agent_git_range_is_safe_before_manifest(
         }
     }
     Ok(true)
+}
+
+fn git_commit_is_compatible_concurrent_work(
+    project_root: &Path,
+    commit_oid: &str,
+    current_session_id: &str,
+) -> Result<bool> {
+    // The launch commit remains the history anchor, but ordinary commits may
+    // advance this shared branch before we freeze the task's actual parent.
+    // A task claim must still pass the separate journal/manifest proof.
+    if !git_commit_task_trailers(project_root, commit_oid)?.is_empty()
+        || git_ref_contains_completed_task(project_root, commit_oid, current_session_id)?
+    {
+        return Ok(false);
+    }
+    let metadata = git_stdout(
+        project_root,
+        &[
+            "show",
+            "-s",
+            "--format=%P%x00%an%x00%ae%x00%cn%x00%ce%x00%B",
+            commit_oid,
+        ],
+        "inspect concurrent commit ownership and parents",
+    )?;
+    let fields = metadata.splitn(6, '\0').collect::<Vec<_>>();
+    let [
+        parents,
+        author_name,
+        author_email,
+        committer_name,
+        committer_email,
+        message,
+    ] = fields.as_slice()
+    else {
+        return Ok(false);
+    };
+    if parents.split_whitespace().count() != 1 {
+        return Ok(false);
+    }
+    // Inspect both identities: overriding only an agent commit's author (or
+    // committer) must not disguise a premature implementation commit.
+    let has_agent_identity = [*author_name, *committer_name].contains(&AGENT_GIT_IDENTITY_NAME)
+        || [*author_email, *committer_email].contains(&AGENT_GIT_IDENTITY_EMAIL);
+    if !has_agent_identity {
+        return Ok(true);
+    }
+    // CLT may checkpoint the board for a later run while an older Working
+    // journal is blocked. Recognize only the board-only checkpoint shape;
+    // ordinary agent implementation commits still need completion proof.
+    if message.trim_end() != AGENT_GIT_BOARD_CHECKPOINT_MESSAGE
+        || !git_commit_uses_agent_identity(project_root, commit_oid)?
+    {
+        return Ok(false);
+    }
+    let paths = git_nul_separated_paths(
+        project_root,
+        &[
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "--no-renames",
+            "-r",
+            "-z",
+            commit_oid,
+            "--",
+        ],
+        "verify the concurrent task-board checkpoint scope",
+    )?;
+    Ok(!paths.is_empty() && paths.iter().all(|path| path.starts_with("tasks/")))
 }
 
 pub(super) fn git_commit_is_proven_completed_other_session(
