@@ -8,6 +8,12 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 Use this section while developing the next release.
 
+## [0.6.9] - 2026-09-10
+
+### Fixed
+
+- Label the console explicitly as `Log View` while agent output is open, clear previous console feedback when opening logs, and prevent Agent Projects refresh errors from covering the displayed output.
+
 ## [0.6.8] - 2026-09-09
 
 ### Fixed

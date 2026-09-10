@@ -3214,7 +3214,7 @@ pub(super) fn tui_agent_log_title(log_view: &TuiAgentLogView) -> String {
         "l/Esc closes"
     };
     format!(
-        "Agent Output [{status}]: {} ({controls})",
+        "Log View [{status}]: {} ({controls})",
         log_view.project_name,
     )
 }
@@ -4633,11 +4633,11 @@ pub(super) fn tui_console_content<'a>(
     log_view: Option<&'a TuiAgentLogView>,
     feedback: &'a str,
 ) -> (&'a str, Color) {
-    if agent_pane && let Some(error) = panel.last_error.as_deref() {
-        return (error, Color::Red);
-    }
     if let Some(log_view) = log_view {
         return (&log_view.content, Color::Gray);
+    }
+    if agent_pane && let Some(error) = panel.last_error.as_deref() {
+        return (error, Color::Red);
     }
     if agent_pane
         && let Some(problem) = panel
@@ -5546,6 +5546,11 @@ impl TuiApp {
             current_time: String::new(),
             provider_env_statuses: HashMap::new(),
         }
+    }
+
+    pub(super) fn open_agent_log(&mut self, log_view: TuiAgentLogView) {
+        self.feedback_buffer.clear();
+        self.agent_log_view = Some(log_view);
     }
 
     pub(super) fn board_dir(&self) -> PathBuf {
@@ -7190,14 +7195,7 @@ pub(super) fn execute_tui_key_effect(
 
                         match selected_tui_agent_log_view(&app.agent_panel) {
                             Ok(Some(log_view)) => {
-                                let output_kind = if log_view.is_live {
-                                    "live agent output"
-                                } else {
-                                    "latest agent output"
-                                };
-                                app.feedback_buffer =
-                                    format!("Showing {output_kind} for {}", log_view.project_name);
-                                app.agent_log_view = Some(log_view);
+                                app.open_agent_log(log_view);
                                 *last_agent_log_refresh = Instant::now();
                             }
                             Ok(None) => {
@@ -7616,14 +7614,7 @@ pub(super) fn execute_tui_key_effect(
                             selected_task.as_ref(),
                         ) {
                             Ok(Some(log_view)) => {
-                                let output_kind = if log_view.is_live {
-                                    "live agent output"
-                                } else {
-                                    "recorded agent output"
-                                };
-                                app.feedback_buffer =
-                                    format!("Showing {output_kind} for {}", log_view.project_name);
-                                app.agent_log_view = Some(log_view);
+                                app.open_agent_log(log_view);
                                 *last_agent_log_refresh = Instant::now();
                             }
                             Ok(None) => {

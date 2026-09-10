@@ -594,10 +594,7 @@ fn tui_agent_panel_refresh_error_uses_the_red_console() {
         scroll_offset: 0,
         last_error: Some("Agent registry unavailable: database locked".to_string()),
     };
-    let log_view = TuiAgentLogView::message("alpha".to_string(), "latest log".to_string());
-
-    let (content, color) =
-        tui_console_content(true, &panel, Some(&log_view), "Agent pane instructions");
+    let (content, color) = tui_console_content(true, &panel, None, "Agent pane instructions");
 
     assert_eq!(content, "Agent registry unavailable: database locked");
     assert_eq!(color, Color::Red);
@@ -620,6 +617,59 @@ fn tui_kanban_console_displays_an_open_agent_log() {
 
     assert_eq!(content, "live output");
     assert_eq!(color, Color::Gray);
+}
+
+#[test]
+fn opening_agent_log_clears_previous_console_text_and_shows_log_mode() {
+    let root = temp_root("log-mode-console");
+    let backend = ratatui::backend::TestBackend::new(80, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    for pane in [TuiPane::Tasks, TuiPane::AgentProjects] {
+        for is_live in [false, true] {
+            let mut app = TuiApp::new(&root, true);
+            app.current_pane = pane;
+            app.feedback_buffer = "Previous console feedback".to_string();
+            let registry_error = "Agent registry unavailable: database locked";
+            app.agent_panel.last_error = Some(registry_error.to_string());
+            terminal.draw(|frame| render_tui(frame, &app)).unwrap();
+
+            let mut view =
+                TuiAgentLogView::message("alpha".to_string(), "Current agent output".to_string());
+            view.is_live = is_live;
+            app.open_agent_log(view);
+            assert!(app.feedback_buffer.is_empty());
+            terminal.draw(|frame| render_tui(frame, &app)).unwrap();
+            let rendered = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            let status = if is_live { "LIVE" } else { "LATEST" };
+            assert!(rendered.contains(&format!("Log View [{status}]: alpha")));
+            assert!(rendered.contains("l/Esc closes"));
+            assert!(rendered.contains("Current agent output"));
+            assert!(!rendered.contains("Previous console feedback"));
+            assert!(!rendered.contains(registry_error));
+
+            app.agent_log_view = None;
+            terminal.draw(|frame| render_tui(frame, &app)).unwrap();
+            let rendered = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(!rendered.contains("Log View"));
+            assert!(!rendered.contains("Current agent output"));
+            assert!(!rendered.contains("Previous console feedback"));
+            if pane == TuiPane::AgentProjects {
+                assert!(rendered.contains(registry_error));
+            }
+        }
+    }
 }
 
 #[test]
