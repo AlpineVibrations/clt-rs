@@ -14,8 +14,8 @@ fn concurrent_commits_cannot_bypass_task_proof() {
         let root = temp_root("git-concurrent-task-proof");
         init_tasks(&root, false).unwrap();
         let starting_head = initialize_test_git_repository(&root);
-        let mut command = Command::new("git");
-        command.current_dir(&root).args(["commit", "-m"]);
+        let mut command = test_git_command(&root);
+        command.args(["commit", "-m"]);
         let checkpoint = scenario.starts_with("checkpoint");
         command.arg(if checkpoint {
             "Record CLT task board"
