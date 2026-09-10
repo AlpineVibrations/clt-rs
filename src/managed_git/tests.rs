@@ -6,6 +6,7 @@ use crate::worker::tests::reserve_test_worker;
 mod advanced_branch;
 mod follow_up;
 mod orphan;
+mod projection;
 
 #[test]
 fn agent_store_git_finalization_crud_is_idempotent_and_generation_fenced() {

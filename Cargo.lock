@@ -473,6 +473,7 @@ dependencies = [
  "libc",
  "ratatui",
  "serde_json",
+ "tempfile",
  "tokio",
  "toml_edit",
  "tui-input",

@@ -6,10 +6,11 @@ use std::{
     process::{Command, Stdio},
     sync::{Arc, Mutex, mpsc},
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
+use tempfile::TempDir;
 
 use crate::{
     agent::{self, AgentGitMode, GitFinalizationState, open_agent_store_at, with_agent_store_at},
@@ -1514,16 +1515,6 @@ pub(super) fn git_ref_has_one_completed_session_task(
     Ok(marker_count == 1 && completed_count == 1)
 }
 
-pub(super) struct AgentGitTreeProjection {
-    root: PathBuf,
-}
-
-impl Drop for AgentGitTreeProjection {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
-    }
-}
-
 pub(super) fn run_agent_git_projection_command(
     project_root: &Path,
     index_path: &Path,
@@ -1626,34 +1617,21 @@ pub(super) fn materialize_agent_git_task_tree(
 pub(super) fn create_agent_git_tree_projection(
     project_root: &Path,
     source_tree: &str,
-) -> Result<(AgentGitTreeProjection, PathBuf, PathBuf)> {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let projection_root = std::env::temp_dir().join(format!(
-        "clt-git-finalization-{}-{nonce}",
-        std::process::id()
-    ));
-    let mut projection_builder = fs::DirBuilder::new();
+) -> Result<(TempDir, PathBuf, PathBuf)> {
+    // Atomically reserve a random name and retry collisions; timestamps can
+    // repeat across threads. The guard also removes partial projections on error.
+    let mut projection_builder = tempfile::Builder::new();
+    projection_builder.prefix("clt-git-finalization-");
     #[cfg(unix)]
     {
-        use std::os::unix::fs::DirBuilderExt;
-        projection_builder.mode(0o700);
+        use std::os::unix::fs::PermissionsExt;
+        projection_builder.permissions(fs::Permissions::from_mode(0o700));
     }
-    projection_builder
-        .create(&projection_root)
-        .with_context(|| {
-            format!(
-                "Failed to create sealed task projection directory {:?}",
-                projection_root
-            )
-        })?;
-    let projection = AgentGitTreeProjection {
-        root: projection_root,
-    };
-    let index_path = projection.root.join("index");
-    let worktree_path = projection.root.join("worktree");
+    let projection = projection_builder
+        .tempdir()
+        .context("Failed to create sealed task projection directory")?;
+    let index_path = projection.path().join("index");
+    let worktree_path = projection.path().join("worktree");
     fs::create_dir(&worktree_path).with_context(|| {
         format!(
             "Failed to create sealed task projection worktree {:?}",
