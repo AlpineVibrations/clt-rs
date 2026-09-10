@@ -3134,15 +3134,23 @@ fn writable_shared_interactive_reservation_rejects_durable_git_boundaries() {
                 )
                 .unwrap()
         );
+    let error = store
+        .reserve_shared_session_interactive_blocking(
+            launch_project.id,
+            "session-shared-launch",
+            &requester,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("unfinished Git work"), "{error}");
+    assert!(error.contains("launch preparation"), "{error}");
+    assert!(error.contains("press c again"), "{error}");
     assert!(
-        !store
-            .reserve_shared_session_interactive_blocking(
-                launch_project.id,
-                "session-shared-launch",
-                &requester,
-                None,
-            )
+        store
+            .session_control_blocking(launch_project.id, "session-shared-launch")
             .unwrap()
+            .is_none()
     );
 
     let finalization_root = root.join("finalization-project");
@@ -3180,6 +3188,65 @@ fn writable_shared_interactive_reservation_rejects_durable_git_boundaries() {
                 })
                 .unwrap()
         );
+    let error = store
+        .reserve_shared_session_interactive_blocking(
+            finalization_project.id,
+            "session-shared-finalization",
+            &requester,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("unfinished Git work"), "{error}");
+    assert!(
+        error.contains("session-working-finalization (working)"),
+        "{error}"
+    );
+    assert!(
+        store
+            .session_control_blocking(finalization_project.id, "session-shared-finalization")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .session_control_blocking(finalization_project.id, "session-active-finalization")
+            .unwrap()
+            .unwrap()
+            .state,
+        AgentSessionControlState::Running
+    );
+
+    // Resolving the Git boundary makes the same idle session available.
+    let finalization = store
+        .git_finalization_blocking(finalization_project.id, "session-working-finalization")
+        .unwrap()
+        .unwrap();
+    assert!(
+        store
+            .compare_and_set_git_finalization_blocking(
+                finalization_project.id,
+                "session-working-finalization",
+                finalization.generation,
+                agent::GitFinalizationState::Cancelled,
+                None,
+                None,
+                None,
+                "101",
+            )
+            .unwrap()
+    );
+    assert!(
+        store
+            .reserve_shared_session_interactive_blocking(
+                finalization_project.id,
+                "session-shared-finalization",
+                &requester,
+                None,
+            )
+            .unwrap()
+    );
+    // A real reservation race still returns false, rather than a Git error.
     assert!(
         !store
             .reserve_shared_session_interactive_blocking(
@@ -3213,15 +3280,30 @@ fn writable_shared_interactive_reservation_rejects_durable_git_boundaries() {
             .try_acquire_lease_blocking(lease_project.id, "git-owner", "100", "999")
             .unwrap()
     );
-    assert!(
-        !store
-            .reserve_shared_session_interactive_blocking(
-                lease_project.id,
-                "session-shared-lease",
-                &requester,
-                None,
-            )
+    let error = store
+        .reserve_shared_session_interactive_blocking(
+            lease_project.id,
+            "session-shared-lease",
+            &requester,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("unfinished Git work"), "{error}");
+    assert!(error.contains("active project run"), "{error}");
+    assert_eq!(
+        store
+            .lease_for_project_blocking(lease_project.id)
             .unwrap()
+            .unwrap()
+            .holder,
+        "git-owner"
+    );
+    assert!(
+        store
+            .session_control_blocking(lease_project.id, "session-shared-lease")
+            .unwrap()
+            .is_none()
     );
 
     fs::remove_dir_all(root).unwrap();

@@ -959,12 +959,34 @@ impl TursoAgentStore {
                 .await?
                     != 0;
                 if git_boundary_conflict {
+                    // A durable Git boundary is not a reservation race. Explain
+                    // the owner while holding the same transaction used to check
+                    // it, so the TUI does not tell users to retry indefinitely.
+                    let mut rows = transaction.query(
+                        "SELECT codex_session_id, state FROM git_finalizations
+                          WHERE project_id = ?1
+                            AND state NOT IN ('completed', 'cancelled')
+                          ORDER BY created_at, codex_session_id LIMIT 1",
+                        [project_id],
+                    ).await?;
+                    let owner = if let Some(row) = rows.next().await? {
+                        format!(
+                            "session {} ({})",
+                            row_text(&row, 0, "codex_session_id")?,
+                            row_text(&row, 1, "state")?,
+                        )
+                    } else {
+                        "the active project run or its launch preparation".to_string()
+                    };
+                    drop(rows);
                     transaction.commit().await.with_context(|| {
                         format!(
                             "Failed to finish rejecting unsafe shared interactive session {codex_session_id}"
                         )
                     })?;
-                    return Ok(false);
+                    anyhow::bail!(
+                        "Shared Codex is blocked by unfinished Git work for {owner}. Finish or resolve that Git work, then press c again; pausing the project does not stop its current run."
+                    );
                 }
                 let restore_stopped =
                     is_stopped_shared_interactive_holder(interactive_holder);
