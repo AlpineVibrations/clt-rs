@@ -570,7 +570,8 @@ fn tui_agent_panel_refresh_error_preserves_the_last_snapshot() {
     };
     panel.state.select(Some(1));
     let selected_row = panel.selected_row_identity();
-    let refresh_error = std::io::Error::other("database locked").into();
+    let refresh_error = anyhow::Error::new(std::io::Error::other("database locked"))
+        .context("automatic recovery could not proceed");
 
     panel.apply_refresh_result(Path::new("/tmp/alpha"), selected_row, Err(refresh_error));
 
@@ -580,7 +581,7 @@ fn tui_agent_panel_refresh_error_preserves_the_last_snapshot() {
     assert_eq!(panel.scroll_offset, 1);
     assert_eq!(
         panel.last_error.as_deref(),
-        Some("Agent registry unavailable: database locked")
+        Some("Agent registry unavailable: automatic recovery could not proceed: database locked")
     );
 }
 

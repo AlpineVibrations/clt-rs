@@ -1744,7 +1744,7 @@ impl ShmWalCoordination {
     ///    WAL scan — we are the first process.
     ///
     /// 2. **Authority initialized and we opened from a local disk scan**
-    ///    (no writer/checkpoint is active): repair transient owner/reader
+    ///    (writer/checkpoint locks acquired): repair transient reader
     ///    state first. If the scan only sees an empty WAL and the durable
     ///    authority is already at frame 0, keep the durable authority because
     ///    the scan cannot prove newer header metadata. Otherwise, if the
@@ -1753,9 +1753,7 @@ impl ShmWalCoordination {
     ///    frame index and rebuild it from the local scan.
     ///
     /// 3. **Authority initialized and trustworthy**: adopt the authority's
-    ///    snapshot as our local state. If our local view also came from a
-    ///    disk scan and the authority's frame index is empty, backfill it
-    ///    from our local frame cache.
+    ///    snapshot as our local state without modifying the shared index.
     fn seed_or_sync_authority(&self) {
         let snapshot = self.authority.snapshot();
         let local_wal_view_loaded_from_disk = self
@@ -1764,14 +1762,24 @@ impl ShmWalCoordination {
             .metadata
             .loaded_from_disk_scan
             .load(Ordering::Acquire);
-        if Self::authority_is_uninitialized(snapshot) {
-            self.sync_authority_from_local();
-            self.sync_authority_frames_from_local();
-        } else if local_wal_view_loaded_from_disk
-            && !self.authority.writer_or_checkpoint_lock_active()
-        {
-            self.repair_or_reseed_authority_from_local_disk_scan(snapshot);
+        let recovery_guard =
+            if Self::authority_is_uninitialized(snapshot) || local_wal_view_loaded_from_disk {
+                self.authority.try_recovery_guard()
+            } else {
+                None
+            };
+        if let Some(_guard) = recovery_guard {
+            // A peer may have committed since the first snapshot. Reload only
+            // after acquiring both locks and keep them through index publication.
+            let snapshot = self.authority.snapshot();
+            if Self::authority_is_uninitialized(snapshot) {
+                self.sync_authority_from_local();
+                self.sync_authority_frames_from_local();
+            } else {
+                self.repair_or_reseed_authority_from_local_disk_scan(snapshot);
+            }
         } else {
+            let snapshot = self.authority.snapshot();
             let needs_zero_frame_header_rewrite = snapshot.max_frame == 0 && {
                 let shared = self.shared.read();
                 !shared.metadata.initialized.load(Ordering::Acquire)
@@ -1786,12 +1794,6 @@ impl ShmWalCoordination {
                     .metadata
                     .initialized
                     .store(false, Ordering::Release);
-            }
-            if local_wal_view_loaded_from_disk
-                && !self.authority.writer_or_checkpoint_lock_active()
-                && self.authority.iter_latest_frames(0, u64::MAX).is_empty()
-            {
-                self.sync_authority_frames_from_local();
             }
         }
     }

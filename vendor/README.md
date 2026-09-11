@@ -46,6 +46,16 @@ same-process ownership reservation remains held through the unlock. A determinis
 regression inserts a successor at the unlock boundary and verifies that the old
 release cannot erase it, using native and process-scoped mappings.
 
+Coordination reseeding now acquires both checkpoint and writer locks, reloads the
+shared snapshot under those locks, and retains them until the index is published.
+The previous idle-lock probe allowed a writer to start before repair trimmed the
+frame index, causing `shared WAL frame index length changed while publishing an
+entry`. Readers that cannot acquire the locks adopt the current shared snapshot
+without changing its index. Transient reader repair preserves the guard's owner
+metadata, and the guard releases both locks on return or unwind. Regressions cover
+writer/checkpoint exclusion with native and process-scoped mappings, interrupted
+repair, and concurrent connection opens during 2,000 registry writes.
+
 Remove the patch only after a released upstream version contains the equivalent
-reader ownership fixes and passes these regressions. Do not replace it by removing
+ownership and reseeding fixes and passes these regressions. Do not replace it by removing
 CLT's checkpoint pin or discarding the WAL.

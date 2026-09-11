@@ -1507,7 +1507,7 @@ impl TuiAgentPanel {
                 self.restore_or_normalize_selection(selected_row);
             }
             Err(err) => {
-                self.last_error = Some(format!("Agent registry unavailable: {err}"));
+                self.last_error = Some(format!("Agent registry unavailable: {err:#}"));
             }
         }
     }

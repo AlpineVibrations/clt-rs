@@ -167,11 +167,6 @@ impl ProcessLocalOwnershipState {
         self.writer_owner = None;
     }
 
-    /// Return whether any sibling connection in this process currently owns the writer slot.
-    fn writer_active(&self) -> bool {
-        self.writer_owner.is_some()
-    }
-
     /// Record that one local connection now owns the process-local checkpoint slot.
     fn try_acquire_checkpoint(&mut self, owner: SharedOwnerRecord) -> bool {
         if self.checkpoint_owner.is_some() {
@@ -697,6 +692,18 @@ struct FrameIndexBlockMapping {
 
 unsafe impl Send for MappedSharedWalCoordination {}
 unsafe impl Sync for MappedSharedWalCoordination {}
+
+pub(crate) struct SharedWalRecoveryGuard<'a> {
+    coordination: &'a MappedSharedWalCoordination,
+}
+
+impl Drop for SharedWalRecoveryGuard<'_> {
+    fn drop(&mut self) {
+        let owner = self.coordination.owner_record();
+        self.coordination.release_writer(owner);
+        self.coordination.release_checkpoint(owner);
+    }
+}
 
 impl std::fmt::Debug for MappedSharedWalCoordination {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1292,8 +1299,9 @@ impl MappedSharedWalCoordination {
     /// Repair transient runtime state when a process determines that it can
     /// reconcile the tshm with a local WAL disk scan.
     ///
-    /// Clears writer/checkpoint owners and reclaims stale reader slots, but
-    /// leaves the durable frame index intact.
+    /// Reclaims stale reader slots, but leaves writer/checkpoint ownership and
+    /// the durable frame index intact. The caller holds a recovery guard;
+    /// acquiring its locks has already replaced any stale owner metadata.
     ///
     /// For reader slots, we must NOT blindly clear slots owned by
     /// live processes: doing so would cause those processes to panic with
@@ -1305,10 +1313,6 @@ impl MappedSharedWalCoordination {
     /// probes here is weaker and can misclassify recycled PIDs as live.
     pub(crate) fn repair_transient_state_for_exclusive_open(&self) {
         let header = self.header();
-        header.writer_owner.store(UNOWNED_LOCK, Ordering::Release);
-        header
-            .checkpoint_owner
-            .store(UNOWNED_LOCK, Ordering::Release);
 
         // For reader slots, we must check byte-range locks before
         // clearing: another live process may hold a slot. Blindly clearing
@@ -1819,21 +1823,18 @@ impl MappedSharedWalCoordination {
         }
     }
 
-    /// Determine whether the writer or checkpoint lock is currently held by any process.
-    pub(crate) fn writer_or_checkpoint_lock_active(&self) -> bool {
-        let (writer_held, checkpoint_held) = self
-            .with_local_lock_state(|entry| (entry.writer_lock_held, entry.checkpoint_lock_held));
-        if self.uses_linux_ofd_locking() {
-            return self.byte_lock_is_held(WRITER_LOCK_OFFSET, writer_held)
-                || self.byte_lock_is_held(CHECKPOINT_LOCK_OFFSET, checkpoint_held);
+    /// Fence coordination reseeding against writers and checkpoints. Probing
+    /// for idle locks is insufficient: a peer can start between the probe and
+    /// an index rollback. Use the same lock order as a restarting checkpoint.
+    pub(crate) fn try_recovery_guard(&self) -> Option<SharedWalRecoveryGuard<'_>> {
+        if !self.try_acquire_checkpoint(self.owner_record) {
+            return None;
         }
-        if self.with_process_local_ownership(|entry| {
-            entry.writer_active() || entry.checkpoint_active()
-        }) {
-            return true;
+        if !self.try_acquire_writer(self.owner_record) {
+            self.release_checkpoint(self.owner_record);
+            return None;
         }
-        self.byte_lock_is_held(WRITER_LOCK_OFFSET, false)
-            || self.byte_lock_is_held(CHECKPOINT_LOCK_OFFSET, false)
+        Some(SharedWalRecoveryGuard { coordination: self })
     }
 
     /// Determine whether the checkpoint lock is currently held by any process.
@@ -3240,6 +3241,54 @@ mod tests {
     }
 
     #[test]
+    fn mapped_shared_wal_recovery_guard_excludes_writers_and_checkpoints() {
+        for process_scoped in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("coordination.tshm");
+            let create = if process_scoped {
+                create_process_scoped_mapping
+            } else {
+                create_mapping
+            };
+            let repair = create(&path);
+            let peer = create(&path);
+            let owner = peer.owner_record();
+            peer.record_frame(7, 1);
+
+            assert!(peer.try_acquire_writer(owner));
+            assert!(repair.try_recovery_guard().is_none());
+            // A failed recovery acquisition must release the checkpoint lock.
+            assert!(peer.try_acquire_checkpoint(owner));
+            peer.release_writer(owner);
+            assert!(repair.try_recovery_guard().is_none());
+            peer.release_checkpoint(owner);
+
+            {
+                let _guard = repair.try_recovery_guard().unwrap();
+                repair.repair_transient_state_for_exclusive_open();
+                assert_eq!(repair.writer_owner(), Some(repair.owner_record()));
+                assert_eq!(repair.checkpoint_owner(), Some(repair.owner_record()));
+                assert!(!peer.try_acquire_writer(owner));
+                assert!(!peer.try_acquire_checkpoint(owner));
+                assert_eq!(peer.find_frame(7, 0, 1, None), Some(1));
+            }
+            assert!(peer.try_acquire_writer(owner));
+            peer.record_frame(9, 2);
+            peer.release_writer(owner);
+            assert!(peer.try_acquire_checkpoint(owner));
+            peer.release_checkpoint(owner);
+            assert_eq!(peer.find_frame(9, 0, 2, None), Some(2));
+
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = repair.try_recovery_guard().unwrap();
+                panic!("interrupted repair");
+            }));
+            assert!(panic.is_err());
+            assert!(peer.try_recovery_guard().is_some());
+        }
+    }
+
+    #[test]
     fn mapped_shared_wal_coordination_repair_reclaims_dead_owners_without_clearing_frame_index() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("coordination.tshm");
@@ -3260,7 +3309,10 @@ mod tests {
         mapped.reader_owners()[0]
             .store(SharedOwnerRecord::new(u32::MAX, 3).raw(), Ordering::Release);
 
-        mapped.repair_transient_state_for_exclusive_open();
+        {
+            let _guard = mapped.try_recovery_guard().unwrap();
+            mapped.repair_transient_state_for_exclusive_open();
+        }
 
         assert_eq!(mapped.writer_owner(), None);
         assert_eq!(mapped.checkpoint_owner(), None);
@@ -3283,7 +3335,10 @@ mod tests {
             .register_reader(mapped_b.owner_record(), 4)
             .unwrap();
 
-        mapped_a.repair_transient_state_for_exclusive_open();
+        {
+            let _guard = mapped_a.try_recovery_guard().unwrap();
+            mapped_a.repair_transient_state_for_exclusive_open();
+        }
 
         assert_eq!(mapped_a.reader_owner(reader.slot_index), Some(reader.owner));
         assert_eq!(mapped_a.min_active_reader_frame(), Some(4));
@@ -3317,7 +3372,10 @@ mod tests {
             let older = mapped.register_reader(mapped.owner_record(), 2).unwrap();
             assert_eq!(first, sibling);
 
-            mapped.repair_transient_state_for_exclusive_open();
+            {
+                let _guard = mapped.try_recovery_guard().unwrap();
+                mapped.repair_transient_state_for_exclusive_open();
+            }
 
             assert_eq!(mapped.reader_owner(first.slot_index), Some(first.owner));
             assert_eq!(mapped.reader_owner(older.slot_index), Some(older.owner));

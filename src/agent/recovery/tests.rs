@@ -14,6 +14,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[path = "wal_tail_tests.rs"]
 mod wal_tail_tests;
 
+#[path = "concurrent_open_tests.rs"]
+mod concurrent_open_tests;
+
 const CHECKPOINT_CHILD_STATE: &str = "CLT_REGISTRY_RECOVERY_CHECKPOINT_TEST_STATE";
 const REOPEN_CHILD_STATE: &str = "CLT_REGISTRY_RECOVERY_REOPEN_TEST_STATE";
 
