@@ -301,6 +301,8 @@ pub(super) fn wait_for_deferred_agent_migrations(
 #[cfg(test)]
 mod tests;
 
+mod health;
+
 #[cfg(test)]
 pub(super) fn run_agent_daemon_loop(
     state_dir: &Path,
@@ -377,6 +379,64 @@ pub(super) async fn run_agent_daemon_loop_async(
         AgentDaemonExecutor::Inline(_) => agent_lease_holder(),
         AgentDaemonExecutor::Independent { .. } => agent_scheduler_lease_holder(),
     });
+    let supervised_service = daemon_checkin.mode == "service"
+        && matches!(executor, AgentDaemonExecutor::Independent { .. });
+    let daemon = run_agent_daemon_loop_inner(
+        state_dir.clone(),
+        executor,
+        poll_interval,
+        max_passes,
+        shutdown,
+        daemon_checkin.clone(),
+    );
+    let result = if supervised_service {
+        match health::supervise_daemon(
+            daemon,
+            || {
+                let state_dir = state_dir.clone();
+                let checkin = daemon_checkin.clone();
+                tokio::task::spawn_blocking(move || {
+                    with_agent_store_at(&state_dir, |store| {
+                        record_agent_daemon_checkin(store, &checkin)
+                    })
+                })
+            },
+            Duration::from_secs(AGENT_DAEMON_CHECKIN_STALE_SECONDS / 3),
+            Duration::from_secs(AGENT_DAEMON_CHECKIN_STALE_SECONDS),
+        )
+        .await
+        {
+            health::DaemonHealthOutcome::Stopped(result) => result,
+            health::DaemonHealthOutcome::Unresponsive(error) => {
+                eprintln!(
+                    "{error:#}; exiting the scheduler so the service manager restarts it. Independent workers continue."
+                );
+                // A stuck spawn_blocking operation cannot be cancelled, and
+                // dropping its runtime would wait forever. This process owns
+                // only the scheduler; launchd/systemd owns worker lifetimes.
+                #[cfg(not(test))]
+                std::process::exit(1);
+                #[cfg(test)]
+                return Err(error);
+            }
+        }
+    } else {
+        daemon.await
+    };
+    if result.is_ok() {
+        clear_agent_daemon_checkin_best_effort(&state_dir, &daemon_checkin.holder).await;
+    }
+    result
+}
+
+async fn run_agent_daemon_loop_inner(
+    state_dir: PathBuf,
+    executor: AgentDaemonExecutor,
+    poll_interval: Duration,
+    max_passes: Option<usize>,
+    shutdown: AgentShutdownSignal,
+    daemon_checkin: AgentDaemonCheckinSource,
+) -> Result<()> {
     let mut scheduled_passes = 0;
     let mut active_passes: Vec<tokio::task::JoinHandle<Result<AgentSchedulerStart>>> = Vec::new();
     let mut active_runs: Vec<AgentDaemonRun> = Vec::new();
@@ -495,7 +555,6 @@ pub(super) async fn run_agent_daemon_loop_async(
             if let Some(error) = recovery_error {
                 return Err(error);
             }
-            clear_agent_daemon_checkin_best_effort(&state_dir, &daemon_checkin.holder).await;
             return Ok(());
         }
 
