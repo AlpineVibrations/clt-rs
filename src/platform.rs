@@ -2,7 +2,7 @@ use std::{
     collections::HashSet,
     ffi::{OsStr, OsString},
     fs,
-    io::{self},
+    io::{self, Read, Seek, Write},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::atomic::{AtomicBool, Ordering},
@@ -644,6 +644,52 @@ pub(super) fn restart_running_agent_service() -> Result<()> {
             "Automatic agent service recovery is only supported on macOS launchd and Linux user systemd."
         ),
     }
+}
+
+/// Coordinate recovery across TUIs without trusting the unhealthy registry.
+/// Keep the returned lock through the service command; the durable timestamp
+/// also gives a new daemon time to start if the requesting TUI exits midway.
+pub(super) struct AgentServiceRestartClaim(fs::File);
+
+impl Drop for AgentServiceRestartClaim {
+    fn drop(&mut self) {
+        // Closing alone may leave the lock alive in a concurrently forked child
+        // that has not reached exec yet. Explicitly release our ownership.
+        let _ = self.0.unlock();
+    }
+}
+
+pub(super) fn claim_agent_service_restart(
+    state_dir: &Path,
+    now: u64,
+) -> Result<Option<AgentServiceRestartClaim>> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(state_dir.join("service-restart.lock"))?;
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(fs::TryLockError::WouldBlock) => return Ok(None),
+        Err(fs::TryLockError::Error(error)) => return Err(error.into()),
+    }
+    let mut claim = AgentServiceRestartClaim(file);
+    let file = &mut claim.0;
+    let mut previous = String::new();
+    file.read_to_string(&mut previous)?;
+    if previous
+        .parse::<u64>()
+        .ok()
+        .is_some_and(|last| now >= last && now - last < 60)
+    {
+        return Ok(None);
+    }
+    file.rewind()?;
+    file.set_len(0)?;
+    write!(file, "{now}")?;
+    file.sync_all()?;
+    Ok(Some(claim))
 }
 
 pub(super) fn systemd_start_command_args() -> [&'static [&'static str]; 3] {

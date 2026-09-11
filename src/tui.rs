@@ -2556,21 +2556,27 @@ pub(super) fn load_tui_agent_panel_snapshot_inner(
 ) -> Result<TuiAgentPanelSnapshot> {
     let state_dir = agent_state_dir()?;
     let service_status = agent_service_status(&state_dir);
-    let store = open_agent_store_at(&state_dir)?;
+    let mut store = open_agent_store_at(&state_dir)?;
     let mut checkins = store.list_daemon_checkins_blocking()?;
     let now = agent_timestamp_seconds();
     let service_restarted =
         recover_stale_service && agent_service_needs_restart(&service_status, &checkins, now);
     if service_restarted {
-        restart_running_agent_service().context("Failed to restart stale agent service")?;
-        for checkin in checkins
-            .iter()
-            .filter(|checkin| checkin.mode == "service" && !daemon_checkin_is_fresh(checkin, now))
-        {
-            store.clear_daemon_checkin_blocking(&checkin.holder)?;
+        // Never hold a database reader while waiting for a service restart.
+        // Another TUI may already have restarted it since our first snapshot.
+        drop(store);
+        if let Some(_claim) = crate::platform::claim_agent_service_restart(&state_dir, now)? {
+            let current = open_agent_store_at(&state_dir)?.list_daemon_checkins_blocking()?;
+            if agent_service_needs_restart(
+                &agent_service_status(&state_dir),
+                &current,
+                agent_timestamp_seconds(),
+            ) {
+                restart_running_agent_service().context("Failed to restart stale agent service")?;
+            }
         }
-        checkins
-            .retain(|checkin| checkin.mode != "service" || daemon_checkin_is_fresh(checkin, now));
+        store = open_agent_store_at(&state_dir)?;
+        checkins = store.list_daemon_checkins_blocking()?;
     }
     let daemon_status = if service_restarted {
         "service restarting".to_string()

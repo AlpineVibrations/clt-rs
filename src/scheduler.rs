@@ -1592,21 +1592,18 @@ pub(super) fn project_has_resumable_doing_task(
     let doing = read_task_entries(&get_tasks_dir(&project.path), TaskStatus::Doing)?;
     with_agent_store_at(state_dir, |store| {
         for task in doing {
-            let externally_completed =
-                recoverable_codex_session_id_from_task_content(&task.content)
-                    .map(|session_id| {
-                        store
-                            .git_finalization_blocking(project.id, session_id)
-                            .map(|journal| {
-                                journal.is_some_and(|journal| {
-                                    journal.state == GitFinalizationState::Cancelled
-                                        && journal.last_error.as_deref()
-                                            == Some(AGENT_EXTERNAL_COMPLETION_REASON)
-                                })
-                            })
-                    })
-                    .transpose()?
-                    .unwrap_or(false);
+            let Some(session_id) = recoverable_codex_session_id_from_task_content(&task.content)
+            else {
+                // A project lease does not establish ownership of a human's
+                // Doing task. Only a durable task/session link permits resume.
+                continue;
+            };
+            let externally_completed = store
+                .git_finalization_blocking(project.id, session_id)?
+                .is_some_and(|journal| {
+                    journal.state == GitFinalizationState::Cancelled
+                        && journal.last_error.as_deref() == Some(AGENT_EXTERNAL_COMPLETION_REASON)
+                });
             if !externally_completed {
                 return Ok(true);
             }

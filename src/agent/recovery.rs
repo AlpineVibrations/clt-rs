@@ -13,6 +13,8 @@ use turso::{Database, Value, params_from_iter};
 
 use super::{TursoAgentStore, configure_agent_connection};
 
+pub(super) mod health;
+
 pub(crate) const SNAPSHOT_FILE: &str = "registry.json";
 const DIRTY_FILE: &str = "registry-dirty";
 const REQUIRED_FILE: &str = "recovery-required";
@@ -37,6 +39,22 @@ const TABLES: &[(&str, &str)] = &[
 pub(super) struct RegistryAccess {
     // Keep this field until every Turso handle and checkpoint pin has been dropped.
     _file: File,
+}
+
+impl Drop for RegistryAccess {
+    fn drop(&mut self) {
+        // A child forked by another thread can retain this open description
+        // until exec. Release ownership when this store exits, even then.
+        let _ = self._file.unlock();
+    }
+}
+
+pub(super) struct RegistryWriteLock(File);
+
+impl Drop for RegistryWriteLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
 }
 
 impl RegistryAccess {
@@ -65,11 +83,11 @@ fn lock_file(state_dir: &Path, name: &str) -> Result<File> {
         .with_context(|| format!("Failed to open registry lock {name}"))
 }
 
-pub(super) fn write_lock(state_dir: &Path) -> Result<File> {
+pub(super) fn write_lock(state_dir: &Path) -> Result<RegistryWriteLock> {
     let file = lock_file(state_dir, "agent-write.lock")?;
     file.lock()
         .context("Failed to serialize durable registry updates")?;
-    Ok(file)
+    Ok(RegistryWriteLock(file))
 }
 
 pub(crate) fn check_required(state_dir: &Path) -> Result<()> {
@@ -251,26 +269,7 @@ pub(crate) fn read_snapshot(state_dir: &Path) -> Result<Option<Json>> {
     Ok(Some(snapshot))
 }
 
-async fn integrity_check(db: &Database) -> Result<()> {
-    let conn = db.connect()?;
-    let mut rows = conn.query("PRAGMA integrity_check", ()).await?;
-    let mut count = 0;
-    while let Some(row) = rows.next().await? {
-        let result = row.get::<String>(0)?;
-        anyhow::ensure!(result == "ok", "Agent registry integrity check: {result}");
-        count += 1;
-    }
-    anyhow::ensure!(
-        count == 1,
-        "Agent registry integrity check returned no definitive result"
-    );
-    let mut foreign = conn.query("PRAGMA foreign_key_check", ()).await?;
-    anyhow::ensure!(
-        foreign.next().await?.is_none(),
-        "Agent registry has broken foreign keys"
-    );
-    Ok(())
-}
+use health::integrity_check;
 
 async fn restore_snapshot(db: &Database, snapshot: &Json) -> Result<()> {
     let mut conn = db.connect()?;
@@ -458,7 +457,7 @@ pub(crate) fn recover_registry_automatically(state_dir: &Path) -> Result<()> {
     match result {
         Ok(report) => {
             eprintln!(
-                "Automatically recovered agent registry coordination; integrity check passed. Original database bundle retained at {}",
+                "Automatically recovered agent registry coordination and indexes; integrity check passed. Original database bundle retained at {}",
                 report.quarantine.display()
             );
             Ok(())
@@ -533,7 +532,7 @@ fn recover_registry_with_policy(
         {
             let store = TursoAgentStore::open_for_recovery(state_dir)?;
             store.blocking.block_on_recovery(async {
-                integrity_check(&store.recovery_db).await?;
+                health::repair_worker_indexes_if_needed(&store.recovery_db).await?;
                 snapshot_db(&store.recovery_db, state_dir).await
             })?;
         }

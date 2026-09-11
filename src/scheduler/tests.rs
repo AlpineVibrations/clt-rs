@@ -1657,12 +1657,81 @@ fn agent_scheduler_only_recovers_uncontrolled_session_marked_doing_tasks() {
 
 #[cfg(unix)]
 #[test]
+fn reclaimed_workers_and_leases_do_not_claim_manual_doing_tasks() {
+    for abandoned_worker in [false, true] {
+        for queued_todo in [false, true] {
+            let root = temp_root("agent-manual-doing-recovery");
+            let state_dir = root.join("state");
+            let project_root = root.join("project");
+            init_tasks(&project_root, false).unwrap();
+            let doing = "# Doing\n- Human work with no agent session\n";
+            fs::write(project_root.join("tasks/doing.md"), doing).unwrap();
+            if queued_todo {
+                add_task(&project_root, "Queued agent work", None).unwrap();
+            }
+            let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
+            store
+                .register_project_blocking(&project_root, "project")
+                .unwrap();
+            let project = store.list_projects_blocking().unwrap().remove(0);
+            store
+                .set_project_git_mode_blocking(project.id, AgentGitMode::Commit)
+                .unwrap();
+            store
+                .try_acquire_lease_blocking(project.id, "old-holder", "100", "101")
+                .unwrap();
+            if abandoned_worker {
+                assert!(crate::worker::tests::reserve_test_worker(
+                    &store,
+                    project.id,
+                    "dead-worker",
+                    "old-holder",
+                    "100",
+                    1
+                ));
+                assert!(
+                    store
+                        .abandon_worker_blocking(agent::AgentWorkerAbandonment {
+                            worker_token: "dead-worker",
+                            expected_state: "dispatching",
+                            expected_worker_pid: None,
+                            expected_heartbeat_at: Some("100"),
+                            finished_at: "101",
+                            error: "worker exited before claiming a task",
+                            permitted_successor_holder: None,
+                        })
+                        .unwrap()
+                );
+            }
+            drop(store);
+            let start = run_agent_scheduler_pass(&state_dir, false, &[]).unwrap();
+            assert_eq!(start.jobs.len(), usize::from(queued_todo));
+            if let Some(job) = start.jobs.first() {
+                assert_eq!(job.task_selection, AgentTaskSelection::NextTodo);
+                assert!(job.resume_session_id.is_none());
+            }
+            assert_eq!(
+                fs::read_to_string(project_root.join("tasks/doing.md")).unwrap(),
+                doing
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn agent_scheduler_resumes_doing_task_after_crashed_process() {
     let root = temp_root("agent-resume-doing-dead-lease");
     let state_dir = root.join("state/clt");
     let project_root = root.join("project");
     init_tasks(&project_root, false).unwrap();
-    add_task(&project_root, "interrupted task", None).unwrap();
+    add_task(
+        &project_root,
+        "interrupted task codex:crashed-session",
+        None,
+    )
+    .unwrap();
     move_task(&project_root, TaskStatus::Todo, TaskStatus::Doing, "1").unwrap();
     let project_root = fs::canonicalize(project_root).unwrap();
     let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
@@ -1705,7 +1774,12 @@ fn agent_scheduler_resumes_doing_task_after_lease_expiry() {
     let state_dir = root.join("state/clt");
     let project_root = root.join("project");
     init_tasks(&project_root, false).unwrap();
-    add_task(&project_root, "expired interrupted task", None).unwrap();
+    add_task(
+        &project_root,
+        "expired interrupted task codex:expired-session",
+        None,
+    )
+    .unwrap();
     move_task(&project_root, TaskStatus::Todo, TaskStatus::Doing, "1").unwrap();
     let project_root = fs::canonicalize(project_root).unwrap();
     let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();

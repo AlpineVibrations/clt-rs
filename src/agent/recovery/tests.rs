@@ -21,6 +21,30 @@ const CHECKPOINT_CHILD_STATE: &str = "CLT_REGISTRY_RECOVERY_CHECKPOINT_TEST_STAT
 const REOPEN_CHILD_STATE: &str = "CLT_REGISTRY_RECOVERY_REOPEN_TEST_STATE";
 
 #[test]
+fn exited_registry_owners_release_locks_even_with_inherited_handles() {
+    let root = temp_root("registry-inherited-locks");
+    let first = RegistryAccess::shared(&root).unwrap();
+    let inherited_reader = first._file.try_clone().unwrap();
+    let second = RegistryAccess::shared(&root).unwrap();
+    drop(first);
+    // Releasing one reader must still respect another actual client's fence.
+    assert!(RegistryAccess::exclusive(&root).is_err());
+    drop(second);
+    let exclusive = RegistryAccess::exclusive(&root).unwrap();
+    drop(exclusive);
+    drop(inherited_reader);
+
+    let writer = write_lock(&root).unwrap();
+    let inherited_writer = writer.0.try_clone().unwrap();
+    drop(writer);
+    let next = lock_file(&root, "agent-write.lock").unwrap();
+    next.try_lock().unwrap();
+    next.unlock().unwrap();
+    drop(inherited_writer);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn registry_open_automatically_repairs_idle_coordination_and_preserves_records() {
     let (root, state_dir, store, project) = registered_store("registry-auto-recovery");
     store
@@ -206,7 +230,7 @@ fn registry_reopened_reader_child_preserves_pin_ownership() {
     assert!(!state_dir.join(REQUIRED_FILE).exists());
 }
 
-fn registered_store(label: &str) -> (PathBuf, PathBuf, TursoAgentStore, AgentProject) {
+pub(super) fn registered_store(label: &str) -> (PathBuf, PathBuf, TursoAgentStore, AgentProject) {
     let root = temp_root(label);
     let state_dir = root.join("state/clt");
     let project_root = root.join("project");

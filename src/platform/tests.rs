@@ -3,6 +3,23 @@ use crate::test_support::prelude::*;
 use crate::test_support::*;
 
 #[test]
+fn stale_service_restart_is_exclusive_and_has_a_cross_client_cooldown() {
+    let root = temp_root("agent-restart-claim");
+    fs::create_dir_all(&root).unwrap();
+    let claim = claim_agent_service_restart(&root, 100).unwrap().unwrap();
+    // Model a concurrently forked child retaining the same open description.
+    let inherited = claim.0.try_clone().unwrap();
+    assert!(claim_agent_service_restart(&root, 200).unwrap().is_none());
+    drop(claim);
+    assert!(claim_agent_service_restart(&root, 159).unwrap().is_none());
+    assert!(claim_agent_service_restart(&root, 160).unwrap().is_some());
+    // A backwards clock does not fence recovery indefinitely.
+    assert!(claim_agent_service_restart(&root, 90).unwrap().is_some());
+    drop(inherited);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn scheduler_service_stop_does_not_open_a_damaged_database() {
     let root = temp_root("agent-stop-damaged-registry");
     fs::create_dir_all(&root).unwrap();

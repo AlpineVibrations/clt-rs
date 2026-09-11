@@ -6,12 +6,17 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+## [0.6.10] - 2026-09-11
+
 ### Added
 
 - Show the current project's agent status after the Kanban console title when its registered agent is enabled.
 
 ### Fixed
 
+- Detect damaged agent registry indexes during normal use and automatically repair supported worker-index damage when the registry is idle, preserving task history and a backup of the original database.
+- Coordinate stale-service restarts across open TUIs with a shared cooldown, and explicitly release registry and restart locks even when child processes inherit their file handles.
+- Require a saved session before resuming a Doing task after a worker or lease expires, preventing the scheduler from claiming manually started tasks.
 - Prevent concurrent managed Git projections from failing on temporary directory name collisions while preserving private permissions and automatic cleanup.
 - Allow ordinary user commits, including patch-version bumps, and CLT board checkpoints while an agent task is in progress. Preserve the original launch journal and seal or reseal the task against the current branch parent without discarding concurrent work.
 

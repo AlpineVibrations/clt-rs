@@ -1328,6 +1328,15 @@ impl TursoAgentStore {
             recovery::check_required(state_dir)?;
         }
         let store = Self::open_with_access(state_dir, Some(access), false)?;
+        // Serialize health checks with registry opens/updates. Checking once per
+        // minute catches readable but inconsistent indexes before retries keep
+        // treating stale rows as current ownership or heartbeat information.
+        store
+            .blocking
+            .block_on(recovery::health::check_health_if_due(
+                &store.recovery_db,
+                state_dir,
+            ))?;
         if !state_dir.join(recovery::SNAPSHOT_FILE).exists() {
             store
                 .blocking

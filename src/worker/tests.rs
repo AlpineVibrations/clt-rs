@@ -1023,7 +1023,7 @@ fn scheduler_resumes_doing_task_after_independent_worker_dies() {
     let root = temp_root("independent-worker-crash-recovery");
     let state_dir = root.join("state/clt");
     let project_root = root.join("project");
-    add_task(&project_root, "interrupted task", None).unwrap();
+    add_task(&project_root, "interrupted task codex:worker-session", None).unwrap();
     move_task(&project_root, TaskStatus::Todo, TaskStatus::Doing, "1").unwrap();
     let project_root = fs::canonicalize(project_root).unwrap();
     let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
@@ -1076,6 +1076,10 @@ fn scheduler_resumes_doing_task_after_independent_worker_dies() {
     assert_eq!(
         start.jobs[0].task_selection,
         AgentTaskSelection::ResumeDoing
+    );
+    assert_eq!(
+        start.jobs[0].resume_session_id.as_deref(),
+        Some("worker-session")
     );
     let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
     assert!(store.list_active_workers_blocking().unwrap().is_empty());
