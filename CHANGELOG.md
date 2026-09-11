@@ -6,6 +6,12 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+## [0.6.11] - 2026-09-11
+
+### Fixed
+
+- Save the exact task-to-session link when automated runs with Git automation off move a task to Doing, so the selected task's log and session controls are immediately available.
+
 ## [0.6.10] - 2026-09-11
 
 ### Added

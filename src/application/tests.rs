@@ -2,6 +2,166 @@ use crate::test_support::prelude::*;
 use crate::test_support::*;
 use crate::tui::tests::tui_agent_project_for_test;
 
+#[test]
+fn git_off_activation_links_the_exact_task_and_exposes_its_live_log() {
+    for folders in [false, true] {
+        let root = temp_root("git-off-task-activation");
+        init_tasks(&root, folders).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        add_task(&root, "unrelated task", None).unwrap();
+        add_task(&root, "selected task", None).unwrap();
+        let state_dir = root.join("state");
+        let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store.register_project_blocking(&root, "project").unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert_eq!(project.git_mode, AgentGitMode::Off);
+        let stdout_path = root.join("run.out");
+        let stderr_path = root.join("run.err");
+        fs::write(
+            &stderr_path,
+            "session id: session-live\nWorking on selected task\n",
+        )
+        .unwrap();
+        store
+            .mark_session_running_blocking(
+                project.id,
+                "session-live",
+                4242,
+                "run-live",
+                &stdout_path,
+                &stderr_path,
+            )
+            .unwrap();
+        // Another session in the same project must not become the task's target.
+        store
+            .mark_session_running_blocking(
+                project.id,
+                "session-other",
+                4243,
+                "run-other",
+                &root.join("other.out"),
+                &root.join("other.err"),
+            )
+            .unwrap();
+        move_task_to_doing_with_agent_session(
+            &root,
+            "2",
+            &AutomatedAgentChildContext {
+                project_id: project.id,
+                run_token: "run-live".to_string(),
+            },
+            &project,
+            &store,
+        )
+        .unwrap();
+        let doing = read_task_entries(&root.join("tasks"), TaskStatus::Doing).unwrap();
+        assert_eq!(doing.len(), 1);
+        assert_eq!(doing[0].summary, "selected task");
+        assert_eq!(
+            codex_session_for_task(&doing[0]).as_deref(),
+            Some("session-live")
+        );
+        let todo = read_task_entries(&root.join("tasks"), TaskStatus::Todo).unwrap();
+        assert_eq!(todo.len(), 1);
+        assert_eq!(todo[0].summary, "unrelated task");
+        assert!(codex_session_for_task(&todo[0]).is_none());
+        let mut selected = tui_agent_project_for_test(project.id, "project");
+        selected.project = project;
+        selected.runtime_state = TuiAgentRuntimeState::Running;
+        let mut panel = TuiAgentPanel {
+            projects: vec![selected],
+            current_project_registration: None,
+            daemon_status: "running".to_string(),
+            state: ListState::default(),
+            scroll_offset: 0,
+            last_error: None,
+        };
+        panel.state.select(Some(0));
+        let view = selected_tui_task_log_view_at(&panel, TaskStatus::Doing, &doing[0], &state_dir)
+            .unwrap()
+            .unwrap();
+        assert!(view.is_live);
+        assert!(view.content.contains("Working on selected task"));
+        assert_eq!(view.session_target.unwrap().session_id, "session-live");
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn git_off_activation_preserves_existing_session_ownership() {
+    for scenario in [
+        "other-session",
+        "other-task",
+        "nested-task",
+        "other-project",
+    ] {
+        let root = temp_root("git-off-task-activation-ownership");
+        init_tasks(&root, false).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        add_task(
+            &root,
+            if scenario == "other-session" {
+                "selected task codex:session-other"
+            } else {
+                "selected task"
+            },
+            None,
+        )
+        .unwrap();
+        if scenario == "other-task" {
+            fs::write(
+                root.join("tasks/doing.md"),
+                "# Doing Tasks\n- existing task codex:session-live\n",
+            )
+            .unwrap();
+        }
+        if scenario == "nested-task" {
+            let nested = root.join("tasks/doing/0001-parent");
+            fs::create_dir_all(&nested).unwrap();
+            // Nested Markdown indexes can equal the selected top-level index.
+            fs::write(
+                nested.join("todo.md"),
+                "# Todo Tasks\n- nested task codex:session-live\n",
+            )
+            .unwrap();
+        }
+        let todo_before = fs::read(root.join("tasks/todo.md")).unwrap();
+        let doing_before = fs::read(root.join("tasks/doing.md")).unwrap();
+        let store = agent::TursoAgentStore::open_blocking(&root.join("state")).unwrap();
+        store.register_project_blocking(&root, "project").unwrap();
+        let mut project = store.list_projects_blocking().unwrap().remove(0);
+        store
+            .mark_session_running_blocking(
+                project.id,
+                "session-live",
+                4242,
+                "run-live",
+                &root.join("run.out"),
+                &root.join("run.err"),
+            )
+            .unwrap();
+        if scenario == "other-project" {
+            project.path = root.join("other-project");
+        }
+        let result = move_task_to_doing_with_agent_session(
+            &root,
+            "1",
+            &AutomatedAgentChildContext {
+                project_id: project.id,
+                run_token: "run-live".to_string(),
+            },
+            &project,
+            &store,
+        );
+        assert!(result.is_err(), "{scenario}");
+        assert_eq!(fs::read(root.join("tasks/todo.md")).unwrap(), todo_before);
+        assert_eq!(fs::read(root.join("tasks/doing.md")).unwrap(), doing_before);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
 fn assert_folder_move_preserves_managed_destination(automated_completion: bool) {
     let root = temp_root("managed-destination-conversion");
     init_tasks(&root, false).unwrap();

@@ -45,6 +45,7 @@ use crate::{
         parse_one_based_task_index, read_markdown_entries,
         recoverable_codex_session_id_from_task_content, remove_task_entry, reorder_directory_task,
         reorder_markdown_task, task_content_with_codex_session, task_entry_at,
+        task_for_codex_session_in_board,
     },
     tui::{
         format_agent_daemon_runtime_status, load_task_agent_session_states,
@@ -1158,8 +1159,58 @@ pub(super) fn move_task(
                 &store,
             );
         }
+        return move_task_to_doing_with_agent_session(
+            root,
+            task_index_str,
+            &context,
+            &project,
+            &store,
+        );
     }
     move_task_in_board(&get_tasks_dir(root), from, to, task_index_str).map(|_| ())
+}
+
+pub(super) fn move_task_to_doing_with_agent_session(
+    root: &Path,
+    task_index_str: &str,
+    context: &AutomatedAgentChildContext,
+    project: &agent::AgentProject,
+    store: &agent::TursoAgentStore,
+) -> Result<()> {
+    let root = canonicalize_existing_path(root)?;
+    anyhow::ensure!(
+        project.path == root,
+        "Automated agent context project {} targets {}, not {}",
+        context.project_id,
+        project.path.display(),
+        root.display()
+    );
+    let session_id = running_session_for_automated_child(store, context)?;
+    let task_index = parse_one_based_task_index(task_index_str)?;
+    let board_dir = get_tasks_dir(&root);
+    let _mutation_lock = acquire_board_mutation_lock(&board_dir)?;
+    let entry = task_entry_at(&board_dir, TaskStatus::Todo, task_index)?;
+    anyhow::ensure!(
+        recoverable_codex_session_id_from_task_content(&entry.content)
+            .is_none_or(|existing| existing == session_id),
+        "Selected Todo task already belongs to a different Codex session"
+    );
+    if let Some((status, linked)) = task_for_codex_session_in_board(&board_dir, &session_id)? {
+        anyhow::ensure!(
+            status == TaskStatus::Todo
+                && linked.source == entry.source
+                && recoverable_codex_session_id_from_task_content(&entry.content)
+                    == Some(session_id.as_str()),
+            "Codex session {session_id} already belongs to another task"
+        );
+    }
+    ensure_managed_git_task_mutation_allowed(&board_dir, &entry, true, None)?;
+    ensure_status_conversion_allowed(&board_dir, TaskStatus::Doing)?;
+    // Persist ownership before publishing Doing, under the same board lock.
+    // Git-off runs need this link just as managed Git runs do: their task logs
+    // and controls must not depend on the runner guessing the board change.
+    attach_codex_session_to_task_after_lock(&root, TaskStatus::Todo, &entry, &session_id, || {})?;
+    move_task_in_board_after_lock(&board_dir, TaskStatus::Todo, TaskStatus::Doing, task_index)
 }
 
 pub(super) fn running_session_for_automated_child(
