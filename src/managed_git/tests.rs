@@ -1602,6 +1602,125 @@ fn user_done_move_refuses_an_active_managed_git_worker() {
 }
 
 #[test]
+fn user_done_move_reclaims_an_exited_scheduler_lease() {
+    for live in [false, true] {
+        let session_id = "session-scheduler-lease-external-completion";
+        let (root, project_root, store, finalization) = externally_completed_working_task_fixture(
+            "automated-git-user-external-completion-scheduler-lease",
+            session_id,
+        );
+        store
+            .transition_session_control_state_blocking(
+                finalization.project_id,
+                session_id,
+                AgentSessionControlState::Running,
+                AgentSessionControlState::ResumeRequested,
+            )
+            .unwrap();
+        let pid = if live { std::process::id() } else { u32::MAX };
+        let holder = format!("clt-scheduler-{pid}");
+        assert!(
+            store
+                .try_acquire_lease_blocking(finalization.project_id, &holder, "100", "9999999999",)
+                .unwrap()
+        );
+        let result = move_task_to_done_in_board_with_store(
+            &get_tasks_dir(&project_root),
+            TaskStatus::Doing,
+            "1",
+            &store,
+        );
+        if live {
+            assert!(
+                format!("{:#}", result.unwrap_err()).contains("still has an active project lease")
+            );
+            assert_eq!(read_tasks(&project_root, "doing").unwrap().len(), 1);
+            assert_eq!(
+                store
+                    .lease_for_project_blocking(finalization.project_id)
+                    .unwrap()
+                    .unwrap()
+                    .holder,
+                holder
+            );
+        } else {
+            assert_eq!(result.unwrap().as_deref(), Some(session_id));
+            assert!(read_tasks(&project_root, "doing").unwrap().is_empty());
+            assert!(
+                store
+                    .lease_for_project_blocking(finalization.project_id)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn user_done_move_reconciles_exited_managed_git_worker() {
+    let session_id = "session-exited-worker-external-completion";
+    let (root, project_root, store, finalization) = externally_completed_working_task_fixture(
+        "automated-git-user-external-completion-exited-worker",
+        session_id,
+    );
+    store
+        .transition_session_control_state_blocking(
+            finalization.project_id,
+            session_id,
+            AgentSessionControlState::Running,
+            AgentSessionControlState::ResumeRequested,
+        )
+        .unwrap();
+    assert!(
+        store
+            .try_acquire_lease_blocking(finalization.project_id, "scheduler", "100", "9999999999",)
+            .unwrap()
+    );
+    assert!(reserve_test_worker(
+        &store,
+        finalization.project_id,
+        "exited-external-worker",
+        "scheduler",
+        "101",
+        1,
+    ));
+    assert!(
+        store
+            .claim_worker_blocking("exited-external-worker", u32::MAX, "102")
+            .unwrap()
+    );
+
+    let result = move_task_to_done_in_board_with_store(
+        &get_tasks_dir(&project_root),
+        TaskStatus::Doing,
+        "1",
+        &store,
+    )
+    .unwrap();
+
+    assert_eq!(result.as_deref(), Some(session_id));
+    assert!(store.list_active_workers_blocking().unwrap().is_empty());
+    assert!(
+        store
+            .lease_for_project_blocking(finalization.project_id)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .git_finalization_blocking(finalization.project_id, session_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        GitFinalizationState::Cancelled
+    );
+    assert!(read_tasks(&project_root, "doing").unwrap().is_empty());
+    assert_eq!(read_tasks(&project_root, "done").unwrap().len(), 1);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn external_completion_transaction_requires_exact_generation_and_identity() {
     let session_id = "session-fenced-external-completion";
     let (root, project_root, store, finalization) = externally_completed_working_task_fixture(

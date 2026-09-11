@@ -113,6 +113,45 @@ pub(super) enum AgentJobAcquisitionResult {
     SessionSuspended,
 }
 
+struct AgentUnstartedLeaseGuard<'a> {
+    state_dir: &'a Path,
+    leases: Vec<(i64, String)>,
+}
+
+impl<'a> AgentUnstartedLeaseGuard<'a> {
+    fn new(state_dir: &'a Path) -> Self {
+        Self {
+            state_dir,
+            leases: Vec::new(),
+        }
+    }
+
+    fn track(&mut self, project_id: i64, holder: &str) {
+        self.leases.push((project_id, holder.to_string()));
+    }
+
+    fn disarm(&mut self) {
+        self.leases.clear();
+    }
+}
+
+impl Drop for AgentUnstartedLeaseGuard<'_> {
+    fn drop(&mut self) {
+        for (project_id, holder) in &self.leases {
+            let released = with_agent_store_at(self.state_dir, |store| {
+                store
+                    .release_lease_blocking(*project_id, holder)
+                    .map(|_| ())
+            });
+            if let Err(error) = released {
+                eprintln!(
+                    "Failed to release unstarted scheduler job lease for project {project_id}: {error:#}"
+                );
+            }
+        }
+    }
+}
+
 pub(super) fn acquire_agent_job_stage(
     request: AgentJobAcquisitionRequest<'_>,
 ) -> Result<AgentJobAcquisitionResult> {
@@ -157,6 +196,8 @@ pub(super) fn acquire_agent_job_stage(
         }
     }
 
+    let mut unstarted_lease = AgentUnstartedLeaseGuard::new(state_dir);
+    unstarted_lease.track(project.id, holder);
     if resume_session_id.is_none() {
         let controls = with_agent_store_at(state_dir, |store| {
             store.session_controls_for_project_blocking(project.id)
@@ -165,6 +206,7 @@ pub(super) fn acquire_agent_job_stage(
             with_agent_store_at(state_dir, |store| {
                 store.release_lease_blocking(project.id, holder).map(|_| ())
             })?;
+            unstarted_lease.disarm();
             return Ok(AgentJobAcquisitionResult::SessionSuspended);
         }
     }
@@ -183,6 +225,7 @@ pub(super) fn acquire_agent_job_stage(
         done_task_contents_before,
         blocked_task_snapshots_before,
     };
+    unstarted_lease.disarm();
     Ok(AgentJobAcquisitionResult::Acquired {
         job: Box::new(job),
         acquired_at,
@@ -756,6 +799,9 @@ pub(super) fn run_agent_scheduler_pass_with_max_global_jobs(
         runs_recorded: 0,
     };
     let mut jobs = Vec::new();
+    // A later project can fail after earlier jobs acquired leases. Until the
+    // entire pass returns, none of those jobs has been dispatched to a worker.
+    let mut unstarted_leases = AgentUnstartedLeaseGuard::new(state_dir);
 
     let projects = with_agent_store_at(state_dir, |store| store.list_projects_blocking())?;
 
@@ -1178,6 +1224,7 @@ pub(super) fn run_agent_scheduler_pass_with_max_global_jobs(
             continue;
         };
 
+        unstarted_leases.track(job.project.id, &job.holder);
         println!(
             "Project {}: action=running work={} todo={} ready_todo={} blocked_todo={} doing={} blocked_doing={} scan_status={} lease_holder={} lease_acquired_at={} lease_expires_at={} path={}",
             project.name,
@@ -1197,6 +1244,7 @@ pub(super) fn run_agent_scheduler_pass_with_max_global_jobs(
         jobs.push(*job);
     }
 
+    unstarted_leases.disarm();
     Ok(AgentSchedulerStart { pass, jobs })
 }
 

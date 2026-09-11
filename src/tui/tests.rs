@@ -1134,6 +1134,214 @@ fn running_agent_log_view_streams_the_current_output_file() {
 }
 
 #[test]
+fn reaped_session_logs_are_latest_while_project_runtime_still_looks_active() {
+    for stop_requested in [false, true] {
+        let root = temp_root("reaped-session-log-status");
+        let state_dir = root.join("state");
+        let project_root = root.join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        let log_dir = agent_project_run_log_dir(&state_dir, &project).unwrap();
+        fs::create_dir_all(&log_dir).unwrap();
+        let stdout_path = log_dir.join("200-000-p1-1.out");
+        let stderr_path = log_dir.join("200-000-p1-1.err");
+        fs::write(&stdout_path, "Task implementation finished").unwrap();
+        fs::write(&stderr_path, "session id: session-finished\nCodex exited\n").unwrap();
+        store
+            .mark_session_running_blocking(
+                project.id,
+                "session-finished",
+                4242,
+                "finished-run",
+                &stdout_path,
+                &stderr_path,
+            )
+            .unwrap();
+        if stop_requested {
+            assert!(
+                store
+                    .request_session_stop_blocking(
+                        project.id,
+                        "session-finished",
+                        4242,
+                        "finished-run",
+                    )
+                    .unwrap()
+            );
+        }
+        assert!(
+            store
+                .finalize_reaped_automated_session_blocking(
+                    project.id,
+                    4242,
+                    "finished-run",
+                    "worker",
+                    60,
+                )
+                .unwrap()
+        );
+        let mut panel = TuiAgentPanel {
+            projects: vec![TuiAgentProject {
+                project,
+                scan: AgentProjectScan::empty(),
+                runtime_state: TuiAgentRuntimeState::Running,
+                daemon_scan_problem: None,
+                failure_problem: None,
+            }],
+            current_project_registration: None,
+            daemon_status: "running".to_string(),
+            state: ListState::default(),
+            scroll_offset: 0,
+            last_error: None,
+        };
+        panel.state.select(Some(0));
+
+        // The worker can still hold its lease without a recorded result while
+        // finalizing Git. Its already reaped Codex log must remain viewable.
+        let view = selected_tui_agent_log_view_at(&panel, &state_dir)
+            .unwrap()
+            .unwrap();
+        assert!(!view.is_live);
+        assert!(view.content.contains("Codex exited"));
+        assert!(tui_agent_log_title(&view).contains("[LATEST]"));
+        store
+            .record_run_outcome_blocking(agent::AgentRunOutcome {
+                project_id: panel.projects[0].project.id,
+                status: "failure",
+                started_at: "200",
+                finished_at: Some("201"),
+                exit_code: Some(0),
+                log_dir: Some(log_dir.to_str().unwrap()),
+                stdout_path: Some(stdout_path.to_str().unwrap()),
+                stderr_path: Some(stderr_path.to_str().unwrap()),
+                summary: Some("Git finalization remains pending"),
+                codex_session_id: Some("session-finished"),
+            })
+            .unwrap();
+        let task = task_entry_from_text(
+            TaskSource::MarkdownLine { line_index: 1 },
+            "Finished task",
+            "Finished task codex:session-finished",
+            false,
+        );
+        for runtime_state in [TuiAgentRuntimeState::Running, TuiAgentRuntimeState::Fenced] {
+            panel.projects[0].runtime_state = runtime_state;
+            let project_view = selected_tui_agent_log_view_at(&panel, &state_dir)
+                .unwrap()
+                .unwrap();
+            let task_view =
+                selected_tui_task_log_view_at(&panel, TaskStatus::Doing, &task, &state_dir)
+                    .unwrap()
+                    .unwrap();
+            assert!(!project_view.is_live);
+            assert!(!task_view.is_live);
+            assert_eq!(project_view.session_target, task_view.session_target);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn completed_log_is_latest_but_a_newer_attempt_of_the_same_session_is_live() {
+    let root = temp_root("completed-and-resumed-log-status");
+    let state_dir = root.join("state");
+    let project_root = root.join("project");
+    fs::create_dir_all(&project_root).unwrap();
+    let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
+    store
+        .register_project_blocking(&project_root, "project")
+        .unwrap();
+    let project = store.list_projects_blocking().unwrap().remove(0);
+    let log_dir = agent_project_run_log_dir(&state_dir, &project).unwrap();
+    fs::create_dir_all(&log_dir).unwrap();
+    let old_path = log_dir.join("200-000-p1-1.err");
+    fs::write(
+        &old_path,
+        "session id: session-retry\nFirst attempt finished\n",
+    )
+    .unwrap();
+    store
+        .record_run_outcome_blocking(agent::AgentRunOutcome {
+            project_id: project.id,
+            status: "failure",
+            started_at: "200",
+            finished_at: Some("201"),
+            exit_code: Some(0),
+            log_dir: Some(log_dir.to_str().unwrap()),
+            stdout_path: None,
+            stderr_path: Some(old_path.to_str().unwrap()),
+            summary: Some("Git finalization remains pending"),
+            codex_session_id: Some("session-retry"),
+        })
+        .unwrap();
+    let mut panel = TuiAgentPanel {
+        projects: vec![TuiAgentProject {
+            project,
+            scan: AgentProjectScan::empty(),
+            runtime_state: TuiAgentRuntimeState::Running,
+            daemon_scan_problem: None,
+            failure_problem: None,
+        }],
+        current_project_registration: None,
+        daemon_status: "running".to_string(),
+        state: ListState::default(),
+        scroll_offset: 0,
+        last_error: None,
+    };
+    panel.state.select(Some(0));
+    let task = task_entry_from_text(
+        TaskSource::MarkdownLine { line_index: 1 },
+        "Retry task",
+        "Retry task codex:session-retry",
+        false,
+    );
+    let project_view = selected_tui_agent_log_view_at(&panel, &state_dir)
+        .unwrap()
+        .unwrap();
+    let task_view = selected_tui_task_log_view_at(&panel, TaskStatus::Doing, &task, &state_dir)
+        .unwrap()
+        .unwrap();
+    assert!(!project_view.is_live);
+    assert!(!task_view.is_live);
+
+    let new_path = log_dir.join("300-000-p1-2.err");
+    fs::write(
+        &new_path,
+        "session id: session-retry\nNew attempt running\n",
+    )
+    .unwrap();
+    for register_control in [false, true] {
+        if register_control {
+            store
+                .mark_session_running_blocking(
+                    panel.projects[0].project.id,
+                    "session-retry",
+                    4242,
+                    "new-run",
+                    &log_dir.join("300-000-p1-2.out"),
+                    &new_path,
+                )
+                .unwrap();
+        }
+        let project_view = selected_tui_agent_log_view_at(&panel, &state_dir)
+            .unwrap()
+            .unwrap();
+        let task_view = selected_tui_task_log_view_at(&panel, TaskStatus::Doing, &task, &state_dir)
+            .unwrap()
+            .unwrap();
+        assert!(project_view.is_live);
+        assert!(task_view.is_live);
+        assert!(project_view.content.contains("New attempt running"));
+        assert_eq!(project_view.content, task_view.content);
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn fenced_agent_log_view_keeps_the_orphaned_session_controllable() {
     let root = temp_root("agent-fenced-output");
     let state_dir = root.join("state/clt");

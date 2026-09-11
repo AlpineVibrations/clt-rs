@@ -21,8 +21,9 @@ use crate::{
         AGENT_WORKER_GENERATION, AGENT_WORKER_HEARTBEAT_TIMEOUT_SECONDS,
         AGENT_WORKER_PROTOCOL_VERSION, AGENT_WORKER_STARTUP_TIMEOUT_SECONDS,
         AGENT_WORKER_STATE_DISPATCHING, AGENT_WORKER_STATE_FINALIZING, AGENT_WORKER_STATE_RUNNING,
-        AgentDaemonRun, AgentRunCompletion, AgentRunJob, AgentShutdownSignal, AgentTaskSelection,
-        AgentWorkerLaunchSpec, BlockedTaskSnapshot, new_agent_shutdown_signal,
+        AgentDaemonRun, AgentLeaseHolderLiveness, AgentRunCompletion, AgentRunJob,
+        AgentShutdownSignal, AgentTaskSelection, AgentWorkerLaunchSpec, BlockedTaskSnapshot,
+        new_agent_shutdown_signal,
     },
     managed_git::{
         cancel_unlinked_working_git_finalization, reconcile_agent_git_finalization,
@@ -38,9 +39,9 @@ use crate::{
         agent_timestamp_seconds, print_agent_log_tail_with_limit, tail_lines,
     },
     scheduler::{
-        agent_heartbeat_tail_enabled, agent_lease_timeout, agent_max_global_jobs,
-        run_agent_daemon_database_operation_with_recovery, scan_agent_project,
-        task_status_for_codex_session,
+        agent_heartbeat_tail_enabled, agent_lease_holder_liveness, agent_lease_timeout,
+        agent_max_global_jobs, run_agent_daemon_database_operation_with_recovery,
+        scan_agent_project, task_status_for_codex_session,
     },
     session_control::codex_session_for_task,
     task::{
@@ -192,6 +193,93 @@ pub(super) fn is_inline_agent_worker(worker: &agent::AgentWorkerRecord) -> bool 
     worker
         .service_label
         .starts_with(AGENT_INLINE_WORKER_SERVICE_LABEL_PREFIX)
+}
+
+/// A manual Done move must not depend on the scheduler having reaped an exited
+/// worker. Only retire proven-dead workers here; never launch work or stop a
+/// live session as a side effect of accepting the user's completion.
+pub(super) fn reconcile_idle_project_ownership(
+    store: &agent::TursoAgentStore,
+    project_id: i64,
+) -> Result<()> {
+    reconcile_exited_project_workers_with(
+        store,
+        project_id,
+        local_process_is_running,
+        #[cfg(not(test))]
+        drain_agent_worker_service,
+        #[cfg(test)]
+        |_| Ok(true),
+    )
+}
+
+fn reconcile_exited_project_workers_with(
+    store: &agent::TursoAgentStore,
+    project_id: i64,
+    mut process_is_running: impl FnMut(u32) -> Option<bool>,
+    mut drain_worker: impl FnMut(&agent::AgentWorkerRecord) -> Result<bool>,
+) -> Result<()> {
+    if store
+        .session_controls_for_project_blocking(project_id)?
+        .iter()
+        .any(|control| {
+            !matches!(
+                control.state,
+                AgentSessionControlState::Stopped | AgentSessionControlState::ResumeRequested
+            ) || control.child_pid.is_some()
+                || control.interactive_holder.is_some()
+                || control.interactive_launch_token.is_some()
+        })
+    {
+        return Ok(());
+    }
+    for worker in store
+        .list_active_workers_blocking()?
+        .into_iter()
+        .filter(|worker| worker.project_id == project_id)
+    {
+        if worker.protocol_version > AGENT_WORKER_PROTOCOL_VERSION
+            || worker.worker_pid.and_then(&mut process_is_running) != Some(false)
+            || is_inline_agent_worker(&worker)
+                && store
+                    .git_launch_state_blocking(project_id, &worker.worker_token)?
+                    .is_some()
+        {
+            continue;
+        }
+        // Service removal prevents its reserved generation from restarting.
+        // Abandonment then compares the observed PID, state, heartbeat and
+        // lease so a concurrent claim or renewal cannot be cleared.
+        if !drain_worker(&worker)? {
+            continue;
+        }
+        let lease = store.lease_for_project_blocking(project_id)?;
+        store.abandon_worker_blocking(agent::AgentWorkerAbandonment {
+            worker_token: &worker.worker_token,
+            expected_state: &worker.state,
+            expected_worker_pid: worker.worker_pid,
+            expected_heartbeat_at: worker.heartbeat_at.as_deref(),
+            finished_at: &agent_timestamp(),
+            error: "Worker process exited before the user accepted external task completion",
+            permitted_successor_holder: lease
+                .as_ref()
+                .filter(|lease| lease.holder != worker.lease_holder)
+                .map(|lease| lease.holder.as_str()),
+        })?;
+    }
+    if !store
+        .list_active_workers_blocking()?
+        .iter()
+        .any(|worker| worker.project_id == project_id)
+        && let Some(lease) = store.lease_for_project_blocking(project_id)?
+        && agent_lease_holder_liveness(&lease.holder) == AgentLeaseHolderLiveness::Dead
+    {
+        // A scheduler can exit between acquiring a lease and dispatching its
+        // worker. Reclaim only that exact dead owner; the completion transaction
+        // still rejects any new worker, control or successor lease.
+        store.release_lease_blocking(project_id, &lease.holder)?;
+    }
+    Ok(())
 }
 
 pub(super) fn reconcile_independent_agent_workers_with(

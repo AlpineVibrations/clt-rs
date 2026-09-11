@@ -50,6 +50,7 @@ use crate::{
         format_agent_daemon_runtime_status, load_task_agent_session_states,
         task_display_text_with_agent_flag,
     },
+    worker::reconcile_idle_project_ownership,
 };
 
 #[cfg(test)]
@@ -1538,6 +1539,7 @@ fn move_user_task_to_done_with_store_after_lock(
         );
     }
 
+    reconcile_idle_project_ownership(store, project.id)?;
     let acquired_at = agent_timestamp();
     let expires_at = agent_timestamp_after(AGENT_EXTERNAL_COMPLETION_LEASE_SECONDS);
     let lease_holder = external_completion_lease_holder();

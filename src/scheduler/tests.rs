@@ -2,6 +2,83 @@ use crate::runner::tests::FakeAgentRunner;
 use crate::test_support::prelude::*;
 use crate::test_support::*;
 
+#[test]
+fn failed_scheduler_pass_releases_jobs_that_were_never_dispatched() {
+    let root = temp_root("scheduler-failed-pass-leases");
+    let state_dir = root.join("state");
+    let first_root = root.join("first");
+    let second_root = root.join("second");
+    let broken_root = root.join("broken");
+    let busy_root = root.join("busy");
+    let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
+    for (path, name) in [
+        (&first_root, "a-first"),
+        (&second_root, "b-second"),
+        (&broken_root, "c-broken"),
+        (&busy_root, "d-busy"),
+    ] {
+        add_task(path, "Ready task", None).unwrap();
+        store.register_project_blocking(path, name).unwrap();
+    }
+    let projects = store.list_projects_blocking().unwrap();
+    let busy_project = &projects[3];
+    assert!(
+        store
+            .try_acquire_lease_blocking(
+                busy_project.id,
+                "another-scheduler",
+                &agent_timestamp(),
+                &agent_timestamp_after(3600),
+            )
+            .unwrap()
+    );
+    // Board scans report their errors, but inspecting interrupted Doing tasks
+    // subsequently fails the pass after the first two jobs acquired leases.
+    fs::write(broken_root.join("tasks/doing.md"), [0xff]).unwrap();
+    let error =
+        match run_agent_scheduler_pass_with_max_global_jobs(&state_dir, false, &[], 12, None) {
+            Ok(_) => panic!("an unreadable Doing board must fail the pass"),
+            Err(error) => error,
+        };
+    assert!(format!("{error:#}").contains("UTF-8"));
+    for project in &projects[..2] {
+        assert!(
+            store
+                .lease_for_project_blocking(project.id)
+                .unwrap()
+                .is_none()
+        );
+    }
+    assert_eq!(
+        store
+            .lease_for_project_blocking(busy_project.id)
+            .unwrap()
+            .unwrap()
+            .holder,
+        "another-scheduler",
+    );
+    assert!(store.list_active_workers_blocking().unwrap().is_empty());
+
+    fs::write(broken_root.join("tasks/doing.md"), "# Doing Tasks\n").unwrap();
+    let retry =
+        run_agent_scheduler_pass_with_max_global_jobs(&state_dir, false, &[], 12, None).unwrap();
+    assert_eq!(retry.jobs.len(), 3);
+    assert_eq!(retry.pass.skipped_active_lease, 1);
+    // A successful pass transfers these reservations to its caller for launch.
+    for job in &retry.jobs {
+        assert_eq!(
+            store
+                .lease_for_project_blocking(job.project.id)
+                .unwrap()
+                .unwrap()
+                .holder,
+            job.holder,
+        );
+        release_agent_job_lease_for_shutdown(job).unwrap();
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
 struct OrphanWorkingJournalFixture {
     root: PathBuf,
     state_dir: PathBuf,

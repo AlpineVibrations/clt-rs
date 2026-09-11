@@ -3343,12 +3343,7 @@ pub(super) fn active_agent_log_for_codex_session(
 ) -> Result<Option<PathBuf>> {
     let store = open_agent_store_at(state_dir)?;
     if let Some(control) = store.session_control_blocking(selected.project.id, session_id)? {
-        if matches!(
-            control.state,
-            AgentSessionControlState::Running
-                | AgentSessionControlState::StopRequested
-                | AgentSessionControlState::InterruptRequested
-        ) {
+        if agent_session_control_has_live_log(&control) {
             return Ok(control
                 .stderr_path
                 .map(PathBuf::from)
@@ -3369,7 +3364,56 @@ pub(super) fn active_agent_log_for_codex_session(
         return Ok(None);
     };
 
-    Ok((agent_codex_session_id_from_log(&path)?.as_deref() == Some(session_id)).then_some(path))
+    Ok(
+        (agent_codex_session_id_from_log(&path)?.as_deref() == Some(session_id)
+            && agent_log_path_is_live(&store, selected.project.id, &path, Some(session_id))?)
+        .then_some(path),
+    )
+}
+
+fn agent_session_control_has_live_log(control: &agent::AgentSessionControlRecord) -> bool {
+    control.child_pid.is_some()
+        && matches!(
+            control.state,
+            AgentSessionControlState::Running
+                | AgentSessionControlState::StopRequested
+                | AgentSessionControlState::InterruptRequested
+                | AgentSessionControlState::Interactive
+        )
+}
+
+fn agent_log_path_is_live(
+    store: &agent::TursoAgentStore,
+    project_id: i64,
+    path: &Path,
+    session_id: Option<&str>,
+) -> Result<bool> {
+    if let Some(session_id) = session_id
+        && let Some(control) = store.session_control_blocking(project_id, session_id)?
+    {
+        return Ok(agent_session_control_has_live_log(&control)
+            && [
+                control.stderr_path.as_deref(),
+                control.stdout_path.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|recorded| Path::new(recorded) == path));
+    }
+
+    let run = match session_id {
+        Some(session_id) => store.latest_run_for_codex_session_blocking(project_id, session_id)?,
+        None => store.latest_run_for_project_blocking(project_id)?,
+    };
+    // A project lease can outlive Codex while Git finalization runs. Compare the
+    // actual log path so a completed attempt cannot hide a newer resumed run.
+    Ok(!run.as_ref().is_some_and(|run| {
+        run.finished_at.is_some()
+            && [run.stderr_path.as_deref(), run.stdout_path.as_deref()]
+                .into_iter()
+                .flatten()
+                .any(|recorded| Path::new(recorded) == path)
+    }))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3446,12 +3490,13 @@ pub(super) fn selected_tui_agent_log_view_at(
                 if control.state == AgentSessionControlState::Stopped {
                     return None;
                 }
+                let is_live = agent_session_control_has_live_log(&control);
                 control
                     .stderr_path
                     .or(control.stdout_path)
                     .map(PathBuf::from)
                     .filter(|path| path.is_file())
-                    .map(|path| (path, control.codex_session_id))
+                    .map(|path| (path, control.codex_session_id, is_live))
             })
     } else {
         None
@@ -3466,17 +3511,25 @@ pub(super) fn selected_tui_agent_log_view_at(
     };
 
     let (path, settings_path, is_live, session_target) = match fenced_session {
-        Some((path, session_id)) => (
+        Some((path, session_id, is_live)) => (
             Some(path.clone()),
             Some(path),
-            true,
+            is_live,
             Some(TuiCodexSessionTarget::new(&selected.project, session_id)),
         ),
         None => match live_path {
             Some(path) => {
-                let session_target = agent_codex_session_id_from_log(&path)?
+                let session_id = agent_codex_session_id_from_log(&path)?;
+                let store = open_agent_store_at(state_dir)?;
+                let is_live = agent_log_path_is_live(
+                    &store,
+                    selected.project.id,
+                    &path,
+                    session_id.as_deref(),
+                )?;
+                let session_target = session_id
                     .map(|session_id| TuiCodexSessionTarget::new(&selected.project, session_id));
-                (Some(path.clone()), Some(path), true, session_target)
+                (Some(path.clone()), Some(path), is_live, session_target)
             }
             None => {
                 let store = open_agent_store_at(state_dir)?;

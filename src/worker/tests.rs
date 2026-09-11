@@ -3,6 +3,206 @@ use crate::test_support::prelude::*;
 use crate::test_support::*;
 
 #[test]
+fn manual_completion_reclaims_only_proven_exited_unchanged_project_workers() {
+    for scenario in [
+        "dead",
+        "alive",
+        "unknown",
+        "undrained",
+        "renewed",
+        "other-project",
+        "live-session",
+    ] {
+        let root = temp_root("manual-completion-worker-reconciliation");
+        let store = agent::TursoAgentStore::open_blocking(&root.join("state")).unwrap();
+        let project_root = root.join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert!(
+            store
+                .try_acquire_lease_blocking(project.id, "scheduler", "100", "9999999999")
+                .unwrap()
+        );
+        assert!(reserve_test_worker(
+            &store,
+            project.id,
+            "worker",
+            "scheduler",
+            "101",
+            1
+        ));
+        assert!(store.claim_worker_blocking("worker", 123, "102").unwrap());
+        if scenario == "live-session" {
+            store
+                .mark_session_running_blocking(
+                    project.id,
+                    "session",
+                    456,
+                    "worker",
+                    &root.join("out"),
+                    &root.join("err"),
+                )
+                .unwrap();
+        }
+        let mut drained = false;
+        super::reconcile_exited_project_workers_with(
+            &store,
+            if scenario == "other-project" {
+                project.id + 1
+            } else {
+                project.id
+            },
+            |_| match scenario {
+                "alive" => Some(true),
+                "unknown" => None,
+                _ => Some(false),
+            },
+            |_| {
+                drained = true;
+                if scenario == "renewed" {
+                    assert!(
+                        store
+                            .renew_worker_blocking("worker", 123, "103", "9999999999")
+                            .unwrap()
+                    );
+                }
+                Ok(scenario != "undrained")
+            },
+        )
+        .unwrap();
+        let workers = store.list_active_workers_blocking().unwrap();
+        if scenario == "dead" {
+            assert!(drained);
+            assert!(workers.is_empty());
+            assert!(
+                store
+                    .lease_for_project_blocking(project.id)
+                    .unwrap()
+                    .is_none()
+            );
+        } else {
+            assert_eq!(workers.len(), 1, "{scenario}");
+            assert!(
+                store
+                    .lease_for_project_blocking(project.id)
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(
+                drained,
+                matches!(scenario, "undrained" | "renewed"),
+                "{scenario}"
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn manual_completion_preserves_unproven_worker_and_launch_generations() {
+    for scenario in ["inline-launch-pending", "future-protocol", "missing-pid"] {
+        let root = temp_root("manual-completion-unproven-worker");
+        let store = agent::TursoAgentStore::open_blocking(&root.join("state")).unwrap();
+        let project_root = root.join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert!(
+            store
+                .try_acquire_lease_blocking(project.id, "scheduler", "100", "9999999999",)
+                .unwrap()
+        );
+        let reservation = agent::AgentWorkerReservation {
+            project_id: project.id,
+            worker_token: "worker",
+            expected_lease_holder: "scheduler",
+            max_active_workers: 1,
+            protocol_version: AGENT_WORKER_PROTOCOL_VERSION
+                + i64::from(scenario == "future-protocol"),
+            service_label: if scenario == "inline-launch-pending" {
+                "clt-inline-worker-worker"
+            } else {
+                "clt-agent-worker-worker.service"
+            },
+            binary_path: Path::new("/tmp/test-worker-clt"),
+            command_arguments: "[]",
+            path_env: OsStr::new("/usr/bin:/bin"),
+            codex_path: None,
+            task_selection: "next_todo",
+            resume_session_id: None,
+            created_at: "101",
+        };
+        if scenario == "inline-launch-pending" {
+            assert!(
+                store
+                    .reserve_and_claim_worker_blocking(reservation, 123, "102")
+                    .unwrap()
+            );
+            let git_start = AgentGitStartState {
+                starting_head: "abc123".to_string(),
+                branch_ref: Some("refs/heads/main".to_string()),
+                upstream_ref: None,
+                worktree_baseline: "[]".to_string(),
+            };
+            assert!(
+                store
+                    .record_git_launch_state_blocking(
+                        project.id,
+                        "worker",
+                        AgentGitMode::Commit,
+                        &git_start,
+                        "103",
+                    )
+                    .unwrap()
+            );
+        } else {
+            assert!(store.reserve_worker_blocking(reservation).unwrap());
+            if scenario == "future-protocol" {
+                assert!(store.claim_worker_blocking("worker", 123, "102").unwrap());
+            }
+        }
+
+        super::reconcile_exited_project_workers_with(
+            &store,
+            project.id,
+            |_| Some(false),
+            |_| panic!("manual completion must not drain {scenario}"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            store.list_active_workers_blocking().unwrap().len(),
+            1,
+            "{scenario}"
+        );
+        assert_eq!(store.run_count_blocking().unwrap(), 0, "{scenario}");
+        assert_eq!(
+            store
+                .lease_for_project_blocking(project.id)
+                .unwrap()
+                .unwrap()
+                .holder,
+            agent_worker_lease_holder("worker"),
+            "{scenario}",
+        );
+        if scenario == "inline-launch-pending" {
+            assert!(
+                store
+                    .git_launch_state_blocking(project.id, "worker")
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
 fn idle_run_with_unfinished_tasks_records_failure_and_backs_off() {
     for remaining_status in [None, Some(TaskStatus::Todo), Some(TaskStatus::Doing)] {
         let root = temp_root("idle-run-board-validation");
