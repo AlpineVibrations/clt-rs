@@ -1905,7 +1905,7 @@ pub(super) fn agent_session_resume_worker_log_path(
         .join(format!("p{project_id}-{session_id}.log"))
 }
 
-pub(super) fn tui_stopped_codex_session_control(
+pub(super) fn tui_inactive_codex_session_control(
     project_id: i64,
     session_id: &str,
 ) -> Result<Option<agent::AgentSessionControlRecord>> {
@@ -1913,6 +1913,12 @@ pub(super) fn tui_stopped_codex_session_control(
     with_agent_store_at(&state_dir, |store| {
         Ok(store
             .session_control_blocking(project_id, session_id)?
-            .filter(|control| control.state == AgentSessionControlState::Stopped))
+            .filter(|control| {
+                matches!(
+                    control.state,
+                    AgentSessionControlState::Stopped | AgentSessionControlState::ResumeRequested
+                ) && control.child_pid.is_none()
+                    && control.interactive_holder.is_none()
+            }))
     })
 }

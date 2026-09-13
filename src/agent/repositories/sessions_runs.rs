@@ -860,7 +860,24 @@ impl TursoAgentStore {
                                 interactive_holder = ?1,
                                 interactive_launch_token = NULL, updated_at = ?2
                           WHERE project_id = ?3 AND codex_session_id = ?4
-                            AND state = 'stopped'
+                            AND (
+                                state = 'stopped'
+                                OR (
+                                    state = 'resume_requested'
+                                    AND child_pid IS NULL
+                                    AND interactive_holder IS NULL
+                                    AND EXISTS (
+                                        SELECT 1 FROM leases
+                                         WHERE project_id = ?3 AND holder = ?1
+                                           AND CAST(expires_at AS INTEGER) > CAST(?2 AS INTEGER)
+                                    )
+                                    AND NOT EXISTS (
+                                        SELECT 1 FROM agent_workers
+                                         WHERE project_id = ?3
+                                           AND state IN ('dispatching', 'running', 'finalizing')
+                                    )
+                                )
+                            )
                             AND (
                                 run_token = ?5
                                 OR (run_token IS NULL AND ?5 IS NULL)

@@ -6,6 +6,12 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+## [0.6.12] - 2026-09-13
+
+### Fixed
+
+- Restore selected-task output from its exact session record when a stale worker never saved run history. Allow `c` to open an inactive session queued for recovery after acquiring exclusive ownership, and keep it stopped on return. Show continuation errors instead of hiding them behind an open log.
+
 ## [0.6.11] - 2026-09-11
 
 ### Fixed

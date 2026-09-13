@@ -46,6 +46,58 @@ fn current_control(
 }
 
 #[test]
+fn queued_interactive_reservation_refuses_an_unfinished_worker() {
+    let (root, _state_dir, store, expected) = supervision_fixture("queued-interactive-worker");
+    store
+        .set_session_control_recovery_token_blocking(
+            expected.project_id,
+            &expected.codex_session_id,
+            "original-run",
+        )
+        .unwrap();
+    assert!(
+        store
+            .try_acquire_lease_blocking(expected.project_id, "scheduler", "100", "9999999999")
+            .unwrap()
+    );
+    assert!(reserve_test_worker(
+        &store,
+        expected.project_id,
+        "worker",
+        "scheduler",
+        "100",
+        1
+    ));
+    // A released lease must not allow takeover before its worker finishes.
+    assert!(
+        store
+            .release_lease_blocking(expected.project_id, "clt-worker-worker")
+            .unwrap()
+    );
+    let holder = "clt-stopped-interactive-test";
+    assert!(
+        store
+            .try_acquire_lease_blocking(expected.project_id, holder, "100", "9999999999")
+            .unwrap()
+    );
+    assert!(
+        !store
+            .reserve_idle_session_interactive_blocking(
+                expected.project_id,
+                &expected.codex_session_id,
+                holder,
+                Some("original-run"),
+            )
+            .unwrap()
+    );
+    assert_eq!(
+        current_control(&store, &expected).state,
+        AgentSessionControlState::ResumeRequested
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn orphan_supervision_claim_is_durable_and_excludes_stale_competing_claimants() {
     let (root, state_dir, store, expected) = supervision_fixture("supervision-single-claim");
     store

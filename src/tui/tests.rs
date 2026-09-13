@@ -1418,6 +1418,111 @@ fn fenced_agent_log_view_keeps_the_orphaned_session_controllable() {
 }
 
 #[test]
+fn completed_task_keeps_reaped_session_output_without_run_history() {
+    let root = temp_root("completed-reaped-session-output");
+    let state_dir = root.join("state");
+    let project_root = root.join("project");
+    init_tasks(&project_root, false).unwrap();
+    let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
+    store
+        .register_project_blocking(&project_root, "project")
+        .unwrap();
+    let project = store.list_projects_blocking().unwrap().remove(0);
+    let stdout_path = root.join("completed.out");
+    let stderr_path = root.join("completed.err");
+    fs::write(&stdout_path, "").unwrap();
+    fs::write(&stderr_path, "OpenAI Codex v0.154.0\n--------\nmodel: gpt-6-astra\nreasoning effort: xhigh\nsession id: session-completed\n--------\nCompleted task output\n").unwrap();
+    store
+        .mark_session_running_blocking(
+            project.id,
+            "session-completed",
+            4242,
+            "reaped-run",
+            &stdout_path,
+            &stderr_path,
+        )
+        .unwrap();
+    assert!(
+        store
+            .transition_session_control_state_blocking(
+                project.id,
+                "session-completed",
+                AgentSessionControlState::Running,
+                AgentSessionControlState::ResumeRequested,
+            )
+            .unwrap()
+    );
+    let mut panel = TuiAgentPanel {
+        projects: vec![TuiAgentProject {
+            project,
+            scan: AgentProjectScan::empty(),
+            runtime_state: TuiAgentRuntimeState::Idle,
+            daemon_scan_problem: None,
+            failure_problem: None,
+        }],
+        current_project_registration: None,
+        daemon_status: "stopped".to_string(),
+        state: ListState::default(),
+        scroll_offset: 0,
+        last_error: None,
+    };
+    panel.state.select(Some(0));
+    let task = task_entry_from_text(
+        TaskSource::MarkdownLine { line_index: 1 },
+        "Completed task",
+        "Completed task codex:session-completed",
+        false,
+    );
+    for has_final_output in [false, true] {
+        if has_final_output {
+            fs::write(&stdout_path, "Final response for completed task").unwrap();
+        }
+        let view = selected_tui_task_log_view_at(&panel, TaskStatus::Done, &task, &state_dir)
+            .unwrap()
+            .unwrap();
+        assert!(!view.is_live);
+        assert_eq!(
+            view.path,
+            Some(if has_final_output {
+                stdout_path.clone()
+            } else {
+                stderr_path.clone()
+            })
+        );
+        assert_eq!(view.settings.model.as_deref(), Some("gpt-6-astra"));
+        assert_eq!(view.settings.reasoning_effort.as_deref(), Some("xhigh"));
+        assert_eq!(
+            viewed_tui_codex_session_target(Some(&view))
+                .unwrap()
+                .session_id,
+            "session-completed"
+        );
+    }
+    assert_eq!(
+        tui_codex_session_availability_for_path_at(
+            &mut panel,
+            &project_root,
+            "session-completed",
+            &state_dir,
+        )
+        .unwrap(),
+        TuiCodexSessionAvailability::SelectedSessionQueued
+    );
+    let unrelated_task = task_entry_from_text(
+        TaskSource::MarkdownLine { line_index: 2 },
+        "Other task",
+        "Other task codex:session-other",
+        false,
+    );
+    assert!(
+        selected_tui_task_log_view_at(&panel, TaskStatus::Done, &unrelated_task, &state_dir)
+            .unwrap()
+            .is_none()
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn kanban_agent_log_view_uses_the_active_project_for_selected_doing_task() {
     let root = temp_root("kanban-agent-log");
     let state_dir = root.join("state/clt");

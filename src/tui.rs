@@ -50,7 +50,7 @@ use crate::{
     runner::{
         AgentRunSettings, agent_codex_session_id_from_log, agent_project_run_log_dir,
         agent_run_settings_from_log, agent_timestamp, agent_timestamp_seconds,
-        latest_agent_log_path, preferred_recorded_agent_output_path,
+        latest_agent_log_path, preferred_agent_output_path, preferred_recorded_agent_output_path,
     },
     scheduler::{
         agent_failure_backoff, agent_lease_holder_liveness, interactive_lease_holder_liveness,
@@ -64,7 +64,7 @@ use crate::{
         reserve_tui_idle_codex_session_interactive, reserve_tui_shared_codex_session_interactive,
         resume_codex_session_interactively, spawn_agent_session_resume_worker,
         task_supports_interactive_codex_resume, toggle_tui_codex_session_stop,
-        tui_stopped_codex_session_control,
+        tui_inactive_codex_session_control,
     },
     task::{
         TASK_STATUSES, TaskBoard, TaskEntry, TaskSource, TaskStatus, acquire_board_mutation_lock,
@@ -3320,13 +3320,29 @@ pub(super) fn selected_tui_task_log_view_at(
             let store = open_agent_store_at(state_dir)?;
             let run =
                 store.latest_run_for_codex_session_blocking(selected.project.id, &session_id)?;
-            (
-                run.as_ref().and_then(preferred_recorded_agent_output_path),
-                run.as_ref()
-                    .and_then(|run| run.stderr_path.as_ref())
-                    .map(PathBuf::from),
-                false,
-            )
+            if let Some(path) = run.as_ref().and_then(preferred_recorded_agent_output_path) {
+                (
+                    Some(path),
+                    run.as_ref()
+                        .and_then(|run| run.stderr_path.as_ref())
+                        .map(PathBuf::from),
+                    false,
+                )
+            } else {
+                // A reaped or recovered worker can retain exact-session logs
+                // even when it never persisted a session-linked run outcome.
+                let control = store.session_control_blocking(selected.project.id, &session_id)?;
+                (
+                    control.as_ref().and_then(|control| {
+                        preferred_agent_output_path(
+                            control.stdout_path.as_deref(),
+                            control.stderr_path.as_deref(),
+                        )
+                    }),
+                    control.and_then(|control| control.stderr_path.map(PathBuf::from)),
+                    false,
+                )
+            }
         }
     };
 
@@ -3426,6 +3442,7 @@ fn agent_log_path_is_live(
 pub(super) enum TuiCodexSessionAvailability {
     Idle,
     SelectedSessionBusy,
+    SelectedSessionQueued,
     ProjectBusy,
 }
 
@@ -3453,6 +3470,14 @@ pub(super) fn tui_codex_session_availability_for_path_at(
 
     let store = open_agent_store_at(state_dir)?;
     let controls = store.session_controls_for_project_blocking(selected.project.id)?;
+    if controls.iter().any(|control| {
+        control.codex_session_id == session_id
+            && control.state == AgentSessionControlState::ResumeRequested
+            && control.child_pid.is_none()
+            && control.interactive_holder.is_none()
+    }) {
+        return Ok(TuiCodexSessionAvailability::SelectedSessionQueued);
+    }
     if controls.iter().any(|control| {
         control.codex_session_id == session_id && control.state != AgentSessionControlState::Stopped
     }) {
@@ -5368,7 +5393,8 @@ pub(super) fn run_tui_codex_session_continue(
             TuiCodexHandoffStage::PreparingIdleSession
         },
     )?;
-    let stopped_control = tui_stopped_codex_session_control(target.project_id, &target.session_id)?;
+    let stopped_control =
+        tui_inactive_codex_session_control(target.project_id, &target.session_id)?;
     let restore_stopped = stopped_control.is_some();
     let (interactive_lease, provisional_holder) = if shares_project {
         (
@@ -7567,6 +7593,9 @@ pub(super) fn execute_tui_key_effect(
                     }
                     KeyCode::Char('c') => {
                         let selected_status = statuses[app.selected_board];
+                        // Show continuation failures instead of leaving the
+                        // previous output (including a missing-log message) on top.
+                        app.agent_log_view = None;
                         let Some((_, task)) = selected_task_entry_in_board(
                             &board_dir,
                             selected_status,

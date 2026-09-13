@@ -2405,7 +2405,14 @@ pub(super) fn latest_agent_log_path(log_dir: &Path, extension: &str) -> Result<O
 }
 
 pub(super) fn preferred_recorded_agent_output_path(run: &agent::AgentRunRecord) -> Option<PathBuf> {
-    let stdout_path = run.stdout_path.as_ref().map(PathBuf::from);
+    preferred_agent_output_path(run.stdout_path.as_deref(), run.stderr_path.as_deref())
+}
+
+pub(super) fn preferred_agent_output_path(
+    stdout_path: Option<&str>,
+    stderr_path: Option<&str>,
+) -> Option<PathBuf> {
+    let stdout_path = stdout_path.map(PathBuf::from);
     let stdout_has_output = stdout_path
         .as_ref()
         .and_then(|path| fs::metadata(path).ok())
@@ -2414,6 +2421,6 @@ pub(super) fn preferred_recorded_agent_output_path(run: &agent::AgentRunRecord) 
     if stdout_has_output {
         stdout_path
     } else {
-        run.stderr_path.as_ref().map(PathBuf::from).or(stdout_path)
+        stderr_path.map(PathBuf::from).or(stdout_path)
     }
 }

@@ -1564,6 +1564,101 @@ fn stopping_interactive_takeover_keeps_the_exact_session_stopped() {
 }
 
 #[test]
+fn queued_session_can_open_as_idle_and_remains_stopped_after_exit() {
+    let root = temp_root("queued-completed-session-continue");
+    let state_dir = root.join("state");
+    let project_root = root.join("project");
+    init_tasks(&project_root, false).unwrap();
+    fs::write(
+        project_root.join("tasks/done.md"),
+        "- Finished task codex:session-done\n",
+    )
+    .unwrap();
+    let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
+    store
+        .register_project_blocking(&project_root, "project")
+        .unwrap();
+    let project_id = store.list_projects_blocking().unwrap().remove(0).id;
+    store
+        .set_session_control_recovery_token_blocking(project_id, "session-done", "reaped-run")
+        .unwrap();
+    let holder = InteractiveAgentLease::holder_for_stopped_session();
+    // A queued session may be claimed only by its current exclusive lease owner.
+    assert!(
+        !store
+            .reserve_idle_session_interactive_blocking(
+                project_id,
+                "session-done",
+                &holder,
+                Some("reaped-run"),
+            )
+            .unwrap()
+    );
+    let lease =
+        InteractiveAgentLease::try_acquire_with_holder_at(&state_dir, project_id, &holder, 60)
+            .unwrap()
+            .unwrap();
+    assert!(
+        !store
+            .reserve_idle_session_interactive_blocking(
+                project_id,
+                "session-done",
+                &holder,
+                Some("old-run"),
+            )
+            .unwrap()
+    );
+    assert!(
+        store
+            .reserve_idle_session_interactive_blocking(
+                project_id,
+                "session-done",
+                &holder,
+                Some("reaped-run"),
+            )
+            .unwrap()
+    );
+    let disposition = InteractiveGuardianDisposition::from_handoff(
+        InteractiveCodexResumeMode::WritableIdle,
+        &holder,
+    );
+    assert_eq!(disposition, InteractiveGuardianDisposition::RestoreStopped);
+    let guardian = interactive_guardian_holder(disposition);
+    assert!(
+        store
+            .adopt_interactive_guardian_blocking(
+                project_id,
+                Some("session-done"),
+                &holder,
+                &guardian,
+                60,
+            )
+            .unwrap()
+    );
+    assert!(
+        store
+            .recover_stale_interactive_guardian_blocking(
+                project_id,
+                "session-done",
+                &guardian,
+                None,
+                disposition,
+            )
+            .unwrap()
+    );
+    let control = store
+        .session_control_blocking(project_id, "session-done")
+        .unwrap()
+        .unwrap();
+    assert_eq!(control.state, AgentSessionControlState::Stopped);
+    assert_eq!(control.run_token.as_deref(), Some("reaped-run"));
+    assert!(control.child_pid.is_none());
+    assert!(control.interactive_holder.is_none());
+    lease.release().unwrap();
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn completed_task_session_can_be_opened_repeatedly() {
     let root = temp_root("interactive-completed-task-repeat");
     let state_dir = root.join("state/clt");
