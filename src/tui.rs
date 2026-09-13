@@ -3318,8 +3318,8 @@ pub(super) fn selected_tui_task_log_view_at(
         Some(path) => (Some(path.clone()), Some(path), true),
         None => {
             let store = open_agent_store_at(state_dir)?;
-            let run =
-                store.latest_run_for_codex_session_blocking(selected.project.id, &session_id)?;
+            let run = store
+                .latest_output_run_for_codex_session_blocking(selected.project.id, &session_id)?;
             if let Some(path) = run.as_ref().and_then(preferred_recorded_agent_output_path) {
                 (
                     Some(path),
@@ -3424,7 +3424,9 @@ fn agent_log_path_is_live(
     }
 
     let run = match session_id {
-        Some(session_id) => store.latest_run_for_codex_session_blocking(project_id, session_id)?,
+        Some(session_id) => {
+            store.latest_output_run_for_codex_session_blocking(project_id, session_id)?
+        }
         None => store.latest_run_for_project_blocking(project_id)?,
     };
     // A project lease can outlive Codex while Git finalization runs. Compare the
@@ -3470,23 +3472,37 @@ pub(super) fn tui_codex_session_availability_for_path_at(
 
     let store = open_agent_store_at(state_dir)?;
     let controls = store.session_controls_for_project_blocking(selected.project.id)?;
-    if controls.iter().any(|control| {
+    let selected_queued = controls.iter().any(|control| {
         control.codex_session_id == session_id
             && control.state == AgentSessionControlState::ResumeRequested
             && control.child_pid.is_none()
             && control.interactive_holder.is_none()
-    }) {
-        return Ok(TuiCodexSessionAvailability::SelectedSessionQueued);
-    }
-    if controls.iter().any(|control| {
-        control.codex_session_id == session_id && control.state != AgentSessionControlState::Stopped
-    }) {
+    });
+    if !selected_queued
+        && controls.iter().any(|control| {
+            control.codex_session_id == session_id
+                && control.state != AgentSessionControlState::Stopped
+        })
+    {
         return Ok(TuiCodexSessionAvailability::SelectedSessionBusy);
     }
     if controls.iter().any(|control| {
         control.codex_session_id != session_id && control.state != AgentSessionControlState::Stopped
     }) {
         return Ok(TuiCodexSessionAvailability::ProjectBusy);
+    }
+    if selected_queued {
+        return Ok(
+            if selected.runtime_state.is_running()
+                || store
+                    .lease_for_project_blocking(selected.project.id)?
+                    .is_some()
+            {
+                TuiCodexSessionAvailability::ProjectBusy
+            } else {
+                TuiCodexSessionAvailability::SelectedSessionQueued
+            },
+        );
     }
 
     if selected.runtime_state.is_running() {
@@ -3564,7 +3580,18 @@ pub(super) fn selected_tui_agent_log_view_at(
             }
             None => {
                 let store = open_agent_store_at(state_dir)?;
-                let run = store.latest_run_for_project_blocking(selected.project.id)?;
+                let mut run = store.latest_run_for_project_blocking(selected.project.id)?;
+                if run
+                    .as_ref()
+                    .is_some_and(|run| run.stdout_path.is_none() && run.stderr_path.is_none())
+                    && let Some(session_id) =
+                        run.as_ref().and_then(|run| run.codex_session_id.as_deref())
+                {
+                    run = store.latest_output_run_for_codex_session_blocking(
+                        selected.project.id,
+                        session_id,
+                    )?;
+                }
                 let session_target = run
                     .as_ref()
                     .and_then(|run| run.codex_session_id.clone())

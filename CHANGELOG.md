@@ -6,6 +6,10 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+### Fixed
+
+- Keep completed-task and project logs visible when a later Git-recovery acknowledgement has no output paths, using the recorded output from the same Codex session.
+
 ## [0.6.12] - 2026-09-13
 
 ### Fixed

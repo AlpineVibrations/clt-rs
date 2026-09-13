@@ -172,16 +172,18 @@ impl TursoAgentStore {
         }))
     }
 
-    pub(crate) fn latest_run_for_codex_session_blocking(
+    // Recovery acknowledgements have no output. Keep them in outcome history,
+    // but look past them when resolving logs for this exact project/session.
+    pub(crate) fn latest_output_run_for_codex_session_blocking(
         &self,
         project_id: i64,
         codex_session_id: &str,
     ) -> Result<Option<AgentRunRecord>> {
         self.blocking
-            .block_on(self.latest_run_for_codex_session(project_id, codex_session_id))
+            .block_on(self.latest_output_run_for_codex_session(project_id, codex_session_id))
     }
 
-    async fn latest_run_for_codex_session(
+    async fn latest_output_run_for_codex_session(
         &self,
         project_id: i64,
         codex_session_id: &str,
@@ -195,6 +197,7 @@ impl TursoAgentStore {
                  FROM runs r
                  JOIN projects p ON p.id = r.project_id
                  WHERE r.project_id = ?1 AND r.codex_session_id = ?2
+                   AND (r.stdout_path IS NOT NULL OR r.stderr_path IS NOT NULL)
                  ORDER BY r.id DESC
                  LIMIT 1",
                 params![project_id, codex_session_id],
@@ -939,82 +942,40 @@ impl TursoAgentStore {
         expected_stopped_run_token: Option<&str>,
     ) -> Result<bool> {
         self.blocking.block_on_persist(async {
-                let mut conn = self.repositories.sessions_runs.connect().await?;
-                let transaction = conn
-                    .transaction_with_behavior(TransactionBehavior::Immediate)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "Failed to begin reserving shared interactive session {codex_session_id}"
-                        )
-                    })?;
-                let git_boundary_conflict = query_count(
-                    &transaction,
-                    "SELECT COUNT(*)
-                       FROM projects p
-                      WHERE p.id = ?1
-                        AND (
-                            EXISTS (
-                                SELECT 1 FROM agent_git_launch_states launch
-                                 WHERE launch.project_id = p.id
-                            )
-                            OR EXISTS (
-                                SELECT 1 FROM git_finalizations finalization
-                                 WHERE finalization.project_id = p.id
-                                   AND finalization.state NOT IN ('completed', 'cancelled')
-                            )
-                            OR (
-                                p.git_mode <> 'off'
-                                AND EXISTS (
-                                    SELECT 1 FROM leases
-                                     WHERE leases.project_id = p.id
-                                )
-                            )
-                        )",
-                    [project_id],
-                )
-                .await?
-                    != 0;
-                if git_boundary_conflict {
-                    // A durable Git boundary is not a reservation race. Explain
-                    // the owner while holding the same transaction used to check
-                    // it, so the TUI does not tell users to retry indefinitely.
-                    let mut rows = transaction.query(
-                        "SELECT codex_session_id, state FROM git_finalizations
-                          WHERE project_id = ?1
-                            AND state NOT IN ('completed', 'cancelled')
-                          ORDER BY created_at, codex_session_id LIMIT 1",
-                        [project_id],
-                    ).await?;
-                    let owner = if let Some(row) = rows.next().await? {
-                        format!(
-                            "session {} ({})",
-                            row_text(&row, 0, "codex_session_id")?,
-                            row_text(&row, 1, "state")?,
-                        )
-                    } else {
-                        "the active project run or its launch preparation".to_string()
-                    };
-                    drop(rows);
-                    transaction.commit().await.with_context(|| {
-                        format!(
-                            "Failed to finish rejecting unsafe shared interactive session {codex_session_id}"
-                        )
-                    })?;
-                    anyhow::bail!(
-                        "Shared Codex is blocked by unfinished Git work for {owner}. Finish or resolve that Git work, then press c again; pausing the project does not stop its current run."
-                    );
-                }
-                let restore_stopped =
-                    is_stopped_shared_interactive_holder(interactive_holder);
-                let changed = if restore_stopped {
-                    transaction.execute(
+            let mut conn = self.repositories.sessions_runs.connect().await?;
+            let transaction = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to begin reserving shared interactive session {codex_session_id}"
+                    )
+                })?;
+            // Shared interactive use owns only its selected session. The
+            // automated task retains its lease and Git finalization records.
+            let restore_stopped = is_stopped_shared_interactive_holder(interactive_holder);
+            let changed = if restore_stopped {
+                transaction
+                    .execute(
                         "UPDATE session_controls
                             SET state = 'ready_interactive', child_pid = NULL,
                                 interactive_holder = ?1,
                                 interactive_launch_token = NULL, updated_at = ?2
                           WHERE project_id = ?3 AND codex_session_id = ?4
-                            AND state = 'stopped'
+                            AND (
+                                state = 'stopped'
+                                OR (
+                                    state = 'resume_requested'
+                                    AND child_pid IS NULL
+                                    AND interactive_holder IS NULL
+                                    AND NOT EXISTS (
+                                        SELECT 1 FROM agent_workers
+                                         WHERE project_id = ?3
+                                           AND state IN ('dispatching', 'running', 'finalizing')
+                                           AND (worker_token = ?5 OR resume_session_id = ?4)
+                                    )
+                                )
+                            )
                             AND (
                                 run_token = ?5
                                 OR (run_token IS NULL AND ?5 IS NULL)
@@ -1039,8 +1000,9 @@ impl TursoAgentStore {
                         ],
                     )
                     .await
-                } else {
-                    transaction.execute(
+            } else {
+                transaction
+                    .execute(
                         "INSERT INTO session_controls (
                             project_id, codex_session_id, state, child_pid,
                             interactive_holder, updated_at
@@ -1070,19 +1032,19 @@ impl TursoAgentStore {
                         ],
                     )
                     .await
-                }
-                .with_context(|| {
-                    format!(
-                        "Failed to reserve Codex session {codex_session_id} for shared interactive use"
-                    )
-                })?;
-                transaction.commit().await.with_context(|| {
-                    format!(
-                        "Failed to commit shared interactive session {codex_session_id} reservation"
-                    )
-                })?;
-                Ok(changed > 0)
-            })
+            }
+            .with_context(|| {
+                format!(
+                    "Failed to reserve Codex session {codex_session_id} for shared interactive use"
+                )
+            })?;
+            transaction.commit().await.with_context(|| {
+                format!(
+                    "Failed to commit shared interactive session {codex_session_id} reservation"
+                )
+            })?;
+            Ok(changed > 0)
+        })
     }
 
     pub(crate) fn cancel_idle_session_interactive_blocking(

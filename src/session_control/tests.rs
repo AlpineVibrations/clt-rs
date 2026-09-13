@@ -3188,220 +3188,251 @@ fn writable_shared_interactive_reservation_coexists_with_another_active_session(
 }
 
 #[test]
-fn writable_shared_interactive_reservation_rejects_durable_git_boundaries() {
-    let root = temp_root("writable-shared-interactive-git-boundaries");
-    let state_dir = root.join("state/clt");
-    let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
-    let requester = InteractiveAgentLease::holder_for_shared_session(false);
-
-    let launch_root = root.join("launch-project");
-    fs::create_dir_all(&launch_root).unwrap();
-    let launch_root = fs::canonicalize(launch_root).unwrap();
-    store
-        .register_project_blocking(&launch_root, "launch-project")
-        .unwrap();
-    let launch_project = store
-        .list_projects_blocking()
-        .unwrap()
-        .into_iter()
-        .find(|project| project.path == launch_root)
-        .unwrap();
-    store
-        .set_session_control_state_blocking(
-            launch_project.id,
-            "session-active-launch",
-            AgentSessionControlState::Running,
-        )
-        .unwrap();
-    assert!(
+fn writable_shared_interactive_preserves_active_git_work_through_exit_and_reopen() {
+    for git_mode in [AgentGitMode::Commit, AgentGitMode::CommitAndPush] {
+        for boundary in [
+            "lease",
+            "launch",
+            "working",
+            "tracking",
+            "commit_pending",
+            "push_pending",
+        ] {
+            if git_mode == AgentGitMode::Commit && boundary == "push_pending" {
+                continue;
+            }
+            let root = temp_root("writable-shared-active-git");
+            let state_dir = root.join("state");
+            let project_root = root.join("project");
+            fs::create_dir_all(&project_root).unwrap();
+            let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
             store
-                .record_git_launch_state_blocking(
-                    launch_project.id,
-                    "launch-boundary-token",
-                    AgentGitMode::Commit,
-                    &AgentGitStartState {
-                        starting_head: "1111111111111111111111111111111111111111".to_string(),
-                        branch_ref: Some("refs/heads/master".to_string()),
-                        upstream_ref: None,
-                        worktree_baseline: r#"{"version":1,"tracked_patch_ids":{},"untracked_blob_ids":{},"require_clean":false}"#.to_string(),
-                    },
-                    "100",
+                .register_project_blocking(&project_root, "project")
+                .unwrap();
+            let project_id = store.list_projects_blocking().unwrap().remove(0).id;
+            store
+                .mark_session_running_blocking(
+                    project_id,
+                    "session-active",
+                    4242,
+                    "active-run",
+                    &root.join("active.out"),
+                    &root.join("active.err"),
                 )
-                .unwrap()
-        );
-    let error = store
-        .reserve_shared_session_interactive_blocking(
-            launch_project.id,
-            "session-shared-launch",
-            &requester,
-            None,
-        )
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("unfinished Git work"), "{error}");
-    assert!(error.contains("launch preparation"), "{error}");
-    assert!(error.contains("press c again"), "{error}");
-    assert!(
-        store
-            .session_control_blocking(launch_project.id, "session-shared-launch")
-            .unwrap()
-            .is_none()
-    );
-
-    let finalization_root = root.join("finalization-project");
-    fs::create_dir_all(&finalization_root).unwrap();
-    let finalization_root = fs::canonicalize(finalization_root).unwrap();
-    store
-        .register_project_blocking(&finalization_root, "finalization-project")
-        .unwrap();
-    let finalization_project = store
-        .list_projects_blocking()
-        .unwrap()
-        .into_iter()
-        .find(|project| project.path == finalization_root)
-        .unwrap();
-    store
-        .set_session_control_state_blocking(
-            finalization_project.id,
-            "session-active-finalization",
-            AgentSessionControlState::Running,
-        )
-        .unwrap();
-    assert!(
-            store
-                .create_git_finalization_blocking(agent::NewGitFinalization {
-                    project_id: finalization_project.id,
-                    codex_session_id: "session-working-finalization",
-                    git_mode: AgentGitMode::Commit,
-                    starting_head: Some("1111111111111111111111111111111111111111"),
-                    branch_ref: Some("refs/heads/master"),
-                    upstream_ref: None,
-                    worktree_baseline: r#"{"version":1,"tracked_patch_ids":{},"untracked_blob_ids":{},"require_clean":false}"#,
-                    task_identity: None,
-                    owner_run_token: None,
-                    created_at: "100",
-                })
-                .unwrap()
-        );
-    let error = store
-        .reserve_shared_session_interactive_blocking(
-            finalization_project.id,
-            "session-shared-finalization",
-            &requester,
-            None,
-        )
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("unfinished Git work"), "{error}");
-    assert!(
-        error.contains("session-working-finalization (working)"),
-        "{error}"
-    );
-    assert!(
-        store
-            .session_control_blocking(finalization_project.id, "session-shared-finalization")
-            .unwrap()
-            .is_none()
-    );
-    assert_eq!(
-        store
-            .session_control_blocking(finalization_project.id, "session-active-finalization")
-            .unwrap()
-            .unwrap()
-            .state,
-        AgentSessionControlState::Running
-    );
-
-    // Resolving the Git boundary makes the same idle session available.
-    let finalization = store
-        .git_finalization_blocking(finalization_project.id, "session-working-finalization")
-        .unwrap()
-        .unwrap();
-    assert!(
-        store
-            .compare_and_set_git_finalization_blocking(
-                finalization_project.id,
-                "session-working-finalization",
-                finalization.generation,
-                agent::GitFinalizationState::Cancelled,
-                None,
-                None,
-                None,
-                "101",
-            )
-            .unwrap()
-    );
-    assert!(
-        store
-            .reserve_shared_session_interactive_blocking(
-                finalization_project.id,
-                "session-shared-finalization",
+                .unwrap();
+            assert!(
+                store
+                    .set_project_git_mode_for_path_blocking(&project_root, git_mode)
+                    .unwrap()
+            );
+            assert!(
+                store
+                    .try_acquire_lease_blocking(project_id, "active-owner", "100", "9999999999")
+                    .unwrap()
+            );
+            let git_start = AgentGitStartState {
+                starting_head: "1111111111111111111111111111111111111111".to_string(),
+                branch_ref: Some("refs/heads/main".to_string()),
+                upstream_ref: Some("refs/remotes/origin/main".to_string()),
+                worktree_baseline: r#"{"version":1,"tracked_patch_ids":{},"untracked_blob_ids":{},"require_clean":false}"#.to_string(),
+            };
+            if boundary == "launch" {
+                assert!(
+                    store
+                        .record_git_launch_state_blocking(
+                            project_id,
+                            "active-run",
+                            git_mode,
+                            &git_start,
+                            "100"
+                        )
+                        .unwrap()
+                );
+            } else if boundary != "lease" {
+                assert!(
+                    store
+                        .create_git_finalization_blocking(agent::NewGitFinalization {
+                            project_id,
+                            codex_session_id: "session-active",
+                            git_mode,
+                            starting_head: Some(&git_start.starting_head),
+                            branch_ref: git_start.branch_ref.as_deref(),
+                            upstream_ref: git_start.upstream_ref.as_deref(),
+                            worktree_baseline: &git_start.worktree_baseline,
+                            task_identity: Some("active-task"),
+                            owner_run_token: Some("active-run"),
+                            created_at: "100",
+                        })
+                        .unwrap()
+                );
+                if boundary != "working" {
+                    for state in [
+                        GitFinalizationState::Tracking,
+                        GitFinalizationState::CommitPending,
+                        GitFinalizationState::PushPending,
+                    ] {
+                        let journal = store
+                            .git_finalization_blocking(project_id, "session-active")
+                            .unwrap()
+                            .unwrap();
+                        assert!(
+                            store
+                                .compare_and_set_git_finalization_blocking(
+                                    project_id,
+                                    "session-active",
+                                    journal.generation,
+                                    state,
+                                    Some("active-run"),
+                                    Some("2222222222222222222222222222222222222222"),
+                                    None,
+                                    "101"
+                                )
+                                .unwrap()
+                        );
+                        if state.database_value() == boundary {
+                            break;
+                        }
+                    }
+                }
+            }
+            let active_before = store
+                .session_control_blocking(project_id, "session-active")
+                .unwrap();
+            let launch_before = store
+                .git_launch_state_blocking(project_id, "active-run")
+                .unwrap();
+            let journal_before = store
+                .git_finalization_blocking(project_id, "session-active")
+                .unwrap();
+            let requester = InteractiveAgentLease::holder_for_shared_session(false);
+            assert!(
+                store
+                    .reserve_shared_session_interactive_blocking(
+                        project_id,
+                        "session-completed",
+                        &requester,
+                        None
+                    )
+                    .unwrap(),
+                "{git_mode:?} {boundary}"
+            );
+            assert!(
+                !store
+                    .reserve_shared_session_interactive_blocking(
+                        project_id,
+                        "session-completed",
+                        &requester,
+                        None
+                    )
+                    .unwrap()
+            );
+            assert!(
+                !store
+                    .reserve_shared_session_interactive_blocking(
+                        project_id,
+                        "session-active",
+                        &requester,
+                        None
+                    )
+                    .unwrap()
+            );
+            let disposition = InteractiveGuardianDisposition::from_handoff(
+                InteractiveCodexResumeMode::WritableShared,
                 &requester,
-                None,
-            )
-            .unwrap()
-    );
-    // A real reservation race still returns false, rather than a Git error.
-    assert!(
-        !store
-            .reserve_shared_session_interactive_blocking(
-                finalization_project.id,
-                "session-shared-finalization",
-                &requester,
-                None,
-            )
-            .unwrap()
-    );
-
-    let lease_root = root.join("lease-project");
-    fs::create_dir_all(&lease_root).unwrap();
-    let lease_root = fs::canonicalize(lease_root).unwrap();
-    store
-        .register_project_blocking(&lease_root, "lease-project")
-        .unwrap();
-    assert!(
-        store
-            .set_project_git_mode_for_path_blocking(&lease_root, AgentGitMode::Commit)
-            .unwrap()
-    );
-    let lease_project = store
-        .list_projects_blocking()
-        .unwrap()
-        .into_iter()
-        .find(|project| project.path == lease_root)
-        .unwrap();
-    assert!(
-        store
-            .try_acquire_lease_blocking(lease_project.id, "git-owner", "100", "999")
-            .unwrap()
-    );
-    let error = store
-        .reserve_shared_session_interactive_blocking(
-            lease_project.id,
-            "session-shared-lease",
-            &requester,
-            None,
-        )
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("unfinished Git work"), "{error}");
-    assert!(error.contains("active project run"), "{error}");
-    assert_eq!(
-        store
-            .lease_for_project_blocking(lease_project.id)
-            .unwrap()
-            .unwrap()
-            .holder,
-        "git-owner"
-    );
-    assert!(
-        store
-            .session_control_blocking(lease_project.id, "session-shared-lease")
-            .unwrap()
-            .is_none()
-    );
-
-    fs::remove_dir_all(root).unwrap();
+            );
+            assert_eq!(
+                disposition,
+                InteractiveGuardianDisposition::PreserveSharedSession
+            );
+            let guardian = interactive_guardian_holder(disposition);
+            assert!(
+                store
+                    .adopt_interactive_guardian_blocking(
+                        project_id,
+                        Some("session-completed"),
+                        &requester,
+                        &guardian,
+                        60
+                    )
+                    .unwrap()
+            );
+            assert!(
+                store
+                    .register_interactive_guardian_child_blocking(
+                        project_id,
+                        "session-completed",
+                        &guardian,
+                        std::process::id(),
+                        60
+                    )
+                    .unwrap()
+            );
+            assert!(
+                store
+                    .finish_interactive_guardian_blocking(
+                        project_id,
+                        "session-completed",
+                        &guardian,
+                        disposition
+                    )
+                    .unwrap()
+            );
+            let requester = InteractiveAgentLease::holder_for_shared_session(true);
+            assert!(
+                store
+                    .reserve_shared_session_interactive_blocking(
+                        project_id,
+                        "session-completed",
+                        &requester,
+                        None
+                    )
+                    .unwrap()
+            );
+            assert!(
+                store
+                    .cancel_idle_session_interactive_blocking(
+                        project_id,
+                        "session-completed",
+                        &requester
+                    )
+                    .unwrap()
+            );
+            assert_eq!(
+                store
+                    .session_control_blocking(project_id, "session-completed")
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                AgentSessionControlState::Stopped
+            );
+            assert_eq!(
+                store
+                    .session_control_blocking(project_id, "session-active")
+                    .unwrap(),
+                active_before
+            );
+            assert_eq!(
+                store
+                    .git_launch_state_blocking(project_id, "active-run")
+                    .unwrap(),
+                launch_before
+            );
+            assert_eq!(
+                store
+                    .git_finalization_blocking(project_id, "session-active")
+                    .unwrap(),
+                journal_before
+            );
+            let lease = store
+                .lease_for_project_blocking(project_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(lease.holder, "active-owner");
+            assert_eq!(lease.acquired_at, "100");
+            assert_eq!(lease.expires_at, "9999999999");
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
 }
 
 #[test]

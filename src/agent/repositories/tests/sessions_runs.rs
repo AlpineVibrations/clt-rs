@@ -98,6 +98,79 @@ fn queued_interactive_reservation_refuses_an_unfinished_worker() {
 }
 
 #[test]
+fn queued_shared_resume_distinguishes_its_own_worker_from_another_task() {
+    for own_worker in [true, false] {
+        let (root, _state_dir, store, expected) = supervision_fixture("queued-shared-worker");
+        store
+            .set_session_control_recovery_token_blocking(
+                expected.project_id,
+                &expected.codex_session_id,
+                "original-run",
+            )
+            .unwrap();
+        assert!(
+            store
+                .try_acquire_lease_blocking(expected.project_id, "scheduler", "100", "9999999999",)
+                .unwrap()
+        );
+        let worker_token = if own_worker {
+            "original-run"
+        } else {
+            "another-task"
+        };
+        assert!(reserve_test_worker(
+            &store,
+            expected.project_id,
+            worker_token,
+            "scheduler",
+            "100",
+            1
+        ));
+        let holder = "clt-stopped-shared-interactive-test";
+        assert_eq!(
+            store
+                .reserve_shared_session_interactive_blocking(
+                    expected.project_id,
+                    &expected.codex_session_id,
+                    holder,
+                    Some("original-run"),
+                )
+                .unwrap(),
+            !own_worker
+        );
+        assert_eq!(
+            store
+                .lease_for_project_blocking(expected.project_id)
+                .unwrap()
+                .unwrap()
+                .holder,
+            format!("clt-worker-{worker_token}")
+        );
+        if !own_worker {
+            assert!(
+                store
+                    .cancel_idle_session_interactive_blocking(
+                        expected.project_id,
+                        &expected.codex_session_id,
+                        holder,
+                    )
+                    .unwrap()
+            );
+            assert_eq!(
+                current_control(&store, &expected).state,
+                AgentSessionControlState::Stopped
+            );
+        } else {
+            assert_eq!(
+                current_control(&store, &expected).state,
+                AgentSessionControlState::ResumeRequested
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
 fn orphan_supervision_claim_is_durable_and_excludes_stale_competing_claimants() {
     let (root, state_dir, store, expected) = supervision_fixture("supervision-single-claim");
     store

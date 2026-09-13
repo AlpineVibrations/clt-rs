@@ -1246,6 +1246,119 @@ fn reaped_session_logs_are_latest_while_project_runtime_still_looks_active() {
 }
 
 #[test]
+fn git_recovery_without_logs_keeps_exact_completed_session_output() {
+    let root = temp_root("git-recovery-task-output");
+    let state_dir = root.join("state");
+    let project_root = root.join("project");
+    fs::create_dir_all(&project_root).unwrap();
+    let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
+    store
+        .register_project_blocking(&project_root, "project")
+        .unwrap();
+    let project = store.list_projects_blocking().unwrap().remove(0);
+    let stdout = root.join("original.out");
+    let stderr = root.join("original.err");
+    fs::write(&stdout, "Completed the deep-folder scan task").unwrap();
+    fs::write(
+        &stderr,
+        "OpenAI Codex v0.154.0\n--------\nmodel: gpt-6-astra\nreasoning effort: xhigh\n--------\n",
+    )
+    .unwrap();
+    for has_output in [true, false] {
+        store
+            .record_run_outcome_blocking(agent::AgentRunOutcome {
+                project_id: project.id,
+                status: "success",
+                started_at: if has_output { "100" } else { "200" },
+                finished_at: Some("200"),
+                exit_code: has_output.then_some(0),
+                log_dir: None,
+                stdout_path: has_output.then(|| stdout.to_str().unwrap()),
+                stderr_path: has_output.then(|| stderr.to_str().unwrap()),
+                summary: Some(if has_output {
+                    "Task finished"
+                } else {
+                    "Git finalization recovered"
+                }),
+                codex_session_id: Some("session-completed"),
+            })
+            .unwrap();
+    }
+    // Completion bookkeeping must remain the latest outcome without hiding output.
+    let latest = store
+        .latest_run_for_project_blocking(project.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        latest.summary.as_deref(),
+        Some("Git finalization recovered")
+    );
+    assert!(latest.stdout_path.is_none());
+    let mut panel = TuiAgentPanel {
+        projects: vec![TuiAgentProject {
+            project,
+            scan: AgentProjectScan::empty(),
+            runtime_state: TuiAgentRuntimeState::Idle,
+            daemon_scan_problem: None,
+            failure_problem: None,
+        }],
+        current_project_registration: None,
+        daemon_status: "running".to_string(),
+        state: ListState::default(),
+        scroll_offset: 0,
+        last_error: None,
+    };
+    panel.state.select(Some(0));
+    let task = task_entry_from_text(
+        TaskSource::MarkdownLine { line_index: 1 },
+        "Finished task",
+        "Finished task codex:session-completed",
+        false,
+    );
+    let task_view = selected_tui_task_log_view_at(&panel, TaskStatus::Done, &task, &state_dir)
+        .unwrap()
+        .expect("Completed task output survives recovery bookkeeping");
+    let project_view = selected_tui_agent_log_view_at(&panel, &state_dir)
+        .unwrap()
+        .expect("Project output survives recovery bookkeeping");
+    for view in [&task_view, &project_view] {
+        assert_eq!(view.content, "Completed the deep-folder scan task");
+        assert!(!view.is_live);
+        assert_eq!(view.settings.model.as_deref(), Some("gpt-6-astra"));
+        assert_eq!(view.settings.reasoning_effort.as_deref(), Some("xhigh"));
+        assert_eq!(
+            view.session_target.as_ref().unwrap().session_id,
+            "session-completed"
+        );
+    }
+    // A different session with no output cannot borrow this completed task's log.
+    store
+        .record_run_outcome_blocking(agent::AgentRunOutcome {
+            project_id: panel.projects[0].project.id,
+            status: "failure",
+            started_at: "300",
+            finished_at: Some("300"),
+            exit_code: None,
+            log_dir: None,
+            stdout_path: None,
+            stderr_path: None,
+            summary: Some("Different session failed before logging"),
+            codex_session_id: Some("session-other"),
+        })
+        .unwrap();
+    assert!(
+        selected_tui_agent_log_view_at(&panel, &state_dir)
+            .unwrap()
+            .is_none()
+    );
+    let task_view = selected_tui_task_log_view_at(&panel, TaskStatus::Done, &task, &state_dir)
+        .unwrap()
+        .unwrap();
+    assert_eq!(task_view.content, "Completed the deep-folder scan task");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn completed_log_is_latest_but_a_newer_attempt_of_the_same_session_is_live() {
     let root = temp_root("completed-and-resumed-log-status");
     let state_dir = root.join("state");
@@ -1275,6 +1388,20 @@ fn completed_log_is_latest_but_a_newer_attempt_of_the_same_session_is_live() {
             stdout_path: None,
             stderr_path: Some(old_path.to_str().unwrap()),
             summary: Some("Git finalization remains pending"),
+            codex_session_id: Some("session-retry"),
+        })
+        .unwrap();
+    store
+        .record_run_outcome_blocking(agent::AgentRunOutcome {
+            project_id: project.id,
+            status: "success",
+            started_at: "202",
+            finished_at: Some("202"),
+            exit_code: None,
+            log_dir: None,
+            stdout_path: None,
+            stderr_path: None,
+            summary: Some("Git finalization recovered without new agent output"),
             codex_session_id: Some("session-retry"),
         })
         .unwrap();
@@ -1507,6 +1634,23 @@ fn completed_task_keeps_reaped_session_output_without_run_history() {
         )
         .unwrap(),
         TuiCodexSessionAvailability::SelectedSessionQueued
+    );
+    store
+        .set_session_control_state_blocking(
+            panel.projects[0].project.id,
+            "session-running",
+            AgentSessionControlState::Running,
+        )
+        .unwrap();
+    assert_eq!(
+        tui_codex_session_availability_for_path_at(
+            &mut panel,
+            &project_root,
+            "session-completed",
+            &state_dir,
+        )
+        .unwrap(),
+        TuiCodexSessionAvailability::ProjectBusy
     );
     let unrelated_task = task_entry_from_text(
         TaskSource::MarkdownLine { line_index: 2 },
