@@ -6,8 +6,11 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+## [0.6.13] - 2026-09-13
+
 ### Fixed
 
+- Allow Git task completion when a concurrent user commit already includes the frozen baseline changes or implementation, preserving the original journal and validating the remaining staged task against the current parent.
 - Keep completed-task and project logs visible when a later Git-recovery acknowledgement has no output paths, using the recorded output from the same Codex session.
 
 ## [0.6.12] - 2026-09-13

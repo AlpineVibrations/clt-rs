@@ -1,6 +1,104 @@
 use super::*;
 
 #[test]
+fn committed_baseline_requires_evidence_for_each_missing_path() {
+    for tracked in [false, true] {
+        for staged in [false, true] {
+            let root = temp_root("git-baseline-missing-path");
+            init_tasks(&root, false).unwrap();
+            if tracked {
+                fs::write(root.join("local.txt"), "original\n").unwrap();
+            }
+            initialize_test_git_repository(&root);
+            fs::write(root.join("local.txt"), "user baseline\n").unwrap();
+            let start = capture_agent_git_start_state(&root, AgentGitMode::Commit).unwrap();
+            fs::write(root.join("other.txt"), "unrelated commit\n").unwrap();
+            run_test_git(&root, &["add", "other.txt"]);
+            run_test_git(&root, &["commit", "-m", "Other work"]);
+            let parent = run_test_git(&root, &["rev-parse", "HEAD"]);
+            if staged {
+                run_test_git(&root, &["add", "local.txt"]);
+            } else if tracked {
+                fs::write(root.join("local.txt"), "original\n").unwrap();
+            } else {
+                fs::remove_file(root.join("local.txt")).unwrap();
+            }
+            let index = run_test_git(&root, &["write-tree"]);
+            let status = run_test_git(&root, &["status", "--porcelain"]);
+            assert!(
+                !worktree_matches_agent_git_baseline(
+                    &root,
+                    &start.worktree_baseline,
+                    &start.starting_head,
+                    &parent,
+                )
+                .unwrap(),
+                "tracked={tracked}, staged={staged}"
+            );
+            assert_eq!(run_test_git(&root, &["write-tree"]), index);
+            assert_eq!(run_test_git(&root, &["status", "--porcelain"]), status);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+}
+
+#[test]
+fn committed_baseline_handles_file_changes_but_rejects_new_unstaged_work() {
+    for change in ["text", "binary", "delete", "rename", "add"] {
+        let root = temp_root("git-baseline-committed-path");
+        init_tasks(&root, false).unwrap();
+        if change != "add" {
+            fs::write(root.join("local.txt"), "original\n").unwrap();
+        }
+        initialize_test_git_repository(&root);
+        let remaining_path = match change {
+            "delete" => {
+                fs::remove_file(root.join("local.txt")).unwrap();
+                "local.txt"
+            }
+            "rename" => {
+                fs::rename(root.join("local.txt"), root.join("renamed.txt")).unwrap();
+                "renamed.txt"
+            }
+            "binary" => {
+                fs::write(root.join("local.txt"), b"\0user binary\xff").unwrap();
+                "local.txt"
+            }
+            _ => {
+                fs::write(root.join("local.txt"), "user baseline\n").unwrap();
+                "local.txt"
+            }
+        };
+        let start = capture_agent_git_start_state(&root, AgentGitMode::Commit).unwrap();
+        run_test_git(&root, &["add", "--all"]);
+        run_test_git(&root, &["commit", "-m", "Save user baseline"]);
+        let parent = run_test_git(&root, &["rev-parse", "HEAD"]);
+        assert!(
+            worktree_matches_agent_git_baseline(
+                &root,
+                &start.worktree_baseline,
+                &start.starting_head,
+                &parent,
+            )
+            .unwrap(),
+            "{change}"
+        );
+        fs::write(root.join(remaining_path), "unstaged implementation\n").unwrap();
+        assert!(
+            !worktree_matches_agent_git_baseline(
+                &root,
+                &start.worktree_baseline,
+                &start.starting_head,
+                &parent,
+            )
+            .unwrap(),
+            "{change}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
 fn concurrent_commits_cannot_bypass_task_proof() {
     for scenario in [
         "current task trailer",
@@ -79,7 +177,9 @@ fn concurrent_commits_cannot_bypass_task_proof() {
 #[test]
 fn task_finalization_accepts_concurrent_user_commits_and_board_checkpoints() {
     for git_mode in [AgentGitMode::Commit, AgentGitMode::CommitAndPush] {
-        for after_seal in [false, true] {
+        for (after_seal, commit_baseline) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
             let root = temp_root("git-finalization-concurrent-user");
             let project_root = root.join("project");
             let remote_root = root.join("remote.git");
@@ -121,6 +221,9 @@ fn task_finalization_accepts_concurrent_user_commits_and_board_checkpoints() {
                 )
                 .unwrap();
             fs::write(project_root.join("notes.txt"), "user scratch work\n").unwrap();
+            if commit_baseline {
+                fs::write(project_root.join("scratch.txt"), "new user file\n").unwrap();
+            }
             let start = capture_agent_git_start_state(&project_root, git_mode).unwrap();
             ensure_agent_git_working_record(
                 &store,
@@ -171,6 +274,45 @@ fn task_finalization_accepts_concurrent_user_commits_and_board_checkpoints() {
                     "version.txt",
                 ],
             );
+            if commit_baseline {
+                // The user can commit both the frozen baseline and the task's
+                // implementation, including additional work in a baseline file.
+                fs::write(
+                    project_root.join("notes.txt"),
+                    "user scratch work\nimplemented\n",
+                )
+                .unwrap();
+                run_test_git(
+                    &project_root,
+                    &["add", "notes.txt", "scratch.txt", "feature.txt"],
+                );
+                run_test_git(
+                    &project_root,
+                    &[
+                        "commit",
+                        "--only",
+                        "-m",
+                        "Save user work and implementation",
+                        "--",
+                        "notes.txt",
+                        "scratch.txt",
+                        "feature.txt",
+                    ],
+                );
+                // Leave a task-note update to seal even when all code is already
+                // committed. The provisional Done entry must remain uncommitted.
+                let task_path = if after_seal {
+                    "tasks/done.md"
+                } else {
+                    "tasks/doing.md"
+                };
+                let content = fs::read_to_string(project_root.join(task_path)).unwrap();
+                fs::write(
+                    project_root.join(task_path),
+                    content.replace("checked codex:", "checked committed implementation codex:"),
+                )
+                .unwrap();
+            }
             let user_commit = run_test_git(&project_root, &["rev-parse", "HEAD"]);
             if !after_seal {
                 // A later scheduler launch can checkpoint the board while this
@@ -244,6 +386,9 @@ fn task_finalization_accepts_concurrent_user_commits_and_board_checkpoints() {
                 Some(start.starting_head.as_str())
             );
             let baseline = AgentGitWorktreeBaseline::from_json(&pending.worktree_baseline).unwrap();
+            let frozen = AgentGitWorktreeBaseline::from_json(&start.worktree_baseline).unwrap();
+            assert_eq!(baseline.tracked_patch_ids, frozen.tracked_patch_ids);
+            assert_eq!(baseline.untracked_blob_ids, frozen.untracked_blob_ids);
             assert_eq!(
                 baseline.manifest_parent_head.as_deref(),
                 Some(parent.as_str())
@@ -285,11 +430,15 @@ fn task_finalization_accepts_concurrent_user_commits_and_board_checkpoints() {
             assert_eq!(completed.commit_oid.as_deref(), Some(task_commit.as_str()));
             assert_eq!(
                 fs::read_to_string(project_root.join("notes.txt")).unwrap(),
-                "user scratch work\n"
+                if commit_baseline {
+                    "user scratch work\nimplemented\n"
+                } else {
+                    "user scratch work\n"
+                }
             );
             assert_eq!(
                 run_test_git(&project_root, &["status", "--porcelain"]),
-                "M notes.txt"
+                if commit_baseline { "" } else { "M notes.txt" }
             );
             if git_mode == AgentGitMode::CommitAndPush {
                 assert_eq!(
