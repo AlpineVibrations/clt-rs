@@ -1481,6 +1481,7 @@ impl BuildSharedWal {
                 initialized: AtomicBool::new(false),
             },
             runtime: WalSharedRuntime {
+                authority_reconciliation: Default::default(),
                 frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
                 frame_cache_high_water: AtomicU64::new(0),
                 file: Some(file.clone()),

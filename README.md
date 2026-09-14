@@ -293,6 +293,8 @@ Worker launch contracts are versioned. A newer scheduler can recover older persi
 
 Registry opens (including TUI refreshes and scheduler heartbeats) check database integrity at most once per minute. Readable but damaged indexes trigger recovery instead of leaving stale worker, failure, or heartbeat rows in circulation. A busy database is retried without being classified as corruption.
 
+Idle registry clients preserve commits made by other processes when opening new connections. A local WAL scan is used for initial reconciliation only, preventing an older client from restoring stale leases or settings after another client updates them. Recognized Turso index-page panics preserve their original cause in the recovery marker and stop further database operations.
+
 On the next registry open, CLT automatically repairs coordination files when it can acquire exclusive database access and prove that recorded workers and session processes have exited. If integrity errors identify only worker indexes, it rebuilds those indexes from the existing table rows and verifies full database integrity and foreign keys. This preserves run history, settings, and Git journals. The original DB/WAL bundle is quarantined before repair. Automatic repair never stops another process or rebuilds the database from a snapshot; while a live worker or client holds the registry, it waits for that owner to exit. An interrupted registry update, an unfinished repair, or damage beyond the supported worker-index repair requires explicit recovery. Close other CLT TUIs and foreground sessions, then run:
 
 ```bash

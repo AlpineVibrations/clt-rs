@@ -17,6 +17,9 @@ mod wal_tail_tests;
 #[path = "concurrent_open_tests.rs"]
 mod concurrent_open_tests;
 
+#[path = "idle_tests.rs"]
+mod idle_tests;
+
 const CHECKPOINT_CHILD_STATE: &str = "CLT_REGISTRY_RECOVERY_CHECKPOINT_TEST_STATE";
 const REOPEN_CHILD_STATE: &str = "CLT_REGISTRY_RECOVERY_REOPEN_TEST_STATE";
 
@@ -738,6 +741,29 @@ fn registry_shared_wal_panic_marks_recovery_required_and_stops_further_database_
     assert!(retry.is_err());
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert!(TursoAgentStore::open_blocking(&root).is_err());
+    drop(adapter);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn registry_index_page_panic_preserves_the_cause_and_fences_later_updates() {
+    let root = temp_root("registry-index-page-panic");
+    let adapter = AgentStoreBlockingAdapter::new(&root, false).unwrap();
+    let message = "internal error: entered unreachable code: cell_index_read_payload_ptr called on non-index page";
+    let error = adapter
+        .block_on_persist(async {
+            panic!("{message}");
+            #[allow(unreachable_code)]
+            Ok(())
+        })
+        .unwrap_err();
+    assert!(format!("{error:#}").contains(message));
+    assert_eq!(
+        fs::read_to_string(root.join(REQUIRED_FILE)).unwrap(),
+        message
+    );
+    assert!(root.join(DIRTY_FILE).exists());
+    assert!(adapter.block_on(async { Ok(()) }).is_err());
     drop(adapter);
     fs::remove_dir_all(root).unwrap();
 }

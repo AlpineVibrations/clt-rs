@@ -1680,7 +1680,7 @@ impl Drop for TursoAgentStore {
             Err(_) => None,
         };
         if let Some(problem) = problem
-            && recovery::shared_wal_failure(&problem)
+            && recovery::storage_failure(&problem)
             && let Some(state_dir) = state_dir
         {
             let _ = recovery::mark_required(&state_dir, &problem);

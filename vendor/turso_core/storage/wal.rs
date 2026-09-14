@@ -1755,13 +1755,19 @@ impl ShmWalCoordination {
     /// 3. **Authority initialized and trustworthy**: adopt the authority's
     ///    snapshot as our local state without modifying the shared index.
     fn seed_or_sync_authority(&self) {
+        // A disk scan is evidence for one reconciliation only. Once shared
+        // metadata adopts a peer's commit, our local frame cache still lacks
+        // that peer's frames. Reusing the scan flag would make the next
+        // connection publish that stale cache under the newer header.
+        let reconciliation = self.shared.read().runtime.authority_reconciliation.clone();
+        let _reconciliation = reconciliation.lock();
         let snapshot = self.authority.snapshot();
         let local_wal_view_loaded_from_disk = self
             .shared
             .read()
             .metadata
             .loaded_from_disk_scan
-            .load(Ordering::Acquire);
+            .swap(false, Ordering::AcqRel);
         let recovery_guard =
             if Self::authority_is_uninitialized(snapshot) || local_wal_view_loaded_from_disk {
                 self.authority.try_recovery_guard()
@@ -2781,6 +2787,8 @@ pub struct WalSharedMetadata {
 
 /// Process-local coordination and caches layered around the shared WAL metadata.
 pub struct WalSharedRuntime {
+    /// Serialize connection-open reconciliation of a one-use local WAL scan.
+    pub authority_reconciliation: Arc<Mutex<()>>,
     // Frame cache maps a Page to all the frames it has stored in WAL in ascending order.
     // This is to easily find the frame it must checkpoint each connection if a checkpoint is
     // necessary.
@@ -5605,6 +5613,7 @@ impl WalFileShared {
                 initialized: AtomicBool::new(wal_is_initialized),
             },
             runtime: WalSharedRuntime {
+                authority_reconciliation: Default::default(),
                 frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
                 frame_cache_high_water: AtomicU64::new(0),
                 file: Some(file),
@@ -5681,6 +5690,7 @@ impl WalFileShared {
                 initialized: AtomicBool::new(false),
             },
             runtime: WalSharedRuntime {
+                authority_reconciliation: Default::default(),
                 frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
                 frame_cache_high_water: AtomicU64::new(0),
                 file: None,
@@ -5723,6 +5733,7 @@ impl WalFileShared {
                 initialized: AtomicBool::new(false),
             },
             runtime: WalSharedRuntime {
+                authority_reconciliation: Default::default(),
                 frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
                 frame_cache_high_water: AtomicU64::new(0),
                 file: Some(file),

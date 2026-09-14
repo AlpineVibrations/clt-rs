@@ -131,7 +131,7 @@ pub(super) fn finish_update(state_dir: &Path) -> Result<()> {
     sync_directory(state_dir)
 }
 
-pub(super) fn shared_wal_failure(message: &str) -> bool {
+pub(super) fn storage_failure(message: &str) -> bool {
     let text = message.to_ascii_lowercase();
     (text.contains("shared wal")
         && (text.contains("frame") || text.contains("owner") || text.contains("assertion")))
@@ -142,6 +142,7 @@ pub(super) fn shared_wal_failure(message: &str) -> bool {
             "shared owner slot released by non-owner",
             "reader slot updated by non-owner",
             "reader slot released by non-owner",
+            "cell_index_read_payload_ptr called on non-index page",
         ]
         .iter()
         .any(|signature| text.contains(signature))

@@ -6,6 +6,13 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+## [0.6.14] - 2026-09-14
+
+### Fixed
+
+- Prevent idle registry clients from rebuilding the shared WAL index from an outdated local scan, restoring stale leases or settings, and corrupting database pages after another process commits.
+- Preserve the original Turso index-page failure when an update requires recovery, and stop further database operations on the affected handle.
+
 ## [0.6.13] - 2026-09-13
 
 ### Fixed
@@ -224,7 +231,8 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 - Fixed task moves so destination write failures do not remove the source task.
 - Fixed TUI navigation on empty boards.
 
-[Unreleased]: https://github.com/AlpineVibrations/clt-rs/compare/v0.6.8...HEAD
+[Unreleased]: https://github.com/AlpineVibrations/clt-rs/compare/v0.6.14...HEAD
+[0.6.14]: https://github.com/AlpineVibrations/clt-rs/releases/tag/v0.6.14
 [0.6.8]: https://github.com/AlpineVibrations/clt-rs/releases/tag/v0.6.8
 [0.6.7]: https://github.com/AlpineVibrations/clt-rs/releases/tag/v0.6.7
 [0.6.6]: https://github.com/AlpineVibrations/clt-rs/releases/tag/v0.6.6

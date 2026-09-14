@@ -46,11 +46,11 @@ impl AgentStoreBlockingAdapter {
         match catch_unwind(AssertUnwindSafe(|| self.runtime.block_on(future))) {
             Ok(result) => {
                 if let Err(error) = &result
-                    && recovery::shared_wal_failure(&format!("{error:#}"))
+                    && recovery::storage_failure(&format!("{error:#}"))
                 {
                     recovery::mark_required(&self.state_dir, &format!("{error:#}"))?;
                     anyhow::bail!(
-                        "Agent registry recovery required after a shared-WAL failure. Run clt agent recover: {error:#}"
+                        "Agent registry recovery required after a database failure. Run clt agent recover: {error:#}"
                     );
                 }
                 result
@@ -61,12 +61,12 @@ impl AgentStoreBlockingAdapter {
                     .map(String::as_str)
                     .or_else(|| payload.downcast_ref::<&str>().copied())
                     .unwrap_or("");
-                if !recovery::shared_wal_failure(message) {
+                if !recovery::storage_failure(message) {
                     resume_unwind(payload);
                 }
                 recovery::mark_required(&self.state_dir, message)?;
                 anyhow::bail!(
-                    "Agent registry recovery required after a Turso shared-WAL panic. Run clt agent recover: {message}"
+                    "Agent registry recovery required after a Turso storage panic. Run clt agent recover: {message}"
                 )
             }
         }
@@ -77,7 +77,11 @@ impl AgentStoreBlockingAdapter {
         recovery::begin_update(&self.state_dir)?;
         let outcome = self.block_on(future);
         // A panic invalidates the handle; never issue another query on it.
-        recovery::check_required(&self.state_dir)?;
+        // Preserve the operation's original cause instead of replacing it with
+        // the generic recovery-marker message after catching a storage panic.
+        if let Err(recovery_error) = recovery::check_required(&self.state_dir) {
+            return outcome.and(Err(recovery_error));
+        }
         if let Some(db) = &self.database
             && let Err(error) = self.block_on(recovery::snapshot(db, &self.state_dir))
         {

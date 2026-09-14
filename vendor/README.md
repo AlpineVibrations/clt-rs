@@ -56,6 +56,15 @@ metadata, and the guard releases both locks on return or unwind. Regressions cov
 writer/checkpoint exclusion with native and process-scoped mappings, interrupted
 repair, and concurrent connection opens during 2,000 registry writes.
 
+Disk-scan reconciliation is serialized across local connection opens and consumes
+`loaded_from_disk_scan` once. After adopting another process's commit metadata,
+the local frame cache is no longer a complete disk scan. Reusing that flag on a
+later connection could rebuild the shared index from old frames under a newer
+header, resurrecting expired leases and allowing stale page writes to damage
+tables and indexes. A CLT regression keeps an exclusive reopened store idle
+after a partial checkpoint while a peer writes, then verifies repeated fresh
+reads, lease replacement, project disable, reopen, and full integrity.
+
 Remove the patch only after a released upstream version contains the equivalent
 ownership and reseeding fixes and passes these regressions. Do not replace it by removing
 CLT's checkpoint pin or discarding the WAL.
