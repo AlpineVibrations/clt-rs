@@ -356,30 +356,13 @@ pub(super) fn unregister_agent_project(
     cleanup_terminal_agent_worker_services(state_dir, store, Some(&project_root))?;
     #[cfg(test)]
     let _ = state_dir;
-    if unregister_agent_project_with_recovery(store, state_dir, &project_root)? {
+    if store.unregister_project_blocking(&project_root)? {
         println!("Unregistered project: {}", project_root.display());
     } else {
         println!("Project was not registered: {}", project_root.display());
     }
 
     Ok(())
-}
-
-pub(super) fn unregister_agent_project_with_recovery(
-    store: &agent::TursoAgentStore,
-    state_dir: &Path,
-    project_root: &Path,
-) -> Result<bool> {
-    if let Some(project) = store
-        .list_projects_blocking()?
-        .into_iter()
-        .find(|project| project.path == project_root)
-    {
-        reconcile_orphaned_agent_git_journals(state_dir, &project)?;
-    }
-    // Unregistration rechecks all ownership and pending-proof guards after the
-    // recovery lease is released, so a new claim cannot slip through this gap.
-    store.unregister_project_blocking(project_root)
 }
 
 pub(super) fn set_agent_project_enabled(

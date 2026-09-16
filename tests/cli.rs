@@ -489,6 +489,7 @@ fn agent_reconcile_retires_only_unused_journals_and_keeps_the_project_paused() {
 
 fn seed_unregister_cli_journal(
     workspace: &TestWorkspace,
+    state: &str,
     task_identity: Option<&str>,
     worktree_baseline: &str,
     commit_oid: Option<&str>,
@@ -507,10 +508,10 @@ fn seed_unregister_cli_journal(
                     project_id, codex_session_id, state, git_mode, starting_head,
                     branch_ref, worktree_baseline, task_identity, commit_oid,
                     generation, created_at, updated_at
-                 ) SELECT id, 'cli-unregister-journal', 'working', 'commit',
+                 ) SELECT id, 'cli-unregister-journal', ?4, 'commit',
                     'frozen-starting-head', 'refs/heads/main', ?1, ?2, ?3, 0, '100', '100'
                    FROM projects",
-                turso::params![worktree_baseline, task_identity, commit_oid],
+                turso::params![worktree_baseline, task_identity, commit_oid, state],
             )
             .await
             .unwrap();
@@ -551,7 +552,7 @@ fn agent_unregister_retires_an_orphan_and_preserves_project_files() {
         "require_clean": false
     })
     .to_string();
-    seed_unregister_cli_journal(&workspace, None, &baseline, None);
+    seed_unregister_cli_journal(&workspace, "working", None, &baseline, None);
 
     let (stdout, stderr) = assert_success(&workspace.run(&["agent", "unregister"]));
     assert!(stdout.contains("Unregistered project:"), "{stdout}");
@@ -578,17 +579,17 @@ fn agent_unregister_retires_an_orphan_and_preserves_project_files() {
 }
 
 #[test]
-fn agent_unregister_preserves_registration_and_bound_or_sealed_git_proof() {
-    for (task_identity, sealed_tree, commit_oid) in [
-        (Some("v2\nRetain bound task"), None, None),
-        (None, Some("saved-staged-tree"), None),
-        (None, None, Some("saved-commit-oid")),
+fn agent_unregister_removes_all_pending_git_states_without_changing_tasks() {
+    for (state, task_identity, sealed_tree, commit_oid) in [
+        ("working", Some("v2\nRetain bound task"), None, None),
+        ("tracking", None, Some("saved-staged-tree"), None),
+        ("commit_pending", None, Some("saved-staged-tree"), None),
+        ("push_pending", None, None, Some("saved-commit-oid")),
     ] {
         let workspace = TestWorkspace::new("unregister-retained-proof");
         assert_success(&workspace.run(&["init"]));
-        assert_success(&workspace.run(&["add", "Keep this task and registration"]));
+        assert_success(&workspace.run(&["add", "Keep this task after removal"]));
         assert_success(&workspace.run(&["agent", "register"]));
-        assert_success(&workspace.run(&["agent", "pause"]));
         let tasks_before = fs::read(workspace.path().join("tasks/todo.md")).unwrap();
         let baseline = serde_json::json!({
             "version": 2,
@@ -598,46 +599,36 @@ fn agent_unregister_preserves_registration_and_bound_or_sealed_git_proof() {
             "staged_index_tree": sealed_tree
         })
         .to_string();
-        seed_unregister_cli_journal(&workspace, task_identity, &baseline, commit_oid);
+        seed_unregister_cli_journal(&workspace, state, task_identity, &baseline, commit_oid);
 
-        let output = workspace.run(&["agent", "unregister"]);
-        let (stdout, stderr) = output_text(&output);
-        assert!(!output.status.success(), "unregister discarded saved proof");
-        assert!(!stdout.contains("Unregistered project:"), "{stdout}");
-        assert!(
-            stderr.contains("Git finalization(s) are nonterminal"),
-            "{stderr}"
-        );
+        let (stdout, stderr) = assert_success(&workspace.run(&["agent", "unregister"]));
+        assert!(stdout.contains("Unregistered project:"), "{stdout}");
+        assert!(stderr.is_empty(), "{stderr}");
         assert_eq!(
             fs::read(workspace.path().join("tasks/todo.md")).unwrap(),
             tasks_before
         );
         let (projects, _) = assert_success(&workspace.run(&["agent", "projects"]));
-        assert!(projects.contains(workspace.path().to_str().unwrap()));
+        assert!(!projects.contains(workspace.path().to_str().unwrap()));
         let snapshot: serde_json::Value = serde_json::from_slice(
             &fs::read(workspace.path().join("agent-state/registry.json")).unwrap(),
         )
         .unwrap();
-        let tables = &snapshot["tables"];
-        assert_eq!(tables["projects"].as_array().unwrap().len(), 1);
-        assert_eq!(tables["projects"][0]["enabled"], 0);
-        let journals = tables["git_finalizations"].as_array().unwrap();
-        assert_eq!(journals.len(), 1);
-        let journal = &journals[0];
-        assert_eq!(journal["state"], "working");
-        assert_eq!(journal["generation"], 0);
-        assert_eq!(journal["starting_head"], "frozen-starting-head");
-        assert_eq!(journal["branch_ref"], "refs/heads/main");
-        assert_eq!(journal["worktree_baseline"], baseline);
-        assert_eq!(journal["task_identity"], serde_json::json!(task_identity));
-        assert_eq!(journal["commit_oid"], serde_json::json!(commit_oid));
-        assert_eq!(journal["created_at"], "100");
-        assert_eq!(journal["updated_at"], "100");
-        assert!(journal["completed_at"].is_null());
-        let controls = tables["session_controls"].as_array().unwrap();
-        assert_eq!(controls.len(), 1);
-        assert_eq!(controls[0]["codex_session_id"], "cli-unregister-journal");
-        assert_eq!(controls[0]["run_token"], "clt-git-finalization:0");
+        for table in [
+            "projects",
+            "git_finalizations",
+            "session_controls",
+            "agent_git_launch_states",
+        ] {
+            assert!(
+                snapshot["tables"][table].as_array().unwrap().is_empty(),
+                "unregister left rows in {table} for {state}"
+            );
+        }
+
+        assert_success(&workspace.run(&["agent", "register"]));
+        let (projects, _) = assert_success(&workspace.run(&["agent", "projects"]));
+        assert!(projects.contains(workspace.path().to_str().unwrap()));
     }
 }
 

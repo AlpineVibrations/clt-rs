@@ -1009,7 +1009,7 @@ fn agent_store_unregister_removes_registered_project() {
 }
 
 #[test]
-fn agent_store_unregister_and_clean_preserve_an_unconsumed_git_launch_boundary() {
+fn agent_store_unregister_removes_unconsumed_git_launch_boundary_but_clean_preserves_it() {
     let root = temp_root("agent-unregister-unconsumed-git-launch");
     let state_dir = root.join("state/clt");
     let project_root = root.join("project");
@@ -1032,10 +1032,6 @@ fn agent_store_unregister_and_clean_preserve_an_unconsumed_git_launch_boundary()
         )
         .unwrap();
 
-    let unregister_error = store
-        .unregister_project_blocking(&project_root)
-        .unwrap_err();
-    assert!(format!("{unregister_error:#}").contains("launch boundary"));
     let clean_error = store.clean_agent_history_blocking("200").unwrap_err();
     assert!(format!("{clean_error:#}").contains("launch boundary"));
     assert_eq!(store.list_projects_blocking().unwrap().len(), 1);
@@ -1046,11 +1042,20 @@ fn agent_store_unregister_and_clean_preserve_an_unconsumed_git_launch_boundary()
         Some((AgentGitMode::Commit, launch))
     );
 
+    assert!(store.unregister_project_blocking(&project_root).unwrap());
+    assert!(store.list_projects_blocking().unwrap().is_empty());
+    assert!(
+        store
+            .git_launch_state_blocking(project.id, "orphaned-release")
+            .unwrap()
+            .is_none()
+    );
+
     fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
-fn agent_store_unregister_preserves_push_pending_finalization() {
+fn agent_store_unregister_removes_push_pending_finalization() {
     let root = temp_root("agent-unregister-push-pending");
     let state_dir = root.join("state/clt");
     let project_root = root.join("project");
@@ -1130,17 +1135,13 @@ fn agent_store_unregister_preserves_push_pending_finalization() {
             .unwrap()
     );
 
-    let error = store
-        .unregister_project_blocking(&project_root)
-        .unwrap_err();
-    assert!(format!("{error:#}").contains("nonterminal"));
-    assert_eq!(
+    assert!(store.unregister_project_blocking(&project_root).unwrap());
+    assert!(store.list_projects_blocking().unwrap().is_empty());
+    assert!(
         store
             .git_finalization_blocking(project.id, "session-pending-unregister")
             .unwrap()
-            .unwrap()
-            .state,
-        GitFinalizationState::PushPending
+            .is_none()
     );
 
     fs::remove_dir_all(root).unwrap();

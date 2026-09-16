@@ -6,6 +6,12 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+## [0.6.16] - 2026-09-16
+
+### Fixed
+
+- Allow CLI unregister and TUI project removal with unfinished Git finalizations or launch boundaries. Clear the project's stored agent state without changing its files or Git checkout, while retaining active worker and lease checks.
+
 ## [0.6.15] - 2026-09-16
 
 ### Added

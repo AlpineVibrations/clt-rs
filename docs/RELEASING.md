@@ -1,6 +1,6 @@
 # Releasing CLT
 
-CLT 0.6.15 bundles its patched Turso 0.7.2 engine, SDK kit, and Rust API in
+CLT 0.6.15 and later bundle the patched Turso 0.7.2 engine, SDK kit, and Rust API in
 **one `clt-rs` package**. There are no separate fork crates to publish. The
 library target compiles the source under `vendor/` directly; normal crates.io
 dependencies supply the unmodified parser, extension, and proc macros.
@@ -57,8 +57,8 @@ After publication, test both installation modes outside this repository, using
 separate temporary Cargo/install directories:
 
 ```sh
-CARGO_HOME="$(mktemp -d)" cargo install clt-rs --version 0.6.15 --locked --root /tmp/clt-release-locked
-CARGO_HOME="$(mktemp -d)" cargo install clt-rs --version 0.6.15 --root /tmp/clt-release-unlocked
+CARGO_HOME="$(mktemp -d)" cargo install clt-rs --version 0.6.16 --locked --root /tmp/clt-release-locked
+CARGO_HOME="$(mktemp -d)" cargo install clt-rs --version 0.6.16 --root /tmp/clt-release-unlocked
 /tmp/clt-release-locked/bin/clt --version
 /tmp/clt-release-unlocked/bin/clt --version
 ```

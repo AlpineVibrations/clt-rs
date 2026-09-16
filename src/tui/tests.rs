@@ -766,14 +766,8 @@ fn tui_agent_project_removal_requires_confirmation_and_only_unregisters() {
 
     let removal = selected_tui_agent_project_removal(&panel).unwrap();
     assert!(tui_agent_project_removal_prompt(&removal).contains("Press y to confirm"));
-    let message = remove_tui_agent_project_with_store(
-        &mut panel,
-        &project_root,
-        &removal,
-        &store,
-        &state_dir,
-    )
-    .unwrap();
+    let message =
+        remove_tui_agent_project_with_store(&mut panel, &project_root, &removal, &store).unwrap();
 
     assert_eq!(message, "Removed agent project: project");
     assert!(store.list_projects_blocking().unwrap().is_empty());
@@ -787,7 +781,6 @@ fn tui_agent_project_removal_requires_confirmation_and_only_unregisters() {
 
 struct TuiWorkingProjectRemovalFixture {
     root: PathBuf,
-    state_dir: PathBuf,
     project_root: PathBuf,
     store: agent::TursoAgentStore,
     panel: TuiAgentPanel,
@@ -876,7 +869,6 @@ fn tui_working_project_removal_fixture(protection: &str) -> TuiWorkingProjectRem
     panel.state.select(Some(0));
     TuiWorkingProjectRemovalFixture {
         root,
-        state_dir,
         project_root,
         store,
         panel,
@@ -896,7 +888,6 @@ fn tui_agent_project_removal_retires_idle_orphan_journal_and_preserves_files() {
         &fixture.project_root,
         &removal,
         &fixture.store,
-        &fixture.state_dir,
     )
     .unwrap();
 
@@ -947,24 +938,23 @@ fn tui_agent_project_removal_retires_idle_orphan_journal_and_preserves_files() {
 }
 
 #[test]
-fn tui_agent_project_removal_preserves_bound_sealed_and_marker_linked_journals() {
+fn tui_agent_project_removal_clears_bound_sealed_and_marker_linked_journals() {
     for protection in ["bound", "sealed", "marker"] {
         let mut fixture = tui_working_project_removal_fixture(protection);
         let removal = selected_tui_agent_project_removal(&fixture.panel).unwrap();
+        let todo_before = fs::read(fixture.project_root.join("tasks/todo.md")).unwrap();
+        let done_before = fs::read(fixture.project_root.join("tasks/done.md")).unwrap();
 
         let result = remove_tui_agent_project_with_store(
             &mut fixture.panel,
             &fixture.project_root,
             &removal,
             &fixture.store,
-            &fixture.state_dir,
         );
 
-        assert!(result.is_err(), "protection={protection}");
-        let projects = fixture.store.list_projects_blocking().unwrap();
-        assert_eq!(projects.len(), 1, "protection={protection}");
-        assert_eq!(projects[0].id, fixture.journal.project_id);
-        assert_eq!(
+        assert_eq!(result.unwrap(), "Removed agent project: project");
+        assert!(fixture.store.list_projects_blocking().unwrap().is_empty());
+        assert!(
             fixture
                 .store
                 .git_finalization_blocking(
@@ -972,9 +962,7 @@ fn tui_agent_project_removal_preserves_bound_sealed_and_marker_linked_journals()
                     &fixture.journal.codex_session_id,
                 )
                 .unwrap()
-                .unwrap(),
-            fixture.journal,
-            "protection={protection}"
+                .is_none()
         );
         assert!(
             fixture
@@ -984,13 +972,23 @@ fn tui_agent_project_removal_preserves_bound_sealed_and_marker_linked_journals()
                     &fixture.journal.codex_session_id,
                 )
                 .unwrap()
+                .is_none()
+        );
+        assert!(fixture.panel.projects.is_empty());
+        assert_eq!(fixture.panel.state.selected(), Some(0));
+        assert!(
+            fixture
+                .panel
+                .selected_current_project_registration()
                 .is_some()
         );
-        assert_eq!(fixture.panel.projects.len(), 1);
-        assert_eq!(fixture.panel.state.selected(), Some(0));
         assert_eq!(
-            fixture.panel.projects[0].project.id,
-            fixture.journal.project_id
+            fs::read(fixture.project_root.join("tasks/todo.md")).unwrap(),
+            todo_before
+        );
+        assert_eq!(
+            fs::read(fixture.project_root.join("tasks/done.md")).unwrap(),
+            done_before
         );
         assert_eq!(
             fs::read(fixture.project_root.join("work.txt")).unwrap(),
@@ -1001,6 +999,60 @@ fn tui_agent_project_removal_preserves_bound_sealed_and_marker_linked_journals()
             fixture.head
         );
         assert!(run_test_git(&fixture.project_root, &["status", "--porcelain"]).is_empty());
+        drop(fixture.store);
+        fs::remove_dir_all(fixture.root).unwrap();
+    }
+}
+
+#[test]
+fn tui_agent_project_removal_preserves_pending_git_work_while_owned() {
+    for active_worker in [false, true] {
+        let mut fixture = tui_working_project_removal_fixture("bound");
+        let project_id = fixture.journal.project_id;
+        assert!(
+            fixture
+                .store
+                .try_acquire_lease_blocking(project_id, "owner", "100", "9999999999")
+                .unwrap()
+        );
+        if active_worker {
+            assert!(crate::worker::tests::reserve_test_worker(
+                &fixture.store,
+                project_id,
+                "removal-worker",
+                "owner",
+                "101",
+                1,
+            ));
+        }
+        let removal = selected_tui_agent_project_removal(&fixture.panel).unwrap();
+        let error = remove_tui_agent_project_with_store(
+            &mut fixture.panel,
+            &fixture.project_root,
+            &removal,
+            &fixture.store,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains(if active_worker {
+            "independent worker(s) are active"
+        } else {
+            "agent lease is active"
+        }));
+        assert_eq!(fixture.store.list_projects_blocking().unwrap().len(), 1);
+        assert_eq!(fixture.panel.projects.len(), 1);
+        assert_eq!(
+            fixture
+                .store
+                .git_finalization_blocking(project_id, &fixture.journal.codex_session_id)
+                .unwrap()
+                .unwrap(),
+            fixture.journal,
+        );
+        assert_eq!(fixture.store.lease_count_blocking().unwrap(), 1);
+        assert_eq!(
+            fixture.store.list_active_workers_blocking().unwrap().len(),
+            usize::from(active_worker)
+        );
         drop(fixture.store);
         fs::remove_dir_all(fixture.root).unwrap();
     }

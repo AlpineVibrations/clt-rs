@@ -844,31 +844,9 @@ impl TursoAgentStore {
                     format!("Failed to reclaim stale agent lease for project {path}")
                 })?;
         }
-        let pending_git_finalizations = query_count(
-            &transaction,
-            "SELECT COUNT(*) FROM git_finalizations
-              WHERE project_id = (SELECT id FROM projects WHERE path = ?1)
-                AND state IN ('working', 'tracking', 'commit_pending', 'push_pending')",
-            [path.as_str()],
-        )
-        .await?;
-        if pending_git_finalizations > 0 {
-            anyhow::bail!(
-                "Cannot unregister project {path} while {pending_git_finalizations} Git finalization(s) are nonterminal"
-            );
-        }
-        let unconsumed_git_launches = query_count(
-            &transaction,
-            "SELECT COUNT(*) FROM agent_git_launch_states
-              WHERE project_id = (SELECT id FROM projects WHERE path = ?1)",
-            [path.as_str()],
-        )
-        .await?;
-        if unconsumed_git_launches > 0 {
-            anyhow::bail!(
-                "Cannot unregister project {path} while {unconsumed_git_launches} Git launch boundary record(s) remain unconsumed"
-            );
-        }
+        // Explicit unregistration abandons pending Git work. Keep the ownership
+        // checks and deletion in this transaction so a worker cannot claim the
+        // project while its journals are removed. No checkout changes are needed.
         transaction
             .execute(
                 "DELETE FROM agent_workers
