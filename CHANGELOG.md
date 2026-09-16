@@ -6,6 +6,11 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+### Fixed
+
+- Allow task commits and resealing while unrelated unstaged edits or new files appear, preserving that work outside the exact staged commit.
+- Allow manual completion of an idle session-linked task after its text was edited or its work committed externally, while preserving active-owner and sealed-proof checks.
+
 ## [0.6.16] - 2026-09-16
 
 ### Fixed

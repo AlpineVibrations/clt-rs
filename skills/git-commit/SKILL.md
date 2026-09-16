@@ -39,9 +39,9 @@ A dirty worktree is expected when a person, an interactive session, or an indepe
 - Continue with non-conflicting work even when unrelated files are modified.
 - A pre-existing change in the same file is not automatically a conflict. Re-read the affected area, apply the task's change against the current contents, and preserve both changes when the combined result is clear.
 - Stop only for a real conflict: the same behavior or lines require incompatible outcomes and the correct combined result cannot be determined safely.
-- At commit time, stage only the current task's paths or hunks. Leave unrelated unstaged changes in place. When a file contains mixed changes, use patch staging and verify the cached diff before committing.
+- At commit time, stage only the current task's paths or hunks. Leave unrelated unstaged changes in place, including new or changed work added during the run. When a file contains mixed changes, use patch staging and verify the cached diff before committing.
 
-Unstaged work can safely coexist because CLT records a baseline. The Git index is a cooperative boundary during an automated finalization: humans, interactive sessions, and parallel tools sharing the checkout must not stage or unstage until it settles. CLT rejects a fresh run with pre-existing staged changes and detects many later changes, but Git does not record which actor staged a new clean-file change.
+Unstaged and untracked work can safely coexist, including outside edits and new files added after launch. CLT preserves the recorded baseline but seals the reviewed index without comparing the remaining worktree to that baseline. The Git index is a cooperative boundary during an automated finalization: humans, interactive sessions, and parallel tools sharing the checkout must not stage or unstage until it settles. CLT rejects a fresh run with pre-existing staged changes and detects many later changes, but Git does not record which actor staged a new clean-file change.
 
 ## Default Flow
 

@@ -1567,11 +1567,10 @@ fn move_user_task_to_done_with_store_after_lock(
         .task_identity
         .as_deref()
         .context("The Working Git journal has no durable task identity")?;
-    if durable_task_identity(&entry.content).as_deref() != Some(bound_identity) {
-        anyhow::bail!(
-            "Task {session_id} no longer matches its Working Git journal; restore its durable task payload before accepting external completion"
-        );
-    }
+    // A manual Done move accepts the selected session-linked task even after a
+    // user edits its text or commits the work themselves. Preserve the journal's
+    // original identity for the generation-fenced cancellation below; automated
+    // completion still requires its exact task identity and sealed commit.
 
     reconcile_idle_project_ownership(store, project.id)?;
     let acquired_at = agent_timestamp();

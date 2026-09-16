@@ -703,7 +703,10 @@ fn agent_codex_prompt_follows_git_mode() {
     assert!(commit_prompt.contains("$git-commit"));
     assert!(commit_prompt.contains("CLT Agent <clt-agent@localhost>"));
     assert!(commit_prompt.contains("do not change Git configuration"));
-    assert!(commit_prompt.contains("Pre-existing unstaged changes do not prevent a commit"));
+    assert!(
+        commit_prompt
+            .contains("Unrelated unstaged edits and untracked files do not prevent a commit")
+    );
     assert!(commit_prompt.contains("Do not require the worktree to be clean"));
     assert!(commit_prompt.contains("Do not commit when there are no tasks left"));
     assert!(commit_prompt.contains("CLT completed the scheduler-owned startup preparation"));

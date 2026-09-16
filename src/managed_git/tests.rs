@@ -1721,7 +1721,7 @@ fn user_done_move_reconciles_exited_managed_git_worker() {
 }
 
 #[test]
-fn external_completion_transaction_requires_exact_generation_and_identity() {
+fn external_completion_fences_the_journal_but_accepts_user_edited_task_content() {
     let session_id = "session-fenced-external-completion";
     let (root, project_root, store, finalization) = externally_completed_working_task_fixture(
         "automated-git-user-external-completion-fenced",
@@ -1775,14 +1775,34 @@ fn external_completion_transaction_requires_exact_generation_and_identity() {
         format!("# Doing Tasks\n- Changed task identity codex:{session_id}\n"),
     )
     .unwrap();
-    let error = move_task_to_done_in_board_with_store(
+    run_test_git(&project_root, &["add", "tasks"]);
+    run_test_git(
+        &project_root,
+        &["commit", "-m", "Finish and revise task manually"],
+    );
+    let head = run_test_git(&project_root, &["rev-parse", "HEAD"]);
+    let result = move_task_to_done_in_board_with_store(
         &get_tasks_dir(&project_root),
         TaskStatus::Doing,
         "1",
         &store,
     )
-    .unwrap_err();
-    assert!(format!("{error:#}").contains("no longer matches its Working Git journal"));
+    .unwrap();
+    assert_eq!(result.as_deref(), Some(session_id));
+    let cancelled = store
+        .git_finalization_blocking(finalization.project_id, session_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(cancelled.state, GitFinalizationState::Cancelled);
+    assert_eq!(cancelled.task_identity, finalization.task_identity);
+    assert_eq!(cancelled.starting_head, finalization.starting_head);
+    assert_eq!(cancelled.worktree_baseline, finalization.worktree_baseline);
+    assert_eq!(run_test_git(&project_root, &["rev-parse", "HEAD"]), head);
+    assert!(read_tasks(&project_root, "doing").unwrap().is_empty());
+    assert_eq!(
+        read_task_entries(&get_tasks_dir(&project_root), TaskStatus::Done).unwrap()[0].content,
+        format!("Changed task identity codex:{session_id}")
+    );
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -3341,76 +3361,6 @@ fn task_commit_proof_rejects_a_partially_staged_board_move() {
         )
         .unwrap(),
         None
-    );
-
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn git_finalization_rejects_a_board_only_commit_with_source_left_uncommitted() {
-    let root = temp_root("git-finalization-leftover-source");
-    let state_dir = root.join("state/clt");
-    let project_root = root.join("project");
-    init_tasks(&project_root, false).unwrap();
-    fs::write(
-        project_root.join("tasks/doing.md"),
-        "# Doing Tasks\n- Implement source — COMPLETED 2026-09-02: checked codex:session-source\n",
-    )
-    .unwrap();
-    fs::write(project_root.join("source.txt"), "before\n").unwrap();
-    initialize_test_git_repository(&project_root);
-    let project_root = fs::canonicalize(project_root).unwrap();
-    let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
-    store
-        .register_project_blocking(&project_root, "project")
-        .unwrap();
-    store
-        .set_project_git_mode_for_path_blocking(&project_root, AgentGitMode::Commit)
-        .unwrap();
-    let project = store.list_projects_blocking().unwrap().remove(0);
-    store
-        .mark_session_running_blocking(
-            project.id,
-            "session-source",
-            123,
-            "run-source",
-            &root.join("source.out"),
-            &root.join("source.err"),
-        )
-        .unwrap();
-    let git_start = capture_agent_git_start_state(&project_root, AgentGitMode::Commit).unwrap();
-    ensure_agent_git_working_record(
-        &store,
-        &project,
-        "session-source",
-        "run-source",
-        Some(&git_start),
-    )
-    .unwrap();
-    bind_agent_git_working_task_identity(&store, &project, "session-source", "run-source").unwrap();
-    fs::write(project_root.join("source.txt"), "after\n").unwrap();
-    let error = move_task_to_done_with_agent_store(
-        &project_root,
-        TaskStatus::Doing,
-        "1",
-        &AutomatedAgentChildContext {
-            project_id: project.id,
-            run_token: "run-source".to_string(),
-        },
-        &store,
-    )
-    .unwrap_err();
-    assert!(error.to_string().contains("remaining unstaged"));
-
-    let pending = store
-        .git_finalization_blocking(project.id, "session-source")
-        .unwrap()
-        .unwrap();
-    assert_eq!(pending.state, GitFinalizationState::Working);
-    assert_eq!(read_tasks(&project_root, "doing").unwrap().len(), 1);
-    assert_eq!(
-        fs::read_to_string(project_root.join("source.txt")).unwrap(),
-        "after\n"
     );
 
     fs::remove_dir_all(root).unwrap();

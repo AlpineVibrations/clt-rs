@@ -1377,10 +1377,6 @@ pub(super) fn capture_agent_git_worktree_baseline(
     capture_agent_git_worktree_state(project_root)
 }
 
-pub(super) fn is_agent_git_task_board_path(path: &str) -> bool {
-    path == "tasks" || path.starts_with("tasks/")
-}
-
 pub(super) fn require_agent_git_index_matches_head(project_root: &Path) -> Result<()> {
     let cached = Command::new("git")
         .current_dir(project_root)
@@ -1431,71 +1427,6 @@ pub(super) fn capture_agent_git_worktree_state(
             .insert(path.clone(), git_untracked_blob_id(project_root, &path)?);
     }
     Ok(baseline)
-}
-
-pub(super) fn worktree_matches_agent_git_baseline(
-    project_root: &Path,
-    raw_baseline: &str,
-    starting_head: &str,
-    manifest_parent: &str,
-) -> Result<bool> {
-    let expected = AgentGitWorktreeBaseline::from_json(raw_baseline)?;
-    let current = capture_agent_git_worktree_baseline(project_root)?;
-    if expected.require_clean {
-        return Ok(current.tracked_patch_ids.is_empty() && current.untracked_blob_ids.is_empty());
-    }
-    // Callers first audit this range for compatible concurrent commits. A user
-    // may commit their baseline work together with the implementation; the
-    // committed version then owns that path. Keep the frozen journal intact,
-    // and only excuse a missing delta when this accepted history changed its
-    // path. A clean worktree or an unrelated commit alone is not evidence.
-    let committed_paths = git_nul_separated_paths(
-        project_root,
-        &[
-            "diff",
-            "--name-only",
-            "--no-renames",
-            "-z",
-            starting_head,
-            manifest_parent,
-            "--",
-        ],
-        "find baseline paths included in concurrent commits",
-    )?;
-    // The private staged-tree proof below owns task-board commit scope. Ignore raw
-    // board changes here so a person can add another Todo while the agent works;
-    // they remain outside the index and therefore outside the sealed task commit.
-    let current_non_task_is_subset = current
-        .tracked_patch_ids
-        .iter()
-        .filter(|(path, _)| !is_agent_git_task_board_path(path))
-        .all(|(path, patch_id)| expected.tracked_patch_ids.get(path) == Some(patch_id))
-        && current
-            .untracked_blob_ids
-            .iter()
-            .filter(|(path, _)| !is_agent_git_task_board_path(path))
-            .all(|(path, blob_id)| expected.untracked_blob_ids.get(path) == Some(blob_id));
-    let non_task_baseline_preserved = expected
-        .tracked_patch_ids
-        .iter()
-        .filter(|(path, _)| !is_agent_git_task_board_path(path))
-        .all(
-            |(path, patch_id)| match current.tracked_patch_ids.get(path) {
-                Some(current_id) => current_id == patch_id,
-                None => committed_paths.contains(path),
-            },
-        )
-        && expected
-            .untracked_blob_ids
-            .iter()
-            .filter(|(path, _)| !is_agent_git_task_board_path(path))
-            .all(
-                |(path, blob_id)| match current.untracked_blob_ids.get(path) {
-                    Some(current_id) => current_id == blob_id,
-                    None => committed_paths.contains(path),
-                },
-            );
-    Ok(current_non_task_is_subset && non_task_baseline_preserved)
 }
 
 pub(super) fn git_ref_has_one_active_session_task(
@@ -1910,16 +1841,7 @@ pub(super) fn capture_agent_git_staged_manifest(
             "Automated Git completion found an unproven intervening commit before the sealed manifest; keep the implementation and Done transition in one task commit"
         );
     }
-    if !worktree_matches_agent_git_baseline(
-        project_root,
-        raw_baseline,
-        starting_head,
-        &manifest_parent_head,
-    )? {
-        anyhow::bail!(
-            "Stage every task-owned change before `clt done`; remaining unstaged and untracked non-task work must match the pre-task baseline, and missing baseline paths must be accounted for by accepted concurrent commits. Keep concurrent task-board edits unstaged"
-        );
-    }
+
     let expected_task_scope_tree =
         agent_git_task_scope_without_selected(project_root, &manifest_parent_head, task_identity)?;
     let staged_paths = git_nul_separated_paths(
@@ -1940,6 +1862,8 @@ pub(super) fn capture_agent_git_staged_manifest(
             git_delta_id_for_path(project_root, &["--cached"], path)?,
         );
     }
+    // Unstaged and untracked work belongs to the shared checkout, not this
+    // manifest. The index is the agent-reviewed payload; seal only that tree.
     let staged_index_tree = git_stdout(
         project_root,
         &["write-tree"],
@@ -1980,15 +1904,9 @@ pub(super) fn capture_agent_git_staged_manifest(
         || rechecked_tree != staged_index_tree
         || rechecked_branch.as_deref() != branch_ref
         || !git_commit_is_ancestor(project_root, starting_head, &rechecked_parent)?
-        || !worktree_matches_agent_git_baseline(
-            project_root,
-            raw_baseline,
-            starting_head,
-            &manifest_parent_head,
-        )?
     {
         anyhow::bail!(
-            "Git HEAD, index, or unstaged work changed while CLT was sealing the task manifest; retry `clt done`"
+            "Git HEAD, branch, or index changed while CLT was sealing the task manifest; retry `clt done`"
         );
     }
 
@@ -2035,16 +1953,7 @@ pub(super) fn capture_agent_git_resealed_manifest(
             "The branch or history changed incompatibly before the provisional Done manifest could be resealed"
         );
     }
-    if !worktree_matches_agent_git_baseline(
-        project_root,
-        raw_baseline,
-        starting_head,
-        &manifest_parent_head,
-    )? {
-        anyhow::bail!(
-            "Stage every corrected task-owned change before resealing; remaining unstaged and untracked non-task work must match the pre-task baseline, and missing baseline paths must be accounted for by accepted concurrent commits. Keep concurrent task-board edits unstaged"
-        );
-    }
+
     let staged_paths = git_nul_separated_paths(
         project_root,
         &["diff", "--cached", "--name-only", "-z", "--"],
@@ -2109,15 +2018,9 @@ pub(super) fn capture_agent_git_resealed_manifest(
     if rechecked_parent != manifest_parent_head
         || rechecked_tree != sealed_commit_tree
         || rechecked_branch.as_deref() != branch_ref
-        || !worktree_matches_agent_git_baseline(
-            project_root,
-            raw_baseline,
-            starting_head,
-            &manifest_parent_head,
-        )?
     {
         anyhow::bail!(
-            "Git HEAD, branch, index, or unstaged work changed while CLT was resealing the task manifest; retry"
+            "Git HEAD, branch, or index changed while CLT was resealing the task manifest; retry"
         );
     }
     baseline.staged_non_task_patch_ids = Some(staged_non_task_patch_ids);

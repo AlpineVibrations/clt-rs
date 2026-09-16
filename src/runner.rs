@@ -566,7 +566,7 @@ Git commit:
 - Give that commit one exact final message paragraph: `CLT-Task: codex:<session-id>`.
 - If a commit hook changes files or fails after the seal, fix and stage the complete corrected payload, run `clt done done <index>` to reseal that provisional Done entry, inspect it, and retry the one commit.
 - If a user commit advances the branch after sealing but before the task commit, inspect the new HEAD and existing task-commit evidence, preserve the user's changes, rerun affected checks, and reseal the complete staged payload with `clt done done <index>` before committing. Never duplicate an existing task commit.
-- Pre-existing unstaged changes do not prevent a commit. Stage only this task's paths or hunks, verify the staged diff, and leave unrelated changes untouched.
+- Unrelated unstaged edits and untracked files do not prevent a commit, including new or changed work added after launch. Treat outside edits as intentional, stage only this task's paths or hunks, verify the staged diff, and leave unrelated changes untouched.
 - A Todo or other task-board edit added during the run may also remain unstaged. Preserve it and stage only the selected task's board transition and its explicitly linked follow-up; CLT's exact staged-tree proof keeps the concurrent edit outside the sealed commit.
 - Do not require the worktree to be clean before committing.
 - The scheduler supplies the isolated Git identity `CLT Agent <clt-agent@localhost>` for clear automated-commit attribution; do not change Git configuration.

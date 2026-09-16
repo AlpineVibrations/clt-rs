@@ -1,0 +1,5 @@
+clt shouldnot block an agent from commiting if new files or outisde edits have happened. clt agent shouold ago ahead and assume the user added that on pupose. and then when i commited o my own and tryied to finish manually i got blocked. Task 01a0ab85-dcbd-7b42-82f6-dbb3774d361b no longer matches its Working Git journal; restore its durable task payload before accepting external completion. i should be allowed.
+
+COMPLETED 2026-09-16: Seal and reseal only the reviewed index so concurrent files and outside edits remain untouched; allow manual completion of an edited idle session-linked task after a user commit. Updated workflow docs and regression coverage. Checks passed: rustfmt --edition 2024 --check build.rs src/main.rs src/lib.rs tests/architecture.rs tests/cli.rs; cargo clippy --no-deps --locked --all-targets --all-features -- -D warnings; cargo test --locked --all-targets --all-features (621 tests); cargo test --locked --bin clt managed_git::tests -- --test-threads=4 (83 tests).
+
+codex:01a0ab97-83bc-7e40-b60f-d974ba0960c8

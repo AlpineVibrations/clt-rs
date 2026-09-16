@@ -277,7 +277,7 @@ fn invalid_inputs_fail_on_stderr_without_mutating_the_board() {
 }
 
 #[test]
-fn user_done_commands_report_external_completion_for_an_idle_managed_journal() {
+fn user_done_commands_accept_an_edited_task_with_an_idle_managed_journal() {
     for arguments in [
         vec!["done", "doing", "1"],
         vec!["status", "doing", "1", "done"],
@@ -287,7 +287,7 @@ fn user_done_commands_report_external_completion_for_an_idle_managed_journal() {
         assert_success(&workspace.run(&["agent", "register"]));
         fs::write(
             workspace.path().join("tasks/doing.md"),
-            "# Doing Tasks\n- Externally completed work codex:cli-external-completion\n",
+            "# Doing Tasks\n- Externally completed work with user edits codex:cli-external-completion\n",
         )
         .unwrap();
         // Seed the durable state left by a stopped managed run. Exercise the
@@ -331,7 +331,9 @@ fn user_done_commands_report_external_completion_for_an_idle_managed_journal() {
         assert!(
             fs::read_to_string(workspace.path().join("tasks/done.md"))
                 .unwrap()
-                .contains("codex:cli-external-completion")
+                .contains(
+                    "Externally completed work with user edits codex:cli-external-completion"
+                )
         );
     }
 }

@@ -1,100 +1,202 @@
 use super::*;
 
 #[test]
-fn committed_baseline_requires_evidence_for_each_missing_path() {
-    for tracked in [false, true] {
-        for staged in [false, true] {
-            let root = temp_root("git-baseline-missing-path");
-            init_tasks(&root, false).unwrap();
-            if tracked {
-                fs::write(root.join("local.txt"), "original\n").unwrap();
-            }
-            initialize_test_git_repository(&root);
-            fs::write(root.join("local.txt"), "user baseline\n").unwrap();
-            let start = capture_agent_git_start_state(&root, AgentGitMode::Commit).unwrap();
-            fs::write(root.join("other.txt"), "unrelated commit\n").unwrap();
-            run_test_git(&root, &["add", "other.txt"]);
-            run_test_git(&root, &["commit", "-m", "Other work"]);
-            let parent = run_test_git(&root, &["rev-parse", "HEAD"]);
-            if staged {
-                run_test_git(&root, &["add", "local.txt"]);
-            } else if tracked {
-                fs::write(root.join("local.txt"), "original\n").unwrap();
+fn sealing_and_resealing_preserve_concurrent_work_outside_the_index() {
+    for folders in [false, true] {
+        for stage_source in [false, true] {
+            let root = temp_root("git-concurrent-worktree");
+            let project_root = root.join("project");
+            init_tasks(&project_root, folders).unwrap();
+            let doing_path = if folders {
+                "tasks/doing/0001-task.md"
             } else {
-                fs::remove_file(root.join("local.txt")).unwrap();
+                "tasks/doing.md"
+            };
+            fs::write(project_root.join(doing_path), if folders {
+                "Finish feature — COMPLETED 2026-09-16: checked codex:session-worktree\n"
+            } else {
+                "# Doing Tasks\n- Finish feature — COMPLETED 2026-09-16: checked codex:session-worktree\n"
+            }).unwrap();
+            for path in [
+                "source.txt",
+                "notes.txt",
+                "deleted.txt",
+                "renamed.txt",
+                "binary.dat",
+            ] {
+                fs::write(project_root.join(path), "original\n").unwrap();
             }
-            let index = run_test_git(&root, &["write-tree"]);
-            let status = run_test_git(&root, &["status", "--porcelain"]);
-            assert!(
-                !worktree_matches_agent_git_baseline(
-                    &root,
-                    &start.worktree_baseline,
-                    &start.starting_head,
-                    &parent,
+            initialize_test_git_repository(&project_root);
+            let project_root = fs::canonicalize(project_root).unwrap();
+            let store = agent::TursoAgentStore::open_blocking(&root.join("state/clt")).unwrap();
+            store
+                .register_project_blocking(&project_root, "project")
+                .unwrap();
+            store
+                .set_project_git_mode_for_path_blocking(&project_root, AgentGitMode::Commit)
+                .unwrap();
+            let project = store.list_projects_blocking().unwrap().remove(0);
+            store
+                .mark_session_running_blocking(
+                    project.id,
+                    "session-worktree",
+                    123,
+                    "run-worktree",
+                    &root.join("run.out"),
+                    &root.join("run.err"),
                 )
-                .unwrap(),
-                "tracked={tracked}, staged={staged}"
+                .unwrap();
+            fs::write(project_root.join("notes.txt"), "baseline tracked work\n").unwrap();
+            fs::write(
+                project_root.join("scratch.txt"),
+                "baseline untracked work\n",
+            )
+            .unwrap();
+            let start = capture_agent_git_start_state(&project_root, AgentGitMode::Commit).unwrap();
+            ensure_agent_git_working_record(
+                &store,
+                &project,
+                "session-worktree",
+                "run-worktree",
+                Some(&start),
+            )
+            .unwrap();
+            assert!(
+                bind_agent_git_working_task_identity(
+                    &store,
+                    &project,
+                    "session-worktree",
+                    "run-worktree"
+                )
+                .unwrap()
             );
-            assert_eq!(run_test_git(&root, &["write-tree"]), index);
-            assert_eq!(run_test_git(&root, &["status", "--porcelain"]), status);
+
+            if stage_source {
+                fs::write(project_root.join("source.txt"), "staged implementation\n").unwrap();
+                run_test_git(&project_root, &["add", "source.txt"]);
+            }
+            // Outside edits include the same path as staged implementation, changed
+            // baseline files, new files, binary edits, deletions, and renames.
+            fs::write(project_root.join("source.txt"), "additional user work\n").unwrap();
+            fs::write(project_root.join("notes.txt"), "revised user notes\n").unwrap();
+            fs::write(project_root.join("scratch.txt"), "revised user scratch\n").unwrap();
+            fs::write(project_root.join("new.txt"), "new user file\n").unwrap();
+            fs::write(project_root.join("binary.dat"), b"\0user binary\xff").unwrap();
+            fs::remove_file(project_root.join("deleted.txt")).unwrap();
+            fs::rename(
+                project_root.join("renamed.txt"),
+                project_root.join("moved.txt"),
+            )
+            .unwrap();
+            let expected_work = capture_agent_git_worktree_state(&project_root).unwrap();
+            move_task_to_done_with_agent_store(
+                &project_root,
+                TaskStatus::Doing,
+                "1",
+                &AutomatedAgentChildContext {
+                    project_id: project.id,
+                    run_token: "run-worktree".to_string(),
+                },
+                &store,
+            )
+            .unwrap();
+            run_test_git(&project_root, &["add", "--all", "--", "tasks"]);
+            assert_eq!(
+                capture_agent_git_worktree_state(&project_root).unwrap(),
+                expected_work
+            );
+
+            // Changes arriving after sealing must also survive a corrected seal.
+            fs::write(project_root.join("later.txt"), "user work after sealing\n").unwrap();
+            let expected_work = capture_agent_git_worktree_state(&project_root).unwrap();
+            let index = run_test_git(&project_root, &["write-tree"]);
+            let pending = store
+                .git_finalization_blocking(project.id, "session-worktree")
+                .unwrap()
+                .unwrap();
+            let manifest = capture_agent_git_resealed_manifest(
+                AgentGitProofContext {
+                    store: &store,
+                    project_id: project.id,
+                },
+                &project_root,
+                &pending.worktree_baseline,
+                "session-worktree",
+                pending.task_identity.as_deref().unwrap(),
+                &start.starting_head,
+                start.branch_ref.as_deref(),
+            )
+            .unwrap();
+            assert_eq!(run_test_git(&project_root, &["write-tree"]), index);
+            assert!(
+                store
+                    .reseal_git_finalization_manifest_blocking(
+                        project.id,
+                        "session-worktree",
+                        pending.generation,
+                        pending.task_identity.as_deref().unwrap(),
+                        &manifest,
+                        "run-worktree",
+                        "200"
+                    )
+                    .unwrap()
+            );
+            run_test_agent_git(
+                &project_root,
+                &[
+                    "commit",
+                    "-m",
+                    "Finish feature",
+                    "-m",
+                    "CLT-Task: codex:session-worktree",
+                ],
+            );
+            let pending = store
+                .git_finalization_blocking(project.id, "session-worktree")
+                .unwrap()
+                .unwrap();
+            let completed = reconcile_agent_git_finalization(
+                &store,
+                &project_root,
+                pending,
+                Some("run-worktree"),
+                None,
+            )
+            .unwrap();
+            assert_eq!(completed.state, GitFinalizationState::Completed);
+            assert_eq!(
+                run_test_git(&project_root, &["rev-parse", "HEAD^{tree}"]),
+                index
+            );
+            assert_eq!(
+                capture_agent_git_worktree_state(&project_root).unwrap(),
+                expected_work
+            );
+            assert_eq!(
+                run_test_git(&project_root, &["show", "HEAD:source.txt"]),
+                if stage_source {
+                    "staged implementation"
+                } else {
+                    "original"
+                }
+            );
+            assert_eq!(
+                run_test_git(&project_root, &["show", "HEAD:notes.txt"]),
+                "original"
+            );
+            assert!(
+                !run_test_git(&project_root, &["ls-tree", "--name-only", "HEAD"])
+                    .lines()
+                    .any(
+                        |path| ["scratch.txt", "new.txt", "later.txt", "moved.txt"].contains(&path)
+                    )
+            );
+            let frozen = AgentGitWorktreeBaseline::from_json(&start.worktree_baseline).unwrap();
+            let sealed = AgentGitWorktreeBaseline::from_json(&completed.worktree_baseline).unwrap();
+            assert_eq!(sealed.tracked_patch_ids, frozen.tracked_patch_ids);
+            assert_eq!(sealed.untracked_blob_ids, frozen.untracked_blob_ids);
             fs::remove_dir_all(root).unwrap();
         }
-    }
-}
-
-#[test]
-fn committed_baseline_handles_file_changes_but_rejects_new_unstaged_work() {
-    for change in ["text", "binary", "delete", "rename", "add"] {
-        let root = temp_root("git-baseline-committed-path");
-        init_tasks(&root, false).unwrap();
-        if change != "add" {
-            fs::write(root.join("local.txt"), "original\n").unwrap();
-        }
-        initialize_test_git_repository(&root);
-        let remaining_path = match change {
-            "delete" => {
-                fs::remove_file(root.join("local.txt")).unwrap();
-                "local.txt"
-            }
-            "rename" => {
-                fs::rename(root.join("local.txt"), root.join("renamed.txt")).unwrap();
-                "renamed.txt"
-            }
-            "binary" => {
-                fs::write(root.join("local.txt"), b"\0user binary\xff").unwrap();
-                "local.txt"
-            }
-            _ => {
-                fs::write(root.join("local.txt"), "user baseline\n").unwrap();
-                "local.txt"
-            }
-        };
-        let start = capture_agent_git_start_state(&root, AgentGitMode::Commit).unwrap();
-        run_test_git(&root, &["add", "--all"]);
-        run_test_git(&root, &["commit", "-m", "Save user baseline"]);
-        let parent = run_test_git(&root, &["rev-parse", "HEAD"]);
-        assert!(
-            worktree_matches_agent_git_baseline(
-                &root,
-                &start.worktree_baseline,
-                &start.starting_head,
-                &parent,
-            )
-            .unwrap(),
-            "{change}"
-        );
-        fs::write(root.join(remaining_path), "unstaged implementation\n").unwrap();
-        assert!(
-            !worktree_matches_agent_git_baseline(
-                &root,
-                &start.worktree_baseline,
-                &start.starting_head,
-                &parent,
-            )
-            .unwrap(),
-            "{change}"
-        );
-        fs::remove_dir_all(root).unwrap();
     }
 }
 
