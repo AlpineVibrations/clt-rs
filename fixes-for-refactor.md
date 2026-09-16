@@ -54,3 +54,17 @@ Add a recovery path with these boundaries:
 6. Retain the quarantined bundle for history and forensic recovery.
 
 Do not merely suppress the Turso assertion, delete a live `-tshm`, discard the WAL, or remove the long-lived checkpoint pin in isolation. The pin currently prevents the earlier auto-checkpoint/stale-index failure, so replacing it requires regression coverage for checkpoint pressure, simultaneous daemon/TUI/worker access, abrupt process death, coordination-file rebuild, and interrupted Git finalization.
+
+## Refactor implementation
+
+Implemented on `refactor` using the application/store/scheduler/TUI boundaries:
+
+- External Done acceptance is generation-fenced in the Git-journal repository; CLI/TUI feedback distinguishes human acceptance from proven Git completion. Cancellation survives interrupted board moves and registry reconstruction.
+- Worker-index recovery wraps both scans and independent reservation and retries only once while retaining the scheduler lease.
+- Pending non-push sessions are retagged before guarded acquisition; stored failures remain visible over idle finalization status.
+- `registry.json` durably snapshots project/model preferences, worker/session identity, launch boundaries and Git journals. A cross-process writer lock and durable dirty marker fence the database-to-file publication window.
+- `clt agent stop` avoids database access. `clt agent recover` stops verified services, refuses live users, atomically publishes an archived copy of the original DB/WAL/coordination bundle, tries coordination-only repair, and reconstructs a fresh registry only from a trustworthy snapshot. Interrupted or ambiguous updates remain blocked, with the original bundle retained under `quarantine/`.
+- The checkpoint pin remains. Recovery tests cover checkpoint pressure, peer stores, process death, coordination rebuilding, corrupt-registry reconstruction, frozen finalization state, and interrupted recovery.
+- The 0.6.1 follow-up fixes Turso's reclamation of its own live reader during coordination reseeding, which the TUI can trigger without an agent service. Regression coverage includes partially checkpointed registries, overlapping stores, and complete or partial uncommitted WAL tails. The pinned engine patch and provenance live under `vendor/`.
+
+The earlier master fix `d84f13b` (concurrent unstaged Todo edits during Git sealing) was already present in this branch; its end-to-end Git regression remains part of verification.

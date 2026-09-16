@@ -1,0 +1,10 @@
+we have another git skill issue probably and our logic in clt also. so when a task is blocked it just chose to mark it blocked and leave it uncommited. that is horrible. it should commit it because otherwise the next task is going to start and mix in with its uncommited code. it would be better to add anew doing task that is blocked that addresses teh blocked part when a task is mainly done and satisfies the implementation.  here is the message that codex gave us MD-CR-004 is implemented but remains Doing with a dated BLOCKED note.                                                                                                                                                                        │
+│                                                                                                                                                                                                                                             │
+│266 tests pass. The GPU harness fails identically on the unchanged starting revision, blocking finalization under your rules.                                                                                                                │
+│                                                                                                                                                                                                                                        
+│Changes are preserved uncommitted. No push or second task started.
+
+Completion note:
+COMPLETED 2026-09-04: Added clt follow-up for independent blocked Doing work, exact Git sealing/resealing of linked follow-ups, separate-session recovery and progress reporting; updated prompts, skills, README and changelog. Checks: cargo fmt --all -- --check; cargo clippy --locked --all-targets --all-features -- -D warnings; cargo test --locked --all-targets --all-features (485 passed); quick_validate.py for both bundled skills; git diff --check.
+
+codex:01a06e92-3294-7782-bd67-b8135ca2c945

@@ -1,6 +1,6 @@
 [package]
 name = "clt-rs"
-version = "0.5.6"
+version = "0.6.15"
 edition = "2024"
 description = "File-backed task manager with a TUI Kanban board and multi-project Codex agent registry"
 license = "MIT"
@@ -8,21 +8,113 @@ repository = "https://github.com/AlpineVibrations/clt-rs"
 readme = "README.md"
 keywords = ["cli", "tasks", "kanban", "tui", "agent"]
 categories = ["command-line-utilities"]
+include = [
+    "src/**",
+    "tests/**",
+    "skills/**",
+    "vendor/**",
+    "build.rs",
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "LICENSE*",
+    "CHANGELOG.md",
+    "ARCHITECTURE.md",
+    "docs/RELEASING.md",
+    "scripts/check_release.py",
+]
+
+# Compile the bundled engine as part of this package, using its upstream edition.
+# CLT application modules are included by src/main.rs and keep Rust 2024.
+[lib]
+name = "clt_database"
+path = "vendor/turso_core/lib.rs"
+edition = "2021"
+doctest = false
 
 [[bin]]
 name = "clt"
 path = "src/main.rs"
 
 [dependencies]
-clap = { version = "4.5", features = ["derive"] }
-ratatui = "0.30"
-crossterm = "0.29"
 anyhow = "1.0"
-chrono = "0.4"
+chrono = { version = "0.4", features = ["clock"] }
+clap = { version = "4.5", features = ["derive"] }
+crossterm = "0.29"
 libc = "0.2"
-tui-input = "0.15.3"
-tokio = { version = "1.52", features = ["macros", "rt-multi-thread", "signal", "time"] }
-turso = { version = "0.7", default-features = false }
-toml_edit = "0.23"
+ratatui = "0.30"
 serde_json = "1.0"
+tempfile = "3.27"
+tokio = { version = "1.52", features = ["macros", "rt-multi-thread", "signal", "time"] }
+toml_edit = "0.23"
+tui-input = "0.15.3"
 ureq = { version = "3.4", default-features = false, features = ["json", "rustls"] }
+
+# Dependencies of the bundled Turso engine and SDK.
+aegis = { version = "0.9.8", features = ["pure-rust"] }
+aes = "0.8.4"
+aes-gcm = "0.10.3"
+allocator-api2 = "0.4"
+arc-swap = "1.7"
+aristo = "0.4"
+bigdecimal = "0.4"
+bitflags = "2.9.4"
+branches = { version = "0.4.3", default-features = false }
+bumpalo = { version = "3", features = ["collections"] }
+bytemuck = "1.23.1"
+cfg_block = "0.1.1"
+crc32c = "0.6.8"
+crossbeam-epoch = "0.9.18"
+crossbeam-utils = "0.8.21"
+either = "1.15"
+env_logger = { version = "0.11.6", default-features = false }
+fallible-iterator = "0.3.0"
+fastbloom = { version = "0.14.1", default-features = false }
+hex = "0.4"
+icu_collator = "2.2.0"
+icu_locale = "2.2.0"
+intrusive-collections = "0.9.7"
+libm = "0.2"
+miette = "7.6.0"
+num-bigint = "0.4"
+num-traits = "0.2"
+pack1 = { version = "1.0.0", features = ["bytemuck"] }
+parking_lot = { version = "0.12.4", features = ["arc_lock", "send_guard"] }
+pastey = "0.2.1"
+rand = "0.9.2"
+rapidhash = "4.1.1"
+regex = "1.11.1"
+regex-syntax = { version = "0.8.5", features = ["unicode"], default-features = false }
+roaring = "0.11.2"
+rustc-hash = "2.0"
+ryu = "1.0.19"
+smallvec = "1.15.1"
+strum = { version = "0.26", features = ["derive"] }
+strum_macros = "0.26"
+thiserror = "2.0.16"
+tracing = "0.1.41"
+tracing-appender = "0.2.3"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+turso_ext = { version = "=0.7.2", features = ["core_only", "vfs"] }
+turso_macros = "=0.7.2"
+turso_parser = "=0.7.2"
+turso_sdk_kit_macros = "=0.7.2"
+twox-hash = "2.1.1"
+uncased = "0.9.10"
+uuid = { version = "1.11.0", features = ["v4", "v5", "v7"] }
+
+[target.'cfg(not(any(target_family = "wasm", all(target_os = "windows", target_arch = "aarch64"))))'.dependencies]
+simsimd = "6.5.3"
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+libloading = "0.8.6"
+
+[target.'cfg(target_family = "unix")'.dependencies]
+polling = "3.7.4"
+rustix = { version = "1.0.5", features = ["fs", "io_uring"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7.5"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_System_IO", "Win32_System_Memory", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_Storage_FileSystem", "Win32_Security", "Win32_System_Diagnostics_Debug"] }

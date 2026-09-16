@@ -1,10 +1,5 @@
 # Feature Ideas
 
-## Codebase Architecture
-
-- Split `src/main.rs` (~18K LOC) into proper modules: `src/agent.rs`, `src/tui.rs`, `src/cli.rs`, `src/tasks.rs`, etc.
-- Introduce integration and unit tests for each module.
-
 ## Quality of Life
 
 - Task search/filter on the CLI (`clt list --search "bug"`) and a `/` filter in the TUI.

@@ -1,0 +1,14 @@
+Detect and recover damaged agent registry indexes without restart loops or claiming manual Doing tasks (BUG, HIGH)
+
+Investigation note: The September 11 failure combined an abandoned worker with an unmarked Doing task. Scheduler recovery treated the project lease as task ownership and selected ResumeDoing without a saved Git journal. Separately, a preserved registry copy contained incorrect entry counts in all three automatic agent_workers indexes; retry state and heartbeat reads reverted, and open TUIs repeatedly restarted the scheduler. The precise write that damaged the indexes has not been established.
+
+Verification evidence: The new normal-open recovery path repaired the actual preserved registry copy and passed SQLite integrity_check. Direct row comparisons confirmed that all 15 projects, 880 worker records, 1,645 runs, 59 Git journals, 2 leases, and 18 session controls were unchanged. No history reconstruction was needed. Regression fixtures cover damaged worker indexes, refusal to repair unrelated index damage, waiting for another registry client, preserving manual Doing tasks after abandoned workers or expired leases, and a shared restart cooldown with inherited file handles.
+
+Additional finding: Concurrent process tests exposed registry and restart locks surviving their owner because a forked child retained the same open file description. Lock guards now explicitly unlock on drop; deterministic inherited-handle tests verify release without bypassing a separate live reader's recovery fence.
+
+Completion note:
+COMPLETED 2026-09-11: Added integrity checks on registry opens with a one-minute interval, guarded automatic worker-index repair preserving table rows and history, shared TUI restart locking and cooldown, explicit registry lock release, and session ownership checks before resuming Doing tasks. Verified the actual failed registry copy as described above. Checks passed: cargo fmt --all -- --check; cargo clippy --locked --all-targets --all-features -- -D warnings; cargo test --locked --all-targets --all-features (545 unit tests, 4 architecture checks, 14 CLI tests).
+
+Installed with cargo install --path . --locked and restarted the scheduler. Restored this project's enabled setting. Verified the service remains active with the same PID after the periodic integrity check, the project reports zero failures, and installed/scheduler binary hashes match the tested release build. CLT renumbered the Done paths on completion; all 94 pre-existing Done task contents were verified unchanged.
+
+Release note: Bumped the package and lockfile from 0.6.9 to 0.6.10 and published the pending entries under the September 11 changelog section. Verified Cargo metadata and lockfile versions, cargo check --locked --offline, formatting, and diff whitespace checks after the version bump.

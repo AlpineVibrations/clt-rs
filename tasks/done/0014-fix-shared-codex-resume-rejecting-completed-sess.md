@@ -1,0 +1,4 @@
+Fix shared Codex resume rejecting completed sessions with a misleading project-changed error (BUG).
+
+Completion note:
+COMPLETED 2026-09-09: Diagnosed MeshDock session 01a088e0-8d1d-7532-acc8-ead7d8852962 as completed; a different active commit-and-push run held the project. Shared interactive reservations now report unfinished Git work and its session ID instead of a misleading session-changed retry error. Preserved exclusive Git ownership and documented that pausing a project does not stop its current worker. Regression checks cover launch, journal, and lease blockers, unchanged reservations/owners, reopening after resolution, and real reservation contention. Checks: cargo fmt --all -- --check; cargo clippy --locked --all-targets --all-features -- -D warnings; full library suite 519 passed with one registry-recovery lock failure that passed on isolated rerun. Binary target tests and cargo build --release --locked also passed.

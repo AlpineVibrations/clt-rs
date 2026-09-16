@@ -1,0 +1,4 @@
+Allow managed task commits after concurrent user commits (BUG)
+
+Completion note:
+COMPLETED 2026-09-10: Accept ordinary one-parent user commits and CLT board-only checkpoints before sealing or resealing while preserving the original launch journal, current-parent tree proof, unrelated work, and existing task-claim/agent-identity/history checks. Updated agent guidance and documentation. Regressions cover a patch-version commit, Working-session repair, board checkpoints, resealing, commit and push, and rejection of unproven task evidence. Checks: cargo fmt --all -- --check; cargo clippy --locked --all-targets --all-features -- -D warnings; cargo test --locked --all-targets --all-features -- --test-threads=1 (541 passed); git diff --check. The initial parallel managed-Git run exposed an existing timestamp collision in Git projection temporary directories; recorded separately in Todo. Source changes are not installed into the live clt binary.

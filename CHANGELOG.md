@@ -6,9 +6,130 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
-Use this section while developing the next release.
+## [0.6.15] - 2026-09-16
 
 ### Added
+
+- Add `clt --version` and `clt -V` to report the package version without opening a task board or agent registry.
+
+### Fixed
+
+- Bundle the patched Turso engine and local Rust API directly in the single `clt-rs` package, so crates.io installs retain the registry fixes without separately publishing fork crates.
+- Reject builds whose database core lacks the required CLT patch marker, verify the actual publishable archive in CI on Linux and macOS, and remove unused vendored sync packages and standalone package scaffolding.
+
+## [0.6.14] - 2026-09-14
+
+### Fixed
+
+- Prevent idle registry clients from rebuilding the shared WAL index from an outdated local scan, restoring stale leases or settings, and corrupting database pages after another process commits.
+- Preserve the original Turso index-page failure when an update requires recovery, and stop further database operations on the affected handle.
+
+## [0.6.13] - 2026-09-13
+
+### Fixed
+
+- Allow Git task completion when a concurrent user commit already includes the frozen baseline changes or implementation, preserving the original journal and validating the remaining staged task against the current parent.
+- Keep completed-task and project logs visible when a later Git-recovery acknowledgement has no output paths, using the recorded output from the same Codex session.
+
+## [0.6.12] - 2026-09-13
+
+### Fixed
+
+- Restore selected-task output from its exact session record when a stale worker never saved run history. Allow `c` to open an inactive session queued for recovery after acquiring exclusive ownership, and keep it stopped on return. Show continuation errors instead of hiding them behind an open log.
+
+## [0.6.11] - 2026-09-11
+
+### Fixed
+
+- Save the exact task-to-session link when automated runs with Git automation off move a task to Doing, so the selected task's log and session controls are immediately available.
+
+## [0.6.10] - 2026-09-11
+
+### Added
+
+- Show the current project's agent status after the Kanban console title when its registered agent is enabled.
+
+### Fixed
+
+- Detect damaged agent registry indexes during normal use and automatically repair supported worker-index damage when the registry is idle, preserving task history and a backup of the original database.
+- Coordinate stale-service restarts across open TUIs with a shared cooldown, and explicitly release registry and restart locks even when child processes inherit their file handles.
+- Require a saved session before resuming a Doing task after a worker or lease expires, preventing the scheduler from claiming manually started tasks.
+- Prevent concurrent managed Git projections from failing on temporary directory name collisions while preserving private permissions and automatic cleanup.
+- Allow ordinary user commits, including patch-version bumps, and CLT board checkpoints while an agent task is in progress. Preserve the original launch journal and seal or reseal the task against the current branch parent without discarding concurrent work.
+
+## [0.6.9] - 2026-09-10
+
+### Fixed
+
+- Label the console explicitly as `Log View` while agent output is open, clear previous console feedback when opening logs, and prevent Agent Projects refresh errors from covering the displayed output.
+
+## [0.6.8] - 2026-09-09
+
+### Fixed
+
+- Reattach supervision to surviving automated Codex processes after their worker exits, preserving the session, current work, and output while restoring stop and interactive takeover controls. Replacement supervisors use exact run claims and generation-safe OS signals; unfinished sessions resume only after the prior process group exits.
+- Let `c` take over the selected active automated session using the same guarded handoff as `i`.
+
+## [0.6.7] - 2026-09-09
+
+### Fixed
+
+- Disable the default elapsed-time cutoff for Codex tasks. Runs continue until completion or explicit stop while renewable leases and process supervision remain active; a positive `CLT_AGENT_RUN_TIMEOUT_SECONDS` is now an opt-in deadline, and `0` means unlimited.
+- Resume the saved Codex session of an unfinished Doing task after a timeout releases its worker and lease, preserving stopped sessions and respecting failure backoff.
+- Validate `NO_TASKS_LEFT` against the board before accepting an idle run. Remaining ready Todo work, an unfinished linked task, or an unreadable board records a failure with backoff instead of repeatedly launching fresh sessions after the success cooldown.
+
+## [0.6.6] - 2026-09-05
+
+### Added
+
+- Automatically repair idle agent registry coordination on the next open, preserving the original database bundle and requiring exclusive access, stopped workers and sessions, and a successful integrity check. Interrupted updates and repairs requiring database reconstruction retain explicit recovery guidance.
+
+### Fixed
+
+- Clear Turso shared-WAL reader metadata before releasing its OS lock, preventing another process from reclaiming the slot during cleanup and triggering an ownership panic or losing its reader metadata.
+- Exit interactive guardians and disconnected automated supervisors after reaping Codex when registry recovery is required, releasing database access instead of retrying finalization indefinitely.
+
+## [0.6.5] - 2026-09-05
+
+### Fixed
+
+- Queue actionable follow-ups in Todo with clear scheduling guidance, reserving blocked Doing follow-ups for explicit obstacles. Ordinary cleanup work can start with its own Git journal instead of repeatedly failing interrupted-task recovery.
+- Allow a verified task commit to include its linked Todo follow-up, including on an otherwise empty folder-backed board, while preserving unrelated task content and commit checks.
+- Resolve both registered and requested project paths during orphan Git journal recovery, so macOS path aliases do not block cleanup or scheduling the next task.
+- Select and reveal the newly completed task at the top of Done when moving it in the TUI, including when the Done list was scrolled down.
+- Recognize Shift+M when terminals report lowercase `m` with a Shift modifier, so the Models page opens and closes consistently from Tasks and Agent Projects while plain `m` still cycles the project model.
+
+## [0.6.3] - 2026-09-04
+
+### Added
+
+- Added `clt follow-up` to record an independent blocked Doing task alongside a verified implementation in the same sealed task commit, with prompt and skill guidance to distinguish pre-existing failures from incomplete acceptance criteria.
+- Keep the displayed agent run's model and thinking effort visible in the log footer, using its recorded startup settings for both live and completed output.
+
+### Fixed
+
+- Refresh the matching remote-tracking ref after verifying an automated push, so Git no longer reports already-published task commits as unpushed. Separate fetch/push repositories and concurrent fetches retain their own tracking state.
+- Place managed Git completions at the top of folder-backed Done lists without renaming unrelated tasks or invalidating their sealed Git proof. Repeated completions, interrupted moves, and manual reordering preserve the displayed order.
+
+## [0.6.2] - 2026-09-04
+
+### Fixed
+
+- Retire idle, unbound Git journals with no task marker or sealed proof before scheduling, so an older project's abandoned session cannot repeatedly block new work after the checkout advances.
+- Added `clt agent reconcile [PATH]` to apply the same guarded cleanup to a registered project, including while it is paused.
+- Apply orphan cleanup before CLI and TUI project removal so unused journals do not prevent unregistering a project; linked tasks and sealed Git proof remain protected.
+
+## [0.6.1] - 2026-09-04
+
+### Fixed
+
+- Fixed registry reader ownership failures when opening an existing database from the TUI or CLI, including after a partial checkpoint or interrupted WAL write and before the agent service has started.
+
+## [0.6.0] - 2026-09-04
+
+### Added
+
+- Added external registry snapshots and `clt agent recover` with exclusive service drain, preserved DB/WAL quarantine, coordination repair, and fail-closed reconstruction of Git journals.
 
 - Added persisted daemon project-scan errors to the Agent Projects pane, with red `ERROR` rows and actionable macOS Full Disk Access guidance for inaccessible external drives.
 - Added `n` and `+` TUI shortcuts that create a Todo subtask under the selected task, automatically expand Markdown-backed parent storage, and open the resulting nested board.
@@ -60,9 +181,11 @@ Use this section while developing the next release.
 
 ### Fixed
 
-- Retag abandoned `WORKING` Git-finalization sessions before guarded recovery so a worker crash cannot strand a project behind a false active-lease fence, and show an idle failed recovery as `ERROR` instead of letting `FINAL` hide the failure.
-- Rebuild the active-worker project index and retry worker reservation when a SQLite-restored legacy index quotes worker states as identifiers and Turso reports `no such column: dispatching`.
-- Moving an idle, session-linked managed Git task to Done now explicitly accepts external completion: CLT safely cancels its stale `WORKING` journal and queued resume state under a short project fence, while continuing to protect live sessions and sealed commit/push proof.
+- Allowed explicit user Done moves to accept idle externally completed `WORKING` tasks without discarding sealed Git proof.
+- Recovered malformed active-worker indexes during independent reservation and scheduler scanning with one guarded retry.
+- Retagged abandoned `WORKING` sessions before finalization lease acquisition and kept idle recovery failures visible as `ERROR`.
+- Made `clt agent stop` independent of database health and stopped database retries after shared-WAL ownership/frame-index failures.
+
 - Fixed managed Git sealing so a Todo or other task-board edit added during an agent run can remain unstaged and survive outside the exact task commit, while staged unrelated board changes and non-task baseline drift are still rejected.
 
 - Git-enabled scheduling now checkpoints dirty task-board definitions in a dedicated prelaunch commit while preserving unrelated unstaged work, so tasks created in the CLI or TUI no longer fail before Codex starts. Failed pending projects also render as red `ERROR` rows with the stored cause, automatic-retry timing, and an `r` immediate-retry action instead of appearing unexplained as `IDLE`.
@@ -119,5 +242,13 @@ Use this section while developing the next release.
 - Fixed task moves so destination write failures do not remove the source task.
 - Fixed TUI navigation on empty boards.
 
-[Unreleased]: https://github.com/AlpineVibrations/clt-rs/compare/v0.1.10...HEAD
+[Unreleased]: https://github.com/AlpineVibrations/clt-rs/compare/v0.6.14...HEAD
+[0.6.14]: https://github.com/AlpineVibrations/clt-rs/releases/tag/v0.6.14
+[0.6.8]: https://github.com/AlpineVibrations/clt-rs/releases/tag/v0.6.8
+[0.6.7]: https://github.com/AlpineVibrations/clt-rs/releases/tag/v0.6.7
+[0.6.6]: https://github.com/AlpineVibrations/clt-rs/releases/tag/v0.6.6
+[0.6.5]: https://github.com/AlpineVibrations/clt-rs/releases/tag/v0.6.5
+[0.6.2]: https://github.com/AlpineVibrations/clt-rs/releases/tag/v0.6.2
+[0.6.1]: https://github.com/AlpineVibrations/clt-rs/releases/tag/v0.6.1
+[0.6.0]: https://github.com/AlpineVibrations/clt-rs/releases/tag/v0.6.0
 [0.1.10]: https://github.com/AlpineVibrations/clt-rs/releases/tag/v0.1.10
