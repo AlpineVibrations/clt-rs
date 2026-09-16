@@ -97,7 +97,7 @@ fn pad(input: &Value, length: &Value, fill: Option<&Value>, on_left: bool) -> Va
     })
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use super::*;
 

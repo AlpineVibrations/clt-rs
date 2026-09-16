@@ -644,7 +644,7 @@ impl EncryptionContext {
         Ok(())
     }
 
-    #[cfg(feature = "encryption")]
+    #[cfg(clt_turso_feature = "encryption")]
     pub fn encrypt_page(&self, page: &[u8], page_id: usize) -> Result<Vec<u8>> {
         use crate::storage::sqlite3_ondisk::DatabaseHeader;
         if page_id == DatabaseHeader::PAGE_ID {
@@ -693,7 +693,7 @@ impl EncryptionContext {
         Ok(result)
     }
 
-    #[cfg(feature = "encryption")]
+    #[cfg(clt_turso_feature = "encryption")]
     pub fn decrypt_page(&self, encrypted_page: &[u8], page_id: usize) -> Result<Vec<u8>> {
         use crate::storage::sqlite3_ondisk::DatabaseHeader;
         if page_id == DatabaseHeader::PAGE_ID {
@@ -734,7 +734,7 @@ impl EncryptionContext {
         Ok(result)
     }
 
-    #[cfg(feature = "encryption")]
+    #[cfg(clt_turso_feature = "encryption")]
     fn encrypt_page_1(&self, page: &[u8]) -> Result<Vec<u8>> {
         use crate::storage::sqlite3_ondisk::DatabaseHeader;
 
@@ -807,7 +807,7 @@ impl EncryptionContext {
         Ok(result)
     }
 
-    #[cfg(feature = "encryption")]
+    #[cfg(clt_turso_feature = "encryption")]
     fn decrypt_page_1(&self, encrypted_page: &[u8]) -> Result<Vec<u8>> {
         use crate::storage::sqlite3_ondisk::DatabaseHeader;
 
@@ -926,14 +926,14 @@ impl EncryptionContext {
         }
     }
 
-    #[cfg(not(feature = "encryption"))]
+    #[cfg(not(clt_turso_feature = "encryption"))]
     pub fn encrypt_page(&self, _page: &[u8], _page_id: usize) -> Result<Vec<u8>> {
         Err(LimboError::InvalidArgument(
             "encryption is not enabled, cannot encrypt page. enable via passing `--features encryption`".into(),
         ))
     }
 
-    #[cfg(not(feature = "encryption"))]
+    #[cfg(not(clt_turso_feature = "encryption"))]
     pub fn decrypt_page(&self, _encrypted_page: &[u8], _page_id: usize) -> Result<Vec<u8>> {
         Err(LimboError::InvalidArgument(
             "encryption is not enabled, cannot decrypt page. enable via passing `--features encryption`".into(),
@@ -984,8 +984,8 @@ impl From<CipherError> for LimboError {
     }
 }
 
-#[cfg(test)]
-#[cfg(feature = "encryption")]
+#[cfg(clt_turso_tests)]
+#[cfg(clt_turso_feature = "encryption")]
 mod tests {
     use crate::storage::sqlite3_ondisk::DatabaseHeader;
 

@@ -504,7 +504,7 @@ fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
     }
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use super::*;
     use crate::alloc::TryClone;

@@ -617,7 +617,7 @@ pub fn try_capture_parameters(pattern: &Expr, query: &Expr) -> Option<HashMap<i3
 /// - fts_highlight(col1, col2, ..., before_tag, after_tag, query_string) -> columns = args.len() - 3
 ///
 /// Returns 0 for non-FTS functions.
-/// Specific for FTS but cannot gate behind feature = "fts" so it must
+/// Specific for FTS but cannot gate behind clt_turso_feature = "fts" so it must
 /// live in util.rs :/
 pub fn count_fts_column_args(expr: &Expr) -> usize {
     match expr {
@@ -638,7 +638,7 @@ pub fn count_fts_column_args(expr: &Expr) -> usize {
 /// FTS functions like `fts_match(col1, col2, 'query')` should match
 /// `fts_match(col2, col1, 'query')` as long as the same columns are used.
 ///
-/// Semi-specific for FTS but cannot gate behind feature = "fts" so it must
+/// Semi-specific for FTS but cannot gate behind clt_turso_feature = "fts" so it must
 /// live in util.rs :/
 pub fn try_capture_parameters_column_agnostic(
     pattern: &Expr,         // pattern expression from index definition
@@ -4839,7 +4839,7 @@ fn rewrite_upsert_table_refs(upsert: &mut ast::Upsert, old_tbl: &str, new_tbl: &
     }
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 pub mod tests {
     use super::*;
     use crate::schema::{BTreeTable, Type as SchemaValueType};

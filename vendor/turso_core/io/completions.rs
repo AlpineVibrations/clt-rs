@@ -610,7 +610,7 @@ impl TruncateCompletion {
     }
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use crate::CompletionError;
 

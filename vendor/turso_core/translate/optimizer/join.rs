@@ -49,7 +49,7 @@ pub(crate) struct JoinPlanningContext<'a> {
 
 impl<'a> JoinPlanningContext<'a> {
     /// Convenience constructor used by the default planner entrypoints and tests.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(clt_turso_tests), allow(dead_code))]
     fn default_with_order_target(maybe_order_target: Option<&'a OrderTarget>) -> Self {
         Self { maybe_order_target }
     }
@@ -888,7 +888,7 @@ pub struct BestJoinOrderResult {
 /// Compute the best way to join a given set of tables.
 /// Returns the best [JoinN] if one exists, otherwise returns None.
 #[allow(clippy::too_many_arguments)]
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(clt_turso_tests), allow(dead_code))]
 pub fn compute_best_join_order<'a>(
     joined_tables: &[JoinedTable],
     initial_input_cardinality: f64,
@@ -2018,7 +2018,7 @@ fn generate_join_bitmasks(table_number_max_exclusive: usize, how_many: usize) ->
     JoinBitmaskIter::new(table_number_max_exclusive, how_many)
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use std::{collections::VecDeque, sync::Arc};
 

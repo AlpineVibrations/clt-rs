@@ -255,9 +255,9 @@ pub use self::{map::SkipMap, set::SkipSet};
 pub mod comparator;
 pub mod equivalent;
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod base_tests;
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod map_tests;
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod set_tests;

@@ -11,7 +11,7 @@ const WAL_TAIL_CHILD_STATE: &str = "CLT_REGISTRY_WAL_TAIL_TEST_STATE";
 const WAL_TAIL_CHILD_PROJECT: &str = "CLT_REGISTRY_WAL_TAIL_TEST_PROJECT";
 
 fn uncommitted_wal_frame_after(wal: &[u8]) -> Vec<u8> {
-    use turso::core::storage::sqlite3_ondisk::{WalHeader, checksum_wal};
+    use clt_database::turso::core::storage::sqlite3_ondisk::{WalHeader, checksum_wal};
 
     let read_u32 = |bytes: &[u8]| u32::from_be_bytes(bytes.try_into().unwrap());
     assert!(wal.len() > 32, "fixture has no WAL frames");

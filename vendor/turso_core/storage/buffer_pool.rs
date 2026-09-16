@@ -491,7 +491,7 @@ mod arena {
 /// - `BufferPool`: UnsafeCell-based interior mutability
 /// - `PoolInner`: Shared mutable state
 ///
-#[cfg(all(shuttle, test))]
+#[cfg(all(shuttle, clt_turso_tests))]
 mod shuttle_tests {
     use super::*;
     use crate::io::MemoryIO;

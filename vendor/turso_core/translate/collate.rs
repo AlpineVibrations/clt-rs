@@ -434,7 +434,7 @@ pub fn get_expr_collation_ctx_with_symbols(
 /// 1. Explicit COLLATE operator on either side wins (LHS takes precedence)
 /// 2. Column with defined collation on either side wins (LHS takes precedence)
 /// 3. Otherwise BINARY
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 pub fn resolve_comparison_collseq(
     lhs_expr: &Expr,
     rhs_expr: &Expr,
@@ -517,7 +517,7 @@ fn get_collseq_parts_from_expr_with_symbols(
     Ok((maybe_explicit_collseq, maybe_column_collseq))
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use crate::alloc::vec;
     use crate::{sync::Arc, MAIN_DB_ID};

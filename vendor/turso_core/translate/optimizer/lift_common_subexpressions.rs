@@ -185,7 +185,7 @@ fn rebuild_or_expr_from_list(mut operands: Vec<Expr>) -> Expr {
     current_expr
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use super::*;
     use crate::translate::plan::WhereTerm;

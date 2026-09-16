@@ -547,7 +547,7 @@ impl PageCache {
     }
 
     /// Get the current evictable page count (for diagnostics/testing).
-    #[cfg(test)]
+    #[cfg(clt_turso_tests)]
     fn evictable_count(&self) -> usize {
         self.evictable_count
     }
@@ -759,7 +759,7 @@ impl PageCache {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(clt_turso_tests)]
     fn print(&self) {
         use crate::sync::atomic::Ordering;
 
@@ -782,7 +782,7 @@ impl PageCache {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(clt_turso_tests)]
     pub fn keys(&mut self) -> Vec<PageCacheKey> {
         self.map.keys().copied().collect()
     }
@@ -795,7 +795,7 @@ impl PageCache {
         self.capacity
     }
 
-    #[cfg(test)]
+    #[cfg(clt_turso_tests)]
     fn verify_cache_integrity(&self) {
         use rustc_hash::FxHashSet as HashSet;
 
@@ -833,7 +833,7 @@ impl PageCache {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(clt_turso_tests)]
     fn ref_of(&self, key: &PageCacheKey) -> Option<u8> {
         self.map.get(key).map(|&ptr| unsafe { (*ptr).ref_bit })
     }
@@ -845,7 +845,7 @@ impl Default for PageCache {
     }
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use super::*;
     use crate::storage::page_cache::CacheError;

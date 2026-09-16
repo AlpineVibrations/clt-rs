@@ -266,7 +266,7 @@ impl fmt::Display for ConnectionMetrics {
     }
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use super::*;
 

@@ -23,7 +23,7 @@ struct MemStoreInner {
     size: u64,
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 struct WritePause {
     entered: std::sync::mpsc::Sender<()>,
     release: std::sync::mpsc::Receiver<()>,
@@ -100,7 +100,7 @@ impl IO for MemoryIO {
 /// the yield-forcing [`super::MemoryYieldIO`] backends used for testing.
 pub(super) struct MemStore {
     inner: RwLock<MemStoreInner>,
-    #[cfg(test)]
+    #[cfg(clt_turso_tests)]
     next_write_pause: Mutex<Option<WritePause>>,
 }
 
@@ -111,12 +111,12 @@ impl MemStore {
                 pages: BTreeMap::new(),
                 size: 0,
             }),
-            #[cfg(test)]
+            #[cfg(clt_turso_tests)]
             next_write_pause: Mutex::new(None),
         }
     }
 
-    #[cfg(test)]
+    #[cfg(clt_turso_tests)]
     pub(super) fn pause_next_write(
         &self,
     ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
@@ -135,7 +135,7 @@ impl MemStore {
         (entered_rx, release_tx)
     }
 
-    #[cfg(test)]
+    #[cfg(clt_turso_tests)]
     fn pause_test_write(&self) {
         if let Some(pause) = self.next_write_pause.lock().take() {
             pause.entered.send(()).unwrap();
@@ -225,7 +225,7 @@ impl MemStore {
             let written = Self::write_at_inner(&mut inner, offset, buffer.as_slice());
             offset += written as u64;
             total_written += written;
-            #[cfg(test)]
+            #[cfg(clt_turso_tests)]
             self.pause_test_write();
         }
         total_written as i32
@@ -340,7 +340,7 @@ impl File for MemoryFile {
     }
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use super::*;
     use std::{sync::mpsc, time::Duration};

@@ -2264,7 +2264,7 @@ impl DbspCompiler {
     }
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use super::*;
     use crate::incremental::dbsp::Delta;
@@ -2719,7 +2719,7 @@ mod tests {
     }
 
     // Helper function for tests to execute circuit and extract the Delta result
-    #[cfg(test)]
+    #[cfg(clt_turso_tests)]
     fn test_execute(
         circuit: &mut DbspCircuit,
         inputs: HashMap<String, Delta>,
@@ -2736,7 +2736,7 @@ mod tests {
 
     // Helper to get the committed BTree state from main_data_root
     // This reads the actual persisted data from the BTree
-    #[cfg(test)]
+    #[cfg(clt_turso_tests)]
     fn get_current_state(pager: Arc<Pager>, circuit: &DbspCircuit) -> Result<Delta> {
         use crate::storage::btree::CursorTrait;
 

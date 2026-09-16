@@ -40,7 +40,7 @@ pub fn vector_concat(v1: &Vector, v2: &Vector) -> Result<Vector<'static>> {
     })
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use crate::vector::{
         operations::concat::vector_concat,

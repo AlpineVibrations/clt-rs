@@ -34,7 +34,7 @@ pub enum Conv {
     ToString,
 }
 
-#[cfg(feature = "json")]
+#[cfg(clt_turso_feature = "json")]
 pub enum OutputVariant {
     ElementType,
     Binary,
@@ -902,7 +902,7 @@ pub fn json_quote(value: impl AsValueRef) -> crate::Result<Value> {
     }
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use super::*;
     use crate::numeric::Numeric;

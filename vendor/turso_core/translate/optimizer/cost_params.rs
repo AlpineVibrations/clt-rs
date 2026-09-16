@@ -10,8 +10,8 @@
 /// from a JSON file via the `TURSO_OPTIMIZER_PARAMS` environment variable.
 /// The JSON file does not need to specify all fields, and unspecified fields will use the default values.
 #[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(default))]
+#[cfg_attr(clt_turso_feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(clt_turso_feature = "serde", serde(default))]
 pub struct CostModelParams {
     // === Cardinality Fallbacks (when no ANALYZE stats) ===
     /// Assumed rows per table when statistics unavailable.
@@ -139,8 +139,8 @@ impl CostModelParams {
 
 /// Compile-time static default parameters (zero runtime overhead).
 #[cfg(any(
-    not(feature = "optimizer_params"),
-    all(test, feature = "optimizer_params")
+    not(clt_turso_feature = "optimizer_params"),
+    all(clt_turso_tests, clt_turso_feature = "optimizer_params")
 ))]
 pub static DEFAULT_PARAMS: CostModelParams = CostModelParams::new();
 
@@ -154,7 +154,7 @@ impl CostModelParams {
     /// Load parameters from a JSON file.
     ///
     /// Returns default parameters if the file cannot be read, parsed, or validated.
-    #[cfg(feature = "optimizer_params")]
+    #[cfg(clt_turso_feature = "optimizer_params")]
     pub fn load_from_file(path: &std::path::Path) -> Self {
         match std::fs::read_to_string(path) {
             Ok(contents) => match serde_json::from_str::<Self>(&contents) {
@@ -180,7 +180,7 @@ impl CostModelParams {
 
     /// Load parameters from the `TURSO_OPTIMIZER_PARAMS` environment variable path,
     /// or return defaults if not set or loading fails.
-    #[cfg(feature = "optimizer_params")]
+    #[cfg(clt_turso_feature = "optimizer_params")]
     fn from_env_or_default() -> Self {
         match std::env::var("TURSO_OPTIMIZER_PARAMS") {
             Ok(path) => Self::load_from_file(std::path::Path::new(&path)),
@@ -191,16 +191,16 @@ impl CostModelParams {
 
 /// Lazily-loaded parameters from `TURSO_OPTIMIZER_PARAMS` env var (cached process-wide).
 /// Falls back to defaults if env var not set or loading fails.
-#[cfg(feature = "optimizer_params")]
+#[cfg(clt_turso_feature = "optimizer_params")]
 pub static LOADED_PARAMS: std::sync::LazyLock<CostModelParams> =
     std::sync::LazyLock::new(CostModelParams::from_env_or_default);
 
-#[cfg(feature = "optimizer_params")]
+#[cfg(clt_turso_feature = "optimizer_params")]
 impl CostModelParams {
     /// Validate that parameters are within sensible bounds.
     ///
     /// Returns an error message if any parameter is invalid.
-    #[cfg(feature = "optimizer_params")]
+    #[cfg(clt_turso_feature = "optimizer_params")]
     pub fn validate(&self) -> Result<(), String> {
         // Selectivity must be in (0, 1]
         let selectivity_params = [
@@ -267,7 +267,7 @@ impl CostModelParams {
     }
 }
 
-#[cfg(all(test, feature = "optimizer_params"))]
+#[cfg(all(clt_turso_tests, clt_turso_feature = "optimizer_params"))]
 mod tests {
     use super::*;
 
@@ -323,7 +323,7 @@ mod tests {
         assert!(params.validate().is_ok());
     }
 
-    #[cfg(feature = "serde")]
+    #[cfg(clt_turso_feature = "serde")]
     #[test]
     fn test_serde_roundtrip() {
         let params = CostModelParams::default();
@@ -332,7 +332,7 @@ mod tests {
         assert!((params.sel_eq_unindexed - parsed.sel_eq_unindexed).abs() < f64::EPSILON);
     }
 
-    #[cfg(feature = "serde")]
+    #[cfg(clt_turso_feature = "serde")]
     #[test]
     fn test_partial_json_uses_defaults() {
         let defaults = CostModelParams::new();

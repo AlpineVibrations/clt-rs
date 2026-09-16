@@ -552,7 +552,7 @@ fn format_fixed_from_digits(abs_f: f64, precision: usize, max_sig: usize) -> Str
 /// Limit a formatted numeric string to `max_sig` significant digits, rounding
 /// at the boundary. This matches SQLite's behavior of not showing IEEE 754
 /// mantissa noise beyond the float's representable precision.
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 fn limit_significant_digits(s: &str, max_sig: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
     let mut result: Vec<char> = chars.clone();
@@ -1360,7 +1360,7 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
     Ok(Value::build_text(result))
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use super::*;
 

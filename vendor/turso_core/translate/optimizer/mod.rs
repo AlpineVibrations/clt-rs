@@ -138,7 +138,7 @@ impl AvailableIndexes {
             .cloned()
     }
 
-    #[cfg(test)]
+    #[cfg(clt_turso_tests)]
     pub(crate) fn insert_for_table_name(
         &mut self,
         joined_tables: &[JoinedTable],
@@ -153,7 +153,7 @@ impl AvailableIndexes {
             .insert(table_ref.internal_id, indexes);
     }
 
-    #[cfg(test)]
+    #[cfg(clt_turso_tests)]
     pub(crate) fn push_front_for_table_name(
         &mut self,
         joined_tables: &[JoinedTable],
@@ -559,7 +559,7 @@ pub fn optimize_plan(
     Ok(())
 }
 
-#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[cfg(all(clt_turso_feature = "fts", not(target_family = "wasm")))]
 /// Transform MATCH expressions to fts_match() function calls.
 fn transform_match_to_fts_match(
     where_clause: &mut [WhereTerm],
@@ -737,7 +737,7 @@ struct OptimizeTableAccessResult {
 pub fn optimize_select_plan(plan: &mut SelectPlan, resolver: &Resolver) -> Result<()> {
     let schema = resolver.schema();
     // Transform MATCH expressions to fts_match() for FTS optimizer recognition
-    #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+    #[cfg(all(clt_turso_feature = "fts", not(target_family = "wasm")))]
     transform_match_to_fts_match(&mut plan.where_clause, schema, &plan.table_references)?;
 
     unnest::unnest_exists_subqueries(plan)?;
@@ -836,7 +836,7 @@ fn optimize_delete_plan(plan: &mut DeletePlan, resolver: &Resolver) -> Result<()
     let schema = resolver.schema();
     let available_indexes =
         AvailableIndexes::for_table_references(resolver, &plan.table_references);
-    #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+    #[cfg(all(clt_turso_feature = "fts", not(target_family = "wasm")))]
     transform_match_to_fts_match(&mut plan.where_clause, schema, &plan.table_references)?;
 
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
@@ -883,7 +883,7 @@ fn optimize_update_plan(
         vec![plan.target_table.clone()],
         plan.from_tables.outer_query_refs().to_vec(),
     );
-    #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+    #[cfg(all(clt_turso_feature = "fts", not(target_family = "wasm")))]
     transform_match_to_fts_match(&mut plan.where_clause, schema, &target_tables)?;
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
@@ -1851,9 +1851,9 @@ fn optimize_table_access(
 ) -> Result<Option<OptimizeTableAccessResult>> {
     // When optimizer_params feature is enabled, use lazily-loaded params (cached process-wide).
     // Otherwise, use the compile-time static for zero overhead.
-    #[cfg(feature = "optimizer_params")]
+    #[cfg(clt_turso_feature = "optimizer_params")]
     let params: &cost_params::CostModelParams = &cost_params::LOADED_PARAMS;
-    #[cfg(not(feature = "optimizer_params"))]
+    #[cfg(not(clt_turso_feature = "optimizer_params"))]
     let params: &cost_params::CostModelParams = &cost_params::DEFAULT_PARAMS;
 
     if table_references.joined_tables().is_empty() {
@@ -3716,7 +3716,7 @@ fn build_seek_def(
     })
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use super::{where_term_is_null_rejecting_for_table, Optimizable};
     use crate::translate::emitter::{DoubleQuotedDml, Resolver};

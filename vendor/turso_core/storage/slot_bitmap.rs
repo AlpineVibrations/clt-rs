@@ -134,7 +134,7 @@ impl AtomicSlotBitmap {
     }
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 pub mod tests {
     use super::*;
     use rand::{rngs::StdRng, Rng, SeedableRng};

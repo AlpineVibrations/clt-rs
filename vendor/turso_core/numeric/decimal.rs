@@ -212,7 +212,7 @@ pub fn validate_precision_scale(
     Ok(rounded)
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use super::*;
     use bigdecimal::Zero;

@@ -1,14 +1,22 @@
 # Architecture
 
-CLT is an application crate with one supported Rust entry point:
+CLT publishes one Cargo package containing the command and its patched database engine.
+The command has one application entry point:
 
 ```text
-src/main.rs -> clt_rs::run() -> cli::run()
+src/main.rs -> run() -> cli::run()
 ```
 
-`src/main.rs` only launches the library. `src/lib.rs` declares private modules and exposes
-`run() -> anyhow::Result<()>`; no domain, persistence, scheduler, or TUI type is part of the
-public crate API.
+`src/main.rs` includes `src/lib.rs`, which declares the application's private modules
+and its `run() -> anyhow::Result<()>` entry point. The application's code remains in
+the Rust 2024 binary target. The package's `clt_database` library target compiles the
+vendored Turso core with its upstream Rust 2021 edition and includes the SDK kit and
+local Rust API as modules. Both targets ship in the same `clt-rs` archive; there are
+no separately published database forks or nested Cargo packages.
+
+The engine's feature configuration is fixed in `build.rs` to match the previously
+used Turso dependency. Application modules import its local API through
+`clt_database::turso`; database implementation types stay out of application facades.
 
 ## Module map
 
@@ -51,7 +59,7 @@ integration suite for the installed command contract.
 The required verification gates are:
 
 ```bash
-cargo fmt --all -- --check
-cargo clippy --locked --all-targets --all-features -- -D warnings
+rustfmt --edition 2024 --check build.rs src/main.rs src/lib.rs tests/architecture.rs tests/cli.rs
+cargo clippy --no-deps --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-targets --all-features
 ```

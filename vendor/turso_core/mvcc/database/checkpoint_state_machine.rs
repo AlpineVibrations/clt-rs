@@ -8,7 +8,7 @@ use crate::mvcc::database::{
     TxTimestampOrID, WalPos, WriteRowStateMachine, MVCC_META_KEY_PERSISTENT_TX_TS_MAX,
     MVCC_META_TABLE_NAME, SQLITE_SCHEMA_MVCC_TABLE_ID,
 };
-#[cfg(any(test, injected_yields))]
+#[cfg(any(clt_turso_tests, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
 use crate::mvcc::yield_points::{inject_transition_failure, inject_transition_yield};
 use crate::schema::{Index, Schema};
@@ -29,7 +29,7 @@ use crate::{
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::num::NonZeroU64;
 use std::ops::Bound;
-#[cfg(any(test, injected_yields))]
+#[cfg(any(clt_turso_tests, injected_yields))]
 use strum::EnumCount;
 
 use super::lookup_tx_state;
@@ -37,7 +37,7 @@ const COLLECT_PREEMPTION_THRESHOLD: usize = 1024;
 
 macro_rules! with_mvcc_checkpoint_allocation_site {
     ($site:ident, $expr:expr) => {{
-        #[cfg(feature = "allocation_metric")]
+        #[cfg(clt_turso_feature = "allocation_metric")]
         let _turso_allocation_site_guard =
             crate::alloc::enter_allocation_site(crate::alloc::MvccCheckpointAllocationSite::$site);
         $expr
@@ -108,7 +108,7 @@ pub enum CheckpointState {
     Finalize,
 }
 
-#[cfg(any(test, injected_yields))]
+#[cfg(any(clt_turso_tests, injected_yields))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumCount)]
 #[repr(u8)]
 pub(crate) enum CheckpointYieldPoint {
@@ -117,7 +117,7 @@ pub(crate) enum CheckpointYieldPoint {
     AfterCollectTableRows,
 }
 
-#[cfg(any(test, injected_yields))]
+#[cfg(any(clt_turso_tests, injected_yields))]
 impl YieldPointMarker for CheckpointYieldPoint {
     const POINT_COUNT: u8 = Self::COUNT as u8;
 
@@ -126,7 +126,7 @@ impl YieldPointMarker for CheckpointYieldPoint {
     }
 }
 
-#[cfg(any(test, injected_yields))]
+#[cfg(any(clt_turso_tests, injected_yields))]
 fn checkpoint_yield_key() -> u64 {
     const CHECKPOINT_SELECTION_TAG: u64 = 0xC4EC_9011_C4EC_9011;
     CHECKPOINT_SELECTION_TAG
@@ -183,7 +183,7 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     connection: Arc<Connection>,
     /// Database whose pager and schema this checkpoint is writing.
     database_id: usize,
-    #[cfg(any(test, injected_yields))]
+    #[cfg(any(clt_turso_tests, injected_yields))]
     yield_instance_id: u64,
     /// Lock used to block other transactions from running during the checkpoint
     checkpoint_lock: Arc<TursoRwLock>,
@@ -346,7 +346,7 @@ struct SeqCompactDriver<Clock: LogicalClock, A: ConcurrentAllocator = TursoAlloc
     compacted: Vec<(RowID, usize)>,
 }
 
-#[cfg(any(test, injected_yields))]
+#[cfg(any(clt_turso_tests, injected_yields))]
 impl<Clock: LogicalClock, A: ConcurrentAllocator> ProvidesYieldContext
     for CheckpointStateMachine<Clock, A>
 {
@@ -771,7 +771,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         let durable_mvcc_metadata = !connection.db.is_in_memory_db() && mvcc_meta_table.is_some();
         let durable_tx_max = mvstore.durable_txid_max.load(Ordering::SeqCst);
         let durable_txid_max_old = NonZeroU64::new(durable_tx_max);
-        #[cfg(any(test, injected_yields))]
+        #[cfg(any(clt_turso_tests, injected_yields))]
         let yield_instance_id = connection.next_yield_instance_id();
         Self {
             state: CheckpointState::PrepareCheckpoint,
@@ -786,7 +786,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             mvstore,
             connection,
             database_id,
-            #[cfg(any(test, injected_yields))]
+            #[cfg(any(clt_turso_tests, injected_yields))]
             yield_instance_id,
             checkpoint_lock,
             write_set: crate::alloc::vec![],
@@ -825,12 +825,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         }
     }
 
-    #[cfg(test)]
+    #[cfg(clt_turso_tests)]
     pub(crate) fn state_for_test(&self) -> CheckpointState {
         self.state
     }
 
-    #[cfg(test)]
+    #[cfg(clt_turso_tests)]
     pub(crate) fn checkpoint_bounds_for_test(&self) -> (Option<u64>, u64) {
         (
             self.durable_txid_max_old.map(u64::from),
@@ -1348,7 +1348,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         Ok(None)
     }
 
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(any(clt_turso_tests, debug_assertions))]
     fn max_collected_version_timestamp(&self) -> u64 {
         fn max_version_timestamp(version: &RowVersion) -> u64 {
             [version.begin().as_ref(), version.end().as_ref()]
@@ -1523,7 +1523,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         let mut schema_ref = self.connection.db.schema.lock();
         let schema = Schema::try_make_mut(&mut schema_ref)?;
         for (name, table) in schema.tables.iter_mut() {
-            #[cfg(not(feature = "conn_raw_api"))]
+            #[cfg(not(clt_turso_feature = "conn_raw_api"))]
             let _ = name;
             let table = Arc::get_mut(table).expect("this should be the only reference");
             let Some(btree_table) = table.btree_mut() else {
@@ -1531,7 +1531,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             };
             let btree_table = Arc::make_mut(btree_table);
             if btree_table.root_page < 0 {
-                #[cfg(feature = "conn_raw_api")]
+                #[cfg(clt_turso_feature = "conn_raw_api")]
                 let old_root_page = btree_table.root_page;
                 let table_id = MVTableId::from(btree_table.root_page);
                 // Only tables this pass materialized; ones created after our snapshot stay
@@ -1543,7 +1543,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     .and_then(|entry| entry.value().root_page)
                 {
                     btree_table.root_page = root_page as i64;
-                    #[cfg(feature = "conn_raw_api")]
+                    #[cfg(clt_turso_feature = "conn_raw_api")]
                     {
                         schema.table_names_by_root_page.remove(&old_root_page);
                         schema
@@ -2042,7 +2042,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 }
 
                 let durable_old = self.durable_txid_max_old.map(u64::from).unwrap_or_default();
-                #[cfg(any(test, debug_assertions))]
+                #[cfg(any(clt_turso_tests, debug_assertions))]
                 {
                     let collected_max = self.max_collected_version_timestamp();
                     turso_assert!(
@@ -3138,7 +3138,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition
     }
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use super::*;
     use crate::alloc::vec;

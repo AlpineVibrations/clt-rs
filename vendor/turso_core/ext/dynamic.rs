@@ -97,7 +97,7 @@ pub(crate) unsafe extern "C" fn register_vfs(
 /// Get pointers to all the vfs extensions that need to be built in at compile time.
 /// any other types that are defined in the same extension will not be registered
 /// until the database file is opened and `register_builtins` is called.
-#[cfg(feature = "fs")]
+#[cfg(clt_turso_feature = "fs")]
 #[allow(clippy::arc_with_non_send_sync)]
 pub fn add_builtin_vfs_extensions(
     api: Option<ExtensionApi>,
@@ -155,7 +155,7 @@ pub fn add_builtin_vfs_extensions(
 }
 
 #[allow(dead_code)]
-#[cfg(feature = "fs")]
+#[cfg(clt_turso_feature = "fs")]
 fn register_static_vfs_modules(_api: &mut ExtensionApi) {
     /* Placeholder for any VFS modules to build in at compile time */
 }

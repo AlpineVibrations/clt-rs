@@ -8,9 +8,9 @@ use super::collate::{get_collseq_from_expr_with_symbols, CollationSeq};
 use super::emitter::Resolver;
 use super::optimizer::Optimizable;
 use super::plan::TableReferences;
-#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[cfg(all(clt_turso_feature = "fts", not(target_family = "wasm")))]
 use crate::function::FtsFunc;
-#[cfg(feature = "json")]
+#[cfg(clt_turso_feature = "json")]
 use crate::function::JsonFunc;
 use crate::function::{AggFunc, Func, FuncCtx, MathFuncArity, ScalarFunc, VectorFunc};
 use crate::functions::datetime;

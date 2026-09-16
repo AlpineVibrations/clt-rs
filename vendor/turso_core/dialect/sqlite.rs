@@ -28,12 +28,12 @@ pub fn register_builtin_catalog(
         );
     }
 
-    #[cfg(feature = "json")]
+    #[cfg(clt_turso_feature = "json")]
     {
         schema.register_internal_vtab(crate::json::vtab::JsonVirtualTable::json_each())?;
         schema.register_internal_vtab(crate::json::vtab::JsonVirtualTable::json_tree())?;
     }
-    #[cfg(feature = "cli_only")]
+    #[cfg(clt_turso_feature = "cli_only")]
     {
         schema.register_internal_vtab(crate::dbpage::DbPageTable::new())?;
         schema.register_internal_vtab(crate::btree_dump::BtreeDumpTable::new())?;

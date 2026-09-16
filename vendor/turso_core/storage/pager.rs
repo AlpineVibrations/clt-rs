@@ -60,15 +60,15 @@ use crate::storage::encryption::{CipherMode, EncryptionContext, EncryptionKey};
 const DEFAULT_MAX_PAGE_COUNT: u32 = 0xfffffffe;
 const RESERVED_SPACE_NOT_SET: u16 = u16::MAX;
 
-#[cfg(feature = "test_helper")]
+#[cfg(clt_turso_feature = "test_helper")]
 /// Used for testing purposes to change the position of the PENDING BYTE
 static PENDING_BYTE: AtomicU32 = AtomicU32::new(0x40000000);
 
-#[cfg(not(feature = "test_helper"))]
+#[cfg(not(clt_turso_feature = "test_helper"))]
 /// Byte offset that signifies the start of the ignored page - 1 GB mark
 const PENDING_BYTE: u32 = 0x40000000;
 
-#[cfg(not(feature = "omit_autovacuum"))]
+#[cfg(not(clt_turso_feature = "omit_autovacuum"))]
 use ptrmap::*;
 
 #[derive(Debug, Clone)]
@@ -1171,7 +1171,7 @@ const fn auto_vacuum_header_fields(mode: AutoVacuumMode) -> (u32, u32) {
 }
 
 #[derive(Debug, Clone)]
-#[cfg(not(feature = "omit_autovacuum"))]
+#[cfg(not(clt_turso_feature = "omit_autovacuum"))]
 enum PtrMapGetState {
     Start,
     Deserialize {
@@ -1181,7 +1181,7 @@ enum PtrMapGetState {
 }
 
 #[derive(Debug, Clone)]
-#[cfg(not(feature = "omit_autovacuum"))]
+#[cfg(not(clt_turso_feature = "omit_autovacuum"))]
 enum PtrMapPutState {
     Start,
     Deserialize {
@@ -1199,7 +1199,7 @@ enum HeaderRefState {
     },
 }
 
-#[cfg(not(feature = "omit_autovacuum"))]
+#[cfg(not(clt_turso_feature = "omit_autovacuum"))]
 #[derive(Debug, Clone, Copy)]
 enum BtreeCreateVacuumFullState {
     Start,
@@ -1350,7 +1350,7 @@ pub struct Pager {
     /// `read_page_nonblock(idx)` reuses the stored `(page, disk_read)` pair
     /// instead of issuing a duplicate disk read.
     pending_reads: RwLock<HashMap<i64, PendingRead>>,
-    #[cfg(test)]
+    #[cfg(clt_turso_tests)]
     spill_yield: SpillYieldHook,
     /// Dirty pages as a bitmap, naturally sorted by page number.
     dirty_pages: Arc<RwLock<RoaringBitmap>>,
@@ -1384,7 +1384,7 @@ pub struct Pager {
     /// Maximum number of pages allowed in the database. Default is 1073741823 (SQLite default).
     max_page_count: AtomicU32,
     header_ref_state: RwLock<HeaderRefState>,
-    #[cfg(not(feature = "omit_autovacuum"))]
+    #[cfg(not(clt_turso_feature = "omit_autovacuum"))]
     vacuum_state: RwLock<VacuumState>,
     pub(crate) io_ctx: RwLock<IOContext>,
     /// encryption is an opt-in feature. we will enable it only if the flag is passed
@@ -1457,7 +1457,7 @@ struct PendingRead {
 /// Test-only deterministic spill-yield injector for `Pager::read_page`. When
 /// armed, the next matching call (after `skip` ignored matches) returns
 /// `IO(yield)` once, then disarms itself.
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 struct SpillYieldHook {
     /// `-1` = disarmed; otherwise the `page_idx` to fire on.
     target: std::sync::atomic::AtomicI64,
@@ -1465,7 +1465,7 @@ struct SpillYieldHook {
     skip: std::sync::atomic::AtomicUsize,
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 impl SpillYieldHook {
     const fn new() -> Self {
         Self {
@@ -1498,7 +1498,7 @@ impl SpillYieldHook {
     }
 }
 
-#[cfg(not(feature = "omit_autovacuum"))]
+#[cfg(not(clt_turso_feature = "omit_autovacuum"))]
 pub struct VacuumState {
     /// State machine for [Pager::ptrmap_get]
     ptrmap_get_state: PtrMapGetState,
@@ -1638,7 +1638,7 @@ impl Pager {
             page_cache: Arc::new(RwLock::new(page_cache)),
             io,
             pending_reads: RwLock::new(HashMap::new()),
-            #[cfg(test)]
+            #[cfg(clt_turso_tests)]
             spill_yield: SpillYieldHook::new(),
             dirty_pages: Arc::new(RwLock::new(RoaringBitmap::new())),
             subjournal: RwLock::new(None),
@@ -1667,7 +1667,7 @@ impl Pager {
             allocate_page_state: RwLock::new(AllocatePageState::Start),
             max_page_count: AtomicU32::new(DEFAULT_MAX_PAGE_COUNT),
             header_ref_state: RwLock::new(HeaderRefState::Start),
-            #[cfg(not(feature = "omit_autovacuum"))]
+            #[cfg(not(clt_turso_feature = "omit_autovacuum"))]
             vacuum_state: RwLock::new(VacuumState {
                 ptrmap_get_state: PtrMapGetState::Start,
                 ptrmap_put_state: PtrMapPutState::Start,
@@ -2300,18 +2300,18 @@ impl Pager {
         Ok(())
     }
 
-    #[cfg(feature = "test_helper")]
+    #[cfg(clt_turso_feature = "test_helper")]
     pub fn get_pending_byte() -> u32 {
         PENDING_BYTE.load(Ordering::Relaxed)
     }
 
-    #[cfg(feature = "test_helper")]
+    #[cfg(clt_turso_feature = "test_helper")]
     /// Used in testing to allow for pending byte pages in smaller dbs
     pub fn set_pending_byte(val: u32) {
         PENDING_BYTE.store(val, Ordering::Relaxed);
     }
 
-    #[cfg(not(feature = "test_helper"))]
+    #[cfg(not(clt_turso_feature = "test_helper"))]
     pub const fn get_pending_byte() -> u32 {
         PENDING_BYTE
     }
@@ -2388,7 +2388,7 @@ impl Pager {
     /// Retrieves the pointer map entry for a given database page.
     /// `target_page_num` (1-indexed) is the page whose entry is sought.
     /// Returns `Ok(None)` if the page is not supposed to have a ptrmap entry (e.g. header, or a ptrmap page itself).
-    #[cfg(not(feature = "omit_autovacuum"))]
+    #[cfg(not(clt_turso_feature = "omit_autovacuum"))]
     pub fn ptrmap_get(&self, target_page_num: u32) -> Result<IOResult<Option<PtrmapEntry>>> {
         loop {
             let ptrmap_get_state = {
@@ -2477,7 +2477,7 @@ impl Pager {
     /// Writes or updates the pointer map entry for a given database page.
     /// `db_page_no_to_update` (1-indexed) is the page whose entry is to be set.
     /// `entry_type` and `parent_page_no` define the new entry.
-    #[cfg(not(feature = "omit_autovacuum"))]
+    #[cfg(not(clt_turso_feature = "omit_autovacuum"))]
     pub fn ptrmap_put(
         &self,
         db_page_no_to_update: u32,
@@ -2583,14 +2583,14 @@ impl Pager {
             _ if flags.is_index() => PageType::IndexLeaf,
             _ => unreachable!("Invalid flags state"),
         };
-        #[cfg(feature = "omit_autovacuum")]
+        #[cfg(clt_turso_feature = "omit_autovacuum")]
         {
             let page = return_if_io!(self.do_allocate_page(page_type, 0, BtreePageAllocMode::Any));
             Ok(IOResult::Done(page.get().id as u32))
         }
 
         //  If autovacuum is enabled, we need to allocate a new page number that is greater than the largest root page number
-        #[cfg(not(feature = "omit_autovacuum"))]
+        #[cfg(not(clt_turso_feature = "omit_autovacuum"))]
         {
             let auto_vacuum_mode =
                 AutoVacuumMode::from(self.auto_vacuum_mode.load(Ordering::SeqCst));
@@ -2836,7 +2836,7 @@ impl Pager {
         self.wal.is_some()
     }
 
-    #[cfg(test)]
+    #[cfg(clt_turso_tests)]
     pub(crate) fn wal_shared_ptr(&self) -> Option<usize> {
         self.wal
             .as_ref()
@@ -3265,7 +3265,7 @@ impl Pager {
     pub fn read_page(&self, page_idx: i64) -> Result<IOResult<(PageRef, Option<Completion>)>> {
         turso_assert_greater_than_or_equal!(page_idx, 0, "pages in pager should be positive, negative might indicate unallocated pages from mvcc or any other nasty bug");
         tracing::debug!("read_page_nonblock(page_idx = {})", page_idx);
-        #[cfg(test)]
+        #[cfg(clt_turso_tests)]
         if self.spill_yield.should_yield_for(page_idx) {
             io_yield_one!(crate::Completion::new_yield());
         }
@@ -3386,7 +3386,7 @@ impl Pager {
 
     /// Test-only: arm `read_page` to return `IO(yield)` once for `page_id`
     /// after `skip` matching calls have passed through.
-    #[cfg(test)]
+    #[cfg(clt_turso_tests)]
     pub(crate) fn arm_spill_yield_on_read(&self, page_id: i64, skip: usize) {
         self.spill_yield.arm(page_id, skip);
     }
@@ -4920,7 +4920,7 @@ impl Pager {
         }
     }
 
-    #[cfg(feature = "simulator")]
+    #[cfg(clt_turso_feature = "simulator")]
     pub fn run_checkpoint_until_post_sync_gap_for_testing(
         &self,
         mode: CheckpointMode,
@@ -5285,13 +5285,13 @@ impl Pager {
             match &mut *state {
                 AllocatePageState::Start => {
                     let old_db_size = header.database_size.get();
-                    #[cfg(not(feature = "omit_autovacuum"))]
+                    #[cfg(not(clt_turso_feature = "omit_autovacuum"))]
                     let mut new_db_size = old_db_size;
-                    #[cfg(feature = "omit_autovacuum")]
+                    #[cfg(clt_turso_feature = "omit_autovacuum")]
                     let new_db_size = old_db_size;
 
                     tracing::debug!("allocate_page(database_size={})", new_db_size);
-                    #[cfg(not(feature = "omit_autovacuum"))]
+                    #[cfg(not(clt_turso_feature = "omit_autovacuum"))]
                     {
                         //  If the following conditions are met, allocate a pointer map page, add to cache and increment the database size
                         //  - autovacuum is enabled
@@ -5605,7 +5605,7 @@ impl Pager {
         *self.allocate_page_state.write() = AllocatePageState::Start;
         *self.free_page_state.write() = FreePageState::Start;
         *self.spill_state.write() = SpillState::Idle;
-        #[cfg(not(feature = "omit_autovacuum"))]
+        #[cfg(not(clt_turso_feature = "omit_autovacuum"))]
         {
             let mut vacuum_state = self.vacuum_state.write();
             vacuum_state.ptrmap_get_state = PtrMapGetState::Start;
@@ -5797,7 +5797,7 @@ impl CreateBTreeFlags {
 ** PTRMAP_BTREE: The database page is a non-root btree page. The page number
 **               identifies the parent page in the btree.
 */
-#[cfg(not(feature = "omit_autovacuum"))]
+#[cfg(not(clt_turso_feature = "omit_autovacuum"))]
 pub(crate) mod ptrmap {
     #[allow(unused_imports)]
     use crate::{storage::sqlite3_ondisk::PageSize, LimboError, Result};
@@ -5943,7 +5943,7 @@ pub(crate) mod ptrmap {
     }
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use crate::sync::Arc;
 
@@ -6092,8 +6092,8 @@ mod tests {
     }
 }
 
-#[cfg(test)]
-#[cfg(not(feature = "omit_autovacuum"))]
+#[cfg(clt_turso_tests)]
+#[cfg(not(clt_turso_feature = "omit_autovacuum"))]
 mod ptrmap_tests {
     use crate::sync::Arc;
 
@@ -6493,7 +6493,7 @@ mod ptrmap_tests {
     }
 }
 
-#[cfg(all(test, feature = "fs", host_shared_wal))]
+#[cfg(all(clt_turso_tests, clt_turso_feature = "fs", host_shared_wal))]
 mod checkpoint_phase_tests {
     use super::*;
     use crate::io::{PlatformIO, IO};
@@ -6508,11 +6508,11 @@ mod checkpoint_phase_tests {
     /// and mapping primitives, so the experimental IOCP backend is used when
     /// the `experimental_win_iocp` feature is enabled.
     fn shared_wal_test_io() -> Arc<dyn IO> {
-        #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
+        #[cfg(all(target_os = "windows", clt_turso_feature = "experimental_win_iocp"))]
         {
             Arc::new(crate::WindowsIOCP::new().unwrap())
         }
-        #[cfg(not(all(target_os = "windows", feature = "experimental_win_iocp")))]
+        #[cfg(not(all(target_os = "windows", clt_turso_feature = "experimental_win_iocp")))]
         {
             Arc::new(PlatformIO::new().unwrap())
         }

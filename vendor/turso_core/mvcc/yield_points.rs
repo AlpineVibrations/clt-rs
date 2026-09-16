@@ -37,7 +37,7 @@ pub trait FailureInjector: Debug + Send + Sync {
 // state machine should return a synthetic TransitionResult::Io yield here.
 macro_rules! inject_transition_yield {
     ($state_machine:expr, $point:expr) => {{
-        #[cfg(any(test, injected_yields))]
+        #[cfg(any(clt_turso_tests, injected_yields))]
         {
             use $crate::mvcc::yield_hooks::ProvidesYieldContext;
             let yield_context = $state_machine.yield_context();
@@ -59,7 +59,7 @@ pub(crate) use inject_transition_yield;
 // state machine should return a synthetic IOResult::IO yield here.
 macro_rules! inject_io_yield {
     ($state_machine:expr, $point:expr) => {{
-        #[cfg(any(test, injected_yields))]
+        #[cfg(any(clt_turso_tests, injected_yields))]
         {
             use $crate::mvcc::yield_hooks::ProvidesYieldContext;
             let yield_context = $state_machine.yield_context();
@@ -82,7 +82,7 @@ pub(crate) use inject_io_yield;
 // in tests without requiring a real I/O fault.
 macro_rules! inject_transition_failure {
     ($state_machine:expr, $point:expr) => {{
-        #[cfg(any(test, injected_yields))]
+        #[cfg(any(clt_turso_tests, injected_yields))]
         {
             use $crate::mvcc::yield_hooks::ProvidesYieldContext;
             let yield_context = $state_machine.yield_context();

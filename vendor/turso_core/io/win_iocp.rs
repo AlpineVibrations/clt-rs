@@ -1141,7 +1141,7 @@ impl Drop for WindowsFile {
     }
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use std::sync::Arc;
 

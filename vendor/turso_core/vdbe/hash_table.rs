@@ -3278,7 +3278,7 @@ impl HashTable {
     }
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod hashtests {
     use super::*;
     use crate::alloc::vec;

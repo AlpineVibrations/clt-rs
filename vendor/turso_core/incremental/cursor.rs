@@ -372,7 +372,7 @@ impl MaterializedViewCursor {
     }
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use super::*;
     use crate::storage::btree::BTreeCursor;

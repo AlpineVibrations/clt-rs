@@ -40,7 +40,7 @@ impl SaturatingShr for i64 {
 }
 
 #[derive(Debug, Clone, Copy)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(clt_turso_feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Numeric {
     Integer(i64),
     Float(NonNan),

@@ -2289,7 +2289,7 @@ pub enum Cookie {
     ApplicationId = 8,
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use strum::VariantArray;
 

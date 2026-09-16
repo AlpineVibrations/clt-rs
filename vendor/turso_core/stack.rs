@@ -11,13 +11,13 @@ macro_rules! trace_stack {
 }
 pub(crate) use trace_stack;
 
-#[cfg(feature = "stacker")]
+#[cfg(clt_turso_feature = "stacker")]
 pub(crate) struct TraceGuard {
     label: &'static str,
     detail: Option<&'static str>,
 }
 
-#[cfg(feature = "stacker")]
+#[cfg(clt_turso_feature = "stacker")]
 impl TraceGuard {
     fn emit(&self, phase: &'static str) {
         if std::env::var_os("TURSO_TRACE_STACK").is_none() {
@@ -35,14 +35,14 @@ impl TraceGuard {
     }
 }
 
-#[cfg(feature = "stacker")]
+#[cfg(clt_turso_feature = "stacker")]
 impl Drop for TraceGuard {
     fn drop(&mut self) {
         self.emit("exit");
     }
 }
 
-#[cfg(feature = "stacker")]
+#[cfg(clt_turso_feature = "stacker")]
 pub(crate) fn trace_scope(label: &'static str) -> TraceGuard {
     let guard = TraceGuard {
         label,
@@ -52,7 +52,7 @@ pub(crate) fn trace_scope(label: &'static str) -> TraceGuard {
     guard
 }
 
-#[cfg(feature = "stacker")]
+#[cfg(clt_turso_feature = "stacker")]
 pub(crate) fn trace_scope_with_detail(label: &'static str, detail: &'static str) -> TraceGuard {
     let guard = TraceGuard {
         label,
@@ -62,7 +62,7 @@ pub(crate) fn trace_scope_with_detail(label: &'static str, detail: &'static str)
     guard
 }
 
-#[cfg(feature = "stacker")]
+#[cfg(clt_turso_feature = "stacker")]
 pub(crate) fn trace_remaining(label: &'static str) {
     if std::env::var_os("TURSO_TRACE_STACK").is_none() {
         return;
@@ -77,14 +77,14 @@ pub(crate) fn trace_remaining(label: &'static str) {
     );
 }
 
-#[cfg(not(feature = "stacker"))]
+#[cfg(not(clt_turso_feature = "stacker"))]
 #[inline]
 pub(crate) fn trace_scope(_label: &'static str) {}
 
-#[cfg(not(feature = "stacker"))]
+#[cfg(not(clt_turso_feature = "stacker"))]
 #[inline]
 pub(crate) fn trace_scope_with_detail(_label: &'static str, _detail: &'static str) {}
 
-#[cfg(not(feature = "stacker"))]
+#[cfg(not(clt_turso_feature = "stacker"))]
 #[inline]
 pub(crate) fn trace_remaining(_label: &'static str) {}

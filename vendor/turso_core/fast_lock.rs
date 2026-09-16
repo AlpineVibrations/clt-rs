@@ -58,7 +58,7 @@ impl<T> SpinLock<T> {
     }
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use crate::sync::Arc;
 
@@ -83,7 +83,7 @@ mod tests {
     }
 }
 
-#[cfg(all(shuttle, test))]
+#[cfg(all(shuttle, clt_turso_tests))]
 mod shuttle_tests {
     use super::*;
     use crate::sync::*;

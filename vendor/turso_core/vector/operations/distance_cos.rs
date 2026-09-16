@@ -182,7 +182,7 @@ fn vector_f32_sparse_distance_cos(v1: VectorSparse<f32>, v2: VectorSparse<f32>) 
     (1.0f32 - (dot / (norm1 * norm2).sqrt())) as f64
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use crate::vector::{
         operations::convert::vector_convert, vector_types::tests::ArbitraryVector,

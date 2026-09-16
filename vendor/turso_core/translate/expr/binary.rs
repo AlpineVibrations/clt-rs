@@ -707,7 +707,7 @@ pub(super) fn emit_binary_insn(
                 if_true_label,
             );
         }
-        #[cfg(feature = "json")]
+        #[cfg(clt_turso_feature = "json")]
         op @ (ast::Operator::ArrowRight | ast::Operator::ArrowRightShift) => {
             let json_func = match op {
                 ast::Operator::ArrowRight => JsonFunc::JsonArrowExtract,
@@ -1128,7 +1128,7 @@ pub(super) fn emit_binary_condition_insn(
             });
             eval_result(program, target_register);
         }
-        #[cfg(feature = "json")]
+        #[cfg(clt_turso_feature = "json")]
         op @ (ast::Operator::ArrowRight | ast::Operator::ArrowRightShift) => {
             let json_func = match op {
                 ast::Operator::ArrowRight => JsonFunc::JsonArrowExtract,

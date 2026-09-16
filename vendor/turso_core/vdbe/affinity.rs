@@ -687,7 +687,7 @@ fn stringify_register(val: ValueRef) -> Option<Value> {
     }
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use super::*;
 

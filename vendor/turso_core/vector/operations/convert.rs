@@ -179,7 +179,7 @@ fn convert_floats_to_f8(
     Ok(Vector::from_f8(dims, quantized, alpha, shift))
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use crate::vector::{
         operations::convert::vector_convert,

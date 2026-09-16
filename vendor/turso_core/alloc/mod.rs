@@ -228,5 +228,5 @@ pub type Rc<T> = std::rc::Rc<T>;
 
 pub type RcWeak<T> = std::rc::Weak<T>;
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests;

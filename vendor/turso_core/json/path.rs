@@ -414,7 +414,7 @@ fn finalize_path<'a>(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use super::*;
 

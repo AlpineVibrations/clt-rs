@@ -601,13 +601,13 @@ trait WalCoordination: Debug + Send + Sync {
     /// Whether a process-local "last connection" close may run shutdown checkpointing.
     fn should_checkpoint_on_close(&self) -> bool;
 
-    #[cfg(test)]
+    #[cfg(clt_turso_tests)]
     fn backend_name(&self) -> &'static str;
 
-    #[cfg(test)]
+    #[cfg(clt_turso_tests)]
     fn shared_ptr(&self) -> usize;
 
-    #[cfg(test)]
+    #[cfg(clt_turso_tests)]
     fn open_mode_name(&self) -> Option<&'static str> {
         None
     }
@@ -823,7 +823,7 @@ pub trait Wal: Debug + Send + Sync {
     /// readers and writers may proceed again.
     fn release_vacuum_lock(&self);
 
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(any(clt_turso_tests, debug_assertions))]
     fn as_any(&self) -> &dyn std::any::Any;
 }
 
@@ -1361,12 +1361,12 @@ impl WalCoordination for InProcessWalCoordination {
         true
     }
 
-    #[cfg(test)]
+    #[cfg(clt_turso_tests)]
     fn backend_name(&self) -> &'static str {
         "in_process"
     }
 
-    #[cfg(test)]
+    #[cfg(clt_turso_tests)]
     fn shared_ptr(&self) -> usize {
         Arc::as_ptr(&self.shared) as usize
     }
@@ -2375,17 +2375,17 @@ impl WalCoordination for ShmWalCoordination {
         self.authority.is_last_process_mapping()
     }
 
-    #[cfg(test)]
+    #[cfg(clt_turso_tests)]
     fn backend_name(&self) -> &'static str {
         "tshm"
     }
 
-    #[cfg(test)]
+    #[cfg(clt_turso_tests)]
     fn shared_ptr(&self) -> usize {
         Arc::as_ptr(&self.shared) as usize
     }
 
-    #[cfg(test)]
+    #[cfg(clt_turso_tests)]
     fn open_mode_name(&self) -> Option<&'static str> {
         Some(match self.authority.open_mode() {
             SharedWalCoordinationOpenMode::Exclusive => "exclusive",
@@ -3406,7 +3406,7 @@ impl Wal for WalFile {
         parent = "wal_protocol_correctness"
     )]
     fn find_frame(&self, page_id: u64, frame_watermark: Option<u64>) -> Result<Option<u64>> {
-        #[cfg(not(feature = "conn_raw_api"))]
+        #[cfg(not(clt_turso_feature = "conn_raw_api"))]
         turso_assert!(
             frame_watermark.is_none(),
             "unexpected use of frame_watermark optional argument"
@@ -4549,7 +4549,7 @@ impl Wal for WalFile {
         Ok(c)
     }
 
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(any(clt_turso_tests, debug_assertions))]
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -4643,17 +4643,17 @@ impl WalFile {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(clt_turso_tests)]
     pub(crate) fn shared_ptr(&self) -> usize {
         self.coordination.shared_ptr()
     }
 
-    #[cfg(test)]
+    #[cfg(clt_turso_tests)]
     pub(crate) fn coordination_backend_name(&self) -> &'static str {
         self.coordination.backend_name()
     }
 
-    #[cfg(test)]
+    #[cfg(clt_turso_tests)]
     pub(crate) fn coordination_open_mode_name(&self) -> Option<&'static str> {
         self.coordination.open_mode_name()
     }
@@ -5367,7 +5367,7 @@ fn read_database_identity_from_storage(
     )?))
 }
 
-#[cfg(all(test, host_shared_wal))]
+#[cfg(all(clt_turso_tests, host_shared_wal))]
 fn read_database_identity_from_file_path(
     io: &Arc<dyn IO>,
     wal_path: &str,
@@ -5707,7 +5707,7 @@ impl WalFileShared {
         Arc::new(RwLock::new(shared))
     }
 
-    #[cfg(test)]
+    #[cfg(clt_turso_tests)]
     pub(super) fn new_shared(file: Arc<dyn File>) -> Result<Arc<RwLock<WalFileShared>>> {
         let wal_header = WalHeader::new();
         let read_locks = array::from_fn(|_| TursoRwLock::new());
@@ -5806,7 +5806,7 @@ impl WalFileShared {
     /// replacing the lock objects would make normal `end_read_tx` unlock a
     /// fresh empty lock. Keep lock identity stable and refresh only state
     /// derived from storage.
-    #[cfg(feature = "conn_raw_api")]
+    #[cfg(clt_turso_feature = "conn_raw_api")]
     pub fn replace_after_external_restore(&mut self, restored: WalFileShared) {
         self.metadata = restored.metadata;
         self.runtime.frame_cache = restored.runtime.frame_cache;
@@ -5819,7 +5819,7 @@ impl WalFileShared {
     }
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 pub mod test {
     #[cfg(host_shared_wal)]
     use super::{
@@ -5859,11 +5859,11 @@ pub mod test {
     /// and mapping primitives, so the experimental IOCP backend is used when
     /// the `experimental_win_iocp` feature is enabled.
     fn shared_wal_test_io() -> Arc<dyn IO> {
-        #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
+        #[cfg(all(target_os = "windows", clt_turso_feature = "experimental_win_iocp"))]
         {
             Arc::new(crate::WindowsIOCP::new().unwrap())
         }
-        #[cfg(not(all(target_os = "windows", feature = "experimental_win_iocp")))]
+        #[cfg(not(all(target_os = "windows", clt_turso_feature = "experimental_win_iocp")))]
         {
             Arc::new(PlatformIO::new().unwrap())
         }
@@ -5954,7 +5954,7 @@ pub mod test {
         }
     }
 
-    #[cfg(feature = "conn_raw_api")]
+    #[cfg(clt_turso_feature = "conn_raw_api")]
     #[test]
     fn replace_after_external_restore_preserves_lock_identity() {
         let shared = WalFileShared::new_noop();
@@ -6232,7 +6232,7 @@ pub mod test {
     /// writes bytes synchronously yet defers every I/O *completion* until the
     /// next `io.step()`. That makes the "write submitted but not yet durable"
     /// window observable in a single-threaded test.
-    #[cfg(feature = "io_memory_yield")]
+    #[cfg(clt_turso_feature = "io_memory_yield")]
     fn make_initialized_memory_yield_wal(
         page_size: u32,
     ) -> (Arc<dyn IO>, Arc<BufferPool>, WalFile) {
@@ -6267,7 +6267,7 @@ pub mod test {
     /// frame whose bytes were not yet written. `MemoryYieldIO` defers the write
     /// completion until `io.step()`, so this test can observe the frame while
     /// the write is still in flight: the mapping must not be visible yet.
-    #[cfg(feature = "io_memory_yield")]
+    #[cfg(clt_turso_feature = "io_memory_yield")]
     #[test]
     fn append_frames_vectored_frame_hidden_until_write_is_durable() {
         let page_size = 512;
@@ -6649,7 +6649,7 @@ pub mod test {
             .unwrap();
         #[allow(unused_mut)]
         let mut page = vec![0x5a; wal_header.page_size as usize];
-        #[cfg(feature = "checksum")]
+        #[cfg(clt_turso_feature = "checksum")]
         crate::storage::checksum::ChecksumContext::new()
             .add_checksum_to_page(&mut page, 7)
             .unwrap();
@@ -6755,7 +6755,7 @@ pub mod test {
         );
     }
 
-    #[cfg(test)]
+    #[cfg(clt_turso_tests)]
     fn read_slots_with_readers(shared: &WalFileShared) -> Vec<usize> {
         shared
             .runtime

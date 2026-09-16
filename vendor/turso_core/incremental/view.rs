@@ -222,7 +222,7 @@ pub struct IncrementalView {
     populate_state: PopulateState,
     // Computation tracker for statistics
     // We will use this one day to export rows_read, but for now, will just test that we're doing the expected amount of compute
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(clt_turso_tests), allow(dead_code))]
     pub tracker: Arc<Mutex<ComputationTracker>>,
     // Root page of the btree storing the materialized state (0 for unmaterialized)
     root_page: i64,
@@ -1420,7 +1420,7 @@ impl IncrementalView {
     }
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use super::*;
     use crate::alloc::vec;

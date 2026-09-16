@@ -2383,7 +2383,7 @@ impl<'a> LogicalPlanBuilder<'a> {
                 // mode/percentile_disc return an element of the ordered set, whose
                 // type is not known statically.
                 AggFunc::Mode | AggFunc::PercentileDisc => Ok(Type::Text),
-                #[cfg(feature = "json")]
+                #[cfg(clt_turso_feature = "json")]
                 AggFunc::JsonbGroupArray
                 | AggFunc::JsonGroupArray
                 | AggFunc::JsonbGroupObject
@@ -2401,7 +2401,7 @@ impl<'a> LogicalPlanBuilder<'a> {
     }
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use super::*;
     use crate::alloc::vec;

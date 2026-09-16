@@ -245,7 +245,7 @@ impl VacuumDbHeaderMeta {
 pub(crate) struct VacuumTempDb {
     pub conn: Arc<Connection>,
     _db: Arc<Database>,
-    #[cfg(test)]
+    #[cfg(clt_turso_tests)]
     path: String,
     #[cfg(not(target_family = "wasm"))]
     _temp_dir: tempfile::TempDir,
@@ -288,7 +288,7 @@ pub(crate) fn open_vacuum_temp_db(
         .to_str()
         .ok_or_else(|| LimboError::InternalError("vacuum temp path is not valid UTF-8".into()))?
         .to_string();
-    #[cfg(test)]
+    #[cfg(clt_turso_tests)]
     let test_path = path.clone();
 
     let (encryption_opts, encryption_key) = vacuum_temp_db_encryption(source_conn)?;
@@ -307,7 +307,7 @@ pub(crate) fn open_vacuum_temp_db(
     Ok(VacuumTempDb {
         conn,
         _db: db,
-        #[cfg(test)]
+        #[cfg(clt_turso_tests)]
         path: test_path,
         _temp_dir: temp_dir,
     })
@@ -2370,7 +2370,7 @@ fn vacuum_in_place_cleanup(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use super::*;
     use crate::io::{FileId, FileSyncType};
@@ -2814,7 +2814,7 @@ mod tests {
         let source_conn = source_db.connect()?;
         // Source is uninitialized so its header reserved_space isn't usable.
         // Derive from the IOContext to keep reserved_space and the auto-
-        // installed checksum context consistent under `feature = "checksum"`.
+        // installed checksum context consistent under `clt_turso_feature = "checksum"`.
         let reserved_space = source_conn
             .get_pager()
             .io_ctx

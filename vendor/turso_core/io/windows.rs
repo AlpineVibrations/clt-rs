@@ -10,7 +10,7 @@ use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::ptr;
 use std::sync::OnceLock;
-#[cfg(feature = "fs")]
+#[cfg(clt_turso_feature = "fs")]
 use tracing::debug;
 use tracing::{instrument, trace, Level};
 use windows_sys::Win32::Foundation::{
@@ -250,7 +250,7 @@ fn acquire_process_file_lock(path: &str) -> Result<ProcessFileLockGuard> {
 pub struct WindowsIO {}
 
 impl WindowsIO {
-    #[cfg(feature = "fs")]
+    #[cfg(clt_turso_feature = "fs")]
     pub fn new() -> Result<Self> {
         debug!("Using IO backend 'syscall'");
         Ok(Self {})
@@ -584,7 +584,7 @@ impl Drop for WindowsFile {
     }
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use super::*;
 

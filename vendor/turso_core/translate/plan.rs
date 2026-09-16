@@ -3487,7 +3487,7 @@ fn resolve_outer_ref_loop(
     None
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use crate::alloc::TursoFromIterator;
 

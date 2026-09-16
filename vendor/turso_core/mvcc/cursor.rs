@@ -6,7 +6,7 @@ use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
     create_seek_range, MVTableId, MvStore, Row, RowID, RowKey, RowVersions, SortableIndexKey,
 };
-#[cfg(any(test, injected_yields))]
+#[cfg(any(clt_turso_tests, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
 use crate::mvcc::yield_points::inject_io_yield;
 use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
@@ -22,7 +22,7 @@ use crate::{return_if_io, Completion, Connection, LimboError, Pager, Result};
 use std::any::Any;
 use std::fmt::Debug;
 use std::ops::Bound;
-#[cfg(any(test, injected_yields))]
+#[cfg(any(clt_turso_tests, injected_yields))]
 use strum::EnumCount;
 
 #[derive(Clone)]
@@ -127,7 +127,7 @@ enum MvccLazyCursorState {
     Seek(SeekState, IterationDirection),
 }
 
-#[cfg(any(test, injected_yields))]
+#[cfg(any(clt_turso_tests, injected_yields))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumCount)]
 #[repr(u8)]
 pub(crate) enum CursorYieldPoint {
@@ -142,7 +142,7 @@ pub(crate) enum CursorYieldPoint {
     AdvanceBtreeBackwardProgress,
 }
 
-#[cfg(any(test, injected_yields))]
+#[cfg(any(clt_turso_tests, injected_yields))]
 impl YieldPointMarker for CursorYieldPoint {
     const POINT_COUNT: u8 = Self::COUNT as u8;
 
@@ -151,7 +151,7 @@ impl YieldPointMarker for CursorYieldPoint {
     }
 }
 
-#[cfg(any(test, injected_yields))]
+#[cfg(any(clt_turso_tests, injected_yields))]
 impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> ProvidesYieldContext
     for MvccLazyCursor<Clock, A>
 {
@@ -188,7 +188,7 @@ fn current_pos_matches_seek_key(
     })
 }
 
-#[cfg(any(test, injected_yields))]
+#[cfg(any(clt_turso_tests, injected_yields))]
 fn cursor_yield_key(tx_id: u64, table_id: MVTableId) -> u64 {
     // ASCII-ish "CURSORCR"
     // any large number will do
@@ -492,9 +492,9 @@ impl<A: ConcurrentAllocator> IndexShadowFinger<A> {
 
 pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator = TursoAllocator> {
     pub db: Arc<MvStore<Clock, A>>,
-    #[cfg(any(test, injected_yields))]
+    #[cfg(any(clt_turso_tests, injected_yields))]
     connection: Arc<Connection>,
-    #[cfg(any(test, injected_yields))]
+    #[cfg(any(clt_turso_tests, injected_yields))]
     yield_instance_id: u64,
     current_pos: CursorPosition<A>,
     /// Stateful MVCC table iterator if this is a table cursor.
@@ -573,9 +573,9 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         };
         Ok(Self {
             db,
-            #[cfg(any(test, injected_yields))]
+            #[cfg(any(clt_turso_tests, injected_yields))]
             yield_instance_id: connection.next_yield_instance_id(),
-            #[cfg(any(test, injected_yields))]
+            #[cfg(any(clt_turso_tests, injected_yields))]
             connection: connection.clone(),
             tx_id,
             table_iterator: None,

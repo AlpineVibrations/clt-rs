@@ -11,7 +11,7 @@ pub use crate::incremental::join_operator::{JoinEvalState, JoinOperator, JoinTyp
 pub use crate::incremental::project_operator::{ProjectColumn, ProjectOperator};
 
 use crate::incremental::dbsp::{Delta, DeltaPair};
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 use crate::numeric::Numeric;
 use crate::schema::{Index, IndexColumn};
 use crate::storage::btree::BTreeCursor;
@@ -259,7 +259,7 @@ pub trait IncrementalOperator: Debug + Send {
     fn set_tracker(&mut self, tracker: Arc<Mutex<ComputationTracker>>);
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use rustc_hash::FxHashSet as HashSet;
 

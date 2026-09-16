@@ -15,15 +15,15 @@ use std::{fmt::Debug, pin::Pin};
 use turso_macros::AtomicEnum;
 
 cfg_block! {
-    #[cfg(all(target_os = "linux", feature = "io_uring", not(miri)))] {
+    #[cfg(all(target_os = "linux", clt_turso_feature = "io_uring", not(miri)))] {
         mod io_uring;
-        #[cfg(feature = "fs")]
+        #[cfg(clt_turso_feature = "fs")]
         pub use io_uring::UringIO;
     }
 
     #[cfg(all(target_family = "unix", not(miri)))] {
         mod unix;
-        #[cfg(feature = "fs")]
+        #[cfg(clt_turso_feature = "fs")]
         pub use unix::UnixIO;
         pub use unix::UnixIO as PlatformIO;
         pub use PlatformIO as SyscallIO;
@@ -31,15 +31,15 @@ cfg_block! {
 
     #[cfg(all(target_os = "windows", not(miri)))] {
         mod windows;
-        #[cfg(feature = "fs")]
+        #[cfg(clt_turso_feature = "fs")]
         pub use windows::WindowsIO;
         pub use windows::WindowsIO as PlatformIO;
         pub use PlatformIO as SyscallIO;
     }
 
-    #[cfg(all(target_os = "windows", feature = "experimental_win_iocp", not(miri)))] {
+    #[cfg(all(target_os = "windows", clt_turso_feature = "experimental_win_iocp", not(miri)))] {
         mod win_iocp;
-        #[cfg(feature = "fs")]
+        #[cfg(clt_turso_feature = "fs")]
         pub use win_iocp::WindowsIOCP;
     }
 
@@ -51,12 +51,12 @@ cfg_block! {
 }
 
 mod memory;
-#[cfg(feature = "io_memory_yield")]
+#[cfg(clt_turso_feature = "io_memory_yield")]
 mod memory_yield;
-#[cfg(feature = "fs")]
+#[cfg(clt_turso_feature = "fs")]
 mod vfs;
 pub use memory::MemoryIO;
-#[cfg(feature = "io_memory_yield")]
+#[cfg(clt_turso_feature = "io_memory_yield")]
 pub use memory_yield::MemoryYieldIO;
 pub mod clock;
 mod common;
@@ -298,7 +298,7 @@ impl TempFile {
     pub fn with_temp_store(io: &Arc<dyn IO>, temp_store: crate::TempStore) -> Result<Self> {
         #[cfg(not(target_family = "wasm"))]
         {
-            #[cfg(not(feature = "fs"))]
+            #[cfg(not(clt_turso_feature = "fs"))]
             {
                 let _ = (io, temp_store);
                 let memory_io = Arc::new(MemoryIO::new());
@@ -309,7 +309,7 @@ impl TempFile {
                     file: memory_file,
                 })
             }
-            #[cfg(feature = "fs")]
+            #[cfg(clt_turso_feature = "fs")]
             {
                 if matches!(temp_store, crate::TempStore::Memory) {
                     let memory_io = Arc::new(MemoryIO::new());
@@ -771,7 +771,7 @@ crate::thread::thread_local! {
     pub static TEMP_BUFFER_CACHE: RefCell<TempBufferCache> = RefCell::new(TempBufferCache::new());
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod buffer_tests {
     use super::*;
 
@@ -907,7 +907,7 @@ pub fn list_registered_io() -> Vec<String> {
     IO_REGISTRY.lock().keys().cloned().collect()
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod io_registry_tests {
     use super::*;
 
@@ -962,7 +962,7 @@ mod io_registry_tests {
     }
 }
 
-#[cfg(all(shuttle, test))]
+#[cfg(all(shuttle, clt_turso_tests))]
 mod shuttle_tests {
     use std::path::PathBuf;
 
@@ -1003,12 +1003,12 @@ mod shuttle_tests {
         }
     }
 
-    #[cfg(all(target_family = "unix", feature = "fs", not(miri)))]
+    #[cfg(all(target_family = "unix", clt_turso_feature = "fs", not(miri)))]
     struct PlatformIOFactory {
         temp_dir: tempfile::TempDir,
     }
 
-    #[cfg(all(target_family = "unix", feature = "fs", not(miri)))]
+    #[cfg(all(target_family = "unix", clt_turso_feature = "fs", not(miri)))]
     impl PlatformIOFactory {
         fn new() -> Self {
             Self {
@@ -1017,7 +1017,7 @@ mod shuttle_tests {
         }
     }
 
-    #[cfg(all(target_family = "unix", feature = "fs", not(miri)))]
+    #[cfg(all(target_family = "unix", clt_turso_feature = "fs", not(miri)))]
     impl IOFactory for PlatformIOFactory {
         fn create(&self) -> Arc<dyn IO> {
             Arc::new(PlatformIO::new().unwrap())
@@ -1027,12 +1027,12 @@ mod shuttle_tests {
         }
     }
 
-    #[cfg(all(target_os = "linux", feature = "io_uring", feature = "fs", not(miri)))]
+    #[cfg(all(target_os = "linux", clt_turso_feature = "io_uring", clt_turso_feature = "fs", not(miri)))]
     struct UringIOFactory {
         temp_dir: tempfile::TempDir,
     }
 
-    #[cfg(all(target_os = "linux", feature = "io_uring", feature = "fs", not(miri)))]
+    #[cfg(all(target_os = "linux", clt_turso_feature = "io_uring", clt_turso_feature = "fs", not(miri)))]
     impl UringIOFactory {
         fn new() -> Self {
             Self {
@@ -1041,7 +1041,7 @@ mod shuttle_tests {
         }
     }
 
-    #[cfg(all(target_os = "linux", feature = "io_uring", feature = "fs", not(miri)))]
+    #[cfg(all(target_os = "linux", clt_turso_feature = "io_uring", clt_turso_feature = "fs", not(miri)))]
     impl IOFactory for UringIOFactory {
         fn create(&self) -> Arc<dyn IO> {
             Arc::new(UringIO::new().unwrap())
@@ -1053,8 +1053,8 @@ mod shuttle_tests {
 
     #[cfg(all(
         target_os = "windows",
-        feature = "experimental_win_iocp",
-        feature = "fs",
+        clt_turso_feature = "experimental_win_iocp",
+        clt_turso_feature = "fs",
         not(miri)
     ))]
     struct WinIOCPFactory {
@@ -1063,8 +1063,8 @@ mod shuttle_tests {
 
     #[cfg(all(
         target_os = "windows",
-        feature = "experimental_win_iocp",
-        feature = "fs",
+        clt_turso_feature = "experimental_win_iocp",
+        clt_turso_feature = "fs",
         not(miri)
     ))]
     impl WinIOCPFactory {
@@ -1077,8 +1077,8 @@ mod shuttle_tests {
 
     #[cfg(all(
         target_os = "windows",
-        feature = "experimental_win_iocp",
-        feature = "fs",
+        clt_turso_feature = "experimental_win_iocp",
+        clt_turso_feature = "fs",
         not(miri)
     ))]
     impl IOFactory for WinIOCPFactory {
@@ -1100,19 +1100,19 @@ mod shuttle_tests {
                     shuttle::check_random(|| $test_impl(MemoryIOFactory::new()), 1000);
                 }
 
-                #[cfg(all(target_family = "unix", feature = "fs", not(miri)))]
+                #[cfg(all(target_family = "unix", clt_turso_feature = "fs", not(miri)))]
                 #[test]
                 fn [<shuttle_ $test_name _platform>]() {
                     shuttle::check_random(|| $test_impl(PlatformIOFactory::new()), 1000);
                 }
 
-                #[cfg(all(target_os = "linux", feature = "io_uring", feature = "fs", not(miri)))]
+                #[cfg(all(target_os = "linux", clt_turso_feature = "io_uring", clt_turso_feature = "fs", not(miri)))]
                 #[test]
                 fn [<shuttle_ $test_name _uring>]() {
                     shuttle::check_random(|| $test_impl(UringIOFactory::new()), 1000);
                 }
 
-                #[cfg(all(target_os = "windows", feature = "experimental_win_iocp", feature = "fs", not(miri)))]
+                #[cfg(all(target_os = "windows", clt_turso_feature = "experimental_win_iocp", clt_turso_feature = "fs", not(miri)))]
                 #[test]
                 fn [<shuttle_ $test_name _win_iocp>]() {
                     shuttle::check_random(|| $test_impl(WinIOCPFactory::new()), 1000);

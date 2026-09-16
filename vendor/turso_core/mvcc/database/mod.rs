@@ -4,7 +4,7 @@ use crate::alloc::{
 };
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::cursor::{static_iterator_hack, MvccIterator};
-#[cfg(any(test, injected_yields))]
+#[cfg(any(clt_turso_tests, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
 use crate::mvcc::yield_points::{inject_transition_failure, inject_transition_yield};
 use crate::schema::{Schema, Sequence, Table};
@@ -39,7 +39,7 @@ use crate::IOExt;
 use crate::LimboError;
 use crate::PageSize;
 use crate::Result;
-#[cfg(feature = "conn_raw_api")]
+#[cfg(clt_turso_feature = "conn_raw_api")]
 use crate::Value;
 use crate::ValueRef;
 use crate::{io::FileSyncType, io_yield_one, return_if_io};
@@ -53,7 +53,7 @@ use std::collections::{BTreeSet, HashMap as StdHashMap};
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::ops::Bound;
-#[cfg(any(test, injected_yields))]
+#[cfg(any(clt_turso_tests, injected_yields))]
 use strum::EnumCount;
 use tracing::instrument;
 use tracing::Level;
@@ -63,7 +63,7 @@ pub use checkpoint_state_machine::{
     sqlite_schema_btree_identity, CheckpointState, CheckpointStateMachine,
 };
 
-#[cfg(feature = "conn_raw_api")]
+#[cfg(clt_turso_feature = "conn_raw_api")]
 use super::persistent_storage::logical_log::{
     encode_delete_portable_extension, parse_ops_from_plaintext, LOG_RECORD_PREFIX_SIZE,
 };
@@ -71,15 +71,15 @@ use super::persistent_storage::logical_log::{
     HeaderReadResult, IndexOpKind, ParsedOp, StreamingLogicalLogReader, StreamingResult,
     LOG_HDR_SIZE,
 };
-#[cfg(feature = "conn_raw_api")]
+#[cfg(clt_turso_feature = "conn_raw_api")]
 use super::portable_logical::{
     is_portable_logical_name, is_portable_schema_row, is_portable_table_schema_row,
     portable_schema_row_from_record, PortableLogicalBuilder, PortableObjectMapEntry,
 };
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 pub mod hermitage_tests;
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 pub mod tests;
 
 /// Sentinel value for `MvStore::exclusive_tx` indicating no exclusive transaction is active.
@@ -99,7 +99,7 @@ pub(crate) fn first_unsafe_sequence_watermark(seq: &Sequence, value: i64, is_cal
     }
 }
 
-#[cfg(not(any(test, injected_yields)))]
+#[cfg(not(any(clt_turso_tests, injected_yields)))]
 struct YieldContext;
 
 /// A table ID for MVCC.
@@ -508,15 +508,15 @@ pub struct LogRecord {
     ///
     /// Recovery ignores this field. Raw-log consumers use it to resolve the
     /// recovery ops' MVCC table ids and read transaction-level metadata.
-    #[cfg(feature = "conn_raw_api")]
+    #[cfg(clt_turso_feature = "conn_raw_api")]
     pub portable_changes: Vec<u8>,
     /// True when the committing connection requested portable logical-change
     /// frames, even if this transaction has no client-visible metadata.
-    #[cfg(feature = "conn_raw_api")]
+    #[cfg(clt_turso_feature = "conn_raw_api")]
     pub portable_changes_enabled: bool,
     /// True when a frame must carry a portable transaction wrapper even if
     /// the wrapper metadata itself is empty.
-    #[cfg(feature = "conn_raw_api")]
+    #[cfg(clt_turso_feature = "conn_raw_api")]
     pub portable_changes_required: bool,
 }
 
@@ -533,11 +533,11 @@ impl LogRecord {
             buf: vec![0u8; crate::mvcc::persistent_storage::logical_log::LOG_RECORD_PREFIX_SIZE],
             op_count: 0,
             has_header: false,
-            #[cfg(feature = "conn_raw_api")]
+            #[cfg(clt_turso_feature = "conn_raw_api")]
             portable_changes: Vec::new(),
-            #[cfg(feature = "conn_raw_api")]
+            #[cfg(clt_turso_feature = "conn_raw_api")]
             portable_changes_enabled: false,
-            #[cfg(feature = "conn_raw_api")]
+            #[cfg(clt_turso_feature = "conn_raw_api")]
             portable_changes_required: false,
         }
     }
@@ -558,7 +558,7 @@ impl LogRecord {
     /// [`DurableStorage::serialize_row_version`] and
     /// [`DurableStorage::serialize_database_header`] instead so the bytes are
     /// appended one op at a time.
-    #[cfg(test)]
+    #[cfg(clt_turso_tests)]
     pub(crate) fn for_test(
         tx_timestamp: TxID,
         row_versions: &[RowVersion],
@@ -575,7 +575,7 @@ impl LogRecord {
     }
 
     /// Test-only: append one row-version op to the payload buffer.
-    #[cfg(test)]
+    #[cfg(clt_turso_tests)]
     pub(crate) fn push_row_version_for_test(&mut self, row_version: &RowVersion) {
         crate::mvcc::persistent_storage::logical_log::serialize_op_entry(
             &mut self.buf,
@@ -587,7 +587,7 @@ impl LogRecord {
     }
 
     /// Test-only: append a `DatabaseHeader` op to the payload buffer.
-    #[cfg(test)]
+    #[cfg(clt_turso_tests)]
     pub(crate) fn set_header_for_test(&mut self, header: &DatabaseHeader) {
         assert!(!self.has_header, "header op appended twice in test");
         crate::mvcc::persistent_storage::logical_log::serialize_header_entry(&mut self.buf, header);
@@ -596,7 +596,7 @@ impl LogRecord {
     }
 }
 
-#[cfg(feature = "conn_raw_api")]
+#[cfg(clt_turso_feature = "conn_raw_api")]
 fn portable_table_id_from_rootpage(rootpage: i64) -> MVTableId {
     if rootpage > 0 {
         MVTableId::from(-rootpage)
@@ -606,12 +606,12 @@ fn portable_table_id_from_rootpage(rootpage: i64) -> MVTableId {
 }
 
 #[derive(Clone, Debug)]
-#[cfg(feature = "conn_raw_api")]
+#[cfg(clt_turso_feature = "conn_raw_api")]
 struct PortableTableRef {
     name: String,
 }
 
-#[cfg(feature = "conn_raw_api")]
+#[cfg(clt_turso_feature = "conn_raw_api")]
 fn rootpage_for_mv_table_id<Clock: LogicalClock, A: ConcurrentAllocator>(
     mvcc_store: &MvStore<Clock, A>,
     table_id: MVTableId,
@@ -624,7 +624,7 @@ fn rootpage_for_mv_table_id<Clock: LogicalClock, A: ConcurrentAllocator>(
         .unwrap_or_else(|| i64::from(table_id))
 }
 
-#[cfg(feature = "conn_raw_api")]
+#[cfg(clt_turso_feature = "conn_raw_api")]
 fn table_name_for_rootpage_in_schema(schema: &Schema, rootpage: i64) -> Option<String> {
     if rootpage == 0 {
         return None;
@@ -641,7 +641,7 @@ fn table_name_for_rootpage_in_schema(schema: &Schema, rootpage: i64) -> Option<S
         .map(ToString::to_string)
 }
 
-#[cfg(feature = "conn_raw_api")]
+#[cfg(clt_turso_feature = "conn_raw_api")]
 fn table_name_for_rootpage(connection: &Connection, rootpage: i64) -> Option<String> {
     {
         let schema = connection.schema.read();
@@ -654,7 +654,7 @@ fn table_name_for_rootpage(connection: &Connection, rootpage: i64) -> Option<Str
     table_name_for_rootpage_in_schema(&schema, rootpage)
 }
 
-#[cfg(feature = "conn_raw_api")]
+#[cfg(clt_turso_feature = "conn_raw_api")]
 fn table_name_for_rootpage_in_mvcc_schema<Clock: LogicalClock, A: ConcurrentAllocator>(
     mvcc_store: &MvStore<Clock, A>,
     rootpage: i64,
@@ -683,7 +683,7 @@ fn table_name_for_rootpage_in_mvcc_schema<Clock: LogicalClock, A: ConcurrentAllo
     None
 }
 
-#[cfg(feature = "conn_raw_api")]
+#[cfg(clt_turso_feature = "conn_raw_api")]
 fn portable_table_name_for_mv_table_id<Clock: LogicalClock, A: ConcurrentAllocator>(
     connection: &Connection,
     mvcc_store: &MvStore<Clock, A>,
@@ -694,7 +694,7 @@ fn portable_table_name_for_mv_table_id<Clock: LogicalClock, A: ConcurrentAllocat
         .or_else(|| table_name_for_rootpage_in_mvcc_schema(mvcc_store, rootpage))
 }
 
-#[cfg(feature = "conn_raw_api")]
+#[cfg(clt_turso_feature = "conn_raw_api")]
 fn portable_delete_op_extension_for_row_version<Clock: LogicalClock, A: ConcurrentAllocator>(
     connection: &Connection,
     mvcc_store: &MvStore<Clock, A>,
@@ -1496,7 +1496,7 @@ impl CommitCoordinator {
     }
 }
 
-#[cfg(any(test, injected_yields))]
+#[cfg(any(clt_turso_tests, injected_yields))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumCount)]
 #[repr(u8)]
 pub(crate) enum CommitYieldPoint {
@@ -1518,14 +1518,14 @@ pub(crate) enum CommitYieldPoint {
     AfterRemoveTx,
 }
 
-#[cfg(any(test, injected_yields))]
+#[cfg(any(clt_turso_tests, injected_yields))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumCount)]
 #[repr(u8)]
 pub(crate) enum ExclusiveTxYieldPoint {
     AfterTimestampCheckBeforeCas,
 }
 
-#[cfg(any(test, injected_yields))]
+#[cfg(any(clt_turso_tests, injected_yields))]
 impl YieldPointMarker for ExclusiveTxYieldPoint {
     const POINT_COUNT: u8 = Self::COUNT as u8;
 
@@ -1534,7 +1534,7 @@ impl YieldPointMarker for ExclusiveTxYieldPoint {
     }
 }
 
-#[cfg(any(test, injected_yields))]
+#[cfg(any(clt_turso_tests, injected_yields))]
 impl YieldPointMarker for CommitYieldPoint {
     const POINT_COUNT: u8 = Self::COUNT as u8;
 
@@ -1543,14 +1543,14 @@ impl YieldPointMarker for CommitYieldPoint {
     }
 }
 
-#[cfg(any(test, injected_yields))]
+#[cfg(any(clt_turso_tests, injected_yields))]
 fn commit_yield_key(tx_id: u64) -> u64 {
     // any large number will do
     const COMMIT_SELECTION_TAG: u64 = 0xC011_C011_C011_C011;
     tx_id ^ COMMIT_SELECTION_TAG
 }
 
-#[cfg(any(test, injected_yields))]
+#[cfg(any(clt_turso_tests, injected_yields))]
 impl<Clock: LogicalClock, A: ConcurrentAllocator> ProvidesYieldContext
     for CommitStateMachine<Clock, A>
 {
@@ -1567,7 +1567,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> ProvidesYieldContext
 pub struct CommitStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator> {
     state: CommitState<Clock, A>,
     is_finalized: bool,
-    #[cfg(any(test, injected_yields))]
+    #[cfg(any(clt_turso_tests, injected_yields))]
     yield_instance_id: u64,
     did_commit_schema_change: bool,
     tx_id: TxID,
@@ -1667,7 +1667,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         Self {
             state,
             is_finalized: false,
-            #[cfg(any(test, injected_yields))]
+            #[cfg(any(clt_turso_tests, injected_yields))]
             yield_instance_id: connection.next_yield_instance_id(),
             did_commit_schema_change: schema_did_change_from_tx,
             tx_id,
@@ -2018,7 +2018,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                 ))
             })?;
         let write_set_len = tx.write_set.lock().entries.len();
-        #[cfg(feature = "conn_raw_api")]
+        #[cfg(clt_turso_feature = "conn_raw_api")]
         let connection = Arc::clone(&self.connection);
         let CommitState::BuildLogRecord(ctx) = &mut self.state else {
             unreachable!("step_build_log_record requires BuildLogRecord state")
@@ -2319,13 +2319,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                 entry_versions.push(committed_version);
             }
             for committed_version in &entry_versions {
-                #[cfg(feature = "conn_raw_api")]
+                #[cfg(clt_turso_feature = "conn_raw_api")]
                 let portable_extension = portable_delete_op_extension_for_row_version(
                     &connection,
                     mvcc_store,
                     committed_version,
                 )?;
-                #[cfg(not(feature = "conn_raw_api"))]
+                #[cfg(not(clt_turso_feature = "conn_raw_api"))]
                 let portable_extension: Option<Vec<u8>> = None;
                 mvcc_store.storage.serialize_row_version(
                     log_record,
@@ -2407,14 +2407,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         mvcc_store: &Arc<MvStore<Clock, A>>,
         log_record: &mut LogRecord,
     ) -> Result<()> {
-        #[cfg(not(feature = "conn_raw_api"))]
+        #[cfg(not(clt_turso_feature = "conn_raw_api"))]
         {
             let _ = mvcc_store;
             let _ = log_record;
             Ok(())
         }
 
-        #[cfg(feature = "conn_raw_api")]
+        #[cfg(clt_turso_feature = "conn_raw_api")]
         {
             if !self.connection.portable_logical_changes_enabled() {
                 return Ok(());
@@ -5729,7 +5729,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         connection: &Connection,
         expected_schema_generation: Option<u64>,
     ) -> Result<TxID> {
-        #[cfg(not(any(test, injected_yields)))]
+        #[cfg(not(any(clt_turso_tests, injected_yields)))]
         let _ = connection;
         // Existing transactions already hold one blocking-checkpoint read guard
         // from begin_tx() (truncate path only). When upgrading read->write, do not acquire another one.
@@ -5807,16 +5807,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             }
             begin_ts
         };
-        #[cfg(any(test, injected_yields))]
+        #[cfg(any(clt_turso_tests, injected_yields))]
         let exclusive_yield_context = YieldContext::new(
             connection.yield_injector(),
             None,
             connection.next_yield_instance_id(),
             tx_id,
         );
-        #[cfg(any(test, injected_yields))]
+        #[cfg(any(clt_turso_tests, injected_yields))]
         let exclusive_yield_context = Some(&exclusive_yield_context);
-        #[cfg(not(any(test, injected_yields)))]
+        #[cfg(not(any(clt_turso_tests, injected_yields)))]
         let exclusive_yield_context: Option<&YieldContext> = None;
 
         let already_exclusive = self.is_exclusive_tx(&tx_id);
@@ -6727,7 +6727,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         tx_id: &TxID,
         yield_context: Option<&YieldContext>,
     ) -> Result<()> {
-        #[cfg(not(any(test, injected_yields)))]
+        #[cfg(not(any(clt_turso_tests, injected_yields)))]
         let _ = yield_context;
         if self.exclusive_tx.load(Ordering::Acquire) == *tx_id {
             // Re-entrant upgrade attempt for the same transaction.
@@ -6751,7 +6751,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 return Err(LimboError::Busy);
             }
         }
-        #[cfg(any(test, injected_yields))]
+        #[cfg(any(clt_turso_tests, injected_yields))]
         if let Some(yield_context) = yield_context {
             if yield_context.injector.as_ref().is_some_and(|injector| {
                 injector.should_yield(

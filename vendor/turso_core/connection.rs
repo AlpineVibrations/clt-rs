@@ -1,6 +1,6 @@
 use crate::alloc::TryClone;
 use crate::error::io_error;
-#[cfg(any(test, injected_yields))]
+#[cfg(any(clt_turso_tests, injected_yields))]
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
 use crate::statement::StatementOrigin;
 use crate::storage::{journal_mode, pager::SavepointResult};
@@ -10,11 +10,11 @@ use crate::sync::{
     },
     Arc, RwLock,
 };
-#[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+#[cfg(all(clt_turso_feature = "fs", clt_turso_feature = "conn_raw_api"))]
 use crate::types::{WalFrameInfo, WalState};
-#[cfg(feature = "fs")]
+#[cfg(clt_turso_feature = "fs")]
 use crate::util::{OpenMode, OpenOptions};
-#[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+#[cfg(all(clt_turso_feature = "fs", clt_turso_feature = "conn_raw_api"))]
 use crate::Page;
 use crate::{
     ast, function,
@@ -38,14 +38,14 @@ use smallvec::SmallVec;
 use std::cmp::Ordering as CmpOrdering;
 use std::fmt::Display;
 use std::ops::Deref;
-#[cfg(feature = "simulator")]
+#[cfg(clt_turso_feature = "simulator")]
 use std::path::Path;
 #[cfg(not(target_family = "wasm"))]
 use tempfile::TempDir;
 use tracing::{instrument, Level};
 use turso_macros::{turso_assert_ne, AtomicEnum};
 
-#[cfg(feature = "simulator")]
+#[cfg(clt_turso_feature = "simulator")]
 fn db_identity_for_testing(db_path: &Path) -> Result<(u32, u32)> {
     let bytes =
         std::fs::read(db_path).map_err(|e| io_error(e, "read db header for simulator testing"))?;
@@ -233,14 +233,14 @@ enum ReparsePhase {
     },
 }
 
-#[cfg(not(feature = "fs"))]
+#[cfg(not(clt_turso_feature = "fs"))]
 #[derive(Default)]
 pub(crate) enum AttachDatabaseState {
     #[default]
     Start,
 }
 
-#[cfg(feature = "fs")]
+#[cfg(clt_turso_feature = "fs")]
 #[derive(Default)]
 pub(crate) enum AttachDatabaseState {
     #[default]
@@ -255,7 +255,7 @@ pub(crate) enum AttachDatabaseState {
     Done,
 }
 
-#[cfg(feature = "fs")]
+#[cfg(clt_turso_feature = "fs")]
 pub(crate) struct AttachDatabaseInitState {
     alias: String,
     reserved_space: Option<u8>,
@@ -265,7 +265,7 @@ pub(crate) struct AttachDatabaseInitState {
     init_st: crate::InitState,
 }
 
-#[cfg(feature = "fs")]
+#[cfg(clt_turso_feature = "fs")]
 pub(crate) struct AttachDatabaseBootstrapState {
     alias: String,
     db: Arc<Database>,
@@ -378,9 +378,9 @@ pub struct Connection {
     ///
     /// This is off by default because the metadata is only useful for raw-log
     /// consumers such as sync clients.
-    #[cfg(feature = "conn_raw_api")]
+    #[cfg(clt_turso_feature = "conn_raw_api")]
     pub(super) portable_logical_changes_enabled: AtomicBool,
-    #[cfg(feature = "conn_raw_api")]
+    #[cfg(clt_turso_feature = "conn_raw_api")]
     pub(super) mvcc_log_metadata: RwLock<HashMap<String, String>>,
     pub(super) capture_data_changes: RwLock<Option<CaptureDataChangesInfo>>,
     /// CDC v2: transaction ID for grouping CDC records by transaction.
@@ -421,11 +421,11 @@ pub struct Connection {
     /// Main DB uses `mv_tx` above for zero-cost hot path access.
     pub(crate) attached_mv_txs:
         RwLock<HashMap<usize, (crate::mvcc::database::TxID, TransactionMode)>>,
-    #[cfg(any(test, injected_yields))]
+    #[cfg(any(clt_turso_tests, injected_yields))]
     pub(super) yield_injector: RwLock<Option<Arc<dyn YieldInjector>>>,
-    #[cfg(any(test, injected_yields))]
+    #[cfg(any(clt_turso_tests, injected_yields))]
     pub(super) failure_injector: RwLock<Option<Arc<dyn FailureInjector>>>,
-    #[cfg(any(test, injected_yields))]
+    #[cfg(any(clt_turso_tests, injected_yields))]
     pub(super) yield_instance_id_counter: AtomicU64,
 
     /// Per-connection view transaction states for uncommitted changes. This represents
@@ -592,18 +592,18 @@ impl Connection {
 
     fn effective_temp_store(&self) -> crate::TempStore {
         let temp_store = self.get_temp_store();
-        #[cfg(feature = "fs")]
+        #[cfg(clt_turso_feature = "fs")]
         {
             temp_store
         }
-        #[cfg(not(feature = "fs"))]
+        #[cfg(not(clt_turso_feature = "fs"))]
         {
             let _ = temp_store;
             crate::TempStore::Memory
         }
     }
 
-    #[cfg(feature = "fs")]
+    #[cfg(clt_turso_feature = "fs")]
     fn create_temp_database(&self) -> Result<TempDatabase> {
         let temp_store = self.effective_temp_store();
         let db_opts = self.make_temp_database_opts();
@@ -673,7 +673,7 @@ impl Connection {
         }
     }
 
-    #[cfg(not(feature = "fs"))]
+    #[cfg(not(clt_turso_feature = "fs"))]
     fn create_temp_database(&self) -> Result<TempDatabase> {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = Database::open_file_with_flags(
@@ -1176,7 +1176,7 @@ impl Connection {
     /// Sync replace-base can install a page snapshot outside ordinary SQL DDL.
     /// The replacement may reuse the same schema cookie while changing root
     /// pages, so cookie-based refresh would keep stale btree metadata.
-    #[cfg(feature = "conn_raw_api")]
+    #[cfg(clt_turso_feature = "conn_raw_api")]
     pub fn force_reparse_schema(self: &Arc<Connection>) -> Result<()> {
         self.force_reparse_schema_inner(true)
     }
@@ -1716,7 +1716,7 @@ impl Connection {
         Ok(Some((stmt, parser.offset())))
     }
 
-    #[cfg(feature = "fs")]
+    #[cfg(clt_turso_feature = "fs")]
     pub fn from_uri(uri: &str, db_opts: DatabaseOpts) -> Result<(Arc<dyn IO>, Arc<Connection>)> {
         use crate::util::MEMORY_PATH;
         let opts = OpenOptions::parse(uri)?;
@@ -1763,7 +1763,7 @@ impl Connection {
         Ok((io, conn))
     }
 
-    #[cfg(feature = "fs")]
+    #[cfg(clt_turso_feature = "fs")]
     fn from_uri_attached(
         uri: &str,
         mut db_opts: DatabaseOpts,
@@ -1959,7 +1959,7 @@ impl Connection {
     }
 
     /// Read schema version at current transaction
-    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    #[cfg(all(clt_turso_feature = "fs", clt_turso_feature = "conn_raw_api"))]
     pub fn read_schema_version(&self) -> Result<u32> {
         let pager = self.pager.load();
         pager
@@ -1972,7 +1972,7 @@ impl Connection {
     ///
     /// New version of the schema must be strictly greater than previous one - otherwise method will panic
     /// Write transaction must be opened in advance - otherwise method will panic
-    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    #[cfg(all(clt_turso_feature = "fs", clt_turso_feature = "conn_raw_api"))]
     pub fn write_schema_version(self: &Arc<Connection>, version: u32) -> Result<()> {
         let TransactionState::Write { .. } = self.get_tx_state() else {
             return Err(LimboError::InternalError(
@@ -2001,7 +2001,7 @@ impl Connection {
 
     /// Try to read page with given ID with fixed WAL watermark position
     /// This method return false if page is not found (so, this is probably new page created after watermark position which wasn't checkpointed to the DB file yet)
-    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    #[cfg(all(clt_turso_feature = "fs", clt_turso_feature = "conn_raw_api"))]
     pub fn try_wal_watermark_read_page(
         &self,
         page_idx: u32,
@@ -2032,23 +2032,23 @@ impl Connection {
     /// `core/io/win_iocp.rs`); every watermark-read site must treat that as
     /// "page absent" (size 0) rather than a hard error. Centralized here so the
     /// platform handling cannot drift across the (now four) call sites.
-    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    #[cfg(all(clt_turso_feature = "fs", clt_turso_feature = "conn_raw_api"))]
     pub fn wal_watermark_read_error_is_absent_page(err: &crate::error::CompletionError) -> bool {
-        #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
+        #[cfg(all(target_os = "windows", clt_turso_feature = "experimental_win_iocp"))]
         {
             matches!(
                 err,
                 crate::error::CompletionError::IOError(std::io::ErrorKind::UnexpectedEof, _)
             )
         }
-        #[cfg(not(all(target_os = "windows", feature = "experimental_win_iocp")))]
+        #[cfg(not(all(target_os = "windows", clt_turso_feature = "experimental_win_iocp")))]
         {
             let _ = err;
             false
         }
     }
 
-    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    #[cfg(all(clt_turso_feature = "fs", clt_turso_feature = "conn_raw_api"))]
     pub fn try_wal_watermark_read_page_begin(
         &self,
         page_idx: u32,
@@ -2069,7 +2069,7 @@ impl Connection {
         Ok(Some((page_ref, c)))
     }
 
-    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    #[cfg(all(clt_turso_feature = "fs", clt_turso_feature = "conn_raw_api"))]
     pub fn try_wal_watermark_read_page_end(
         &self,
         page: &mut [u8],
@@ -2086,17 +2086,17 @@ impl Connection {
 
     /// Return unique set of page numbers changes after WAL watermark position in the current WAL session
     /// (so, if concurrent connection wrote something to the WAL - this method will not see this change)
-    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    #[cfg(all(clt_turso_feature = "fs", clt_turso_feature = "conn_raw_api"))]
     pub fn wal_changed_pages_after(&self, frame_watermark: u64) -> Result<Vec<u32>> {
         self.pager.load().wal_changed_pages_after(frame_watermark)
     }
 
-    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    #[cfg(all(clt_turso_feature = "fs", clt_turso_feature = "conn_raw_api"))]
     pub fn wal_state(&self) -> Result<WalState> {
         self.pager.load().wal_state()
     }
 
-    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    #[cfg(all(clt_turso_feature = "fs", clt_turso_feature = "conn_raw_api"))]
     pub fn wal_get_frame(&self, frame_no: u64, frame: &mut [u8]) -> Result<WalFrameInfo> {
         use crate::storage::sqlite3_ondisk::parse_wal_frame_header;
 
@@ -2112,13 +2112,13 @@ impl Connection {
     /// Insert `frame` (header included) at the position `frame_no` in the WAL
     /// If WAL already has frame at that position - turso-db will compare content of the page and either report conflict or return OK
     /// If attempt to write frame at the position `frame_no` will create gap in the WAL - method will return error
-    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    #[cfg(all(clt_turso_feature = "fs", clt_turso_feature = "conn_raw_api"))]
     pub fn wal_insert_frame(&self, frame_no: u64, frame: &[u8]) -> Result<WalFrameInfo> {
         self.pager.load().wal_insert_frame(frame_no, frame)
     }
 
     /// Start WAL session by initiating read+write transaction for this connection
-    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    #[cfg(all(clt_turso_feature = "fs", clt_turso_feature = "conn_raw_api"))]
     pub fn wal_insert_begin(&self) -> Result<()> {
         let pager = self.pager.load();
         pager.begin_read_tx()?;
@@ -2144,7 +2144,7 @@ impl Connection {
 
     /// Finish WAL session by ending read+write transaction taken in the [Self::wal_insert_begin] method
     /// All frames written after last commit frame (db_size > 0) within the session will be rolled back
-    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    #[cfg(all(clt_turso_feature = "fs", clt_turso_feature = "conn_raw_api"))]
     pub fn wal_insert_end(self: &Arc<Connection>, force_commit: bool) -> Result<()> {
         use crate::{return_if_io, types::IOResult};
 
@@ -2329,7 +2329,7 @@ impl Connection {
     /// External restore paths can move the schema cookie backwards. In that
     /// case the shared schema cache must be replaced rather than updated
     /// monotonically, otherwise new connections can re-adopt stale metadata.
-    #[cfg(feature = "conn_raw_api")]
+    #[cfg(clt_turso_feature = "conn_raw_api")]
     pub fn publish_schema_after_external_restore(&self) -> Result<()> {
         if self.get_tx_state() != TransactionState::None {
             return Err(LimboError::Busy);
@@ -2348,7 +2348,7 @@ impl Connection {
 
     /// Roll back the main-database MVCC transaction while keeping the
     /// surrounding raw WAL-insert session open.
-    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    #[cfg(all(clt_turso_feature = "fs", clt_turso_feature = "conn_raw_api"))]
     pub fn reset_main_mvcc_tx_for_wal_session(&self) {
         let mv_store = self.mv_store();
         let Some(mv_store) = mv_store.as_ref() else {
@@ -2363,21 +2363,21 @@ impl Connection {
 
     /// Discard the main-db MVCC transaction left by a sync raw-WAL session
     /// before reparsing state after external file replacement.
-    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    #[cfg(all(clt_turso_feature = "fs", clt_turso_feature = "conn_raw_api"))]
     pub fn discard_main_mvcc_tx_after_external_restore(&self) {
         let pager = self.pager.load();
         self.clear_internal_main_mvcc_tx(&pager);
     }
 
     /// Returns whether the main database currently has a live MVCC transaction.
-    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    #[cfg(all(clt_turso_feature = "fs", clt_turso_feature = "conn_raw_api"))]
     pub fn has_main_mvcc_tx_for_wal_session(&self) -> bool {
         self.get_mv_tx_id().is_some()
     }
 
     /// Commit the main-database MVCC transaction while keeping the surrounding
     /// raw WAL-insert session open.
-    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    #[cfg(all(clt_turso_feature = "fs", clt_turso_feature = "conn_raw_api"))]
     pub fn commit_main_mvcc_tx_for_wal_session(self: &Arc<Self>) -> Result<()> {
         let mv_store_handle = self.mv_store();
         let Some(mv_store) = mv_store_handle.as_ref() else {
@@ -2397,7 +2397,7 @@ impl Connection {
         Ok(())
     }
 
-    #[cfg(feature = "conn_raw_api")]
+    #[cfg(clt_turso_feature = "conn_raw_api")]
     pub fn reload_wal_after_external_restore(&self) -> Result<()> {
         self.db.reload_wal_after_external_restore()
     }
@@ -2405,7 +2405,7 @@ impl Connection {
     /// Enable or disable writing portable logical-change metadata into MVCC
     /// logical-log frames.
     pub fn set_portable_logical_changes_enabled(&self, enabled: bool) {
-        #[cfg(feature = "conn_raw_api")]
+        #[cfg(clt_turso_feature = "conn_raw_api")]
         {
             self.portable_logical_changes_enabled
                 .store(enabled, Ordering::Release);
@@ -2414,19 +2414,19 @@ impl Connection {
     }
 
     pub fn portable_logical_changes_enabled(&self) -> bool {
-        #[cfg(feature = "conn_raw_api")]
+        #[cfg(clt_turso_feature = "conn_raw_api")]
         {
             self.portable_logical_changes_enabled
                 .load(Ordering::Acquire)
         }
-        #[cfg(not(feature = "conn_raw_api"))]
+        #[cfg(not(clt_turso_feature = "conn_raw_api"))]
         {
             false
         }
     }
 
     pub fn set_mvcc_log_meta(&self, key: String, value: Option<String>) {
-        #[cfg(feature = "conn_raw_api")]
+        #[cfg(clt_turso_feature = "conn_raw_api")]
         {
             let mut metadata = self.mvcc_log_metadata.write();
             match value {
@@ -2438,37 +2438,37 @@ impl Connection {
                 }
             }
         }
-        #[cfg(not(feature = "conn_raw_api"))]
+        #[cfg(not(clt_turso_feature = "conn_raw_api"))]
         {
             let _ = (key, value);
         }
     }
 
-    #[cfg(feature = "conn_raw_api")]
+    #[cfg(clt_turso_feature = "conn_raw_api")]
     pub(crate) fn mvcc_log_meta_snapshot(&self) -> HashMap<String, String> {
         self.mvcc_log_metadata.read().clone()
     }
 
     pub(crate) fn clear_mvcc_log_meta(&self) {
-        #[cfg(feature = "conn_raw_api")]
+        #[cfg(clt_turso_feature = "conn_raw_api")]
         {
             self.mvcc_log_metadata.write().clear();
         }
     }
 
     pub fn mvcc_log_meta(&self, key: &str) -> Option<String> {
-        #[cfg(feature = "conn_raw_api")]
+        #[cfg(clt_turso_feature = "conn_raw_api")]
         {
             return self.mvcc_log_metadata.read().get(key).cloned();
         }
-        #[cfg(not(feature = "conn_raw_api"))]
+        #[cfg(not(clt_turso_feature = "conn_raw_api"))]
         {
             let _ = key;
             None
         }
     }
 
-    #[cfg(feature = "simulator")]
+    #[cfg(clt_turso_feature = "simulator")]
     pub fn checkpoint_for_testing(&self, mode: CheckpointMode) -> Result<CheckpointResult> {
         let pager = self.pager.load();
         pager
@@ -2476,7 +2476,7 @@ impl Connection {
             .block(|| pager.checkpoint(mode, SyncMode::Full, true))
     }
 
-    #[cfg(all(feature = "simulator", target_pointer_width = "64", host_shared_wal))]
+    #[cfg(all(clt_turso_feature = "simulator", target_pointer_width = "64", host_shared_wal))]
     pub fn install_unpublished_backfill_proof_for_testing(
         &self,
         upper_bound_inclusive: u64,
@@ -2620,7 +2620,7 @@ impl Connection {
         Ok(())
     }
 
-    #[cfg(feature = "fs")]
+    #[cfg(clt_turso_feature = "fs")]
     pub fn open_new(&self, path: &str, vfs: &str) -> Result<(Arc<dyn IO>, Arc<Database>)> {
         Database::open_with_vfs(&self.db, path, vfs)
     }
@@ -2628,17 +2628,17 @@ impl Connection {
     pub fn list_vfs(&self) -> Vec<String> {
         #[allow(unused_mut)]
         let mut all_vfs = vec![String::from("memory")];
-        #[cfg(feature = "fs")]
+        #[cfg(clt_turso_feature = "fs")]
         {
             #[cfg(target_family = "unix")]
             {
                 all_vfs.push("syscall".to_string());
             }
-            #[cfg(all(target_os = "linux", feature = "io_uring"))]
+            #[cfg(all(target_os = "linux", clt_turso_feature = "io_uring"))]
             {
                 all_vfs.push("io_uring".to_string());
             }
-            #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
+            #[cfg(all(target_os = "windows", clt_turso_feature = "experimental_win_iocp"))]
             {
                 all_vfs.push("experimental_win_iocp".to_string());
             }
@@ -2849,7 +2849,7 @@ impl Connection {
         }
     }
 
-    #[cfg(any(test, injected_yields))]
+    #[cfg(any(clt_turso_tests, injected_yields))]
     pub fn set_yield_injector(&self, injector: Option<Arc<dyn YieldInjector>>) {
         let mut slot = self.yield_injector.write();
         match injector {
@@ -2870,12 +2870,12 @@ impl Connection {
         }
     }
 
-    #[cfg(any(test, injected_yields))]
+    #[cfg(any(clt_turso_tests, injected_yields))]
     pub(crate) fn yield_injector(&self) -> Option<Arc<dyn YieldInjector>> {
         self.yield_injector.read().clone()
     }
 
-    #[cfg(any(test, injected_yields))]
+    #[cfg(any(clt_turso_tests, injected_yields))]
     pub fn set_failure_injector(&self, injector: Option<Arc<dyn FailureInjector>>) {
         let mut slot = self.failure_injector.write();
         match injector {
@@ -2896,12 +2896,12 @@ impl Connection {
         }
     }
 
-    #[cfg(any(test, injected_yields))]
+    #[cfg(any(clt_turso_tests, injected_yields))]
     pub(crate) fn failure_injector(&self) -> Option<Arc<dyn FailureInjector>> {
         self.failure_injector.read().clone()
     }
 
-    #[cfg(any(test, injected_yields))]
+    #[cfg(any(clt_turso_tests, injected_yields))]
     #[inline(always)]
     pub(crate) fn next_yield_instance_id(&self) -> u64 {
         self.yield_instance_id_counter
@@ -3212,7 +3212,7 @@ impl Connection {
     }
 
     /// Attach a database file with the given alias name
-    #[cfg(not(feature = "fs"))]
+    #[cfg(not(clt_turso_feature = "fs"))]
     pub(crate) fn attach_database(
         &self,
         _path: &str,
@@ -3224,7 +3224,7 @@ impl Connection {
         ))
     }
 
-    #[cfg(not(feature = "fs"))]
+    #[cfg(not(clt_turso_feature = "fs"))]
     pub(crate) fn attach_database_with_config(
         &self,
         _path: &str,
@@ -3238,7 +3238,7 @@ impl Connection {
     }
 
     /// Attach a database file with the given alias name
-    #[cfg(feature = "fs")]
+    #[cfg(clt_turso_feature = "fs")]
     pub(crate) fn attach_database(
         &self,
         path: &str,
@@ -3249,8 +3249,8 @@ impl Connection {
     }
 
     /// Attach a database file with an optional pre-initialization reserved-space override.
-    #[cfg(feature = "fs")]
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(clt_turso_feature = "fs")]
+    #[cfg_attr(not(clt_turso_tests), allow(dead_code))]
     pub(crate) fn attach_database_with_config(
         &self,
         path: &str,
@@ -4966,7 +4966,7 @@ impl SymbolTable {
     }
 }
 
-#[cfg(all(test, feature = "fs"))]
+#[cfg(all(clt_turso_tests, clt_turso_feature = "fs"))]
 mod tests {
     use super::*;
     use tempfile::TempDir;
@@ -5138,7 +5138,7 @@ mod tests {
         assert_eq!(pager.get_reserved_space(), Some(48));
     }
 
-    #[cfg(feature = "checksum")]
+    #[cfg(clt_turso_feature = "checksum")]
     #[test]
     fn test_attach_database_with_config_rejects_reserved_space_below_minimum() {
         let temp_dir = TempDir::new().unwrap();

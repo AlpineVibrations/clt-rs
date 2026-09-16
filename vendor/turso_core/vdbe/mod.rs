@@ -32,7 +32,7 @@ pub mod insn;
 pub mod metrics;
 pub mod rowset;
 pub mod sorter;
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod statement_lifecycle_tests;
 pub mod vacuum;
 pub mod value;
@@ -65,7 +65,7 @@ use crate::{
 };
 use smallvec::SmallVec;
 
-#[cfg(feature = "json")]
+#[cfg(clt_turso_feature = "json")]
 use crate::json::JsonCacheCell;
 use crate::sync::RwLock;
 use crate::{
@@ -732,7 +732,7 @@ pub struct ProgramState {
     /// `SQLITE_BUSY` halt through `op_halt`, which would mis-wrap it as
     /// a constraint error.
     pub sequence_inner_retry_count: u32,
-    #[cfg(feature = "json")]
+    #[cfg(clt_turso_feature = "json")]
     json_cache: JsonCacheCell,
     active_op_state: ActiveOpStateSlot,
     seek_state: OpSeekState,
@@ -829,7 +829,7 @@ impl ProgramState {
             sequence_inner_commit: None,
             sequence_inner_tx_pending: None,
             sequence_inner_retry_count: 0,
-            #[cfg(feature = "json")]
+            #[cfg(clt_turso_feature = "json")]
             json_cache: JsonCacheCell::new(),
             active_op_state: ActiveOpStateSlot::default(),
             seek_state: OpSeekState::Start,
@@ -946,7 +946,7 @@ impl ProgramState {
         self.execution_state = ProgramExecutionState::Init;
         self.query_deadline = None;
         self.current_collation = None;
-        #[cfg(feature = "json")]
+        #[cfg(clt_turso_feature = "json")]
         self.json_cache.clear();
 
         // A caller can reset or drop a statement after an MVCC auto-checkpoint
@@ -3136,7 +3136,7 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
     }
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use super::*;
     use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -3194,7 +3194,7 @@ mod tests {
 /// These tests verify that the implementation correctly upholds these invariants
 /// under concurrent access patterns.
 
-#[cfg(all(shuttle, test))]
+#[cfg(all(shuttle, clt_turso_tests))]
 mod shuttle_tests {
     use super::*;
     use crate::sync::Arc;

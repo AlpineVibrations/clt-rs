@@ -701,7 +701,7 @@ pub fn translate_expr(
 
                     Ok(target_register)
                 }
-                #[cfg(feature = "json")]
+                #[cfg(clt_turso_feature = "json")]
                 Func::Json(j) => match j {
                     JsonFunc::Json | JsonFunc::Jsonb => {
                         let args = expect_arguments_exact!(args, 1, j);
@@ -1254,7 +1254,7 @@ pub fn translate_expr(
                             });
                             Ok(target_register)
                         }
-                        #[cfg(feature = "fs")]
+                        #[cfg(clt_turso_feature = "fs")]
                         #[cfg(not(target_family = "wasm"))]
                         ScalarFunc::LoadExtension => {
                             let args = expect_arguments_exact!(args, 1, srf);
@@ -1290,7 +1290,7 @@ pub fn translate_expr(
                             });
                             Ok(target_register)
                         }
-                        #[cfg(feature = "test_helper")]
+                        #[cfg(clt_turso_feature = "test_helper")]
                         ScalarFunc::TestNondetCounter => {
                             if !args.is_empty() {
                                 crate::bail_parse_error!(
@@ -2057,7 +2057,7 @@ pub fn translate_expr(
                         Ok(target_register)
                     }
                 },
-                #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+                #[cfg(all(clt_turso_feature = "fts", not(target_family = "wasm")))]
                 Func::Fts(_) => {
                     // FTS functions are handled via index method pattern matching.
                     // If we reach here, no index matched, so translate as a regular function call.

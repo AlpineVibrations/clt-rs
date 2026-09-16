@@ -2633,7 +2633,7 @@ pub fn emit_fk_drop_table_check(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use super::*;
 

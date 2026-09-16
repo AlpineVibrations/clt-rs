@@ -24,14 +24,14 @@ fn rust_sources(directory: &Path) -> Vec<PathBuf> {
 }
 
 #[test]
-fn launcher_and_library_expose_one_entry_point() {
+fn launcher_keeps_one_application_entry_point() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let main = fs::read_to_string(root.join("src/main.rs")).unwrap();
     let library = fs::read_to_string(root.join("src/lib.rs")).unwrap();
 
     assert_eq!(
         main,
-        "fn main() -> anyhow::Result<()> {\n    clt_rs::run()\n}\n"
+        "include!(\"lib.rs\");\n\nfn main() -> anyhow::Result<()> {\n    run()\n}\n"
     );
     let public_items = library
         .lines()

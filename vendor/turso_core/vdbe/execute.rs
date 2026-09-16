@@ -107,13 +107,13 @@ fn btree_cursor_with_yield_context(
     cursor: Box<BTreeCursor>,
     connection: &Arc<Connection>,
 ) -> Box<BTreeCursor> {
-    #[cfg(any(test, injected_yields))]
+    #[cfg(any(clt_turso_tests, injected_yields))]
     {
         let mut cursor = cursor;
         cursor.install_yield_context(connection);
         cursor
     }
-    #[cfg(not(any(test, injected_yields)))]
+    #[cfg(not(any(clt_turso_tests, injected_yields)))]
     {
         let _ = connection;
         cursor
@@ -142,7 +142,7 @@ use crate::vdbe::vacuum::{
     VacuumTargetBuildConfig, VacuumTargetBuildContext,
 };
 
-#[cfg(feature = "json")]
+#[cfg(clt_turso_feature = "json")]
 use crate::{
     function::JsonFunc, json, json::convert_dbtype_to_raw_jsonb, json::get_json,
     json::is_json_valid, json::json_array, json::json_array_length, json::json_arrow_extract,
@@ -155,7 +155,7 @@ use crate::{
 
 use super::{make_record, Program, ProgramState, Register};
 
-#[cfg(feature = "fs")]
+#[cfg(clt_turso_feature = "fs")]
 use crate::connection::resolve_ext_path;
 use crate::{bail_constraint_error, must_be_btree_cursor, MvStore, Pager, Result};
 
@@ -1451,7 +1451,7 @@ pub fn op_vupdate(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
-    #[cfg(not(feature = "cli_only"))]
+    #[cfg(not(clt_turso_feature = "cli_only"))]
     let _ = pager;
     load_insn!(
         VUpdate {
@@ -1471,12 +1471,12 @@ pub fn op_vupdate(
         panic!("VUpdate on non-virtual table cursor");
     };
     let allow_dbpage_write = {
-        #[cfg(feature = "cli_only")]
+        #[cfg(clt_turso_feature = "cli_only")]
         {
             virtual_table.name == crate::dbpage::DBPAGE_TABLE_NAME
                 && program.connection.db.opts.unsafe_testing
         }
-        #[cfg(not(feature = "cli_only"))]
+        #[cfg(not(clt_turso_feature = "cli_only"))]
         {
             false
         }
@@ -1503,11 +1503,11 @@ pub fn op_vupdate(
         }
     }
     let result = if allow_dbpage_write {
-        #[cfg(feature = "cli_only")]
+        #[cfg(clt_turso_feature = "cli_only")]
         {
             crate::dbpage::update_dbpage(pager, &argv)
         }
-        #[cfg(not(feature = "cli_only"))]
+        #[cfg(not(clt_turso_feature = "cli_only"))]
         {
             unreachable!("sqlite_dbpage writes require cli_only feature");
         }
@@ -3290,13 +3290,13 @@ pub enum OpTransactionState {
     BeginStatement,
 }
 
-#[cfg(any(test, injected_yields))]
+#[cfg(any(clt_turso_tests, injected_yields))]
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum TransactionYieldPoint {
     BeforeStart,
 }
 
-#[cfg(any(test, injected_yields))]
+#[cfg(any(clt_turso_tests, injected_yields))]
 impl crate::mvcc::yield_hooks::YieldPointMarker for TransactionYieldPoint {
     const POINT_COUNT: u8 = 1;
 
@@ -3567,7 +3567,7 @@ pub fn op_transaction_inner(
                     );
                     return Err(LimboError::SchemaUpdated);
                 }
-                #[cfg(any(test, injected_yields))]
+                #[cfg(any(clt_turso_tests, injected_yields))]
                 {
                     if let Some(IOResult::IO(io)) =
                         crate::mvcc::yield_hooks::maybe_inject_io_yield::<(), _>(
@@ -6023,11 +6023,11 @@ fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> R
             payload.push(Value::from_i64(0)); // count
             payload.push(Value::Null); // fraction (set on first step)
         }
-        #[cfg(feature = "json")]
+        #[cfg(clt_turso_feature = "json")]
         AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
             payload.push(Value::Blob(vec![]));
         }
-        #[cfg(feature = "json")]
+        #[cfg(clt_turso_feature = "json")]
         AggFunc::JsonGroupArray | AggFunc::JsonbGroupArray => {
             payload.push(Value::Blob(vec![]));
         }
@@ -6281,7 +6281,7 @@ fn update_agg_payload(
                 "External aggregate not supported in update_agg_payload".to_string(),
             ));
         }
-        #[cfg(feature = "json")]
+        #[cfg(clt_turso_feature = "json")]
         AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
             // arg = key, maybe_arg2 = value
             let Some(value) = maybe_arg2 else {
@@ -6336,7 +6336,7 @@ fn update_agg_payload(
                 payload.push(arg.clone());
             }
         }
-        #[cfg(feature = "json")]
+        #[cfg(clt_turso_feature = "json")]
         AggFunc::JsonGroupArray | AggFunc::JsonbGroupArray => {
             // arg = value
             let mut data = convert_dbtype_to_raw_jsonb(arg, Conv::NotStrict)?;
@@ -6476,22 +6476,22 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
                 "finalize_agg_payload called for External aggregate".to_string(),
             ));
         }
-        #[cfg(feature = "json")]
+        #[cfg(clt_turso_feature = "json")]
         AggFunc::JsonGroupObject => {
             let data = payload[0].to_blob().expect("Should be blob");
             json_from_raw_bytes_agg(data, false)?
         }
-        #[cfg(feature = "json")]
+        #[cfg(clt_turso_feature = "json")]
         AggFunc::JsonbGroupObject => {
             let data = payload[0].to_blob().expect("Should be blob");
             json_from_raw_bytes_agg(data, true)?
         }
-        #[cfg(feature = "json")]
+        #[cfg(clt_turso_feature = "json")]
         AggFunc::JsonGroupArray => {
             let data = payload[0].to_blob().expect("Should be blob");
             json_from_raw_bytes_agg(data, false)?
         }
-        #[cfg(feature = "json")]
+        #[cfg(clt_turso_feature = "json")]
         AggFunc::JsonbGroupArray => {
             let data = payload[0].to_blob().expect("Should be blob");
             json_from_raw_bytes_agg(data, true)?
@@ -6768,7 +6768,7 @@ pub fn op_agg_step(
                 AggFunc::GroupConcat | AggFunc::StringAgg => {
                     Some(state.registers[*delimiter].get_value().clone())
                 }
-                #[cfg(feature = "json")]
+                #[cfg(clt_turso_feature = "json")]
                 AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
                     Some(state.registers[*delimiter].get_value().clone())
                 }
@@ -6858,20 +6858,20 @@ pub fn op_agg_final(
                 AggFunc::Count | AggFunc::Count0 => {
                     state.registers[dest_reg].set_int(0);
                 }
-                #[cfg(feature = "json")]
+                #[cfg(clt_turso_feature = "json")]
                 AggFunc::JsonGroupArray => {
                     state.registers[dest_reg].set_text(Text::json("[]".to_string()))?;
                 }
-                #[cfg(feature = "json")]
+                #[cfg(clt_turso_feature = "json")]
                 AggFunc::JsonbGroupArray => {
                     state.registers[dest_reg]
                         .set_blob(json::jsonb::Jsonb::make_empty_array(1).data())?;
                 }
-                #[cfg(feature = "json")]
+                #[cfg(clt_turso_feature = "json")]
                 AggFunc::JsonGroupObject => {
                     state.registers[dest_reg].set_text(Text::json("{}".to_string()))?;
                 }
-                #[cfg(feature = "json")]
+                #[cfg(clt_turso_feature = "json")]
                 AggFunc::JsonbGroupObject => {
                     state.registers[dest_reg]
                         .set_blob(json::jsonb::Jsonb::make_empty_obj(1).data())?;
@@ -7336,7 +7336,7 @@ pub fn op_function(
     let arg_count = func.arg_count;
 
     match &func.func {
-        #[cfg(feature = "json")]
+        #[cfg(clt_turso_feature = "json")]
         crate::function::Func::Json(json_func) => match json_func {
             JsonFunc::Json => {
                 let json_value = &state.registers[*start_reg];
@@ -7911,7 +7911,7 @@ pub fn op_function(
             ScalarFunc::Random => {
                 state.registers[*dest].set_int(pager.io.generate_random_number());
             }
-            #[cfg(feature = "test_helper")]
+            #[cfg(clt_turso_feature = "test_helper")]
             ScalarFunc::TestNondetCounter => {
                 // Test-only: process-global atomic counter that increments on
                 // every evaluation. Used in sqltests to verify that the
@@ -8085,7 +8085,7 @@ pub fn op_function(
                     replacement.get_value(),
                 ));
             }
-            #[cfg(feature = "fs")]
+            #[cfg(clt_turso_feature = "fs")]
             #[cfg(not(target_family = "wasm"))]
             ScalarFunc::LoadExtension => {
                 if !program.connection.can_load_extensions() {
@@ -8107,14 +8107,14 @@ pub fn op_function(
             }
             ScalarFunc::TableColumnsJsonArray => {
                 assert_eq!(arg_count, 1);
-                #[cfg(not(feature = "json"))]
+                #[cfg(not(clt_turso_feature = "json"))]
                 {
                     return Err(LimboError::InvalidArgument(
                         "table_columns_json_array: turso must be compiled with JSON support"
                             .to_string(),
                     ));
                 }
-                #[cfg(feature = "json")]
+                #[cfg(clt_turso_feature = "json")]
                 {
                     use crate::types::TextSubtype;
 
@@ -8158,14 +8158,14 @@ pub fn op_function(
             }
             ScalarFunc::BinRecordJsonObject => {
                 assert_eq!(arg_count, 2);
-                #[cfg(not(feature = "json"))]
+                #[cfg(not(clt_turso_feature = "json"))]
                 {
                     return Err(LimboError::InvalidArgument(
                         "bin_record_json_object: turso must be compiled with JSON support"
                             .to_string(),
                     ));
                 }
-                #[cfg(feature = "json")]
+                #[cfg(clt_turso_feature = "json")]
                 'outer: {
                     use crate::types::ValueIterator;
                     use std::str::FromStr;
@@ -9594,7 +9594,7 @@ pub fn op_function(
                 state.registers[*dest + 4].set_value(sql.clone());
             }
         }
-        #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+        #[cfg(all(clt_turso_feature = "fts", not(target_family = "wasm")))]
         crate::function::Func::Fts(fts_func) => {
             // FTS functions are typically handled via index method pattern matching.
             // If we reach here, just return a fallback since no FTS index matched.
@@ -9835,7 +9835,7 @@ pub fn op_yield(
             // Strip JSON subtypes from co-routine output columns so they do not
             // survive the subquery boundary, matching SQLite's OP_Copy P5=0x0002.
             // subtype_clear_count > 0 only for coroutine body yields.
-            #[cfg(feature = "json")]
+            #[cfg(clt_turso_feature = "json")]
             if *subtype_clear_count > 0 {
                 use crate::types::TextSubtype;
                 for reg in &mut state.registers
@@ -14062,12 +14062,12 @@ pub fn op_integrity_check(
                 });
             }
 
-            #[cfg(not(feature = "omit_autovacuum"))]
+            #[cfg(not(clt_turso_feature = "omit_autovacuum"))]
             let skip_page_never_used = !matches!(
                 target_pager.get_auto_vacuum_mode(),
                 crate::storage::pager::AutoVacuumMode::None
             );
-            #[cfg(feature = "omit_autovacuum")]
+            #[cfg(clt_turso_feature = "omit_autovacuum")]
             let skip_page_never_used = false;
 
             if !skip_page_never_used {
@@ -14267,7 +14267,7 @@ pub fn op_rename_table(
             .tables
             .remove(&normalized_from)
             .expect("table being renamed should be in schema");
-        #[cfg(feature = "conn_raw_api")]
+        #[cfg(clt_turso_feature = "conn_raw_api")]
         schema.unregister_table_root_page(table.as_ref());
         match Arc::make_mut(&mut table) {
             Table::BTree(btree) => {
@@ -14297,7 +14297,7 @@ pub fn op_rename_table(
             _ => panic!("only btree and virtual tables can be renamed"),
         }
 
-        #[cfg(feature = "conn_raw_api")]
+        #[cfg(clt_turso_feature = "conn_raw_api")]
         schema.register_table_root_page(&normalized_to, table.as_ref());
         schema.tables.insert(normalized_to.to_owned(), table);
 
@@ -16925,7 +16925,7 @@ fn maybe_transform_root_page_to_positive(mvcc_store: Option<&Arc<MvStore>>, root
     }
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use super::*;
     use crate::alloc::vec;

@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use turso::Database;
+use clt_database::turso::Database;
 
 use super::{atomic_write, mark_required};
 

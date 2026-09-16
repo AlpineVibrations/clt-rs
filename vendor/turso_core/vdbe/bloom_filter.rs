@@ -189,7 +189,7 @@ fn normalized_f64_bits(f: f64) -> u64 {
     }
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod bloomtests {
     use super::*;
     use crate::types::Text;

@@ -585,7 +585,7 @@ impl LogicalLog {
         Self::new_internal(file, io, encryption_ctx, ENCRYPTED_PAYLOAD_CHUNK_SIZE)
     }
 
-    #[cfg(test)]
+    #[cfg(clt_turso_tests)]
     fn new_with_payload_chunk_size(
         file: Arc<dyn File>,
         io: Arc<dyn crate::IO>,
@@ -633,13 +633,13 @@ impl LogicalLog {
         let payload_size = tx.buf.len() - LOG_RECORD_PREFIX_SIZE;
         let payload_size_u64 = payload_size as u64;
 
-        #[cfg(feature = "conn_raw_api")]
+        #[cfg(clt_turso_feature = "conn_raw_api")]
         let has_portable_changes = tx.portable_changes_required || !tx.portable_changes.is_empty();
-        #[cfg(not(feature = "conn_raw_api"))]
+        #[cfg(not(clt_turso_feature = "conn_raw_api"))]
         let has_portable_changes = false;
-        #[cfg(feature = "conn_raw_api")]
+        #[cfg(clt_turso_feature = "conn_raw_api")]
         let portable_changes_enabled = tx.portable_changes_enabled || has_portable_changes;
-        #[cfg(not(feature = "conn_raw_api"))]
+        #[cfg(not(clt_turso_feature = "conn_raw_api"))]
         let portable_changes_enabled = false;
 
         // 1. Ensure we have a log header object (created lazily on first write).
@@ -685,7 +685,7 @@ impl LogicalLog {
         };
         let frame_payload_start = LOG_HDR_SIZE + tx_header_size;
 
-        #[cfg(feature = "conn_raw_api")]
+        #[cfg(clt_turso_feature = "conn_raw_api")]
         let extension_block = if !has_portable_changes {
             Vec::new()
         } else {
@@ -707,7 +707,7 @@ impl LogicalLog {
             )?;
             encode_extension_record(EXTENSION_TYPE_PORTABLE_CHANGES, 0, &portable_changes)?
         };
-        #[cfg(not(feature = "conn_raw_api"))]
+        #[cfg(not(clt_turso_feature = "conn_raw_api"))]
         let extension_block = Vec::new();
 
         let extension_size = u64::try_from(extension_block.len()).map_err(|_| {
@@ -875,10 +875,10 @@ impl LogicalLog {
     }
 
     pub fn upgrade_header_for_log_tx(&mut self, tx: &LogRecord) -> Result<Option<Completion>> {
-        #[cfg(feature = "conn_raw_api")]
+        #[cfg(clt_turso_feature = "conn_raw_api")]
         let portable_changes_enabled =
             tx.portable_changes_enabled || !tx.portable_changes.is_empty();
-        #[cfg(not(feature = "conn_raw_api"))]
+        #[cfg(not(clt_turso_feature = "conn_raw_api"))]
         let portable_changes_enabled = {
             let _ = tx;
             false
@@ -1840,7 +1840,7 @@ pub struct StreamingLogicalLogReader {
     /// Plaintext bytes per encrypted payload chunk. Production uses the fixed format constant;
     /// tests may override via `new_with_encrypted_payload_chunk_size_for_test`.
     encrypted_payload_chunk_size: usize,
-    #[cfg(test)]
+    #[cfg(clt_turso_tests)]
     pending_ops: std::collections::VecDeque<ParsedOp>,
     // Reused scratch buffer for decrypted chunk plaintext. Kept on the reader so encrypted
     // recovery can reuse the allocation across chunks and transaction frames.
@@ -1879,7 +1879,7 @@ impl StreamingLogicalLogReader {
             running_crc: 0,
             encryption_ctx,
             encrypted_payload_chunk_size,
-            #[cfg(test)]
+            #[cfg(clt_turso_tests)]
             pending_ops: std::collections::VecDeque::new(),
             decrypt_scratch,
             in_flight_read: None,
@@ -1891,7 +1891,7 @@ impl StreamingLogicalLogReader {
         Self::new_internal(file, encryption_ctx, ENCRYPTED_PAYLOAD_CHUNK_SIZE)
     }
 
-    #[cfg(test)]
+    #[cfg(clt_turso_tests)]
     fn new_with_payload_chunk_size(
         file: Arc<dyn File>,
         encryption_ctx: Option<EncryptionContext>,
@@ -1911,7 +1911,7 @@ impl StreamingLogicalLogReader {
         self.last_valid_offset
     }
 
-    #[cfg(test)]
+    #[cfg(clt_turso_tests)]
     pub fn has_pending_ops(&self) -> bool {
         !self.pending_ops.is_empty()
     }
@@ -1998,7 +1998,7 @@ impl StreamingLogicalLogReader {
         self.last_valid_offset = LOG_HDR_SIZE;
     }
 
-    #[cfg(test)]
+    #[cfg(clt_turso_tests)]
     pub(crate) fn next_frame_blocking(
         &mut self,
         io: &Arc<dyn crate::IO>,
@@ -2051,7 +2051,7 @@ impl StreamingLogicalLogReader {
     ///
     /// This is a test-only version of [Self::next_frame], and it could eventually be replaced
     /// in tests by [Self::next_frame], which didn't exist when [Self::next_record] was written.
-    #[cfg(test)]
+    #[cfg(clt_turso_tests)]
     pub fn next_record(
         &mut self,
         io: &Arc<dyn crate::IO>,
@@ -3870,7 +3870,7 @@ enum EncryptedChunkReadResult {
     Eof,
 }
 
-#[cfg_attr(test, derive(Debug))]
+#[cfg_attr(clt_turso_tests, derive(Debug))]
 enum ParseResult {
     /// A fully validated transaction frame was parsed.
     Frame(ParsedFrame),
@@ -3883,7 +3883,7 @@ enum ParseResult {
     InvalidFrame,
 }
 
-#[cfg_attr(test, derive(Debug))]
+#[cfg_attr(clt_turso_tests, derive(Debug))]
 pub struct ParsedFrame {
     ops: Vec<ParsedOp>,
     pub portable_changes: Vec<u8>,
@@ -3893,7 +3893,7 @@ pub struct ParsedFrame {
     pub end_offset: usize,
 }
 
-#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+#[cfg_attr(clt_turso_tests, derive(Debug, PartialEq, Eq))]
 pub(crate) enum ParsedOp {
     UpsertTable {
         table_id: MVTableId,
@@ -3933,7 +3933,7 @@ pub(crate) enum IndexOpKind {
     Delete,
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use crate::types::IOResult;
     use crate::util::IOExt as _;
@@ -3972,7 +3972,7 @@ mod tests {
         LOG_HDR_SIZE, LOG_VERSION, LOG_VERSION_V2, TX_EXT_HEADER_SIZE, TX_HEADER_SIZE,
         TX_HEADER_SIZE_V2, TX_TRAILER_SIZE,
     };
-    #[cfg(feature = "conn_raw_api")]
+    #[cfg(clt_turso_feature = "conn_raw_api")]
     use super::{EXTENSION_RECORD_HEADER_SIZE, EXTENSION_TYPE_PORTABLE_CHANGES, OP_UPSERT_TABLE};
     use crate::OpenFlags;
     use crate::{turso_assert, turso_assert_less_than};
@@ -7240,7 +7240,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "conn_raw_api")]
+    #[cfg(clt_turso_feature = "conn_raw_api")]
     #[test]
     fn test_portable_changes_upgrade_non_empty_lml2_log_to_lml3() {
         init_tracing();
@@ -7299,7 +7299,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "conn_raw_api")]
+    #[cfg(clt_turso_feature = "conn_raw_api")]
     #[test]
     fn test_next_portable_change_frame_returns_empty_and_nonempty_lml3_frames() {
         init_tracing();
@@ -7358,7 +7358,7 @@ mod tests {
             .is_none());
     }
 
-    #[cfg(feature = "conn_raw_api")]
+    #[cfg(clt_turso_feature = "conn_raw_api")]
     #[test]
     fn test_portable_extension_block_precedes_recovery_payload() {
         init_tracing();

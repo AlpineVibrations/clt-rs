@@ -461,7 +461,7 @@ pub fn translate_aggregation_step(
             });
             target_register
         }
-        #[cfg(feature = "json")]
+        #[cfg(clt_turso_feature = "json")]
         AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
             if num_args != 2 {
                 crate::bail_parse_error!("max bad number of arguments");
@@ -479,7 +479,7 @@ pub fn translate_aggregation_step(
             });
             target_register
         }
-        #[cfg(feature = "json")]
+        #[cfg(clt_turso_feature = "json")]
         AggFunc::JsonGroupArray | AggFunc::JsonbGroupArray => {
             if num_args != 1 {
                 crate::bail_parse_error!("max bad number of arguments");

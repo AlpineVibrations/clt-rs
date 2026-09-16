@@ -53,7 +53,7 @@ pub fn vector_slice(vector: &Vector, start: usize, end: usize) -> Result<Vector<
     }
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use crate::vector::{
         operations::slice::vector_slice,

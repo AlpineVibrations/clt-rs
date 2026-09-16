@@ -9,7 +9,7 @@ use crate::{
 };
 
 // we use math functions from Rust stdlib in order to be as portable as possible for the production version of the tursodb
-#[cfg(not(test))]
+#[cfg(not(clt_turso_tests))]
 mod cmath {
     pub fn exp(x: f64) -> f64 {
         x.exp()
@@ -74,7 +74,7 @@ mod cmath {
 }
 
 // we use exactly same math function as SQLite in tests in order to avoid mismatch in the differential tests due to floating-point precision issues
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod cmath {
     extern "C" {
         pub fn exp(x: f64) -> f64;
@@ -1620,7 +1620,7 @@ fn compare_chars(p: char, t: char, no_case: bool) -> bool {
     }
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use crate::numeric::Numeric;
     use crate::types::Value;

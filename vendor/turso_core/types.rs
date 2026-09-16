@@ -59,15 +59,15 @@ impl Display for ValueType {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(clt_turso_feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum TextSubtype {
     Text,
-    #[cfg(feature = "json")]
+    #[cfg(clt_turso_feature = "json")]
     Json,
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(clt_turso_feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Text {
     pub value: Cow<'static, str>,
     pub subtype: TextSubtype,
@@ -86,7 +86,7 @@ impl Text {
             subtype: TextSubtype::Text,
         }
     }
-    #[cfg(feature = "json")]
+    #[cfg(clt_turso_feature = "json")]
     pub fn json(value: String) -> Self {
         Self {
             value: value.into(),
@@ -262,7 +262,7 @@ impl From<Text> for String {
 // constructed from registers and extracted directly into registers.
 
 #[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(clt_turso_feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Value {
     Null,
     Numeric(Numeric),
@@ -554,7 +554,7 @@ impl Value {
                 let Some(text) = v.to_text() else {
                     return Ok(Value::Null);
                 };
-                #[cfg(feature = "json")]
+                #[cfg(clt_turso_feature = "json")]
                 if v.is_json() {
                     return Ok(Value::Text(Text::json(text.to_string())));
                 }
@@ -3296,7 +3296,7 @@ impl WalFrameInfo {
     }
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use super::*;
     use crate::alloc::vec;

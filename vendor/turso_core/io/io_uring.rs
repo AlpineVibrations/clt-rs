@@ -888,7 +888,7 @@ impl Drop for UringFile {
     }
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use super::*;
     use crate::io::common;

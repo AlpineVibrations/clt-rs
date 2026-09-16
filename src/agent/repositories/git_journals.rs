@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use turso::{Connection, Database, params, transaction::TransactionBehavior};
+use clt_database::turso::{Connection, Database, params, transaction::TransactionBehavior};
 
 use super::RepositoryDatabase;
 use crate::{

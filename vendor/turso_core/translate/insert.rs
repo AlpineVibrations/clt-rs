@@ -3302,15 +3302,15 @@ fn translate_virtual_table_insert(
     resolver: &Resolver,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
-    #[cfg(not(feature = "cli_only"))]
+    #[cfg(not(clt_turso_feature = "cli_only"))]
     let _ = connection;
     let allow_dbpage_write = {
-        #[cfg(feature = "cli_only")]
+        #[cfg(clt_turso_feature = "cli_only")]
         {
             virtual_table.name == crate::dbpage::DBPAGE_TABLE_NAME
                 && connection.db.opts.unsafe_testing
         }
-        #[cfg(not(feature = "cli_only"))]
+        #[cfg(not(clt_turso_feature = "cli_only"))]
         {
             false
         }

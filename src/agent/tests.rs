@@ -1,5 +1,6 @@
 use crate::test_support::prelude::*;
 use crate::test_support::*;
+use clt_database::turso;
 
 #[test]
 fn agent_state_dir_uses_explicit_override() {

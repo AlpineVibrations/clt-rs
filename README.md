@@ -31,17 +31,21 @@ For the internal crate boundaries and module ownership map, see [ARCHITECTURE.md
 
 ## Installation
 
-Ensure you have Rust and Cargo installed.
+Ensure you have Rust and Cargo installed. Starting with CLT 0.6.15, the published package includes the patched database engine:
 
 ```bash
-cargo install clt-rs
+cargo install clt-rs --locked
 ```
 
-To test this refactor checkout, install from the repository directory so the build includes its pinned database fix:
+Or install from this checkout's repository directory:
 
 ```bash
-cargo install --path . --locked
+cargo install --path . --locked --force
 ```
+
+Crates.io builds through 0.6.14 omitted the local Turso fixes because [Cargo removes `[patch]` entries when packaging](https://doc.rust-lang.org/cargo/commands/cargo-package.html). Version 0.6.15 compiles the vendored engine and local Rust API directly as part of the single CLT package. No separate fork packages need publishing. A compile-time check also rejects a core without the required patch marker. Until 0.6.15 is published, install from the patched repository checkout above.
+
+Check the installed version with `clt --version` (or `clt -V`). For older builds without this option, use `cargo install --list`.
 
 After upgrading `clt`, restart the background scheduler so new work uses the newly installed binary:
 
@@ -65,7 +69,7 @@ eval "$(command clt shell-init bash)"
 
 Restart the shell or reload its configuration. After opening another registered project from the agent projects pane, pressing `q` now exits `clt` and leaves the shell in that project's directory. Other `clt` commands continue to work through the wrapper.
 
-The installed `clt` binary embeds both agent skills. Before an automated Codex run, `clt` looks for each required skill by its frontmatter name in the standard repository, user, and admin skill directories. If a skill is unavailable, `clt` adds its bundled instructions to that run's prompt automatically, so `cargo install clt-rs` is sufficient for agent automation.
+The installed `clt` binary embeds both agent skills. Before an automated Codex run, `clt` looks for each required skill by its frontmatter name in the standard repository, user, and admin skill directories. If a skill is unavailable, `clt` adds its bundled instructions to that run's prompt automatically, so no separate skill installation is required for agent automation.
 
 To make the skills discoverable to Codex outside `clt` agent runs, clone this repository and copy the skill folders into the `skills` directory inside your home `.agents` directory. From the repository root, run:
 
@@ -453,3 +457,5 @@ cargo build --release
 ```
 
 Release notes are tracked in [CHANGELOG.md](CHANGELOG.md). New user-facing features, behavior changes, and bug fixes should be added under `Unreleased` first, then moved into a versioned section when publishing a release.
+
+Before publishing, run `python3 scripts/check_release.py` (Python 3.11 or newer). It builds the single CLT archive, verifies that the patched engine is included without separate database packages, and compares packaged Rust source with the source tested in the checkout. Use `--allow-dirty` only for local preparation. See [the release procedure](docs/RELEASING.md) for publication and post-release checks.

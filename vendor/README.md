@@ -1,20 +1,62 @@
-# Vendored Turso core
+# Bundled Turso engine
 
-`turso_core/` contains the published `turso_core` **0.7.2** crate, copied from
-Cargo's crates.io source cache. The package's `.cargo_vcs_info.json` identifies
-upstream revision `046e9cbf67d22491e8ecc941ec2891b02a9f3cad`, directory `core`, in
-[tursodatabase/turso](https://github.com/tursodatabase/turso/tree/046e9cbf67d22491e8ecc941ec2891b02a9f3cad/core).
-The original crates.io archive checksum is
-`7a833cc3bf8d4e6c101c504fa470f8ab4270c2202ff2591b61b2e373b4f20d9b`.
+CLT publishes these three source directories inside its single `clt-rs` crate:
 
-The published source, manifests, build script, benchmarks and tests are retained.
-Only Cargo's local `.cargo-ok` extraction marker was omitted. `LICENSE` contains
-the upstream [MIT license retained from 0.7.0](https://github.com/tursodatabase/turso/blob/e7cb62a8bd2f3655a661a621ee389365c1a1e43e/LICENSE.md),
-which was not included in the published crate's extracted files.
+| Directory | Purpose |
+| --- | --- |
+| `turso_core` | Patched Turso 0.7.2 database engine; CLT's `clt_database` library target |
+| `turso_sdk_kit` | SDK support compiled as a module of that library |
+| `turso` | Rust database API compiled as a module of that library |
 
-CLT's root `[patch.crates-io]` selects this local package, including for
-`cargo install --path . --locked`. All other dependency versions remain pinned
-by the root `Cargo.lock`.
+These are source directories, not nested Cargo packages. The root manifest lists
+all required dependencies, and the root build script supplies the original
+engine feature configuration and version metadata. There are no fork packages
+or local Cargo patches to publish. Both locked and unlocked `cargo install
+clt-rs` builds compile the bundled engine. Unmodified `turso_parser`, `turso_ext`,
+`turso_macros`, and `turso_sdk_kit_macros` remain registry dependencies pinned to
+`=0.7.2`.
+
+The unused sync engine and sync SDK, Rust API sync module, standalone benches,
+examples, integration test directories, bindgen helper, and separate package
+build scripts have been removed. Platform-specific engine implementations remain
+for Linux, macOS, and Windows. The SDK's C API and generated Rust bindings are
+still needed by its Rust API.
+
+## Source provenance and integration
+
+The sources come from the published 0.7.2 crates. `UPSTREAM_Cargo.toml` and
+`UPSTREAM_VCS_INFO.json` preserve each original manifest and upstream revision
+`046e9cbf67d22491e8ecc941ec2891b02a9f3cad` in
+[tursodatabase/turso](https://github.com/tursodatabase/turso/tree/046e9cbf67d22491e8ecc941ec2891b02a9f3cad).
+Each directory retains an MIT `LICENSE`; the license text is retained from
+[the upstream 0.7.0 source](https://github.com/tursodatabase/turso/blob/e7cb62a8bd2f3655a661a621ee389365c1a1e43e/LICENSE.md),
+as the published archives omitted that file.
+
+Original crates.io archive SHA-256 checksums:
+
+| Package | SHA-256 |
+| --- | --- |
+| `turso_core` | `7a833cc3bf8d4e6c101c504fa470f8ab4270c2202ff2591b61b2e373b4f20d9b` |
+| `turso_sdk_kit` | `18c1dc1c0304348c39b97bc6b27cdcb1d7292454ebd0de0f30b5ee3a4c61f9bb` |
+| `turso` | `f9491d7a80312c5abe66a4409e4dce02065503a235453c94b9e4133877e39ffc` |
+
+The engine keeps its upstream Rust 2021 edition and formatting; CLT's binary
+uses Rust 2024. Cargo currently warns that per-target editions are deprecated.
+The core remains at the library crate root so upstream macros and internal
+imports keep working. SDK/API imports are adjusted to their module locations.
+Engine `feature` checks use the private `clt_turso_feature` cfg, with the original
+production feature set enabled by `build.rs`. This keeps CLT's `--all-features`
+from enabling upstream experimental modes. Unrelated upstream test harnesses use
+`clt_turso_tests` and are disabled; the mapped shared-WAL regression tests still
+run normally alongside CLT's recovery tests. Those harness sources are retained
+for comparison with upstream, without pulling their development dependencies.
+
+CLT requires `CLT_WAL_PATCH_LEVEL` at compile time. The
+[release check](../scripts/check_release.py) builds the extracted single archive,
+rejects a dependency on a separate engine, and compares all packaged Rust source
+with the checked-out source. See [the release procedure](../docs/RELEASING.md).
+When updating Turso, reapply these module/configuration adaptations, review its
+original dependency/features list, and run the WAL regressions and archive check.
 
 ## Local changes
 
@@ -65,6 +107,6 @@ tables and indexes. A CLT regression keeps an exclusive reopened store idle
 after a partial checkpoint while a peer writes, then verifies repeated fresh
 reads, lease replacement, project disable, reopen, and full integrity.
 
-Remove the patch only after a released upstream version contains the equivalent
-ownership and reseeding fixes and passes these regressions. Do not replace it by removing
-CLT's checkpoint pin or discarding the WAL.
+Return to an upstream engine dependency only after a released version contains
+the equivalent ownership and reseeding fixes and passes these regressions. Keep
+CLT's checkpoint pin and retained WAL data when making that transition.

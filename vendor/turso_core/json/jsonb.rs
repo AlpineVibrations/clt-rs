@@ -3546,7 +3546,7 @@ fn utf8_sequence_len(ch: u8) -> usize {
     }
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use super::*;
 
@@ -4215,7 +4215,7 @@ world""#,
     }
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod path_operations_tests {
     use super::*;
     use crate::json::path::{JsonPath, PathElement};

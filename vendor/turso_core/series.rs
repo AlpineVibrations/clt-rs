@@ -282,7 +282,7 @@ impl VTabCursor for GenerateSeriesCursor {
     }
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use super::*;
     use quickcheck::{Arbitrary, Gen};

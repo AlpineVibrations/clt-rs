@@ -207,7 +207,7 @@ impl File for MemoryYieldFile {
     }
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use super::*;
     use crate::vdbe::StepResult;

@@ -384,7 +384,7 @@ fn resolve_func_return_type(
     match func {
         Func::Scalar(sf) => resolve_scalar_func_return_type(sf, args, columns, resolver),
         Func::Math(mf) => resolve_math_func_return_type(mf),
-        #[cfg(feature = "json")]
+        #[cfg(clt_turso_feature = "json")]
         Func::Json(jf) => resolve_json_func_return_type(jf),
         Func::Agg(_) => bail_parse_error!("misuse of aggregate function {}()", name),
         Func::External(_) => {
@@ -536,7 +536,7 @@ fn resolve_math_func_return_type(func: &MathFunc) -> Result<CheckExprType> {
 }
 
 /// Resolve the return type of a JSON function.
-#[cfg(feature = "json")]
+#[cfg(clt_turso_feature = "json")]
 fn resolve_json_func_return_type(func: &crate::function::JsonFunc) -> Result<CheckExprType> {
     use crate::function::JsonFunc;
     match func {

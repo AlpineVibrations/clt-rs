@@ -10,9 +10,9 @@ use crate::mvcc::database::{CommitYieldPoint, ExclusiveTxYieldPoint};
 use crate::mvcc::persistent_storage::logical_log::{
     LogicalLog, ENCRYPTED_PAYLOAD_CHUNK_SIZE, EXT_FRAME_MAGIC, FRAME_MAGIC, LOG_HDR_SIZE,
 };
-#[cfg(feature = "conn_raw_api")]
+#[cfg(clt_turso_feature = "conn_raw_api")]
 use crate::mvcc::persistent_storage::logical_log::{ParsedOp, StreamingLogicalLogReader};
-#[cfg(feature = "conn_raw_api")]
+#[cfg(clt_turso_feature = "conn_raw_api")]
 use crate::mvcc::portable_logical::{PortableLogicalBuilder, PortableObjectMapEntry};
 use crate::mvcc::yield_hooks::YieldPointMarker;
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector, YieldPoint};
@@ -311,7 +311,7 @@ impl MvccTestDb {
         }
     }
 
-    #[cfg(feature = "conn_raw_api")]
+    #[cfg(clt_turso_feature = "conn_raw_api")]
     fn new_with_portable_logical_changes() -> Self {
         let db = Self::new();
         db.conn.set_portable_logical_changes_enabled(true);
@@ -2829,7 +2829,7 @@ fn test_mvcc_header_updates_allow_autocommit_statement_tx() {
 /// Missing/corrupt metadata with logical-log frames and no WAL causes fail-closed startup.
 #[test]
 #[cfg_attr(
-    feature = "checksum",
+    clt_turso_feature = "checksum",
     ignore = "byte-level tamper caught by checksum layer"
 )]
 fn test_meta_recovery_case_3_no_wal_log_frames_without_valid_metadata_fails_closed() {
@@ -2913,7 +2913,7 @@ fn test_meta_recovery_case_4_committed_wal_reconcile_before_metadata_boundary_re
 /// Committed WAL with missing metadata row fails closed.
 #[test]
 #[cfg_attr(
-    feature = "checksum",
+    clt_turso_feature = "checksum",
     ignore = "byte-level tamper caught by checksum layer"
 )]
 fn test_meta_recovery_case_5_committed_wal_missing_metadata_fails_closed() {
@@ -3020,7 +3020,7 @@ fn test_meta_recovery_case_7_metadata_table_shape_violation_fails_closed() {
 /// Deletion of metadata row is detected and rejected.
 #[test]
 #[cfg_attr(
-    feature = "checksum",
+    clt_turso_feature = "checksum",
     ignore = "byte-level tamper caught by checksum layer"
 )]
 fn test_meta_recovery_case_9_metadata_row_deleted_fails_closed() {
@@ -4769,7 +4769,7 @@ fn test_checkpoint_post_durable_failure_then_delete_removes_stale_table_row() {
 /// Replay gate uses metadata boundary and never applies frames at or below it.
 #[test]
 #[cfg_attr(
-    feature = "checksum",
+    clt_turso_feature = "checksum",
     ignore = "byte-level tamper caught by checksum layer"
 )]
 fn test_meta_recovery_case_12_replay_gate_skips_at_or_below_metadata_boundary() {
@@ -12148,7 +12148,7 @@ fn test_abandoned_commit_rolls_back_insert_with_injected_yield() {
 /// Gated on `io_memory_yield`: the test needs [`crate::MemoryYieldIO`] to defer
 /// completions so the bootstrap yields are observable. CI exercises it via the
 /// `--all-features` test job.
-#[cfg(feature = "io_memory_yield")]
+#[cfg(clt_turso_feature = "io_memory_yield")]
 #[test]
 fn test_abandoned_journal_mode_mvcc_bootstrap_restores_connection() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -14729,7 +14729,7 @@ fn assert_log_payloads_decrypt(
     );
 }
 
-#[cfg(feature = "conn_raw_api")]
+#[cfg(clt_turso_feature = "conn_raw_api")]
 fn collect_mvcc_portable_change_bytes(conn: &Arc<Connection>) -> Vec<u8> {
     let mv_store = conn
         .mv_store()
@@ -14747,7 +14747,7 @@ fn collect_mvcc_portable_change_bytes(conn: &Arc<Connection>) -> Vec<u8> {
     portable_changes
 }
 
-#[cfg(feature = "conn_raw_api")]
+#[cfg(clt_turso_feature = "conn_raw_api")]
 fn collect_mvcc_portable_change_bytes_with_encryption(
     conn: &Arc<Connection>,
     encryption_ctx: crate::storage::encryption::EncryptionContext,
@@ -14769,7 +14769,7 @@ fn collect_mvcc_portable_change_bytes_with_encryption(
     portable_changes
 }
 
-#[cfg(feature = "conn_raw_api")]
+#[cfg(clt_turso_feature = "conn_raw_api")]
 fn collect_mvcc_recovery_ops(conn: &Arc<Connection>) -> Vec<ParsedOp> {
     let mv_store = conn
         .mv_store()
@@ -14787,14 +14787,14 @@ fn collect_mvcc_recovery_ops(conn: &Arc<Connection>) -> Vec<ParsedOp> {
     ops
 }
 
-#[cfg(feature = "conn_raw_api")]
+#[cfg(clt_turso_feature = "conn_raw_api")]
 fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
         .any(|window| window == needle)
 }
 
-#[cfg(feature = "conn_raw_api")]
+#[cfg(clt_turso_feature = "conn_raw_api")]
 fn read_proto_varint(bytes: &[u8], offset: &mut usize) -> u64 {
     let mut value = 0u64;
     let mut shift = 0;
@@ -14809,12 +14809,12 @@ fn read_proto_varint(bytes: &[u8], offset: &mut usize) -> u64 {
     }
 }
 
-#[cfg(feature = "conn_raw_api")]
+#[cfg(clt_turso_feature = "conn_raw_api")]
 fn decode_proto_sint64(value: u64) -> i64 {
     ((value >> 1) as i64) ^ (-((value & 1) as i64))
 }
 
-#[cfg(feature = "conn_raw_api")]
+#[cfg(clt_turso_feature = "conn_raw_api")]
 fn skip_proto_field(bytes: &[u8], offset: &mut usize, wire_type: u64) {
     match wire_type {
         0 => {
@@ -14828,21 +14828,21 @@ fn skip_proto_field(bytes: &[u8], offset: &mut usize, wire_type: u64) {
     }
 }
 
-#[cfg(feature = "conn_raw_api")]
+#[cfg(clt_turso_feature = "conn_raw_api")]
 #[derive(Clone, Debug)]
 struct DecodedObjectMap {
     mv_table_id: i64,
     name: String,
 }
 
-#[cfg(feature = "conn_raw_api")]
+#[cfg(clt_turso_feature = "conn_raw_api")]
 #[derive(Clone, Debug, Default)]
 struct DecodedPortableTxn {
     objects: Vec<DecodedObjectMap>,
     metadata: std::collections::HashMap<String, String>,
 }
 
-#[cfg(feature = "conn_raw_api")]
+#[cfg(clt_turso_feature = "conn_raw_api")]
 fn decode_object_map(bytes: &[u8], strings: &[String]) -> Option<DecodedObjectMap> {
     let mut offset = 0usize;
     let mut mv_table_id = None;
@@ -14868,7 +14868,7 @@ fn decode_object_map(bytes: &[u8], strings: &[String]) -> Option<DecodedObjectMa
     })
 }
 
-#[cfg(feature = "conn_raw_api")]
+#[cfg(clt_turso_feature = "conn_raw_api")]
 fn decode_metadata(bytes: &[u8], strings: &[String]) -> Option<(String, String)> {
     let mut offset = 0usize;
     let mut key = None;
@@ -14892,7 +14892,7 @@ fn decode_metadata(bytes: &[u8], strings: &[String]) -> Option<(String, String)>
     Some((key?, value?))
 }
 
-#[cfg(feature = "conn_raw_api")]
+#[cfg(clt_turso_feature = "conn_raw_api")]
 fn decode_portable_change_txns(portable_changes: &[u8]) -> Vec<DecodedPortableTxn> {
     let mut txns = Vec::new();
     let mut offset = 0usize;
@@ -14946,12 +14946,12 @@ fn decode_portable_change_txns(portable_changes: &[u8]) -> Vec<DecodedPortableTx
     txns
 }
 
-#[cfg(feature = "conn_raw_api")]
+#[cfg(clt_turso_feature = "conn_raw_api")]
 fn decoded_object_maps(txns: &[DecodedPortableTxn]) -> Vec<&DecodedObjectMap> {
     txns.iter().flat_map(|txn| txn.objects.iter()).collect()
 }
 
-#[cfg(feature = "conn_raw_api")]
+#[cfg(clt_turso_feature = "conn_raw_api")]
 #[test]
 fn test_mvcc_portable_changes_encoder_matches_metadata_wire_golden() {
     let mut builder = PortableLogicalBuilder::new();
@@ -14975,7 +14975,7 @@ fn test_mvcc_portable_changes_encoder_matches_metadata_wire_golden() {
     );
 }
 
-#[cfg(feature = "conn_raw_api")]
+#[cfg(clt_turso_feature = "conn_raw_api")]
 #[test]
 fn test_mvcc_portable_changes_disabled_by_default() {
     let io = Arc::new(MemoryIO::new());
@@ -14992,7 +14992,7 @@ fn test_mvcc_portable_changes_disabled_by_default() {
     assert!(portable_changes.is_empty());
 }
 
-#[cfg(feature = "conn_raw_api")]
+#[cfg(clt_turso_feature = "conn_raw_api")]
 #[test]
 fn test_mvcc_portable_changes_contains_user_schema_and_rows() {
     let db = MvccTestDb::new_with_portable_logical_changes();
@@ -15012,7 +15012,7 @@ fn test_mvcc_portable_changes_contains_user_schema_and_rows() {
         .any(|object| object.name == "items" && object.mv_table_id < 0));
 }
 
-#[cfg(feature = "conn_raw_api")]
+#[cfg(clt_turso_feature = "conn_raw_api")]
 #[test]
 fn test_mvcc_portable_changes_updates_name_mapping_across_rename() {
     let db = MvccTestDb::new_with_portable_logical_changes();
@@ -15036,7 +15036,7 @@ fn test_mvcc_portable_changes_updates_name_mapping_across_rename() {
     assert!(objects.iter().any(|object| object.name == "things"));
 }
 
-#[cfg(feature = "conn_raw_api")]
+#[cfg(clt_turso_feature = "conn_raw_api")]
 #[test]
 fn test_mvcc_portable_changes_emit_refresh_for_same_rowid_schema_update() {
     let db = MvccTestDb::new_with_portable_logical_changes();
@@ -15054,7 +15054,7 @@ fn test_mvcc_portable_changes_emit_refresh_for_same_rowid_schema_update() {
     assert!(objects.iter().any(|object| object.name == "items"));
 }
 
-#[cfg(feature = "conn_raw_api")]
+#[cfg(clt_turso_feature = "conn_raw_api")]
 #[test]
 fn test_mvcc_portable_changes_emit_drop_and_create_for_drop_recreate_same_name() {
     let db = MvccTestDb::new_with_portable_logical_changes();
@@ -15090,7 +15090,7 @@ fn test_mvcc_portable_changes_emit_drop_and_create_for_drop_recreate_same_name()
     );
 }
 
-#[cfg(feature = "conn_raw_api")]
+#[cfg(clt_turso_feature = "conn_raw_api")]
 #[test]
 fn test_mvcc_portable_changes_resolve_rows_through_object_map_in_same_txn() {
     let db = MvccTestDb::new_with_portable_logical_changes();
@@ -15164,7 +15164,7 @@ fn test_mvcc_mode_supports_cdc_for_client_push() {
     assert_eq!(commit_count, 4);
 }
 
-#[cfg(feature = "conn_raw_api")]
+#[cfg(clt_turso_feature = "conn_raw_api")]
 #[test]
 fn test_mvcc_portable_changes_emit_index_drop_for_drop_table() {
     let db = MvccTestDb::new_with_portable_logical_changes();
@@ -15184,7 +15184,7 @@ fn test_mvcc_portable_changes_emit_index_drop_for_drop_table() {
     assert!(!bytes_contain(&portable_changes, b"items_payload_idx"));
 }
 
-#[cfg(feature = "conn_raw_api")]
+#[cfg(clt_turso_feature = "conn_raw_api")]
 #[test]
 fn test_mvcc_portable_changes_emit_index_trigger_and_view_schema_ops() {
     let db = MvccTestDb::new_with_portable_logical_changes();
@@ -15216,7 +15216,7 @@ fn test_mvcc_portable_changes_emit_index_trigger_and_view_schema_ops() {
     ));
 }
 
-#[cfg(feature = "conn_raw_api")]
+#[cfg(clt_turso_feature = "conn_raw_api")]
 #[test]
 fn test_mvcc_portable_changes_emit_trigger_and_view_lifecycle_ops() {
     let db = MvccTestDb::new_with_portable_logical_changes();
@@ -15249,7 +15249,7 @@ fn test_mvcc_portable_changes_emit_trigger_and_view_lifecycle_ops() {
     assert!(!bytes_contain(&portable_changes, b"items_ai"));
 }
 
-#[cfg(feature = "conn_raw_api")]
+#[cfg(clt_turso_feature = "conn_raw_api")]
 #[test]
 fn test_mvcc_portable_changes_emit_header_only_commits() {
     let db = MvccTestDb::new_with_portable_logical_changes();
@@ -15270,7 +15270,7 @@ fn test_mvcc_portable_changes_emit_header_only_commits() {
 }
 
 #[test]
-#[cfg(feature = "conn_raw_api")]
+#[cfg(clt_turso_feature = "conn_raw_api")]
 fn test_mvcc_portable_changes_use_checkpointed_schema_after_restart() {
     let mut db = MvccTestDbNoConn::new_with_random_db();
     {
@@ -15304,7 +15304,7 @@ fn test_mvcc_portable_changes_use_checkpointed_schema_after_restart() {
     }
 }
 
-#[cfg(feature = "conn_raw_api")]
+#[cfg(clt_turso_feature = "conn_raw_api")]
 #[test]
 fn test_mvcc_portable_changes_resolve_user_table_after_cross_connection_checkpoint() {
     let io = Arc::new(MemoryIO::new());
@@ -15359,7 +15359,7 @@ fn test_mvcc_portable_changes_resolve_user_table_after_cross_connection_checkpoi
     );
 }
 
-#[cfg(feature = "conn_raw_api")]
+#[cfg(clt_turso_feature = "conn_raw_api")]
 #[test]
 fn test_mvcc_portable_changes_resolve_table_after_alter_backfill() {
     let db = MvccTestDb::new_with_portable_logical_changes();
@@ -15403,7 +15403,7 @@ fn test_mvcc_portable_changes_resolve_table_after_alter_backfill() {
     );
 }
 
-#[cfg(feature = "conn_raw_api")]
+#[cfg(clt_turso_feature = "conn_raw_api")]
 #[test]
 fn test_mvcc_portable_changes_emit_ddl_and_backfill_rows_in_same_transaction() {
     let db = MvccTestDb::new_with_portable_logical_changes();
@@ -15430,7 +15430,7 @@ fn test_mvcc_portable_changes_emit_ddl_and_backfill_rows_in_same_transaction() {
     assert!(objects.iter().any(|object| object.name == "items"));
 }
 
-#[cfg(feature = "conn_raw_api")]
+#[cfg(clt_turso_feature = "conn_raw_api")]
 #[test]
 fn test_mvcc_portable_changes_delete_carries_pk_projection_not_old_record() {
     let db = MvccTestDb::new_with_portable_logical_changes();
@@ -15471,7 +15471,7 @@ fn test_mvcc_portable_changes_delete_carries_pk_projection_not_old_record() {
     );
 }
 
-#[cfg(feature = "conn_raw_api")]
+#[cfg(clt_turso_feature = "conn_raw_api")]
 #[test]
 fn test_mvcc_portable_changes_do_not_infer_origin_from_application_table() {
     let db = MvccTestDb::new_with_portable_logical_changes();
@@ -15504,7 +15504,7 @@ fn test_mvcc_portable_changes_do_not_infer_origin_from_application_table() {
     assert!(objects.iter().any(|object| object.name == "items"));
 }
 
-#[cfg(feature = "conn_raw_api")]
+#[cfg(clt_turso_feature = "conn_raw_api")]
 #[test]
 fn test_mvcc_portable_changes_metadata_does_not_auto_enable_or_get_consumed() {
     let io = Arc::new(MemoryIO::new());
@@ -15538,7 +15538,7 @@ fn test_mvcc_portable_changes_metadata_does_not_auto_enable_or_get_consumed() {
     );
 }
 
-#[cfg(feature = "conn_raw_api")]
+#[cfg(clt_turso_feature = "conn_raw_api")]
 #[test]
 fn test_mvcc_portable_changes_are_encrypted_with_log_body() {
     use crate::storage::encryption::{CipherMode, EncryptionContext};

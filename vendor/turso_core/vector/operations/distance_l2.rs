@@ -138,7 +138,7 @@ fn vector_f32_sparse_distance_l2(v1: VectorSparse<f32>, v2: VectorSparse<f32>) -
     (sum as f64).sqrt()
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use quickcheck_macros::quickcheck;
 

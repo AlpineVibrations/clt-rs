@@ -218,7 +218,7 @@ impl Display for ExternalFunc {
     }
 }
 
-#[cfg(feature = "json")]
+#[cfg(clt_turso_feature = "json")]
 #[derive(Debug, Clone, PartialEq, strum::EnumIter)]
 pub enum JsonFunc {
     Json,
@@ -249,14 +249,14 @@ pub enum JsonFunc {
     JsonQuote,
 }
 
-#[cfg(feature = "json")]
+#[cfg(clt_turso_feature = "json")]
 impl Deterministic for JsonFunc {
     fn is_deterministic(&self) -> bool {
         true
     }
 }
 
-#[cfg(feature = "json")]
+#[cfg(clt_turso_feature = "json")]
 impl Display for JsonFunc {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -294,7 +294,7 @@ impl Display for JsonFunc {
     }
 }
 
-#[cfg(feature = "json")]
+#[cfg(clt_turso_feature = "json")]
 impl JsonFunc {
     /// Returns true for operator-style entries that should not appear in PRAGMA function_list.
     pub fn is_internal(&self) -> bool {
@@ -383,7 +383,7 @@ impl VectorFunc {
 }
 
 /// Full-text search functions
-#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[cfg(all(clt_turso_feature = "fts", not(target_family = "wasm")))]
 #[derive(Debug, Clone, PartialEq, strum::EnumIter)]
 pub enum FtsFunc {
     /// fts_score(col1, col2, ..., query): computes FTS relevance score
@@ -397,7 +397,7 @@ pub enum FtsFunc {
     Highlight,
 }
 
-#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[cfg(all(clt_turso_feature = "fts", not(target_family = "wasm")))]
 impl FtsFunc {
     pub fn is_deterministic(&self) -> bool {
         true
@@ -412,7 +412,7 @@ impl FtsFunc {
     }
 }
 
-#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[cfg(all(clt_turso_feature = "fts", not(target_family = "wasm")))]
 impl Display for FtsFunc {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let str = match self {
@@ -435,13 +435,13 @@ pub enum AggFunc {
     StringAgg,
     Sum,
     Total,
-    #[cfg(feature = "json")]
+    #[cfg(clt_turso_feature = "json")]
     JsonbGroupArray,
-    #[cfg(feature = "json")]
+    #[cfg(clt_turso_feature = "json")]
     JsonGroupArray,
-    #[cfg(feature = "json")]
+    #[cfg(clt_turso_feature = "json")]
     JsonbGroupObject,
-    #[cfg(feature = "json")]
+    #[cfg(clt_turso_feature = "json")]
     JsonGroupObject,
     ArrayAgg,
     /// `mode() WITHIN GROUP (ORDER BY x)` — most frequent value of `x`.
@@ -653,9 +653,9 @@ impl AggFunc {
             // `[value]` (mode) or `[value, fraction]` (percentiles).
             Self::Mode => 1,
             Self::PercentileCont | Self::PercentileDisc => 2,
-            #[cfg(feature = "json")]
+            #[cfg(clt_turso_feature = "json")]
             Self::JsonGroupArray | Self::JsonbGroupArray => 1,
-            #[cfg(feature = "json")]
+            #[cfg(clt_turso_feature = "json")]
             Self::JsonGroupObject | Self::JsonbGroupObject => 2,
             Self::External(func) => func
                 .agg_args()
@@ -680,9 +680,9 @@ impl AggFunc {
             Self::ArrayAgg => &[1],
             Self::Mode => &[1],
             Self::PercentileCont | Self::PercentileDisc => &[2],
-            #[cfg(feature = "json")]
+            #[cfg(clt_turso_feature = "json")]
             Self::JsonGroupArray | Self::JsonbGroupArray => &[1],
-            #[cfg(feature = "json")]
+            #[cfg(clt_turso_feature = "json")]
             Self::JsonGroupObject | Self::JsonbGroupObject => &[2],
             Self::External(_) => &[-1],
         }
@@ -703,13 +703,13 @@ impl AggFunc {
             Self::Mode => "mode",
             Self::PercentileCont => "percentile_cont",
             Self::PercentileDisc => "percentile_disc",
-            #[cfg(feature = "json")]
+            #[cfg(clt_turso_feature = "json")]
             Self::JsonbGroupArray => "jsonb_group_array",
-            #[cfg(feature = "json")]
+            #[cfg(clt_turso_feature = "json")]
             Self::JsonGroupArray => "json_group_array",
-            #[cfg(feature = "json")]
+            #[cfg(clt_turso_feature = "json")]
             Self::JsonbGroupObject => "jsonb_group_object",
-            #[cfg(feature = "json")]
+            #[cfg(clt_turso_feature = "json")]
             Self::JsonGroupObject => "json_group_object",
             Self::External(_) => "extension function",
         }
@@ -766,7 +766,7 @@ pub enum ScalarFunc {
     ZeroBlob,
     LastInsertRowid,
     Replace,
-    #[cfg(feature = "fs")]
+    #[cfg(clt_turso_feature = "fs")]
     #[cfg(not(target_family = "wasm"))]
     LoadExtension,
     StrfTime,
@@ -797,7 +797,7 @@ pub enum ScalarFunc {
     /// Test-only: returns a monotonically increasing 64-bit integer on every
     /// evaluation. Used to verify that the planner does not deduplicate
     /// equivalent SQL calls that contain nondeterministic functions.
-    #[cfg(feature = "test_helper")]
+    #[cfg(clt_turso_feature = "test_helper")]
     TestNondetCounter,
     StringReverse,
     // SQL-standard string and math extensions (PG/MySQL/Oracle compatible)
@@ -899,7 +899,7 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::ZeroBlob => true,
             ScalarFunc::LastInsertRowid => false,
             ScalarFunc::Replace => true,
-            #[cfg(feature = "fs")]
+            #[cfg(clt_turso_feature = "fs")]
             #[cfg(not(target_family = "wasm"))]
             ScalarFunc::LoadExtension => false,
             ScalarFunc::StrfTime => false,
@@ -932,7 +932,7 @@ impl Deterministic for ScalarFunc {
             | ScalarFunc::Repeat
             | ScalarFunc::Lpad
             | ScalarFunc::Rpad => true,
-            #[cfg(feature = "test_helper")]
+            #[cfg(clt_turso_feature = "test_helper")]
             ScalarFunc::TestNondetCounter => false,
             ScalarFunc::BooleanToInt
             | ScalarFunc::IntToBoolean
@@ -1044,7 +1044,7 @@ impl Display for ScalarFunc {
             Self::LastInsertRowid => "last_insert_rowid",
             Self::Replace => "replace",
             Self::DateTime => "datetime",
-            #[cfg(feature = "fs")]
+            #[cfg(clt_turso_feature = "fs")]
             #[cfg(not(target_family = "wasm"))]
             Self::LoadExtension => "load_extension",
             Self::StrfTime => "strftime",
@@ -1071,7 +1071,7 @@ impl Display for ScalarFunc {
             Self::TestUintDiv => "test_uint_div",
             Self::TestUintLt => "test_uint_lt",
             Self::TestUintEq => "test_uint_eq",
-            #[cfg(feature = "test_helper")]
+            #[cfg(clt_turso_feature = "test_helper")]
             Self::TestNondetCounter => "test_nondet_counter",
             Self::StringReverse => "string_reverse",
             Self::Gcd => "gcd",
@@ -1152,7 +1152,7 @@ impl ScalarFunc {
             | Self::TursoVersion
             | Self::SqliteSourceId
             | Self::TotalChanges => &[0],
-            #[cfg(feature = "test_helper")]
+            #[cfg(clt_turso_feature = "test_helper")]
             Self::TestNondetCounter => &[0],
             // 1-arg
             Self::Abs
@@ -1198,7 +1198,7 @@ impl ScalarFunc {
             | Self::JulianDay
             | Self::StrfTime
             | Self::Printf => &[-1],
-            #[cfg(feature = "fs")]
+            #[cfg(clt_turso_feature = "fs")]
             #[cfg(not(target_family = "wasm"))]
             Self::LoadExtension => &[-1],
             // Internal functions — arity doesn't matter since they're filtered out
@@ -1429,9 +1429,9 @@ pub enum Func {
     Scalar(ScalarFunc),
     Math(MathFunc),
     Vector(VectorFunc),
-    #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+    #[cfg(all(clt_turso_feature = "fts", not(target_family = "wasm")))]
     Fts(FtsFunc),
-    #[cfg(feature = "json")]
+    #[cfg(clt_turso_feature = "json")]
     Json(JsonFunc),
     AlterTable(AlterTableFunc),
     External(Arc<ExternalFunc>),
@@ -1445,9 +1445,9 @@ impl Display for Func {
             Self::Scalar(scalar_func) => write!(f, "{scalar_func}"),
             Self::Math(math_func) => write!(f, "{math_func}"),
             Self::Vector(vector_func) => write!(f, "{vector_func}"),
-            #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+            #[cfg(all(clt_turso_feature = "fts", not(target_family = "wasm")))]
             Self::Fts(fts_func) => write!(f, "{fts_func}"),
-            #[cfg(feature = "json")]
+            #[cfg(clt_turso_feature = "json")]
             Self::Json(json_func) => write!(f, "{json_func}"),
             Self::External(generic_func) => write!(f, "{generic_func}"),
             Self::AlterTable(alter_func) => write!(f, "{alter_func}"),
@@ -1469,9 +1469,9 @@ impl Deterministic for Func {
             Self::Scalar(scalar_func) => scalar_func.is_deterministic(),
             Self::Math(math_func) => math_func.is_deterministic(),
             Self::Vector(vector_func) => vector_func.is_deterministic(),
-            #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+            #[cfg(all(clt_turso_feature = "fts", not(target_family = "wasm")))]
             Self::Fts(fts_func) => fts_func.is_deterministic(),
-            #[cfg(feature = "json")]
+            #[cfg(clt_turso_feature = "json")]
             Self::Json(json_func) => json_func.is_deterministic(),
             Self::External(external_func) => external_func.is_deterministic(),
             Self::AlterTable(_) => true,
@@ -1497,7 +1497,7 @@ impl Func {
                         | ScalarFunc::SqliteSourceId
                         | ScalarFunc::LastInsertRowid
                 );
-                #[cfg(feature = "test_helper")]
+                #[cfg(clt_turso_feature = "test_helper")]
                 let basic = basic || matches!(scalar_func, ScalarFunc::TestNondetCounter);
                 basic
             }
@@ -1525,7 +1525,7 @@ impl Func {
     /// from the referenced tables. This is used for functions like `json_object(*)`
     /// and `jsonb_object(*)` which create a JSON object with column names as keys
     /// and column values as values.
-    #[cfg(feature = "json")]
+    #[cfg(clt_turso_feature = "json")]
     pub fn needs_star_expansion(&self) -> bool {
         matches!(
             self,
@@ -1533,7 +1533,7 @@ impl Func {
         )
     }
 
-    #[cfg(not(feature = "json"))]
+    #[cfg(not(clt_turso_feature = "json"))]
     pub fn needs_star_expansion(&self) -> bool {
         false
     }
@@ -1609,13 +1609,13 @@ impl Func {
                 Ok(Some(Self::Scalar(ScalarFunc::TimeDiff)))
             }
             "array_agg" => Ok(Some(Self::Agg(AggFunc::ArrayAgg))),
-            #[cfg(feature = "json")]
+            #[cfg(clt_turso_feature = "json")]
             "jsonb_group_array" => Ok(Some(Self::Agg(AggFunc::JsonbGroupArray))),
-            #[cfg(feature = "json")]
+            #[cfg(clt_turso_feature = "json")]
             "json_group_array" => Ok(Some(Self::Agg(AggFunc::JsonGroupArray))),
-            #[cfg(feature = "json")]
+            #[cfg(clt_turso_feature = "json")]
             "jsonb_group_object" => Ok(Some(Self::Agg(AggFunc::JsonbGroupObject))),
-            #[cfg(feature = "json")]
+            #[cfg(clt_turso_feature = "json")]
             "json_group_object" => Ok(Some(Self::Agg(AggFunc::JsonGroupObject))),
             "char" | "chr" => Ok(Some(Self::Scalar(ScalarFunc::Char))),
             "coalesce" => Ok(Some(Self::Scalar(ScalarFunc::Coalesce))),
@@ -1680,53 +1680,53 @@ impl Func {
             "likely" => Ok(Some(Self::Scalar(ScalarFunc::Likely))),
             "likelihood" => Ok(Some(Self::Scalar(ScalarFunc::Likelihood))),
             "unlikely" => Ok(Some(Self::Scalar(ScalarFunc::Unlikely))),
-            #[cfg(feature = "json")]
+            #[cfg(clt_turso_feature = "json")]
             "json" => Ok(Some(Self::Json(JsonFunc::Json))),
-            #[cfg(feature = "json")]
+            #[cfg(clt_turso_feature = "json")]
             "jsonb" => Ok(Some(Self::Json(JsonFunc::Jsonb))),
-            #[cfg(feature = "json")]
+            #[cfg(clt_turso_feature = "json")]
             "json_array_length" => Ok(Some(Self::Json(JsonFunc::JsonArrayLength))),
-            #[cfg(feature = "json")]
+            #[cfg(clt_turso_feature = "json")]
             "json_array" => Ok(Some(Self::Json(JsonFunc::JsonArray))),
-            #[cfg(feature = "json")]
+            #[cfg(clt_turso_feature = "json")]
             "jsonb_array" => Ok(Some(Self::Json(JsonFunc::JsonbArray))),
-            #[cfg(feature = "json")]
+            #[cfg(clt_turso_feature = "json")]
             "json_extract" => Ok(Some(Func::Json(JsonFunc::JsonExtract))),
-            #[cfg(feature = "json")]
+            #[cfg(clt_turso_feature = "json")]
             "jsonb_extract" => Ok(Some(Func::Json(JsonFunc::JsonbExtract))),
-            #[cfg(feature = "json")]
+            #[cfg(clt_turso_feature = "json")]
             "json_object" => Ok(Some(Func::Json(JsonFunc::JsonObject))),
-            #[cfg(feature = "json")]
+            #[cfg(clt_turso_feature = "json")]
             "jsonb_object" => Ok(Some(Func::Json(JsonFunc::JsonbObject))),
-            #[cfg(feature = "json")]
+            #[cfg(clt_turso_feature = "json")]
             "json_type" => Ok(Some(Func::Json(JsonFunc::JsonType))),
-            #[cfg(feature = "json")]
+            #[cfg(clt_turso_feature = "json")]
             "json_error_position" => Ok(Some(Self::Json(JsonFunc::JsonErrorPosition))),
-            #[cfg(feature = "json")]
+            #[cfg(clt_turso_feature = "json")]
             "json_valid" => Ok(Some(Self::Json(JsonFunc::JsonValid))),
-            #[cfg(feature = "json")]
+            #[cfg(clt_turso_feature = "json")]
             "json_patch" => Ok(Some(Self::Json(JsonFunc::JsonPatch))),
-            #[cfg(feature = "json")]
+            #[cfg(clt_turso_feature = "json")]
             "jsonb_patch" => Ok(Some(Self::Json(JsonFunc::JsonbPatch))),
-            #[cfg(feature = "json")]
+            #[cfg(clt_turso_feature = "json")]
             "json_remove" => Ok(Some(Self::Json(JsonFunc::JsonRemove))),
-            #[cfg(feature = "json")]
+            #[cfg(clt_turso_feature = "json")]
             "jsonb_remove" => Ok(Some(Self::Json(JsonFunc::JsonbRemove))),
-            #[cfg(feature = "json")]
+            #[cfg(clt_turso_feature = "json")]
             "json_replace" => Ok(Some(Self::Json(JsonFunc::JsonReplace))),
-            #[cfg(feature = "json")]
+            #[cfg(clt_turso_feature = "json")]
             "json_insert" => Ok(Some(Self::Json(JsonFunc::JsonInsert))),
-            #[cfg(feature = "json")]
+            #[cfg(clt_turso_feature = "json")]
             "jsonb_insert" => Ok(Some(Self::Json(JsonFunc::JsonbInsert))),
-            #[cfg(feature = "json")]
+            #[cfg(clt_turso_feature = "json")]
             "jsonb_replace" => Ok(Some(Self::Json(JsonFunc::JsonbReplace))),
-            #[cfg(feature = "json")]
+            #[cfg(clt_turso_feature = "json")]
             "json_pretty" => Ok(Some(Self::Json(JsonFunc::JsonPretty))),
-            #[cfg(feature = "json")]
+            #[cfg(clt_turso_feature = "json")]
             "json_set" => Ok(Some(Self::Json(JsonFunc::JsonSet))),
-            #[cfg(feature = "json")]
+            #[cfg(clt_turso_feature = "json")]
             "jsonb_set" => Ok(Some(Self::Json(JsonFunc::JsonbSet))),
-            #[cfg(feature = "json")]
+            #[cfg(clt_turso_feature = "json")]
             "json_quote" => Ok(Some(Self::Json(JsonFunc::JsonQuote))),
             "unixepoch" => Ok(Some(Self::Scalar(ScalarFunc::UnixEpoch))),
             "julianday" => Ok(Some(Self::Scalar(ScalarFunc::JulianDay))),
@@ -1770,7 +1770,7 @@ impl Func {
             "tan" => Ok(Some(Self::Math(MathFunc::Tan))),
             "tanh" => Ok(Some(Self::Math(MathFunc::Tanh))),
             "trunc" => Ok(Some(Self::Math(MathFunc::Trunc))),
-            #[cfg(feature = "fs")]
+            #[cfg(clt_turso_feature = "fs")]
             #[cfg(not(target_family = "wasm"))]
             "load_extension" => Ok(Some(Self::Scalar(ScalarFunc::LoadExtension))),
             "strftime" => Ok(Some(Self::Scalar(ScalarFunc::StrfTime))),
@@ -1789,11 +1789,11 @@ impl Func {
             "vector_concat" => Ok(Some(Self::Vector(VectorFunc::VectorConcat))),
             "vector_slice" => Ok(Some(Self::Vector(VectorFunc::VectorSlice))),
             // FTS functions
-            #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+            #[cfg(all(clt_turso_feature = "fts", not(target_family = "wasm")))]
             "fts_score" => Ok(Some(Self::Fts(FtsFunc::Score))),
-            #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+            #[cfg(all(clt_turso_feature = "fts", not(target_family = "wasm")))]
             "fts_match" => Ok(Some(Self::Fts(FtsFunc::Match))),
-            #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+            #[cfg(all(clt_turso_feature = "fts", not(target_family = "wasm")))]
             "fts_highlight" => Ok(Some(Self::Fts(FtsFunc::Highlight))),
             // Test type functions (for custom type system testing)
             "test_uint_encode" => Ok(Some(Self::Scalar(ScalarFunc::TestUintEncode))),
@@ -1804,7 +1804,7 @@ impl Func {
             "test_uint_div" => Ok(Some(Self::Scalar(ScalarFunc::TestUintDiv))),
             "test_uint_lt" => Ok(Some(Self::Scalar(ScalarFunc::TestUintLt))),
             "test_uint_eq" => Ok(Some(Self::Scalar(ScalarFunc::TestUintEq))),
-            #[cfg(feature = "test_helper")]
+            #[cfg(clt_turso_feature = "test_helper")]
             "test_nondet_counter" => Ok(Some(Self::Scalar(ScalarFunc::TestNondetCounter))),
             "string_reverse" | "reverse" => Ok(Some(Self::Scalar(ScalarFunc::StringReverse))),
             "gcd" => Ok(Some(Self::Scalar(ScalarFunc::Gcd))),
@@ -1907,7 +1907,7 @@ impl Func {
         }
 
         // JSON functions (feature-gated, filter out operator-style entries)
-        #[cfg(feature = "json")]
+        #[cfg(clt_turso_feature = "json")]
         for f in JsonFunc::iter() {
             if f.is_internal() {
                 continue;
@@ -1916,7 +1916,7 @@ impl Func {
         }
 
         // FTS functions (feature-gated)
-        #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+        #[cfg(all(clt_turso_feature = "fts", not(target_family = "wasm")))]
         for f in FtsFunc::iter() {
             push(f.to_string(), "s", f.arities(), f.is_deterministic());
         }

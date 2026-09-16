@@ -13,7 +13,7 @@ impl ChecksumContext {
         ChecksumContext {}
     }
 
-    #[cfg(not(feature = "checksum"))]
+    #[cfg(not(clt_turso_feature = "checksum"))]
     pub fn add_checksum_to_page(&self, _page: &mut [u8], _page_id: usize) -> Result<()> {
         use crate::LimboError;
         Err(LimboError::InternalError(
@@ -22,7 +22,7 @@ impl ChecksumContext {
         ))
     }
 
-    #[cfg(not(feature = "checksum"))]
+    #[cfg(not(clt_turso_feature = "checksum"))]
     pub fn verify_checksum(
         &self,
         _page: &mut [u8],
@@ -31,7 +31,7 @@ impl ChecksumContext {
         Err(CompletionError::ChecksumNotEnabled)
     }
 
-    #[cfg(feature = "checksum")]
+    #[cfg(clt_turso_feature = "checksum")]
     pub fn add_checksum_to_page(&self, page: &mut [u8], _page_id: usize) -> Result<()> {
         if page.len() != CHECKSUM_PAGE_SIZE {
             return Ok(());
@@ -47,7 +47,7 @@ impl ChecksumContext {
         Ok(())
     }
 
-    #[cfg(feature = "checksum")]
+    #[cfg(clt_turso_feature = "checksum")]
     pub fn verify_checksum(
         &self,
         page: &mut [u8],
@@ -93,8 +93,8 @@ impl Default for ChecksumContext {
     }
 }
 
-#[cfg(test)]
-#[cfg(feature = "checksum")]
+#[cfg(clt_turso_tests)]
+#[cfg(clt_turso_feature = "checksum")]
 mod tests {
     use super::*;
 

@@ -2,6 +2,7 @@ use crate::runner::tests::FakeAgentRunner;
 use crate::test_support::prelude::*;
 use crate::test_support::*;
 use crate::tui::tests::tui_agent_project_for_test;
+use clt_database::turso;
 
 #[test]
 fn interactive_codex_resume_command_is_always_writable() {

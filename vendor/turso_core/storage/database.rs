@@ -52,9 +52,9 @@ impl IOContext {
 
 impl Default for IOContext {
     fn default() -> Self {
-        #[cfg(feature = "checksum")]
+        #[cfg(clt_turso_feature = "checksum")]
         let encryption_or_checksum = EncryptionOrChecksum::Checksum(ChecksumContext::default());
-        #[cfg(not(feature = "checksum"))]
+        #[cfg(not(clt_turso_feature = "checksum"))]
         let encryption_or_checksum = EncryptionOrChecksum::None;
         Self {
             encryption_or_checksum,
@@ -279,7 +279,7 @@ impl DatabaseStorage for DatabaseFile {
     }
 }
 
-#[cfg(feature = "fs")]
+#[cfg(clt_turso_feature = "fs")]
 impl DatabaseFile {
     pub fn new(file: Arc<dyn crate::io::File>) -> Self {
         Self { file }
@@ -297,7 +297,7 @@ fn checksum_buffer(page_idx: usize, buffer: Arc<Buffer>, ctx: &ChecksumContext) 
     buffer
 }
 
-#[cfg(all(test, feature = "checksum"))]
+#[cfg(all(clt_turso_tests, clt_turso_feature = "checksum"))]
 mod tests {
     use super::*;
     use crate::File;

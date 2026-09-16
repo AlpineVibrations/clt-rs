@@ -433,7 +433,7 @@ impl<'a> Vector<'a> {
     }
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 pub(crate) mod tests {
     use crate::vector::operations;
 

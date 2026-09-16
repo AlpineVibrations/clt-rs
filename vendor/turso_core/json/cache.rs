@@ -97,7 +97,7 @@ impl JsonCacheCell {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(clt_turso_tests)]
     pub fn lookup(&self, key: impl AsValueRef) -> Option<Jsonb> {
         assert!(!self.accessed.get());
 
@@ -175,7 +175,7 @@ impl JsonCacheCell {
     }
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use super::*;
     use std::str::FromStr;

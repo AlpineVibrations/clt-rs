@@ -1176,7 +1176,7 @@ pub fn consider_multi_index_intersection(
     ))
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use super::{
         consider_multi_index_intersection, consider_multi_index_union, AnalyzeStats,

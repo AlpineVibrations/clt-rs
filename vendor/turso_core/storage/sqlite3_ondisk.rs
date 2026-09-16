@@ -306,7 +306,7 @@ impl Default for TextEncoding {
 }
 
 #[derive(Pod, Zeroable, Clone, Copy, Debug)]
-#[cfg_attr(test, derive(PartialEq, Eq))]
+#[cfg_attr(clt_turso_tests, derive(PartialEq, Eq))]
 #[repr(C, packed)]
 /// Database Header Format
 pub struct DatabaseHeader {
@@ -2208,7 +2208,7 @@ pub fn read_u32(buf: &[u8], pos: usize) -> u32 {
     u32::from_be_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]])
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use crate::Value;
 

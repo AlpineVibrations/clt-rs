@@ -266,11 +266,11 @@ impl InitLoop {
                                 | OperationMode::DELETE
                         );
                         let allow_dbpage_write = {
-                            #[cfg(feature = "cli_only")]
+                            #[cfg(clt_turso_feature = "cli_only")]
                             {
                                 t_ctx.unsafe_testing && tbl.name == crate::dbpage::DBPAGE_TABLE_NAME
                             }
-                            #[cfg(not(feature = "cli_only"))]
+                            #[cfg(not(clt_turso_feature = "cli_only"))]
                             {
                                 false
                             }

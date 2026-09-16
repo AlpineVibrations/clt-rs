@@ -315,7 +315,7 @@ where
     json_string_to_db_type(json, el_type, OutputVariant::Binary)
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use crate::types::Text;
 

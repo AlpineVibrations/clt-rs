@@ -381,7 +381,7 @@ impl StatAccum {
     }
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use super::parse_stat_numbers;
 

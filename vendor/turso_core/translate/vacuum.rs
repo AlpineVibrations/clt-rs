@@ -88,7 +88,7 @@ fn extract_path_from_expr(expr: &Expr) -> Result<String> {
     }
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use super::*;
 

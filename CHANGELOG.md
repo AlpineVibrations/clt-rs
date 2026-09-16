@@ -6,6 +6,17 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+## [0.6.15] - 2026-09-16
+
+### Added
+
+- Add `clt --version` and `clt -V` to report the package version without opening a task board or agent registry.
+
+### Fixed
+
+- Bundle the patched Turso engine and local Rust API directly in the single `clt-rs` package, so crates.io installs retain the registry fixes without separately publishing fork crates.
+- Reject builds whose database core lacks the required CLT patch marker, verify the actual publishable archive in CI on Linux and macOS, and remove unused vendored sync packages and standalone package scaffolding.
+
 ## [0.6.14] - 2026-09-14
 
 ### Fixed

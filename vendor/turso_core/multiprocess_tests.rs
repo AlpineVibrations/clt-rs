@@ -2,7 +2,7 @@ use super::*;
 use std::process::Command;
 use std::time::Duration;
 
-#[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
+#[cfg(all(target_os = "windows", clt_turso_feature = "experimental_win_iocp"))]
 use crate::WindowsIOCP;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
@@ -33,12 +33,12 @@ const MULTIPROCESS_ASYNC_OPEN_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_async_open_child_process";
 
 fn multiprocess_test_io() -> Arc<dyn IO> {
-    #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
+    #[cfg(all(target_os = "windows", clt_turso_feature = "experimental_win_iocp"))]
     {
         Arc::new(WindowsIOCP::new().unwrap())
     }
 
-    #[cfg(not(all(target_os = "windows", feature = "experimental_win_iocp")))]
+    #[cfg(not(all(target_os = "windows", clt_turso_feature = "experimental_win_iocp")))]
     {
         Arc::new(PlatformIO::new().unwrap())
     }
@@ -200,7 +200,7 @@ fn flip_db_header_reserved_byte(path: &std::path::Path) {
         .open(path)
         .unwrap();
 
-    #[cfg(feature = "checksum")]
+    #[cfg(clt_turso_feature = "checksum")]
     {
         let mut page = vec![0u8; 4096];
         file.read_exact(&mut page).unwrap();
@@ -213,7 +213,7 @@ fn flip_db_header_reserved_byte(path: &std::path::Path) {
         file.sync_all().unwrap();
     }
 
-    #[cfg(not(feature = "checksum"))]
+    #[cfg(not(clt_turso_feature = "checksum"))]
     {
         file.seek(SeekFrom::Start(72)).unwrap();
         let mut byte = [0u8; 1];

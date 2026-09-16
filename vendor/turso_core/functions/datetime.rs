@@ -1389,7 +1389,7 @@ where
     Value::from_text(res)
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use super::*;
 

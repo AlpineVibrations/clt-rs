@@ -35,15 +35,15 @@ pub mod clock;
 pub mod cursor;
 pub mod database;
 pub mod persistent_storage;
-#[cfg(feature = "conn_raw_api")]
+#[cfg(clt_turso_feature = "conn_raw_api")]
 pub mod portable_logical;
-#[cfg(any(test, injected_yields))]
+#[cfg(any(clt_turso_tests, injected_yields))]
 pub(crate) mod yield_hooks;
 pub mod yield_points;
 pub use clock::MvccClock;
 pub use database::MvStore;
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use crate::mvcc::database::tests::{
         commit_tx_no_conn, generate_simple_string_row, MvccTestDbNoConn,

@@ -758,7 +758,7 @@ pub enum SchemaObjectType {
 #[derive(Debug)]
 pub struct Schema {
     pub tables: HashMap<String, Arc<Table>>,
-    #[cfg(feature = "conn_raw_api")]
+    #[cfg(clt_turso_feature = "conn_raw_api")]
     pub(crate) table_names_by_root_page: HashMap<i64, String>,
 
     /// Track which tables are actually materialized views
@@ -816,12 +816,12 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
     use turso_parser::parser::Parser;
 
     let type_sqls: &[&str] = &[
-        #[cfg(feature = "uuid")]
+        #[cfg(clt_turso_feature = "uuid")]
         "CREATE TYPE uuid(value text) BASE blob ENCODE uuid_blob(value) DECODE uuid_str(value) DEFAULT uuid4_str() OPERATOR '<'",
         "CREATE TYPE boolean(value any) BASE integer ENCODE boolean_to_int(value) DECODE CASE WHEN value THEN 1 ELSE 0 END OPERATOR '<'",
-        #[cfg(feature = "json")]
+        #[cfg(clt_turso_feature = "json")]
         "CREATE TYPE json(value text) BASE text ENCODE json(value) DECODE value",
-        #[cfg(feature = "json")]
+        #[cfg(clt_turso_feature = "json")]
         "CREATE TYPE jsonb(value text) BASE blob ENCODE jsonb(value) DECODE json(value)",
         "CREATE TYPE varchar(value text, maxlen integer) BASE text ENCODE CASE WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long for varchar') END DECODE value OPERATOR '<'",
         "CREATE TYPE date(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN date(value) IS NULL THEN RAISE(ABORT, 'invalid date value') ELSE date(value) END DECODE value OPERATOR '<'",
@@ -895,7 +895,7 @@ impl Schema {
 
     pub fn with_options(enable_custom_types: bool) -> crate::Result<Self> {
         let mut tables: HashMap<String, Arc<Table>> = HashMap::default();
-        #[cfg(feature = "conn_raw_api")]
+        #[cfg(clt_turso_feature = "conn_raw_api")]
         let mut table_names_by_root_page = HashMap::default();
         let has_indexes = HashSet::default();
         let indexes: HashMap<String, VecDeque<Arc<Index>>> = HashMap::default();
@@ -904,7 +904,7 @@ impl Schema {
             SCHEMA_TABLE_NAME.to_string(),
             Arc::new(Table::BTree(sqlite_schema_table()?.into())),
         );
-        #[cfg(feature = "conn_raw_api")]
+        #[cfg(clt_turso_feature = "conn_raw_api")]
         table_names_by_root_page.insert(1, SCHEMA_TABLE_NAME.to_string());
         let materialized_view_names = HashSet::default();
         let materialized_view_sql = HashMap::default();
@@ -919,7 +919,7 @@ impl Schema {
         }
         let mut schema = Self {
             tables,
-            #[cfg(feature = "conn_raw_api")]
+            #[cfg(clt_turso_feature = "conn_raw_api")]
             table_names_by_root_page,
             materialized_view_names,
             materialized_view_sql,
@@ -1131,7 +1131,7 @@ impl Schema {
         let name = normalize_ident(view.name());
 
         // Add to tables (so it appears as a regular table)
-        #[cfg(feature = "conn_raw_api")]
+        #[cfg(clt_turso_feature = "conn_raw_api")]
         self.register_table_root_page(&name, table.as_ref());
         self.tables.insert(name.clone(), table);
 
@@ -1353,7 +1353,7 @@ impl Schema {
     pub fn add_btree_table(&mut self, table: Arc<BTreeTable>) -> Result<()> {
         self.check_object_name_conflict(&table.name)?;
         let name = normalize_ident(&table.name);
-        #[cfg(feature = "conn_raw_api")]
+        #[cfg(clt_turso_feature = "conn_raw_api")]
         self.table_names_by_root_page
             .insert(table.root_page, name.clone());
         self.tables.insert(name, Table::BTree(table).into());
@@ -1372,7 +1372,7 @@ impl Schema {
         self.tables.get(&name).cloned()
     }
 
-    #[cfg(feature = "conn_raw_api")]
+    #[cfg(clt_turso_feature = "conn_raw_api")]
     pub fn table_name_for_root_page(&self, root_page: i64) -> Option<&str> {
         self.table_names_by_root_page
             .get(&root_page)
@@ -1381,13 +1381,13 @@ impl Schema {
 
     pub fn remove_table(&mut self, table_name: &str) {
         let name = normalize_ident(table_name);
-        #[cfg(feature = "conn_raw_api")]
+        #[cfg(clt_turso_feature = "conn_raw_api")]
         {
             if let Some(table) = self.tables.remove(&name) {
                 self.unregister_table_root_page(&table);
             }
         }
-        #[cfg(not(feature = "conn_raw_api"))]
+        #[cfg(not(clt_turso_feature = "conn_raw_api"))]
         {
             self.tables.remove(&name);
         }
@@ -1400,7 +1400,7 @@ impl Schema {
         }
     }
 
-    #[cfg(feature = "conn_raw_api")]
+    #[cfg(clt_turso_feature = "conn_raw_api")]
     pub fn register_table_root_page(&mut self, name: &str, table: &Table) {
         if let Table::BTree(table) = table {
             self.table_names_by_root_page
@@ -1408,7 +1408,7 @@ impl Schema {
         }
     }
 
-    #[cfg(feature = "conn_raw_api")]
+    #[cfg(clt_turso_feature = "conn_raw_api")]
     pub fn unregister_table_root_page(&mut self, table: &Table) {
         if let Table::BTree(table) = table {
             self.table_names_by_root_page.remove(&table.root_page);
@@ -1470,7 +1470,7 @@ impl Schema {
             .filter(|i| !i.is_backing_btree_index())
     }
 
-    #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+    #[cfg(all(clt_turso_feature = "fts", not(target_family = "wasm")))]
     pub fn has_fts_index(&self, table_name: &str) -> bool {
         self.get_indices(table_name).any(|idx| {
             idx.index_method.as_ref().is_some_and(|m| {
@@ -2800,7 +2800,7 @@ impl TryClone for Schema {
         let incompatible_views = self.incompatible_views.try_clone()?;
         Ok(Self {
             tables,
-            #[cfg(feature = "conn_raw_api")]
+            #[cfg(clt_turso_feature = "conn_raw_api")]
             table_names_by_root_page: self.table_names_by_root_page.try_clone()?,
             materialized_view_names,
             materialized_view_sql,
@@ -3834,7 +3834,7 @@ impl BTreeTable {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(clt_turso_tests)]
     pub(crate) fn peek_column_dependencies(&self) -> Option<&GeneratedColGraph> {
         self.column_dependencies.0.get()
     }
@@ -5920,7 +5920,7 @@ impl Index {
     }
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use super::*;
     use crate::alloc::vec;

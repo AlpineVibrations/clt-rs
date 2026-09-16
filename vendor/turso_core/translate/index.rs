@@ -1460,7 +1460,7 @@ pub fn translate_optimize(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use super::canonical_create_index_sql;
     use turso_parser::{ast, parser::Parser};

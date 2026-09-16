@@ -1,6 +1,6 @@
 pub const ENV_DISABLE_FILE_LOCK: &str = "LIMBO_DISABLE_FILE_LOCK";
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 pub mod tests {
     use crate::{Result, IO};
     use std::process::{Command, Stdio};

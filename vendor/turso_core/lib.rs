@@ -11,37 +11,43 @@
     )
 )]
 #![recursion_limit = "256"]
+// Keep upstream lint policy separate from the CLT application.
+#![allow(warnings, clippy::all)]
+
+/// CLT's required reader ownership, reseeding, and disk-scan fixes are present.
+/// Increment when CLT starts depending on an additional core correctness fix.
+pub const CLT_WAL_PATCH_LEVEL: u32 = 1;
 
 pub mod alloc;
 pub mod busy;
-#[cfg(feature = "cli_only")]
+#[cfg(clt_turso_feature = "cli_only")]
 pub mod dbpage;
-#[cfg(any(feature = "fuzz", feature = "bench"))]
+#[cfg(any(clt_turso_feature = "fuzz", clt_turso_feature = "bench"))]
 pub mod functions;
 pub mod index_method;
 pub mod io;
-#[cfg(all(feature = "json", any(feature = "fuzz", feature = "bench")))]
+#[cfg(all(clt_turso_feature = "json", any(clt_turso_feature = "fuzz", clt_turso_feature = "bench")))]
 pub mod json;
 #[cfg(all(
-    test,
-    feature = "fs",
+    clt_turso_tests,
+    clt_turso_feature = "fs",
     host_shared_wal,
-    any(not(target_os = "windows"), feature = "experimental_win_iocp")
+    any(not(target_os = "windows"), clt_turso_feature = "experimental_win_iocp")
 ))]
 mod multiprocess_tests;
 pub mod mvcc;
-#[cfg(any(feature = "fuzz", feature = "bench"))]
+#[cfg(any(clt_turso_feature = "fuzz", clt_turso_feature = "bench"))]
 pub mod numeric;
 pub mod schema;
 pub mod skiplist;
 pub mod state_machine;
 pub mod storage;
 pub mod types;
-#[cfg(any(feature = "fuzz", feature = "bench"))]
+#[cfg(any(clt_turso_feature = "fuzz", clt_turso_feature = "bench"))]
 pub mod vdbe;
 pub mod vector;
 
-#[cfg(feature = "cli_only")]
+#[cfg(clt_turso_feature = "cli_only")]
 pub(crate) mod btree_dump;
 pub(crate) mod sync;
 pub(crate) mod thread;
@@ -53,38 +59,38 @@ mod error;
 mod ext;
 mod fast_lock;
 mod function;
-#[cfg(not(any(feature = "fuzz", feature = "bench")))]
+#[cfg(not(any(clt_turso_feature = "fuzz", clt_turso_feature = "bench")))]
 mod functions;
 mod incremental;
 mod info;
-#[cfg(all(feature = "json", not(any(feature = "fuzz", feature = "bench"))))]
+#[cfg(all(clt_turso_feature = "json", not(any(clt_turso_feature = "fuzz", clt_turso_feature = "bench"))))]
 mod json;
-#[cfg(not(any(feature = "fuzz", feature = "bench")))]
+#[cfg(not(any(clt_turso_feature = "fuzz", clt_turso_feature = "bench")))]
 mod numeric;
 mod parameters;
-#[cfg(feature = "percentile")]
+#[cfg(clt_turso_feature = "percentile")]
 mod percentile;
 mod pragma;
 mod progress;
 mod pseudo;
 mod regexp;
-#[cfg(feature = "series")]
+#[cfg(clt_turso_feature = "series")]
 mod series;
 mod stack;
 mod statement;
 mod stats;
 #[allow(dead_code)]
-#[cfg(feature = "time")]
+#[cfg(clt_turso_feature = "time")]
 mod time;
 mod translate;
 mod util;
-#[cfg(feature = "uuid")]
+#[cfg(clt_turso_feature = "uuid")]
 mod uuid;
-#[cfg(not(any(feature = "fuzz", feature = "bench")))]
+#[cfg(not(any(clt_turso_feature = "fuzz", clt_turso_feature = "bench")))]
 mod vdbe;
 mod vtab;
 
-#[cfg(any(feature = "fuzz", feature = "bench"))]
+#[cfg(any(clt_turso_feature = "fuzz", clt_turso_feature = "bench"))]
 pub use function::MathFunc;
 
 use crate::{
@@ -125,7 +131,7 @@ use std::{
     ops::Deref,
     time::Duration,
 };
-#[cfg(feature = "fs")]
+#[cfg(clt_turso_feature = "fs")]
 use storage::database::DatabaseFile;
 #[cfg(host_shared_wal)]
 use storage::shared_wal_coordination::MappedSharedWalCoordination;
@@ -138,16 +144,16 @@ pub use connection::{resolve_ext_path, Connection, Row, StepResult, SymbolTable}
 pub(crate) use connection::{AtomicTransactionState, TransactionState};
 pub use error::{io_error, CompletionError, LimboError};
 pub use function::ContextCollationFunction;
-#[cfg(feature = "io_memory_yield")]
+#[cfg(clt_turso_feature = "io_memory_yield")]
 pub use io::MemoryYieldIO;
-#[cfg(all(feature = "fs", target_family = "unix", not(miri)))]
+#[cfg(all(clt_turso_feature = "fs", target_family = "unix", not(miri)))]
 pub use io::UnixIO;
-#[cfg(all(feature = "fs", target_os = "linux", feature = "io_uring", not(miri)))]
+#[cfg(all(clt_turso_feature = "fs", target_os = "linux", clt_turso_feature = "io_uring", not(miri)))]
 pub use io::UringIO;
 #[cfg(all(
-    feature = "fs",
+    clt_turso_feature = "fs",
     target_os = "windows",
-    feature = "experimental_win_iocp",
+    clt_turso_feature = "experimental_win_iocp",
     not(miri)
 ))]
 pub use io::WindowsIOCP;
@@ -242,7 +248,7 @@ impl DatabaseOpts {
         Self::default()
     }
 
-    #[cfg(feature = "cli_only")]
+    #[cfg(clt_turso_feature = "cli_only")]
     pub fn turso_cli(mut self) -> Self {
         self.enable_load_extension = true;
         self
@@ -325,7 +331,7 @@ pub struct SharedWalOpenTelemetry {
     pub sanitized_backfill_proof_on_open: bool,
 }
 
-#[cfg(feature = "simulator")]
+#[cfg(clt_turso_feature = "simulator")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SharedWalTestingSnapshot {
     pub max_frame: u64,
@@ -586,7 +592,7 @@ enum DatabaseKey {
 static DATABASE_MANAGER: LazyLock<Arc<parking_lot::Mutex<HashMap<DatabaseKey, RegistryEntry>>>> =
     LazyLock::new(|| Arc::new(parking_lot::Mutex::new(HashMap::default())));
 
-#[cfg(feature = "simulator")]
+#[cfg(clt_turso_feature = "simulator")]
 pub fn clear_database_registry() {
     DATABASE_MANAGER.lock().clear();
 }
@@ -772,7 +778,7 @@ impl Database {
         Ok(db)
     }
 
-    #[cfg(feature = "fs")]
+    #[cfg(clt_turso_feature = "fs")]
     pub fn open_file(io: Arc<dyn IO>, path: &str) -> Result<Arc<Database>> {
         Self::open_file_with_flags(io, path, OpenFlags::default(), DatabaseOpts::new(), None)
     }
@@ -780,7 +786,7 @@ impl Database {
     /// Open or retrieve a shared named in-memory database.
     /// Multiple connections to the same `name` share a single `Database`,
     /// matching SQLite's `file:name?mode=memory&cache=shared` semantics.
-    #[cfg(feature = "fs")]
+    #[cfg(clt_turso_feature = "fs")]
     pub fn open_shared_memory(name: &str) -> Result<Arc<Database>> {
         let key = DatabaseKey::SharedMemory(name.to_string());
 
@@ -806,7 +812,7 @@ impl Database {
         Ok(db)
     }
 
-    #[cfg(feature = "fs")]
+    #[cfg(clt_turso_feature = "fs")]
     #[cfg(host_shared_wal)]
     fn effective_open_flags_for_path(
         io: &Arc<dyn IO>,
@@ -841,7 +847,7 @@ impl Database {
         Ok(flags)
     }
 
-    #[cfg(feature = "fs")]
+    #[cfg(clt_turso_feature = "fs")]
     #[cfg(not(host_shared_wal))]
     fn effective_open_flags_for_path(
         _io: &Arc<dyn IO>,
@@ -855,7 +861,7 @@ impl Database {
         Ok(flags)
     }
 
-    #[cfg(feature = "fs")]
+    #[cfg(clt_turso_feature = "fs")]
     #[cfg(host_shared_wal)]
     fn reject_live_multiprocess_wal_for_legacy_open(
         io: &Arc<dyn IO>,
@@ -890,7 +896,7 @@ impl Database {
         Ok(())
     }
 
-    #[cfg(feature = "fs")]
+    #[cfg(clt_turso_feature = "fs")]
     #[cfg(not(host_shared_wal))]
     fn reject_live_multiprocess_wal_for_legacy_open(
         _io: &Arc<dyn IO>,
@@ -900,7 +906,7 @@ impl Database {
         Ok(())
     }
 
-    #[cfg(feature = "fs")]
+    #[cfg(clt_turso_feature = "fs")]
     #[cfg(host_shared_wal)]
     fn reject_live_legacy_wal_for_multiprocess_open(
         io: &Arc<dyn IO>,
@@ -922,7 +928,7 @@ impl Database {
         }
     }
 
-    #[cfg(feature = "fs")]
+    #[cfg(clt_turso_feature = "fs")]
     #[cfg(not(host_shared_wal))]
     fn reject_live_legacy_wal_for_multiprocess_open(
         _io: &Arc<dyn IO>,
@@ -970,7 +976,7 @@ impl Database {
         Ok(Some(db))
     }
 
-    #[cfg(feature = "fs")]
+    #[cfg(clt_turso_feature = "fs")]
     pub fn open_file_with_flags(
         io: Arc<dyn IO>,
         path: &str,
@@ -981,7 +987,7 @@ impl Database {
         Self::open_file_with_flags_and_durable_storage(io, path, flags, opts, encryption_opts, None)
     }
 
-    #[cfg(feature = "fs")]
+    #[cfg(clt_turso_feature = "fs")]
     pub fn open_file_with_flags_and_durable_storage(
         io: Arc<dyn IO>,
         path: &str,
@@ -1122,7 +1128,7 @@ impl Database {
         // Re-derive lock-mode flags from opts the same way the sync
         // `open_file_with_flags` path does: multiprocess WAL must open the
         // WAL file with NoLock or the second process fails to lock `-wal`.
-        #[cfg(feature = "fs")]
+        #[cfg(clt_turso_feature = "fs")]
         let flags = Self::effective_open_flags_for_path(&io, path, flags, opts)?;
         Self::open_with_flags_async_with_allocator(
             state,
@@ -1287,7 +1293,7 @@ impl Database {
     }
 
     /// method for tests - for all other code we must use async alternative
-    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    #[cfg(all(clt_turso_feature = "fs", clt_turso_feature = "conn_raw_api"))]
     pub fn open_with_flags_bypass_registry(
         io: Arc<dyn IO>,
         path: &str,
@@ -2055,7 +2061,7 @@ impl Database {
         }
     }
 
-    #[cfg(feature = "conn_raw_api")]
+    #[cfg(clt_turso_feature = "conn_raw_api")]
     /// Rebuild the process-local shared WAL view after a caller restores the
     /// database and WAL files outside the pager.
     pub fn reload_wal_after_external_restore(self: &Arc<Self>) -> Result<()> {
@@ -2192,9 +2198,9 @@ impl Database {
             cache_size: AtomicI32::new(default_cache_size),
             page_size: AtomicU16::new(page_size.get_raw()),
             wal_auto_actions: AtomicU8::new(WalAutoActions::all_enabled().bits()),
-            #[cfg(feature = "conn_raw_api")]
+            #[cfg(clt_turso_feature = "conn_raw_api")]
             portable_logical_changes_enabled: AtomicBool::new(false),
-            #[cfg(feature = "conn_raw_api")]
+            #[cfg(clt_turso_feature = "conn_raw_api")]
             mvcc_log_metadata: RwLock::new(HashMap::default()),
             capture_data_changes: RwLock::new(None),
             cdc_transaction_id: AtomicI64::new(-1),
@@ -2208,11 +2214,11 @@ impl Database {
             sequence_inner_retries: AtomicU64::new(0),
             mv_tx: RwLock::new(None),
             attached_mv_txs: RwLock::new(HashMap::default()),
-            #[cfg(any(test, injected_yields))]
+            #[cfg(any(clt_turso_tests, injected_yields))]
             yield_injector: RwLock::new(None),
-            #[cfg(any(test, injected_yields))]
+            #[cfg(any(clt_turso_tests, injected_yields))]
             failure_injector: RwLock::new(None),
-            #[cfg(any(test, injected_yields))]
+            #[cfg(any(clt_turso_tests, injected_yields))]
             yield_instance_id_counter: AtomicU64::new(1),
             view_transaction_states: AllViewsTxState::new(),
             metrics: RwLock::new(ConnectionMetrics::new()),
@@ -2630,7 +2636,7 @@ impl Database {
         })
     }
 
-    #[cfg(feature = "simulator")]
+    #[cfg(clt_turso_feature = "simulator")]
     pub fn shared_wal_snapshot_for_testing(&self) -> Result<Option<SharedWalTestingSnapshot>> {
         #[cfg(host_shared_wal)]
         if let Some(authority) = self.shared_wal_coordination()? {
@@ -2646,7 +2652,7 @@ impl Database {
         Ok(None)
     }
 
-    #[cfg(feature = "simulator")]
+    #[cfg(clt_turso_feature = "simulator")]
     pub fn shared_wal_find_frame_for_testing(&self, page_id: u64) -> Result<Option<u64>> {
         #[cfg(host_shared_wal)]
         if let Some(authority) = self.shared_wal_coordination()? {
@@ -2657,7 +2663,7 @@ impl Database {
         Ok(None)
     }
 
-    #[cfg(feature = "simulator")]
+    #[cfg(clt_turso_feature = "simulator")]
     pub fn local_wal_find_frame_for_testing(&self, page_id: u64) -> Result<Option<u64>> {
         let shared = self.shared_wal.read();
         let max_frame = shared.metadata.max_frame.load(Ordering::Acquire);
@@ -2670,7 +2676,7 @@ impl Database {
         }))
     }
 
-    #[cfg(feature = "simulator")]
+    #[cfg(clt_turso_feature = "simulator")]
     pub fn local_wal_max_frame_for_testing(&self) -> Result<u64> {
         Ok(self
             .shared_wal
@@ -2680,7 +2686,7 @@ impl Database {
             .load(Ordering::Acquire))
     }
 
-    #[cfg(feature = "simulator")]
+    #[cfg(clt_turso_feature = "simulator")]
     pub fn clear_backfill_proof_for_testing(&self) -> Result<()> {
         #[cfg(host_shared_wal)]
         {
@@ -2797,7 +2803,7 @@ impl Database {
         Ok(IOResult::Done(pager))
     }
 
-    #[cfg(feature = "fs")]
+    #[cfg(clt_turso_feature = "fs")]
     pub fn io_for_path(path: &str) -> Result<Arc<dyn IO>> {
         let io: Arc<dyn IO> = if is_memory_like(path.trim()) {
             Arc::new(MemoryIO::new())
@@ -2807,7 +2813,7 @@ impl Database {
         Ok(io)
     }
 
-    #[cfg(feature = "fs")]
+    #[cfg(clt_turso_feature = "fs")]
     pub fn io_for_vfs<S: AsRef<str> + std::fmt::Display>(vfs: S) -> Result<Arc<dyn IO>> {
         if let Some(io) = crate::io::get_registered_io(vfs.as_ref()) {
             return Ok(io);
@@ -2821,12 +2827,12 @@ impl Database {
             Some(vfs) => vfs,
             None => match vfs.as_ref() {
                 "memory" => Arc::new(MemoryIO::new()),
-                #[cfg(feature = "io_memory_yield")]
+                #[cfg(clt_turso_feature = "io_memory_yield")]
                 "memory_yield" => Arc::new(MemoryYieldIO::new()),
                 "syscall" => Arc::new(SyscallIO::new()?),
-                #[cfg(all(target_os = "linux", feature = "io_uring", not(miri)))]
+                #[cfg(all(target_os = "linux", clt_turso_feature = "io_uring", not(miri)))]
                 "io_uring" => Arc::new(UringIO::new()?),
-                #[cfg(all(target_os = "windows", feature = "experimental_win_iocp", not(miri)))]
+                #[cfg(all(target_os = "windows", clt_turso_feature = "experimental_win_iocp", not(miri)))]
                 "experimental_win_iocp" => Arc::new(WindowsIOCP::new()?),
 
                 other => {
@@ -2839,7 +2845,7 @@ impl Database {
 
     /// Open a new database file with optionally specifying a VFS without an existing database
     /// connection and symbol table to register extensions.
-    #[cfg(feature = "fs")]
+    #[cfg(clt_turso_feature = "fs")]
     pub fn open_new<S>(
         path: &str,
         vfs: Option<S>,
@@ -2972,12 +2978,12 @@ impl Database {
         self.mv_store.load().is_some()
     }
 
-    #[cfg(feature = "test_helper")]
+    #[cfg(clt_turso_feature = "test_helper")]
     pub fn set_pending_byte(val: u32) {
         Pager::set_pending_byte(val);
     }
 
-    #[cfg(feature = "test_helper")]
+    #[cfg(clt_turso_feature = "test_helper")]
     pub fn get_pending_byte() -> u32 {
         Pager::get_pending_byte()
     }
@@ -3265,7 +3271,7 @@ impl Iterator for QueryRunner<'_> {
     }
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod database_tests {
     use super::{is_memory_like, Database};
 
@@ -3279,7 +3285,7 @@ mod database_tests {
         assert!(!is_memory_like("file:memory.db"));
     }
 
-    #[cfg(feature = "fs")]
+    #[cfg(clt_turso_feature = "fs")]
     #[test]
     fn io_for_path_uses_memory_io_for_named_memory_database() {
         let path = format!(":memory:named-io-selection-{}", std::process::id());
@@ -3291,3 +3297,10 @@ mod database_tests {
         assert!(std::fs::metadata(&path).is_err());
     }
 }
+
+// The engine and SDK are targets/modules of CLT's single Cargo package.
+pub extern crate self as turso_core;
+#[path = "../turso_sdk_kit/src/lib.rs"]
+pub mod turso_sdk_kit;
+#[path = "../turso/src/lib.rs"]
+pub mod turso;

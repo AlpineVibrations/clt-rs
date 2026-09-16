@@ -1,8 +1,8 @@
-#[cfg(feature = "fs")]
+#[cfg(clt_turso_feature = "fs")]
 mod dynamic;
 mod vtab_xconnect;
 use crate::index_method::backing_btree::BackingBtreeIndexMethod;
-#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[cfg(all(clt_turso_feature = "fts", not(target_family = "wasm")))]
 use crate::index_method::fts::{FtsIndexMethod, FTS_INDEX_METHOD_NAME};
 use crate::index_method::toy_vector_sparse_ivf::VectorSparseInvertedIndexMethod;
 use crate::index_method::{
@@ -11,16 +11,16 @@ use crate::index_method::{
 use crate::schema::{Schema, Table};
 use crate::sync::atomic::{AtomicU64, Ordering};
 use crate::sync::Mutex;
-#[cfg(all(target_os = "linux", feature = "io_uring", not(miri)))]
+#[cfg(all(target_os = "linux", clt_turso_feature = "io_uring", not(miri)))]
 use crate::UringIO;
-#[cfg(all(target_os = "windows", feature = "experimental_win_iocp", not(miri)))]
+#[cfg(all(target_os = "windows", clt_turso_feature = "experimental_win_iocp", not(miri)))]
 use crate::WindowsIOCP;
 
 use crate::{function::ExternalFunc, Connection, Database};
 use crate::{vtab::VirtualTable, SymbolTable};
-#[cfg(feature = "fs")]
+#[cfg(clt_turso_feature = "fs")]
 use crate::{LimboError, IO};
-#[cfg(feature = "fs")]
+#[cfg(clt_turso_feature = "fs")]
 pub use dynamic::{add_builtin_vfs_extensions, add_vfs_module, list_vfs_modules, VfsMod};
 use std::{
     ffi::{c_char, c_void, CStr, CString},
@@ -210,7 +210,7 @@ pub(crate) unsafe extern "C" fn register_aggregate_function(
 }
 
 impl Database {
-    #[cfg(feature = "fs")]
+    #[cfg(clt_turso_feature = "fs")]
     #[allow(clippy::arc_with_non_send_sync, dead_code)]
     pub fn open_with_vfs(
         &self,
@@ -222,12 +222,12 @@ impl Database {
 
         let io: Arc<dyn IO> = match vfs {
             "memory" => Arc::new(MemoryIO::new()),
-            #[cfg(feature = "io_memory_yield")]
+            #[cfg(clt_turso_feature = "io_memory_yield")]
             "memory_yield" => Arc::new(crate::MemoryYieldIO::new()),
             "syscall" => Arc::new(SyscallIO::new()?),
-            #[cfg(all(target_os = "linux", feature = "io_uring", not(miri)))]
+            #[cfg(all(target_os = "linux", clt_turso_feature = "io_uring", not(miri)))]
             "io_uring" => Arc::new(UringIO::new()?),
-            #[cfg(all(target_os = "windows", feature = "experimental_win_iocp", not(miri)))]
+            #[cfg(all(target_os = "windows", clt_turso_feature = "experimental_win_iocp", not(miri)))]
             "experimental_win_iocp" => Arc::new(WindowsIOCP::new()?),
             other => match get_vfs_modules().iter().find(|v| v.0 == vfs) {
                 Some((_, vfs)) => vfs.clone(),
@@ -253,7 +253,7 @@ impl Database {
                 BACKING_BTREE_INDEX_METHOD_NAME.to_string(),
                 Arc::new(BackingBtreeIndexMethod),
             );
-            #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+            #[cfg(all(clt_turso_feature = "fts", not(target_family = "wasm")))]
             syms.index_methods
                 .insert(FTS_INDEX_METHOD_NAME.to_string(), Arc::new(FtsIndexMethod));
         }
@@ -273,7 +273,7 @@ impl Database {
             register_aggregate_function,
             unregister_function,
             register_vtab_module,
-            #[cfg(feature = "fs")]
+            #[cfg(clt_turso_feature = "fs")]
             vfs_interface: turso_ext::VfsInterface {
                 register_vfs: dynamic::register_vfs,
                 builtin_vfs: std::ptr::null_mut(),
@@ -281,16 +281,16 @@ impl Database {
             },
         };
 
-        #[cfg(feature = "uuid")]
+        #[cfg(clt_turso_feature = "uuid")]
         crate::uuid::register_extension(&mut ext_api);
-        #[cfg(feature = "series")]
+        #[cfg(clt_turso_feature = "series")]
         crate::series::register_extension(&mut ext_api);
-        #[cfg(feature = "time")]
+        #[cfg(clt_turso_feature = "time")]
         crate::time::register_extension(&mut ext_api);
-        #[cfg(feature = "percentile")]
+        #[cfg(clt_turso_feature = "percentile")]
         crate::percentile::register_extension(&mut ext_api);
         crate::regexp::register_extension(&mut ext_api);
-        #[cfg(feature = "fs")]
+        #[cfg(clt_turso_feature = "fs")]
         {
             let vfslist = add_builtin_vfs_extensions(Some(ext_api)).map_err(|e| e.to_string())?;
             for (name, vfs) in vfslist {
@@ -335,7 +335,7 @@ impl Connection {
             register_aggregate_function,
             unregister_function,
             register_vtab_module,
-            #[cfg(feature = "fs")]
+            #[cfg(clt_turso_feature = "fs")]
             vfs_interface: turso_ext::VfsInterface {
                 register_vfs: dynamic::register_vfs,
                 builtin_vfs: std::ptr::null_mut(),

@@ -124,7 +124,7 @@ fn vector_f32_sparse_distance_jaccard(v1: VectorSparse<f32>, v2: VectorSparse<f3
     1. - (min_sum / max_sum) as f64
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use quickcheck_macros::quickcheck;
 

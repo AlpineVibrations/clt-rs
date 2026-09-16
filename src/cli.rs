@@ -37,7 +37,7 @@ enum ShellKind {
 }
 
 #[derive(Parser)]
-#[command(name = "lls-cli-task")]
+#[command(name = "clt", version)]
 #[command(about = "A simple file-system-backed task management system", long_about = None)]
 struct Cli {
     /// Force use of current directory instead of git root

@@ -2941,7 +2941,7 @@ impl MappedSharedWalCoordination {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(not(all(target_os = "windows", feature = "experimental_win_iocp")))]
+    #[cfg(not(all(target_os = "windows", clt_turso_feature = "experimental_win_iocp")))]
     use crate::io::PlatformIO;
     use crate::io::IO;
     use std::sync::Arc;
@@ -2961,12 +2961,12 @@ mod tests {
     }
 
     fn test_shared_wal_io() -> Arc<dyn IO> {
-        #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
+        #[cfg(all(target_os = "windows", clt_turso_feature = "experimental_win_iocp"))]
         {
             Arc::new(crate::WindowsIOCP::new().unwrap())
         }
 
-        #[cfg(not(all(target_os = "windows", feature = "experimental_win_iocp")))]
+        #[cfg(not(all(target_os = "windows", clt_turso_feature = "experimental_win_iocp")))]
         {
             Arc::new(PlatformIO::new().unwrap())
         }

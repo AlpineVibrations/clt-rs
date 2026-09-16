@@ -157,7 +157,7 @@ impl From<rustix::io::Errno> for LimboError {
     }
 }
 
-#[cfg(all(target_os = "linux", feature = "io_uring"))]
+#[cfg(all(target_os = "linux", clt_turso_feature = "io_uring"))]
 impl From<&'static str> for LimboError {
     fn from(value: &'static str) -> Self {
         CompletionError::UringIOError(value).into()
@@ -171,7 +171,7 @@ pub enum CompletionError {
     #[cfg(target_family = "unix")]
     #[error("I/O error: {0}")]
     RustixIOError(#[from] rustix::io::Errno),
-    #[cfg(all(target_os = "linux", feature = "io_uring"))]
+    #[cfg(all(target_os = "linux", clt_turso_feature = "io_uring"))]
     #[error("I/O error: {0}")]
     // TODO: if needed create an enum for IO Uring errors so that we don't have to pass strings around
     UringIOError(&'static str),

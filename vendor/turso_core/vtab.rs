@@ -598,7 +598,7 @@ pub trait InternalVirtualTableCursor: Send + Sync {
     ) -> Result<bool, LimboError>;
 }
 
-#[cfg(all(test, feature = "fs"))]
+#[cfg(all(clt_turso_tests, clt_turso_feature = "fs"))]
 mod tests {
     use super::*;
     use crate::{Database, DatabaseOpts, MemoryIO, OpenFlags};

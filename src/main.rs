@@ -1,3 +1,5 @@
+include!("lib.rs");
+
 fn main() -> anyhow::Result<()> {
-    clt_rs::run()
+    run()
 }

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use turso::{Connection, Database};
+use clt_database::turso::{Connection, Database};
 
 use super::configure_agent_connection;
 

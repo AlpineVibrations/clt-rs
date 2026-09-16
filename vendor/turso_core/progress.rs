@@ -70,7 +70,7 @@ impl ProgressHandler {
     }
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use super::*;
     use std::sync::{

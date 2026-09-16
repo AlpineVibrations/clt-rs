@@ -12,7 +12,7 @@ use std::os::fd::RawFd;
 use std::ptr::NonNull;
 
 use std::{io::ErrorKind, sync::Arc};
-#[cfg(feature = "fs")]
+#[cfg(clt_turso_feature = "fs")]
 use tracing::debug;
 use tracing::{instrument, trace, Level};
 
@@ -25,7 +25,7 @@ const MAX_IOV: usize = 1024;
 pub struct UnixIO {}
 
 impl UnixIO {
-    #[cfg(feature = "fs")]
+    #[cfg(clt_turso_feature = "fs")]
     pub fn new() -> Result<Self> {
         debug!("Using IO backend 'syscall'");
         Ok(Self {})
@@ -585,7 +585,7 @@ impl Drop for UnixFile {
     }
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use super::*;
     use std::io::Write;

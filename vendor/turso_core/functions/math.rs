@@ -89,7 +89,7 @@ fn value_as_i64(v: &Value) -> Option<i64> {
     }
 }
 
-#[cfg(test)]
+#[cfg(clt_turso_tests)]
 mod tests {
     use super::*;
     use crate::types::Value;

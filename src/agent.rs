@@ -1,3 +1,4 @@
+use clt_database::turso;
 use std::{
     ffi::{OsStr, OsString},
     fs, io,
@@ -11,11 +12,14 @@ use std::{
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
+use clt_database::turso::transaction::TransactionBehavior;
+use clt_database::turso::{Builder, Connection, Database, Value, params};
 use toml_edit::{DocumentMut, Item, Table, value};
-use turso::transaction::TransactionBehavior;
-use turso::{Builder, Connection, Database, Value, params};
 
 use crate::platform::AgentPlatform;
+
+// A release must never silently resolve to Turso without the registry fixes.
+const _: () = assert!(turso::core::CLT_WAL_PATCH_LEVEL >= 1);
 
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
