@@ -1,6 +1,6 @@
-seams like some projects arent continueing agent work. for example the nametastic has a task in todo but its just sitting there and the latest output says The handed-off task remains complete in CLT Done.                                                                                                     │
+seams like some projects arent continueing agent work. for example a registered project has a task in todo but its just sitting there and the latest output says The handed-off task remains complete in CLT Done.                                                                                                     │
 │                                                                                                                                                      │
-│Commit: `72cbad1 Add inline word source entry`                                                                                                        │
+│Commit: `<completed-task-commit>`                                                                                                        │
 │The worktree is clean. No additional task, commit, or push was started.                                                                               │
 │                                                                                                                                                      │
 │

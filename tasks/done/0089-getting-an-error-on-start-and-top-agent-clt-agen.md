@@ -1,7 +1,7 @@
 getting an error on start and top agent clt agent stop
 Failed to connect to bus: No medium found
 Error: systemctl --user stop clt-agent.service failed with status exit status: 1
-pro@8CPU-16GB-SF-A:~/www/agentic-marketing$ clt agent start
+user@host:~/project$ clt agent start
 Failed to connect to bus: No medium found
 Error: systemctl --user daemon-reload failed with status exit status: 1
 
