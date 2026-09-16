@@ -41,9 +41,9 @@ use crate::{
         valid_environment_variable_name,
     },
     application::{
-        AgentLeaseHolderLiveness, AgentProjectScan, ensure_status_conversion_allowed,
-        move_task_in_board, move_task_to_archive_in_board, project_display_name,
-        reorder_task_in_board, update_task_in_board,
+        AgentLeaseHolderLiveness, AgentProjectScan, delete_task_in_board,
+        ensure_status_conversion_allowed, move_task_in_board, move_task_to_archive_in_board,
+        project_display_name, reorder_task_in_board, update_task_in_board,
     },
     platform::{agent_service_status, restart_running_agent_service},
     runner::{
@@ -545,6 +545,29 @@ pub(super) fn move_selected_tui_task_to_archive(
     );
 
     Ok("Moved task to archive".to_string())
+}
+
+pub(super) fn delete_selected_tui_task(
+    board_dir: &Path,
+    statuses: &[TaskStatus],
+    board_states: &mut [ListState],
+    selected_board: usize,
+) -> Result<String> {
+    let status = statuses[selected_board];
+    let Some(idx) = selected_task_index_in_board(board_dir, status, &board_states[selected_board])
+    else {
+        board_states[selected_board].select(None);
+        return Ok("No task selected to delete".to_string());
+    };
+
+    delete_task_in_board(board_dir, status, &(idx + 1).to_string())?;
+    normalize_board_selection_in_board(board_dir, status, &mut board_states[selected_board]);
+
+    Ok(format!("Deleted task {} from {status}", idx + 1))
+}
+
+pub(super) fn tui_deletes_selected_task(key: &crossterm::event::KeyEvent) -> bool {
+    key.code == KeyCode::Delete
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6586,6 +6609,7 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
                                  [b]            - Move selected task to backlog\n\
                                  [B]            - Show/hide backlog column\n\
                                  [Backspace]    - Return to parent board\n\
+                                 [Del]          - Delete selected task\n\
                                  [Agent Del]    - Remove selected project after confirmation\n\
                                  [Tab]          - Toggle task board and agent projects\n\
                                  [Agent m]      - Cycle selected target\n\
@@ -7893,6 +7917,17 @@ pub(super) fn execute_tui_key_effect(
                             statuses[app.selected_board],
                             &mut app.board_states[app.selected_board],
                         );
+                    }
+                    _ if tui_deletes_selected_task(&key) => {
+                        app.feedback_buffer = match delete_selected_tui_task(
+                            &board_dir,
+                            &statuses,
+                            &mut app.board_states,
+                            app.selected_board,
+                        ) {
+                            Ok(message) => message,
+                            Err(error) => format!("Error: {error}"),
+                        };
                     }
                     KeyCode::Char('h') | KeyCode::Char('H') | KeyCode::Char('?') => {
                         app.current_mode = Mode::Help;

@@ -114,7 +114,7 @@ Stock macOS Terminal does not encode Shift in its default Up/Down sequences, so 
 - Shift+Up: send `\033[1;2A`
 - Shift+Down: send `\033[1;2B`
 
-Press `a` to move the selected task into the archive. Press `A` to open the archive's single-panel scrolling view, and press `A` again to return to the Kanban board. The task board has no permanent-deletion shortcut; `d`, `D`, and `Delete` leave tasks in place.
+Press `a` to move the selected task into the archive. Press `A` to open the archive's single-panel scrolling view, and press `A` again to return to the Kanban board. Press `Delete` to permanently delete the selected task. The `d` and `D` keys leave tasks in place.
 
 Backlog is a fourth column for captured work that is not ready to be acted on. It is hidden by default; the task-board console title shows its current task count. Press `b` to move the selected task to Backlog, `B` to show or hide the Backlog column, or `0` to show and focus it. When visible, Backlog appears to the left of To Do and works with the normal Left/Right focus and task-movement controls. Keys `1`, `2`, and `3` continue to focus To Do, Doing, and Done.
 

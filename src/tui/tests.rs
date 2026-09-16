@@ -3402,6 +3402,44 @@ fn tui_archive_action_moves_the_selected_task() {
 }
 
 #[test]
+fn tui_delete_action_removes_only_the_selected_task() {
+    let root = temp_root("tui-delete-selected-task");
+    add_task(&root, "keep this task", None).unwrap();
+    add_task(&root, "delete this task", None).unwrap();
+    let board_dir = root.join("tasks");
+    let mut states: [ListState; 4] = std::array::from_fn(|_| ListState::default());
+    states[TODO_BOARD_INDEX].select(Some(1));
+
+    let message =
+        delete_selected_tui_task(&board_dir, &TASK_STATUSES, &mut states, TODO_BOARD_INDEX)
+            .unwrap();
+
+    assert_eq!(message, "Deleted task 2 from todo");
+    assert_eq!(states[TODO_BOARD_INDEX].selected(), Some(0));
+    assert_eq!(read_tasks(&root, "todo").unwrap(), vec!["- keep this task"]);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn tui_task_delete_shortcut_is_delete_key_only() {
+    let key = |code, modifiers| crossterm::event::KeyEvent::new(code, modifiers);
+
+    assert!(tui_deletes_selected_task(&key(
+        KeyCode::Delete,
+        KeyModifiers::NONE
+    )));
+    assert!(!tui_deletes_selected_task(&key(
+        KeyCode::Char('d'),
+        KeyModifiers::NONE
+    )));
+    assert!(!tui_deletes_selected_task(&key(
+        KeyCode::Char('D'),
+        KeyModifiers::SHIFT
+    )));
+}
+
+#[test]
 fn hiding_focused_backlog_returns_focus_to_todo() {
     let root = temp_root("tui-hide-backlog");
     add_task(&root, "todo task", None).unwrap();
