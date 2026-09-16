@@ -41,9 +41,9 @@ use crate::{
         valid_environment_variable_name,
     },
     application::{
-        AgentLeaseHolderLiveness, AgentProjectScan, delete_task_in_board,
-        ensure_status_conversion_allowed, move_task_in_board, move_task_to_archive_in_board,
-        project_display_name, reorder_task_in_board, update_task_in_board,
+        AgentLeaseHolderLiveness, AgentProjectScan, ensure_status_conversion_allowed,
+        move_task_in_board, move_task_to_archive_in_board, project_display_name,
+        reorder_task_in_board, update_task_in_board,
     },
     platform::{agent_service_status, restart_running_agent_service},
     runner::{
@@ -6586,7 +6586,6 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
                                  [b]            - Move selected task to backlog\n\
                                  [B]            - Show/hide backlog column\n\
                                  [Backspace]    - Return to parent board\n\
-                                 [d/Del]        - Delete selected task\n\
                                  [Agent Del]    - Remove selected project after confirmation\n\
                                  [Tab]          - Toggle task board and agent projects\n\
                                  [Agent m]      - Cycle selected target\n\
@@ -7894,30 +7893,6 @@ pub(super) fn execute_tui_key_effect(
                             statuses[app.selected_board],
                             &mut app.board_states[app.selected_board],
                         );
-                    }
-                    KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Delete => {
-                        if let Some(idx) = selected_task_index_in_board(
-                            &board_dir,
-                            statuses[app.selected_board],
-                            &app.board_states[app.selected_board],
-                        ) {
-                            let status = statuses[app.selected_board];
-                            match delete_task_in_board(&board_dir, status, &(idx + 1).to_string()) {
-                                Ok(_) => {
-                                    app.feedback_buffer =
-                                        format!("Deleted task {} from {}", idx + 1, status);
-                                    app.board_states[app.selected_board].select(if idx > 0 {
-                                        Some(idx - 1)
-                                    } else {
-                                        None
-                                    });
-                                }
-                                Err(e) => app.feedback_buffer = format!("Error: {}", e),
-                            }
-                        } else {
-                            app.board_states[app.selected_board].select(None);
-                            app.feedback_buffer = "No task selected to delete".to_string();
-                        }
                     }
                     KeyCode::Char('h') | KeyCode::Char('H') | KeyCode::Char('?') => {
                         app.current_mode = Mode::Help;
