@@ -723,6 +723,7 @@ pub(super) struct AgentGitWorktreeBaseline {
     tracked_patch_ids: BTreeMap<String, String>,
     untracked_blob_ids: BTreeMap<String, String>,
     require_clean: bool,
+    initial_index_tree: Option<String>,
     staged_non_task_patch_ids: Option<BTreeMap<String, String>>,
     staged_index_tree: Option<String>,
     manifest_parent_head: Option<String>,
@@ -738,6 +739,7 @@ impl Default for AgentGitWorktreeBaseline {
             tracked_patch_ids: BTreeMap::new(),
             untracked_blob_ids: BTreeMap::new(),
             require_clean: false,
+            initial_index_tree: None,
             staged_non_task_patch_ids: None,
             staged_index_tree: None,
             manifest_parent_head: None,
@@ -755,6 +757,7 @@ impl AgentGitWorktreeBaseline {
             "tracked_patch_ids": self.tracked_patch_ids,
             "untracked_blob_ids": self.untracked_blob_ids,
             "require_clean": self.require_clean,
+            "initial_index_tree": self.initial_index_tree,
             "staged_non_task_patch_ids": self.staged_non_task_patch_ids,
             "staged_index_tree": self.staged_index_tree,
             "manifest_parent_head": self.manifest_parent_head,
@@ -797,6 +800,14 @@ impl AgentGitWorktreeBaseline {
                 .get("require_clean")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false),
+            initial_index_tree: value
+                .get("initial_index_tree")
+                .filter(|value| !value.is_null())
+                .map(|value| {
+                    value.as_str().map(str::to_string)
+                        .context("Git worktree baseline initial_index_tree is not text")
+                })
+                .transpose()?,
             staged_non_task_patch_ids: value
                 .get("staged_non_task_patch_ids")
                 .and_then(serde_json::Value::as_object)
@@ -848,27 +859,10 @@ pub(super) fn ensure_agent_git_index_preflight(
         return Ok(());
     }
 
-    let output = Command::new("git")
-        .current_dir(&project.path)
-        .args(["diff", "--cached", "--quiet", "--exit-code", "--"])
-        .output()
-        .with_context(|| {
-            format!(
-                "Failed to inspect the staged Git index in {}",
-                project.path.display()
-            )
-        })?;
-    match output.status.code() {
-        Some(0) => Ok(()),
-        Some(1) => anyhow::bail!(
-            "Refusing to start a fresh automated Git task with pre-existing staged changes; preserve the index and resolve its ownership before retrying"
-        ),
-        _ => anyhow::bail!(
-            "Failed to inspect the staged Git index in {}: {}",
-            project.path.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ),
-    }
+    // Staged work is a launch baseline, not a reason to reject the project.
+    // write-tree still reports real index problems such as unresolved merges.
+    agent_git_index_tree(&project.path)?;
+    Ok(())
 }
 
 pub(super) fn prepare_agent_git_start_state_for_run(
@@ -945,7 +939,7 @@ pub(super) fn prepare_agent_git_start_state_for_run(
 pub(super) fn checkpoint_agent_git_task_board_before_launch(
     project_root: &Path,
 ) -> Result<Option<String>> {
-    require_agent_git_index_matches_head(project_root)?;
+    let starting_index_tree = agent_git_index_tree(project_root)?;
     let starting_head = resolve_git_commit(
         project_root,
         "HEAD",
@@ -987,7 +981,7 @@ pub(super) fn checkpoint_agent_git_task_board_before_launch(
         return Ok(None);
     }
 
-    require_agent_git_index_matches_head(project_root)?;
+    require_agent_git_index_tree(project_root, &starting_index_tree)?;
     let rechecked_head = resolve_git_commit(
         project_root,
         "HEAD",
@@ -1055,7 +1049,7 @@ pub(super) fn checkpoint_agent_git_task_board_before_launch(
         .trim()
         .to_string();
 
-    require_agent_git_index_matches_head(project_root)?;
+    require_agent_git_index_tree(project_root, &starting_index_tree)?;
     if resolve_git_commit(
         project_root,
         "HEAD",
@@ -1074,6 +1068,68 @@ pub(super) fn checkpoint_agent_git_task_board_before_launch(
             "Git HEAD, branch, or index changed before CLT could publish its task-board checkpoint; retry"
         );
     }
+    // Align only board paths that were not already staged. A partially staged
+    // board file can contain work absent from both HEAD and the worktree.
+    let staged_board_paths = git_nul_separated_paths(
+        project_root,
+        &[
+            "diff",
+            "--name-only",
+            "--no-renames",
+            "-z",
+            &starting_head,
+            &starting_index_tree,
+            "--",
+            "tasks",
+        ],
+        "identify pre-existing staged task-board paths",
+    )?;
+    let checkpoint_paths = git_nul_separated_paths(
+        project_root,
+        &[
+            "diff",
+            "--name-only",
+            "--no-renames",
+            "-z",
+            &starting_head,
+            &checkpoint_commit,
+            "--",
+            "tasks",
+        ],
+        "identify checkpoint task-board paths",
+    )?;
+    let align_paths = checkpoint_paths
+        .iter()
+        .filter(|path| !staged_board_paths.contains(path))
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let mut align_args = vec![
+        "--literal-pathspecs",
+        "reset",
+        "--quiet",
+        checkpoint_commit.as_str(),
+        "--",
+    ];
+    align_args.extend(align_paths.iter().copied());
+    let (_index_projection, preserved_index, _) =
+        create_agent_git_tree_projection(project_root, &starting_index_tree)?;
+    if !align_paths.is_empty() {
+        run_agent_git_projection_command(
+            project_root,
+            &preserved_index,
+            None,
+            &align_args,
+            "project the task-board checkpoint into the existing index",
+        )?;
+    }
+    let expected_index_tree = run_agent_git_projection_command(
+        project_root,
+        &preserved_index,
+        None,
+        &["write-tree"],
+        "snapshot the preserved prelaunch index",
+    )?;
+    require_agent_git_index_tree(project_root, &starting_index_tree)?;
     git_stdout(
         project_root,
         &[
@@ -1084,24 +1140,28 @@ pub(super) fn checkpoint_agent_git_task_board_before_launch(
         ],
         "publish the automated task-board checkpoint",
     )?;
-    git_stdout(
+    if !align_paths.is_empty() {
+        git_stdout(
+            project_root,
+            &align_args,
+            "align unstaged task-board paths with their automated checkpoint",
+        )?;
+    }
+    require_agent_git_index_tree(project_root, &expected_index_tree)?;
+    run_agent_git_projection_command(
         project_root,
-        &[
-            "reset",
-            "--quiet",
-            checkpoint_commit.as_str(),
-            "--",
-            "tasks",
-        ],
-        "align the task-board index with its automated checkpoint",
+        &index_path,
+        None,
+        &["add", "-A", "--", "tasks"],
+        "verify the checkpointed task-board worktree",
     )?;
-    require_agent_git_index_matches_head(project_root)?;
-    let remaining = capture_agent_git_worktree_baseline(project_root)?;
-    if remaining
-        .tracked_patch_ids
-        .keys()
-        .chain(remaining.untracked_blob_ids.keys())
-        .any(|path| path == "tasks" || path.starts_with("tasks/"))
+    if run_agent_git_projection_command(
+        project_root,
+        &index_path,
+        None,
+        &["write-tree"],
+        "verify the checkpointed task-board tree",
+    )? != checkpoint_tree
     {
         anyhow::bail!(
             "The task board changed while CLT was publishing its prelaunch checkpoint; retry"
@@ -1164,6 +1224,16 @@ pub(super) fn require_agent_git_board_storage_compatible(project_root: &Path) ->
 }
 
 pub(super) fn synchronize_agent_git_checkout_before_launch(project_root: &Path) -> Result<()> {
+    if !git_stdout(
+        project_root,
+        &["status", "--porcelain", "--untracked-files=all"],
+        "inspect the checkout before automated startup synchronization",
+    )?
+    .is_empty()
+    {
+        // Do not pull, stash, or unstage shared work just to start an agent.
+        return Ok(());
+    }
     let branch_ref = git_optional_stdout(
         project_root,
         &["symbolic-ref", "-q", "HEAD"],
@@ -1375,6 +1445,18 @@ pub(super) fn capture_agent_git_worktree_baseline(
     project_root: &Path,
 ) -> Result<AgentGitWorktreeBaseline> {
     capture_agent_git_worktree_state(project_root)
+}
+
+fn agent_git_index_tree(project_root: &Path) -> Result<String> {
+    git_stdout(project_root, &["write-tree"], "snapshot the Git index")
+}
+
+fn require_agent_git_index_tree(project_root: &Path, expected_tree: &str) -> Result<()> {
+    anyhow::ensure!(
+        agent_git_index_tree(project_root)? == expected_tree,
+        "Git index changed while CLT was preparing the automated task; retry"
+    );
+    Ok(())
 }
 
 pub(super) fn require_agent_git_index_matches_head(project_root: &Path) -> Result<()> {
@@ -2230,7 +2312,7 @@ pub(super) fn capture_agent_git_start_state(
     project_root: &Path,
     git_mode: AgentGitMode,
 ) -> Result<AgentGitStartState> {
-    require_agent_git_index_matches_head(project_root)?;
+    let starting_index_tree = agent_git_index_tree(project_root)?;
     let starting_head = git_stdout(
         project_root,
         &["rev-parse", "--verify", "HEAD^{commit}"],
@@ -2272,13 +2354,14 @@ pub(super) fn capture_agent_git_start_state(
         None
     };
     let mut baseline = capture_agent_git_worktree_baseline(project_root)?;
+    baseline.initial_index_tree = Some(starting_index_tree.clone());
     if let Some(destination) = upstream_destination.as_ref() {
         baseline.upstream_remote = Some(destination.remote.clone());
         baseline.upstream_merge_ref = Some(destination.merge_ref.clone());
         baseline.upstream_push_url = destination.push_url.clone();
     }
     let worktree_baseline = baseline.to_json()?;
-    require_agent_git_index_matches_head(project_root)?;
+    require_agent_git_index_tree(project_root, &starting_index_tree)?;
     let rechecked_head = resolve_git_commit(project_root, "HEAD", "recheck the task start commit")?;
     let rechecked_branch = git_optional_stdout(
         project_root,
@@ -2315,7 +2398,6 @@ pub(super) fn verify_agent_git_start_state_unchanged(
     git_mode: AgentGitMode,
     start: &AgentGitStartState,
 ) -> Result<()> {
-    require_agent_git_index_matches_head(project_root)?;
     let current_head = resolve_git_commit(project_root, "HEAD", "verify the prelaunch Git commit")?;
     let current_branch = git_optional_stdout(
         project_root,
@@ -2325,7 +2407,21 @@ pub(super) fn verify_agent_git_start_state_unchanged(
     )?;
     let current_upstream = resolve_agent_git_upstream(project_root, current_branch.as_deref())?;
     let expected_baseline = AgentGitWorktreeBaseline::from_json(&start.worktree_baseline)?;
+    let current_index_tree = agent_git_index_tree(project_root)?;
     let current_baseline = capture_agent_git_worktree_baseline(project_root)?;
+    // Older journals were created under the clean-index requirement.
+    let expected_index_tree = match expected_baseline.initial_index_tree.as_deref() {
+        Some(tree) => tree.to_string(),
+        None => git_stdout(
+            project_root,
+            &[
+                "rev-parse",
+                "--verify",
+                &format!("{}^{{tree}}", start.starting_head),
+            ],
+            "resolve the legacy prelaunch index",
+        )?,
+    };
     let worktree_is_unchanged = current_baseline.tracked_patch_ids
         == expected_baseline.tracked_patch_ids
         && current_baseline.untracked_blob_ids == expected_baseline.untracked_blob_ids;
@@ -2348,6 +2444,7 @@ pub(super) fn verify_agent_git_start_state_unchanged(
     if current_head != start.starting_head
         || current_branch != start.branch_ref
         || current_upstream != start.upstream_ref
+        || current_index_tree != expected_index_tree
         || !worktree_is_unchanged
         || !upstream_is_unchanged
     {
@@ -2355,6 +2452,7 @@ pub(super) fn verify_agent_git_start_state_unchanged(
             "Git HEAD, branch, upstream, index, or worktree changed after CLT froze the automated run; start the task before making implementation changes or commits"
         );
     }
+    require_agent_git_index_tree(project_root, &current_index_tree)?;
     Ok(())
 }
 

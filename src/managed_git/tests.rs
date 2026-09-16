@@ -7,6 +7,7 @@ mod advanced_branch;
 mod follow_up;
 mod orphan;
 mod projection;
+mod staged_start;
 
 #[test]
 fn agent_store_git_finalization_crud_is_idempotent_and_generation_fenced() {
@@ -384,6 +385,9 @@ fn automated_done_is_provisional_until_the_exact_task_commit_is_proven() {
             &root.join("proof.err"),
         )
         .unwrap();
+    // A task can adopt verified implementation that was already staged at launch.
+    fs::write(project_root.join("feature.txt"), "implemented\n").unwrap();
+    run_test_git(&project_root, &["add", "feature.txt"]);
     let git_start = capture_agent_git_start_state(&project_root, AgentGitMode::Commit).unwrap();
     ensure_agent_git_working_record(
         &store,
@@ -397,8 +401,6 @@ fn automated_done_is_provisional_until_the_exact_task_commit_is_proven() {
         bind_agent_git_working_task_identity(&store, &project, "session-proof", "run-proof",)
             .unwrap()
     );
-    fs::write(project_root.join("feature.txt"), "implemented\n").unwrap();
-    run_test_git(&project_root, &["add", "feature.txt"]);
 
     move_task_to_done_with_agent_store(
         &project_root,
@@ -1098,19 +1100,12 @@ fn startup_git_sync_fast_forwards_before_the_launch_snapshot() {
     run_test_git(&peer_root, &["commit", "-m", "Advance upstream"]);
     run_test_git(&peer_root, &["push"]);
     let expected_head = run_test_git(&peer_root, &["rev-parse", "HEAD"]);
-    fs::write(project_root.join("untracked-local.txt"), "preserve me\n").unwrap();
-
     synchronize_agent_git_checkout_before_launch(&project_root).unwrap();
 
     assert_eq!(
         run_test_git(&project_root, &["rev-parse", "HEAD"]),
         expected_head
     );
-    assert_eq!(
-        fs::read_to_string(project_root.join("untracked-local.txt")).unwrap(),
-        "preserve me\n"
-    );
-
     fs::remove_dir_all(root).unwrap();
 }
 
