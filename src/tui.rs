@@ -6194,7 +6194,7 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
             .agent_panel
             .projects
             .iter()
-            .find(|project| project.project.path == app.active_root && project.project.enabled)
+            .find(|project| project.project.path == app.active_root)
         {
             title.push_str(&format!(" | Agent: {}", project.runtime_state.label()));
         }
