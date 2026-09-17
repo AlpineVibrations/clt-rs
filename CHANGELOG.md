@@ -11,6 +11,7 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 - Allow automated Git tasks to start with existing staged changes; preserve staged entries through task-board checkpoints, freeze the launch index, and skip startup pulls in dirty checkouts.
 
 - Keep the Kanban console title's agent status visible for registered projects whose agent is `OFF`; omit it only for unregistered projects.
+- Show the registered project's configured Codex model, reasoning effort, and fast setting alongside the agent status in the Kanban console title, naming the resolved target in parentheses when the project inherits the CLT default.
 - Remove the task board's `d` and `D` shortcuts to prevent accidental permanent deletion; keep `Delete` available for intentional deletion and `a` for archiving.
 - Allow task commits and resealing while unrelated unstaged edits or new files appear, preserving that work outside the exact staged commit.
 - Allow manual completion of an idle session-linked task after its text was edited or its work committed externally, while preserving active-owner and sealed-proof checks.

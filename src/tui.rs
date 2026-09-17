@@ -1159,12 +1159,21 @@ pub(super) fn tui_start_state(active_board: bool) -> TuiStartState {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub(super) struct TuiAgentResolvedCodexTarget {
+    pub(super) provider_id: Option<String>,
+    pub(super) model_id: Option<String>,
+    pub(super) reasoning_effort: Option<String>,
+}
+
 pub(super) struct TuiAgentProject {
     pub(super) project: agent::AgentProject,
     pub(super) scan: AgentProjectScan,
     pub(super) runtime_state: TuiAgentRuntimeState,
     pub(super) daemon_scan_problem: Option<String>,
     pub(super) failure_problem: Option<String>,
+    /// What Codex runs for this project when its own settings are unset.
+    pub(super) resolved_codex: TuiAgentResolvedCodexTarget,
 }
 
 impl TuiAgentProject {
@@ -2661,12 +2670,14 @@ pub(super) fn load_tui_agent_panel_snapshot_inner(
                 pending_git_finalizations.get(&project.id).copied(),
                 daemon_scan_problem.is_some() || failure_problem.is_some(),
             );
+            let resolved_codex = resolve_tui_agent_codex_target(&store, &project)?;
             Ok(TuiAgentProject {
                 project,
                 scan,
                 runtime_state,
                 daemon_scan_problem,
                 failure_problem,
+                resolved_codex,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -2674,6 +2685,31 @@ pub(super) fn load_tui_agent_panel_snapshot_inner(
     Ok(TuiAgentPanelSnapshot {
         projects,
         daemon_status,
+    })
+}
+
+/// Resolve the Codex target a project's runs actually use when the project has
+/// no explicit model or reasoning effort: the CLT model defaults and the
+/// reasoning configured for that exact model.
+pub(super) fn resolve_tui_agent_codex_target(
+    store: &agent::TursoAgentStore,
+    project: &agent::AgentProject,
+) -> Result<TuiAgentResolvedCodexTarget> {
+    let target = store.resolve_model_target_blocking(project)?;
+    let reasoning_effort = match project.codex_reasoning_effort.as_deref() {
+        Some(effort) => Some(effort.to_string()),
+        None => match (target.provider_id.as_deref(), target.model_id.as_deref()) {
+            (Some(provider), Some(model)) => {
+                store.model_target_reasoning_blocking(provider, model)?
+            }
+            _ => None,
+        },
+    };
+
+    Ok(TuiAgentResolvedCodexTarget {
+        provider_id: target.provider_id,
+        model_id: target.model_id,
+        reasoning_effort,
     })
 }
 
@@ -3911,6 +3947,71 @@ pub(super) fn compact_agent_codex_settings(
     } else {
         settings.join("/")
     }
+}
+
+pub(super) fn format_kanban_console_title(
+    board_title: &str,
+    project: Option<&TuiAgentProject>,
+    width: usize,
+    right_title: Option<&str>,
+) -> String {
+    let base = format!("{board_title} Console");
+    let Some(project) = project else {
+        return base;
+    };
+
+    // Keep the title from colliding with the right-aligned Backlog status.
+    let reserved = 2 + right_title.map_or(0, |title| title.chars().count());
+    let available = width.saturating_sub(reserved);
+    let status = format!(" | Agent: {}", project.runtime_state.label());
+    let settings = format!(" | {}", format_agent_project_codex_settings_label(project));
+
+    let full = format!("{base}{status}{settings}");
+    if full.chars().count() <= available {
+        return full;
+    }
+    let with_status = format!("{base}{status}");
+    if with_status.chars().count() <= available {
+        return with_status;
+    }
+
+    base
+}
+
+pub(super) fn format_codex_model_target(provider: Option<&str>, model: &str) -> String {
+    match provider.filter(|provider| *provider != "openai") {
+        Some(provider) => format!("{provider}/{model}"),
+        None => model.to_string(),
+    }
+}
+
+pub(super) fn format_agent_project_codex_settings_label(project: &TuiAgentProject) -> String {
+    let settings = &project.project;
+    let model = match settings.codex_model.as_deref() {
+        Some(model) => format_codex_model_target(settings.codex_provider.as_deref(), model),
+        None => match project.resolved_codex.model_id.as_deref() {
+            // Name what CLT's default resolves to so "default" is never a mystery.
+            Some(model) => format!(
+                "default ({})",
+                format_codex_model_target(project.resolved_codex.provider_id.as_deref(), model)
+            ),
+            None => "default".to_string(),
+        },
+    };
+    let thinking = match settings.codex_reasoning_effort.as_deref() {
+        Some(effort) => effort.to_string(),
+        None => match project.resolved_codex.reasoning_effort.as_deref() {
+            Some(effort) => format!("default ({effort})"),
+            None => "default".to_string(),
+        },
+    };
+
+    let mut parts = vec![format!("Model: {model}"), format!("Thinking: {thinking}")];
+    if settings.codex_fast_enabled {
+        parts.push("Fast: on".to_string());
+    }
+
+    parts.join(" | ")
 }
 
 pub(super) fn agent_codex_column_width(
@@ -6212,19 +6313,19 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
     } else if app.archive_view {
         (format!("{board_title} Archive Console"), None)
     } else {
-        let mut title = format!("{board_title} Console");
-        if let Some(project) = app
-            .agent_panel
-            .projects
-            .iter()
-            .find(|project| project.project.path == app.active_root)
-        {
-            title.push_str(&format!(" | Agent: {}", project.runtime_state.label()));
-        }
         let right_title = (!app.backlog_visible).then(|| {
             let backlog_count = app.task_snapshot.board_entries[BACKLOG_BOARD_INDEX].len();
             format!(" Backlog: {backlog_count} [B] ")
         });
+        let title = format_kanban_console_title(
+            board_title,
+            app.agent_panel
+                .projects
+                .iter()
+                .find(|project| project.project.path == app.active_root),
+            size.width as usize,
+            right_title.as_deref(),
+        );
         (title, right_title)
     };
 

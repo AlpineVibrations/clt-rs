@@ -418,6 +418,7 @@ pub(crate) fn tui_agent_project_for_test(id: i64, name: &str) -> TuiAgentProject
         runtime_state: TuiAgentRuntimeState::Idle,
         daemon_scan_problem: None,
         failure_problem: None,
+        resolved_codex: TuiAgentResolvedCodexTarget::default(),
     }
 }
 
@@ -755,6 +756,7 @@ fn tui_agent_project_removal_requires_confirmation_and_only_unregisters() {
             runtime_state: TuiAgentRuntimeState::Idle,
             daemon_scan_problem: None,
             failure_problem: None,
+            resolved_codex: TuiAgentResolvedCodexTarget::default(),
         }],
         current_project_registration: None,
         daemon_status: "not-installed".to_string(),
@@ -859,6 +861,7 @@ fn tui_working_project_removal_fixture(protection: &str) -> TuiWorkingProjectRem
             runtime_state: TuiAgentRuntimeState::Finalizing,
             daemon_scan_problem: None,
             failure_problem: None,
+            resolved_codex: TuiAgentResolvedCodexTarget::default(),
         }],
         current_project_registration: None,
         daemon_status: "not-installed".to_string(),
@@ -1243,6 +1246,7 @@ fn reaped_session_logs_are_latest_while_project_runtime_still_looks_active() {
                 runtime_state: TuiAgentRuntimeState::Running,
                 daemon_scan_problem: None,
                 failure_problem: None,
+                resolved_codex: TuiAgentResolvedCodexTarget::default(),
             }],
             current_project_registration: None,
             daemon_status: "running".to_string(),
@@ -1353,6 +1357,7 @@ fn git_recovery_without_logs_keeps_exact_completed_session_output() {
             runtime_state: TuiAgentRuntimeState::Idle,
             daemon_scan_problem: None,
             failure_problem: None,
+            resolved_codex: TuiAgentResolvedCodexTarget::default(),
         }],
         current_project_registration: None,
         daemon_status: "running".to_string(),
@@ -1464,6 +1469,7 @@ fn completed_log_is_latest_but_a_newer_attempt_of_the_same_session_is_live() {
             runtime_state: TuiAgentRuntimeState::Running,
             daemon_scan_problem: None,
             failure_problem: None,
+            resolved_codex: TuiAgentResolvedCodexTarget::default(),
         }],
         current_project_registration: None,
         daemon_status: "running".to_string(),
@@ -1562,6 +1568,7 @@ fn fenced_agent_log_view_keeps_the_orphaned_session_controllable() {
             runtime_state: TuiAgentRuntimeState::Fenced,
             daemon_scan_problem: None,
             failure_problem: None,
+            resolved_codex: TuiAgentResolvedCodexTarget::default(),
         }],
         current_project_registration: None,
         daemon_status: "running".to_string(),
@@ -1638,6 +1645,7 @@ fn completed_task_keeps_reaped_session_output_without_run_history() {
             runtime_state: TuiAgentRuntimeState::Idle,
             daemon_scan_problem: None,
             failure_problem: None,
+            resolved_codex: TuiAgentResolvedCodexTarget::default(),
         }],
         current_project_registration: None,
         daemon_status: "stopped".to_string(),
@@ -1868,6 +1876,7 @@ fn open_kanban_agent_log_follows_the_selected_task() {
             runtime_state: TuiAgentRuntimeState::Idle,
             daemon_scan_problem: None,
             failure_problem: None,
+            resolved_codex: TuiAgentResolvedCodexTarget::default(),
         }],
         current_project_registration: None,
         daemon_status: "not-installed".to_string(),
@@ -2044,6 +2053,7 @@ fn open_agent_log_follows_the_highlighted_project() {
                 runtime_state: TuiAgentRuntimeState::Idle,
                 daemon_scan_problem: None,
                 failure_problem: None,
+                resolved_codex: TuiAgentResolvedCodexTarget::default(),
             })
             .collect(),
         current_project_registration: None,
@@ -3294,6 +3304,229 @@ fn tui_console_block_right_aligns_the_backlog_status() {
         .join("");
     assert!(top_border.starts_with("┌clt Console"));
     assert!(top_border.ends_with(" Backlog: 2 [B] ┐"));
+}
+
+#[test]
+fn kanban_console_title_shows_agent_status_and_codex_settings() {
+    let mut project = tui_agent_project_for_test(1, "alpha");
+    project.runtime_state = TuiAgentRuntimeState::Running;
+
+    let title = format_kanban_console_title("clt", Some(&project), 200, None);
+    assert_eq!(
+        title,
+        "clt Console | Agent: RUNNING | Model: default | Thinking: default"
+    );
+
+    // "default" names what CLT actually resolves to.
+    project.resolved_codex = TuiAgentResolvedCodexTarget {
+        provider_id: Some("openai".to_string()),
+        model_id: Some("gpt-5.6-sol".to_string()),
+        reasoning_effort: Some("high".to_string()),
+    };
+    let title = format_kanban_console_title("clt", Some(&project), 200, None);
+    assert_eq!(
+        title,
+        "clt Console | Agent: RUNNING | Model: default (gpt-5.6-sol) | Thinking: default (high)"
+    );
+
+    project.project.codex_provider = Some("openrouter".to_string());
+    project.project.codex_model = Some("gpt-6-astra".to_string());
+    project.project.codex_reasoning_effort = Some("xhigh".to_string());
+    project.project.codex_fast_enabled = true;
+
+    let title = format_kanban_console_title("clt", Some(&project), 200, None);
+    assert_eq!(
+        title,
+        "clt Console | Agent: RUNNING | Model: openrouter/gpt-6-astra | Thinking: xhigh | Fast: on"
+    );
+
+    // An explicit project model never shows the resolved default in parens.
+    assert!(!title.contains("default"));
+}
+
+#[test]
+fn kanban_console_title_omits_settings_without_a_registered_project() {
+    assert_eq!(
+        format_kanban_console_title("clt", None, 200, None),
+        "clt Console"
+    );
+}
+
+#[test]
+fn kanban_console_title_skips_the_provider_prefix_for_openai() {
+    let mut project = tui_agent_project_for_test(1, "alpha");
+    project.project.codex_provider = Some("openai".to_string());
+    project.project.codex_model = Some("gpt-5.6-sol".to_string());
+    project.runtime_state = TuiAgentRuntimeState::Idle;
+
+    assert_eq!(
+        format_kanban_console_title("clt", Some(&project), 200, None),
+        "clt Console | Agent: IDLE | Model: gpt-5.6-sol | Thinking: default"
+    );
+}
+
+#[test]
+fn kanban_resolved_codex_target_follows_project_and_clt_defaults() {
+    let root = temp_root("kanban-resolved-codex-target");
+    let state_dir = root.join("state/clt");
+    let project_root = root.join("project");
+    fs::create_dir_all(&project_root).unwrap();
+    let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
+    store
+        .register_project_blocking(&project_root, "project")
+        .unwrap();
+    store
+        .set_model_default_blocking("openai", "gpt-5.6-sol")
+        .unwrap();
+    store
+        .set_model_target_reasoning_blocking("openai", "gpt-5.6-sol", Some("high"))
+        .unwrap();
+
+    let mut project = store.list_projects_blocking().unwrap().remove(0);
+    let resolved = resolve_tui_agent_codex_target(&store, &project).unwrap();
+    assert_eq!(resolved.provider_id.as_deref(), Some("openai"));
+    assert_eq!(resolved.model_id.as_deref(), Some("gpt-5.6-sol"));
+    assert_eq!(resolved.reasoning_effort.as_deref(), Some("high"));
+
+    // An explicit project model wins and does not inherit the CLT default reasoning.
+    project.codex_model = Some("gpt-6-astra".to_string());
+    project.codex_provider = Some("openrouter".to_string());
+    let resolved = resolve_tui_agent_codex_target(&store, &project).unwrap();
+    assert_eq!(resolved.model_id.as_deref(), Some("gpt-6-astra"));
+    assert_eq!(resolved.provider_id.as_deref(), Some("openrouter"));
+    assert_eq!(resolved.reasoning_effort, None);
+
+    // An explicit project reasoning is reported verbatim.
+    project.codex_reasoning_effort = Some("xhigh".to_string());
+    let resolved = resolve_tui_agent_codex_target(&store, &project).unwrap();
+    assert_eq!(resolved.reasoning_effort.as_deref(), Some("xhigh"));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn kanban_console_title_names_the_resolved_default_thinking() {
+    let mut project = tui_agent_project_for_test(1, "alpha");
+    project.resolved_codex = TuiAgentResolvedCodexTarget {
+        provider_id: Some("openrouter".to_string()),
+        model_id: Some("gpt-6-astra".to_string()),
+        reasoning_effort: Some("low".to_string()),
+    };
+
+    assert_eq!(
+        format_kanban_console_title("clt", Some(&project), 200, None),
+        "clt Console | Agent: IDLE | Model: default (openrouter/gpt-6-astra) | Thinking: default (low)"
+    );
+}
+
+#[test]
+fn kanban_render_shows_registered_project_codex_settings_in_the_console_title() {
+    use ratatui::backend::TestBackend;
+
+    let root = temp_root("kanban-title-codex-settings");
+    let mut app = TuiApp::new(&root, true);
+    app.task_snapshot.board_title = "clt".to_string();
+    app.active_root = PathBuf::from("/tmp/kanban-title-project");
+    let mut project = tui_agent_project_for_test(1, "alpha");
+    project.project.path = app.active_root.clone();
+    project.runtime_state = TuiAgentRuntimeState::Running;
+    project.project.codex_provider = Some("openrouter".to_string());
+    project.project.codex_model = Some("gpt-6-astra".to_string());
+    project.project.codex_reasoning_effort = Some("xhigh".to_string());
+    app.agent_panel.projects = vec![project];
+
+    let backend = TestBackend::new(140, 28);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| render_tui(frame, &app)).unwrap();
+
+    let buffer = terminal.backend().buffer();
+    let console_title = (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .find(|line| line.contains("Console"))
+        .expect("console title row rendered");
+    assert!(
+        console_title.contains("Agent: RUNNING"),
+        "missing agent status: {console_title}"
+    );
+    assert!(
+        console_title.contains("Model: openrouter/gpt-6-astra"),
+        "missing model: {console_title}"
+    );
+    assert!(
+        console_title.contains("Thinking: xhigh"),
+        "missing thinking setting: {console_title}"
+    );
+
+    // With no project settings, the title names the resolved CLT defaults.
+    let mut inherited = tui_agent_project_for_test(2, "beta");
+    inherited.project.path = app.active_root.clone();
+    inherited.resolved_codex = TuiAgentResolvedCodexTarget {
+        provider_id: Some("openai".to_string()),
+        model_id: Some("gpt-5.6-sol".to_string()),
+        reasoning_effort: Some("high".to_string()),
+    };
+    let mut inherited_app = TuiApp::new(&root, true);
+    inherited_app.task_snapshot.board_title = "clt".to_string();
+    inherited_app.active_root = app.active_root.clone();
+    inherited_app.agent_panel.projects = vec![inherited];
+    terminal
+        .draw(|frame| render_tui(frame, &inherited_app))
+        .unwrap();
+
+    let buffer = terminal.backend().buffer();
+    let inherited_title = (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .find(|line| line.contains("Console"))
+        .expect("console title row rendered");
+    assert!(
+        inherited_title.contains("Model: default (gpt-5.6-sol)"),
+        "missing resolved model: {inherited_title}"
+    );
+    assert!(
+        inherited_title.contains("Thinking: default (high)"),
+        "missing resolved thinking: {inherited_title}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn kanban_console_title_yields_settings_before_colliding_with_the_right_title() {
+    let mut project = tui_agent_project_for_test(1, "alpha");
+    project.runtime_state = TuiAgentRuntimeState::Running;
+    project.project.codex_provider = Some("openrouter".to_string());
+    project.project.codex_model = Some("gpt-6-astra".to_string());
+    project.project.codex_reasoning_effort = Some("xhigh".to_string());
+
+    let right_title = " Backlog: 12 [B] ";
+    let full = "clt Console | Agent: RUNNING | Model: openrouter/gpt-6-astra | Thinking: xhigh";
+    let with_status = "clt Console | Agent: RUNNING";
+
+    assert_eq!(
+        format_kanban_console_title(
+            "clt",
+            Some(&project),
+            full.len() + right_title.len() + 2,
+            Some(right_title)
+        ),
+        full
+    );
+    assert_eq!(
+        format_kanban_console_title("clt", Some(&project), full.len(), Some(right_title)),
+        with_status
+    );
+    assert_eq!(
+        format_kanban_console_title("clt", Some(&project), with_status.len(), Some(right_title)),
+        "clt Console"
+    );
 }
 
 #[test]
