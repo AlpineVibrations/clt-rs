@@ -202,6 +202,119 @@ impl TursoAgentStore {
         })
     }
 
+    /// Retire an unbound journal whose owning run can no longer be running.
+    ///
+    /// A run that ends after registering its Codex session but before claiming a
+    /// task leaves a WORKING journal with no task identity and no commit proof.
+    /// Its recorded owner token belongs to a run that already finished, so the
+    /// normal owner-fenced retirement can never match again and the project
+    /// stays wedged. This retires that exact journal only while the project is
+    /// idle, so a live run is never disturbed.
+    pub(crate) fn retire_abandoned_unbound_git_finalization_blocking(
+        &self,
+        project_id: i64,
+        codex_session_id: &str,
+        expected_generation: i64,
+        reason: &str,
+        updated_at: &str,
+    ) -> Result<bool> {
+        self.blocking.block_on_persist(async {
+            let mut conn = self.repositories.git_journals.connect().await?;
+            let transaction = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .await
+                .context("Failed to begin retiring an abandoned unbound Git journal")?;
+            let idle_project = query_count(
+                &transaction,
+                "SELECT COUNT(*) FROM git_finalizations g
+                  WHERE g.project_id = ?1 AND g.codex_session_id = ?2
+                    AND g.state = 'working' AND g.generation = ?3
+                    AND g.task_identity IS NULL AND g.commit_oid IS NULL
+                    AND g.completed_at IS NULL AND g.acknowledged_at IS NULL
+                    AND g.owner_run_token IS NOT NULL
+                    AND NOT EXISTS (
+                        SELECT 1 FROM agent_workers w
+                         WHERE w.project_id = ?1
+                           AND w.state IN ('dispatching', 'running', 'finalizing')
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM agent_workers owner
+                         WHERE owner.project_id = ?1
+                           AND owner.worker_token = g.owner_run_token
+                           AND owner.state IN ('dispatching', 'running', 'finalizing')
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM leases l
+                         WHERE l.project_id = ?1
+                           AND CAST(l.expires_at AS INTEGER) > CAST(?4 AS INTEGER)
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM session_controls sc
+                         WHERE sc.project_id = ?1 AND sc.codex_session_id = ?2
+                           AND (sc.child_pid IS NOT NULL
+                                OR sc.interactive_holder IS NOT NULL
+                                OR sc.interactive_launch_token IS NOT NULL
+                                OR sc.state NOT IN ('stopped', 'resume_requested')
+                                OR EXISTS (
+                                    SELECT 1 FROM agent_workers live
+                                     WHERE live.worker_token = sc.run_token
+                                       AND live.state IN ('dispatching', 'running', 'finalizing')
+                                ))
+                    )",
+                params![
+                    project_id,
+                    codex_session_id,
+                    expected_generation,
+                    updated_at,
+                ],
+            )
+            .await?
+                == 1;
+            if !idle_project {
+                transaction
+                    .rollback()
+                    .await
+                    .context("Failed to finish rejecting a non-idle abandoned Git journal")?;
+                return Ok(false);
+            }
+            transaction
+                .execute(
+                    "UPDATE git_finalizations
+                        SET state = 'cancelled', owner_run_token = NULL,
+                            generation = generation + 1, last_error = ?1,
+                            updated_at = ?2, completed_at = ?2
+                      WHERE project_id = ?3 AND codex_session_id = ?4
+                        AND state = 'working' AND generation = ?5",
+                    params![
+                        reason,
+                        updated_at,
+                        project_id,
+                        codex_session_id,
+                        expected_generation,
+                    ],
+                )
+                .await
+                .context("Failed to cancel the abandoned unbound Git journal")?;
+            transaction
+                .execute(
+                    "DELETE FROM session_controls
+                      WHERE project_id = ?1 AND codex_session_id = ?2
+                        AND state IN ('stopped', 'resume_requested')
+                        AND child_pid IS NULL
+                        AND interactive_holder IS NULL
+                        AND interactive_launch_token IS NULL",
+                    params![project_id, codex_session_id],
+                )
+                .await
+                .context("Failed to clear the abandoned journal's idle session control")?;
+            transaction
+                .commit()
+                .await
+                .context("Failed to durably retire the abandoned unbound Git journal")?;
+            Ok(true)
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn accept_external_git_completion_blocking(
         &self,

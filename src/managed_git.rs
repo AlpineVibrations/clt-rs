@@ -13,8 +13,11 @@ use anyhow::{Context, Result};
 use tempfile::TempDir;
 
 use crate::{
-    agent::{self, AgentGitMode, GitFinalizationState, open_agent_store_at, with_agent_store_at},
-    application::{AgentLeaseHolderLiveness, AgentTaskSelection},
+    agent::{
+        self, AGENT_ABANDONED_UNBOUND_JOURNAL_REASON, AgentGitMode, GitFinalizationState,
+        open_agent_store_at, with_agent_store_at,
+    },
+    application::{AgentLeaseHolderLiveness, AgentRunJob, AgentTaskSelection},
     platform::{configure_agent_child_command, stop_agent_child_process},
     runner::{agent_timestamp, agent_timestamp_after},
     scheduler::{
@@ -415,16 +418,63 @@ pub(super) fn cancel_orphaned_working_git_finalization_with_before_lock(
     )
 }
 
+/// Retire unbound journals whose owning run already ended and whose session no
+/// longer has any board marker. A run that stops before claiming a task leaves
+/// exactly this shape behind; its recorded owner token belongs to a finished
+/// run, so the ordinary owner-fenced retirement can never match it again and
+/// the project would otherwise stay wedged forever.
+pub(super) fn retire_abandoned_unbound_git_journals(
+    state_dir: &Path,
+    project: &agent::AgentProject,
+) -> Result<usize> {
+    let candidates = with_agent_store_at(state_dir, |store| {
+        Ok(store
+            .list_pending_git_finalizations_blocking(Some(project.id))?
+            .into_iter()
+            .filter(|journal| {
+                journal.state == GitFinalizationState::Working
+                    && journal.task_identity.is_none()
+                    && journal.commit_oid.is_none()
+            })
+            .collect::<Vec<_>>())
+    })?;
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+    let board_dir = get_tasks_dir(&project.path);
+    let _mutation_lock = acquire_board_mutation_lock(&board_dir)?;
+    let mut retired = 0;
+    for journal in candidates {
+        if task_tree_contains_session_marker(&board_dir, &journal.codex_session_id)? {
+            continue;
+        }
+        let done = with_agent_store_at(state_dir, |store| {
+            store.retire_abandoned_unbound_git_finalization_blocking(
+                project.id,
+                &journal.codex_session_id,
+                journal.generation,
+                AGENT_ABANDONED_UNBOUND_JOURNAL_REASON,
+                &agent_timestamp(),
+            )
+        })?;
+        if done {
+            retired += 1;
+        }
+    }
+    Ok(retired)
+}
+
 /// Retire only unbound orphan journals; this does not finalize or publish work.
 pub(super) fn reconcile_orphaned_agent_git_journals(
     state_dir: &Path,
     project: &agent::AgentProject,
 ) -> Result<usize> {
+    let retired = retire_abandoned_unbound_git_journals(state_dir, project)?;
     let pending = with_agent_store_at(state_dir, |store| {
         store.list_pending_git_finalizations_blocking(Some(project.id))
     })?;
     if pending.is_empty() {
-        return Ok(0);
+        return Ok(retired);
     }
     let lease = try_acquire_agent_git_finalization_lease(state_dir, project, false)?
         .context("Project is still owned by an agent or interactive session; retry reconciliation after it stops")?;
@@ -439,9 +489,32 @@ pub(super) fn reconcile_orphaned_agent_git_journals(
         Ok(retired)
     })();
     let released = lease.release();
-    let retired = result?;
+    let retired_orphans = result?;
     released?;
-    Ok(retired)
+    Ok(retired + retired_orphans)
+}
+
+/// Retire a journal this run owns once the run has proven it never claimed a
+/// task. The board lock inside the cancellation keeps this race-free with any
+/// concurrent Done move, and a live owner token still keeps its journal.
+pub(super) fn retire_unlinked_working_git_finalization_after_run(
+    job: &AgentRunJob,
+    finalization: &agent::GitFinalizationRecord,
+    session_run_token: Option<&str>,
+) -> Result<bool> {
+    let Some(owner_run_token) = session_run_token
+        .filter(|run_token| finalization.owner_run_token.as_deref() == Some(*run_token))
+    else {
+        return Ok(false);
+    };
+    with_agent_store_at(&job.state_dir, |store| {
+        cancel_unlinked_working_git_finalization(
+            store,
+            &job.project.path,
+            finalization,
+            owner_run_token,
+        )
+    })
 }
 
 pub(super) fn cancel_unlinked_working_git_finalization(
@@ -2476,6 +2549,30 @@ pub(super) fn ensure_agent_git_working_record(
                 existing.git_mode.label(),
                 project.git_mode.label()
             );
+        }
+        // A journal that never bound a task can be adopted by the run that now
+        // owns this session. Without this, a resumed run inherits the token of a
+        // run that already finished and can never retire its own journal again.
+        if existing.state == GitFinalizationState::Working
+            && existing.task_identity.is_none()
+            && existing.commit_oid.is_none()
+            && existing.owner_run_token.as_deref() != Some(run_token)
+        {
+            let adopted = store.compare_and_set_git_finalization_blocking(
+                project.id,
+                session_id,
+                existing.generation,
+                GitFinalizationState::Working,
+                Some(run_token),
+                None,
+                None,
+                &agent_timestamp(),
+            )?;
+            if !adopted {
+                anyhow::bail!(
+                    "Codex session {session_id} lost its unbound Git journal to a concurrent run before adoption"
+                );
+            }
         }
         return Ok(());
     }

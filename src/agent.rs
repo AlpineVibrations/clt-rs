@@ -164,6 +164,7 @@ pub(super) const AGENT_CODEX_REASONING_EFFORTS: [&str; 7] =
 pub(super) const AGENT_STATE_DIR_ENV: &str = "CLT_AGENT_STATE_DIR";
 pub(super) const AGENT_GIT_FINALIZATION_RESUME_TOKEN_PREFIX: &str = "clt-git-finalization:";
 pub(super) const AGENT_EXTERNAL_COMPLETION_REASON: &str = "Managed Git proof was cancelled because a user explicitly moved the task to Done as an external completion";
+pub(super) const AGENT_ABANDONED_UNBOUND_JOURNAL_REASON: &str = "Managed Git proof was cancelled because its run ended before claiming a task";
 pub(super) const AGENT_DB_FILE: &str = "agent.db";
 const AGENT_DATABASE_OPEN_RETRY_ATTEMPTS: usize = 100;
 const AGENT_DATABASE_OPEN_RETRY_MILLIS: u64 = 10;

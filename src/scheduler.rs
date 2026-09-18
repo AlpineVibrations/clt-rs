@@ -32,6 +32,7 @@ use crate::{
     },
     managed_git::{
         agent_git_push_retry_backoff_remaining, reconcile_pending_agent_git_finalizations,
+        retire_abandoned_unbound_git_journals,
         record_agent_git_push_retry_error, record_agent_git_push_retry_error_message,
         repair_working_git_task_link, try_acquire_agent_git_finalization_lease,
     },
@@ -912,6 +913,11 @@ pub(super) fn run_agent_scheduler_pass_with_max_global_jobs(
             now,
         )?;
         existing_lease = agent_lease_for_project(state_dir, project.id)?;
+        // Retire task-less journals whose owning run already ended before the
+        // guarded finalization lease is attempted. Their recorded owner token
+        // can never be matched again, so leaving them pending would skip this
+        // project forever with reason=active_lease.
+        retire_abandoned_unbound_git_journals(state_dir, &project)?;
         let finalizations_before_reconcile = with_agent_store_at(state_dir, |store| {
             store.list_pending_git_finalizations_blocking(Some(project.id))
         })?;

@@ -26,7 +26,7 @@ use crate::{
         new_agent_shutdown_signal,
     },
     managed_git::{
-        cancel_unlinked_working_git_finalization, reconcile_agent_git_finalization,
+        reconcile_agent_git_finalization, retire_unlinked_working_git_finalization_after_run,
         task_content_has_completed_note, worktree_contains_completed_done_task,
     },
     platform::{
@@ -1227,32 +1227,21 @@ pub(super) fn run_agent_job_inner(
                 let durably_blocked = linked_task.as_ref().is_some_and(|(task_status, task)| {
                     task_status.is_active() && task_entry_is_blocked(task)
                 });
+                let unbound = finalization.task_identity.is_none()
+                    && finalization.commit_oid.is_none();
                 if durably_blocked {
                     status = "blocked";
                     summary = "The linked task recorded a durable blocker; its pre-run Git journal remains available for a later recovery without finalizing the task.".to_string();
-                } else if status == "idle" && linked_task.is_none() {
-                    if let Some(owner_run_token) = session_run_token
-                        .as_deref()
-                        .or(finalization.owner_run_token.as_deref())
-                    {
-                        let cancelled = with_agent_store_at(&job.state_dir, |store| {
-                            cancel_unlinked_working_git_finalization(
-                                store,
-                                &job.project.path,
-                                &finalization,
-                                owner_run_token,
-                            )
-                        })?;
-                        if !cancelled {
-                            git_finalization_pending = true;
-                            status = "failure";
-                            summary = "The unused Git journal or its task link changed before CLT could cancel it safely."
-                                .to_string();
-                        }
-                    } else {
+                } else if linked_task.is_none() && (status == "idle" || unbound) {
+                    let cancelled = retire_unlinked_working_git_finalization_after_run(
+                        &job,
+                        &finalization,
+                        session_run_token.as_deref(),
+                    )?;
+                    if !cancelled {
                         git_finalization_pending = true;
                         status = "failure";
-                        summary = "An unused Git journal could not be cancelled because its running generation was unavailable.".to_string();
+                        summary = "An unused Git journal could not be cancelled because its task link or running generation changed.".to_string();
                     }
                 } else if status != "blocked" {
                     git_finalization_pending = true;

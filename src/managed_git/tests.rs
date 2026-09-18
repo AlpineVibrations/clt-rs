@@ -4389,6 +4389,107 @@ fn scheduler_prioritizes_pending_git_finalization_over_new_todo_work() {
 }
 
 #[test]
+fn scheduler_retires_an_abandoned_unbound_journal_and_schedules_new_work() {
+    let root = temp_root("scheduler-abandoned-unbound-journal");
+    let state_dir = root.join("state/clt");
+    let project_root = root.join("project");
+    init_tasks(&project_root, false).unwrap();
+    fs::write(
+        project_root.join("tasks/todo.md"),
+        "# Todo Tasks\n- Next ready task\n",
+    )
+    .unwrap();
+    let starting_head = initialize_test_git_repository(&project_root);
+    let branch_ref = run_test_git(&project_root, &["symbolic-ref", "HEAD"]);
+    let project_root = fs::canonicalize(project_root).unwrap();
+    let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
+    store
+        .register_project_blocking(&project_root, "project")
+        .unwrap();
+    assert!(
+        store
+            .set_project_git_mode_for_path_blocking(&project_root, AgentGitMode::Commit)
+            .unwrap()
+    );
+    let project = store.list_projects_blocking().unwrap().remove(0);
+    // A launch that ended before claiming a task: the session registered, the
+    // journal was created unbound, and the run then disappeared.
+    store
+        .mark_session_running_blocking(
+            project.id,
+            "session-abandoned",
+            4242,
+            "finished-run-token",
+            &root.join("abandoned.out"),
+            &root.join("abandoned.err"),
+        )
+        .unwrap();
+    assert!(
+        store
+            .create_git_finalization_blocking(agent::NewGitFinalization {
+                project_id: project.id,
+                codex_session_id: "session-abandoned",
+                git_mode: AgentGitMode::Commit,
+                starting_head: Some(&starting_head),
+                branch_ref: Some(&branch_ref),
+                upstream_ref: None,
+                worktree_baseline: r#"{"version":1,"tracked_patch_ids":{},"untracked_blob_ids":{},"require_clean":false}"#,
+                task_identity: None,
+                owner_run_token: Some("finished-run-token"),
+                created_at: "100",
+            })
+            .unwrap()
+    );
+    assert!(
+        store
+            .finalize_reaped_automated_session_blocking(
+                project.id,
+                4242,
+                "finished-run-token",
+                "scheduler",
+                600,
+            )
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .session_control_blocking(project.id, "session-abandoned")
+            .unwrap()
+            .unwrap()
+            .state,
+        AgentSessionControlState::ResumeRequested
+    );
+    drop(store);
+
+    let start =
+        run_agent_scheduler_pass_with_max_global_jobs(&state_dir, true, &[], 1, None).unwrap();
+
+    // Before the fix this pass returned no job and skipped the project forever
+    // with reason=active_lease.
+    assert_eq!(start.pass.skipped_active_lease, 0);
+    assert_eq!(start.jobs.len(), 1);
+    assert_eq!(start.jobs[0].task_selection, AgentTaskSelection::NextTodo);
+    let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
+    let journal = store
+        .git_finalization_blocking(project.id, "session-abandoned")
+        .unwrap()
+        .unwrap();
+    assert_eq!(journal.state, GitFinalizationState::Cancelled);
+    assert_eq!(
+        journal.last_error.as_deref(),
+        Some(AGENT_ABANDONED_UNBOUND_JOURNAL_REASON)
+    );
+    assert!(
+        store
+            .session_control_blocking(project.id, "session-abandoned")
+            .unwrap()
+            .is_none()
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn scheduler_retags_abandoned_working_session_before_finalization_lease() {
     let root = temp_root("scheduler-working-finalization-recovery-token");
     let state_dir = root.join("state/clt");

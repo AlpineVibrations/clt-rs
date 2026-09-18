@@ -15,6 +15,7 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 - Remove the task board's `d` and `D` shortcuts to prevent accidental permanent deletion; keep `Delete` available for intentional deletion and `a` for archiving.
 - Allow task commits and resealing while unrelated unstaged edits or new files appear, preserving that work outside the exact staged commit.
 - Allow manual completion of an idle session-linked task after its text was edited or its work committed externally, while preserving active-owner and sealed-proof checks.
+- Retire task-less managed Git journals left behind by a run that ended before claiming a task; the project no longer wedges with `reason=active_lease` or a permanent `WORKING` journal, and a resumed run adopts such a journal so it can still be retired later.
 
 ## [0.6.16] - 2026-09-16
 
