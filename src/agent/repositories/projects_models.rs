@@ -1,13 +1,16 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use clt_database::turso::{Connection, Database, params, transaction::TransactionBehavior};
+use clt_database::turso::{
+    Connection, Database, Value, params, params_from_iter, transaction::TransactionBehavior,
+};
 
 use super::RepositoryDatabase;
 use crate::{
     agent::{
         AgentGitMode, AgentModelDefaults, AgentModelProvider, AgentModelTarget, AgentProject,
-        TursoAgentStore, query_count, row_integer, row_optional_text, row_text,
+        AgentProviderCredential, TursoAgentStore, agent_provider_env_key, query_count,
+        resolve_agent_provider_credential, row_integer, row_optional_text, row_text,
     },
     application::AgentLeaseHolderLiveness,
     runner::{agent_timestamp, agent_timestamp_seconds},
@@ -16,6 +19,16 @@ use crate::{
 
 /// Persistence for registered projects, provider configuration, and models.
 pub(in crate::agent) struct ProjectsModelsRepository(RepositoryDatabase);
+
+/// Selects the stored-key column when it exists. The expression keeps a single
+/// result shape so both compatibility modes map through the same row code.
+fn provider_api_key_column(available: bool) -> &'static str {
+    if available {
+        "api_key"
+    } else {
+        "NULL AS api_key"
+    }
+}
 
 impl ProjectsModelsRepository {
     pub(in crate::agent) fn new(db: &Database) -> Self {
@@ -28,6 +41,14 @@ impl ProjectsModelsRepository {
 }
 
 impl TursoAgentStore {
+    /// Migration 18 adds the stored provider key column, and it is deferred
+    /// while a pinned worker from an older generation is active. Reads and
+    /// writes then keep the pre-key column set so compatibility mode stays
+    /// usable; the key itself becomes available once the migration applies.
+    fn provider_api_key_column_is_available(&self) -> bool {
+        self.pending_migration_version().is_none()
+    }
+
     pub(crate) fn set_project_enabled_blocking(
         &self,
         project_id: i64,
@@ -312,13 +333,18 @@ impl TursoAgentStore {
     }
 
     pub(crate) fn list_model_providers_blocking(&self) -> Result<Vec<AgentModelProvider>> {
-        self.blocking.block_on(async {
+        let api_key_available = self.provider_api_key_column_is_available();
+        self.blocking.block_on(async move {
             let conn = self.repositories.projects_models.connect().await?;
             let mut rows = conn
                 .query(
-                    "SELECT provider_id, name, base_url, env_key, built_in, enabled
+                    &format!(
+                        "SELECT provider_id, name, base_url, env_key, built_in, enabled,
+                                {}
                          FROM model_providers
                          ORDER BY built_in DESC, name COLLATE NOCASE, provider_id COLLATE NOCASE",
+                        provider_api_key_column(api_key_available)
+                    ),
                     (),
                 )
                 .await
@@ -332,9 +358,49 @@ impl TursoAgentStore {
                     env_key: row_optional_text(&row, 3, "env_key")?,
                     built_in: row_integer(&row, 4, "built_in")? != 0,
                     enabled: row_integer(&row, 5, "enabled")? != 0,
+                    api_key: row_optional_text(&row, 6, "api_key")?,
                 });
             }
             Ok(providers)
+        })
+    }
+
+    pub(crate) fn model_provider_blocking(
+        &self,
+        provider_id: &str,
+    ) -> Result<Option<AgentModelProvider>> {
+        let api_key_available = self.provider_api_key_column_is_available();
+        self.blocking.block_on(async move {
+            let conn = self.repositories.projects_models.connect().await?;
+            let mut rows = conn
+                .query(
+                    &format!(
+                        "SELECT provider_id, name, base_url, env_key, built_in, enabled,
+                                {}
+                         FROM model_providers
+                         WHERE provider_id = ?1",
+                        provider_api_key_column(api_key_available)
+                    ),
+                    [provider_id],
+                )
+                .await
+                .with_context(|| format!("Failed to read model provider {provider_id}"))?;
+            let Some(row) = rows
+                .next()
+                .await
+                .with_context(|| format!("Failed to read model provider {provider_id}"))?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(AgentModelProvider {
+                id: row_text(&row, 0, "provider_id")?,
+                name: row_text(&row, 1, "name")?,
+                base_url: row_optional_text(&row, 2, "base_url")?,
+                env_key: row_optional_text(&row, 3, "env_key")?,
+                built_in: row_integer(&row, 4, "built_in")? != 0,
+                enabled: row_integer(&row, 5, "enabled")? != 0,
+                api_key: row_optional_text(&row, 6, "api_key")?,
+            }))
         })
     }
 
@@ -471,9 +537,25 @@ impl TursoAgentStore {
         &self,
         provider: &AgentModelProvider,
     ) -> Result<()> {
-        self.blocking.block_on_persist(async {
+        let api_key_available = self.provider_api_key_column_is_available();
+        self.blocking.block_on_persist(async move {
             let conn = self.repositories.projects_models.connect().await?;
-            conn.execute(
+            let sql = if api_key_available {
+                "INSERT INTO model_providers (
+                        provider_id, name, base_url, env_key, api_key, built_in, enabled,
+                        created_at, updated_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'), datetime('now'))
+                     ON CONFLICT(provider_id) DO UPDATE SET
+                        name = excluded.name,
+                        base_url = excluded.base_url,
+                        env_key = excluded.env_key,
+                        api_key = COALESCE(excluded.api_key, model_providers.api_key),
+                        built_in = excluded.built_in,
+                        enabled = excluded.enabled,
+                        updated_at = datetime('now')"
+            } else {
+                // Compatibility mode: no stored-key column yet, and a stored key
+                // cannot be set through the UI until the migration applies.
                 "INSERT INTO model_providers (
                         provider_id, name, base_url, env_key, built_in, enabled,
                         created_at, updated_at
@@ -484,18 +566,44 @@ impl TursoAgentStore {
                         env_key = excluded.env_key,
                         built_in = excluded.built_in,
                         enabled = excluded.enabled,
-                        updated_at = datetime('now')",
-                params![
-                    provider.id.as_str(),
-                    provider.name.as_str(),
-                    provider.base_url.as_deref(),
-                    provider.env_key.as_deref(),
-                    if provider.built_in { 1_i64 } else { 0_i64 },
-                    if provider.enabled { 1_i64 } else { 0_i64 },
-                ],
-            )
-            .await
-            .with_context(|| format!("Failed to save model provider {}", provider.id))?;
+                        updated_at = datetime('now')"
+            };
+            let mut parameters = vec![
+                Value::Text(provider.id.clone()),
+                Value::Text(provider.name.clone()),
+                provider
+                    .base_url
+                    .clone()
+                    .map(Value::Text)
+                    .unwrap_or(Value::Null),
+                provider
+                    .env_key
+                    .clone()
+                    .map(Value::Text)
+                    .unwrap_or(Value::Null),
+            ];
+            if api_key_available {
+                parameters.push(
+                    provider
+                        .api_key
+                        .clone()
+                        .map(Value::Text)
+                        .unwrap_or(Value::Null),
+                );
+            }
+            parameters.push(if provider.built_in {
+                Value::Integer(1)
+            } else {
+                Value::Integer(0)
+            });
+            parameters.push(if provider.enabled {
+                Value::Integer(1)
+            } else {
+                Value::Integer(0)
+            });
+            conn.execute(sql, params_from_iter(parameters))
+                .await
+                .with_context(|| format!("Failed to save model provider {}", provider.id))?;
             Ok(())
         })
     }
@@ -604,6 +712,85 @@ impl TursoAgentStore {
                 .with_context(|| format!("Failed to update provider {provider_id}"))?;
             Ok(changed > 0)
         })
+    }
+
+    /// Stores or clears the provider's API key in the CLT registry. A stored key
+    /// outranks the provider's environment variable when CLT launches Codex.
+    pub(crate) fn set_model_provider_api_key_blocking(
+        &self,
+        provider_id: &str,
+        api_key: Option<&str>,
+    ) -> Result<bool> {
+        if !self.provider_api_key_column_is_available() {
+            anyhow::bail!(
+                "Storing provider API keys is unavailable while an agent schema migration is deferred"
+            );
+        }
+        self.blocking.block_on_persist(async {
+            let conn = self.repositories.projects_models.connect().await?;
+            let changed = conn
+                .execute(
+                    "UPDATE model_providers SET api_key = ?1, updated_at = datetime('now')
+                         WHERE provider_id = ?2",
+                    params![api_key, provider_id],
+                )
+                .await
+                .with_context(|| format!("Failed to update provider {provider_id} API key"))?;
+            Ok(changed > 0)
+        })
+    }
+
+    /// Resolves the credential CLT should give Codex for this provider, using
+    /// the stored key first and the provider's environment variable second.
+    pub(crate) fn resolve_provider_credential_blocking(
+        &self,
+        provider_id: &str,
+    ) -> Result<Option<(String, AgentProviderCredential)>> {
+        let provider = self.model_provider_blocking(provider_id)?;
+        let env_key = agent_provider_env_key(
+            provider
+                .as_ref()
+                .and_then(|provider| provider.env_key.as_deref()),
+        )
+        .to_string();
+        // Only a provider that names an environment variable can use one; a
+        // local endpoint with no env_key has no environment fallback. A missing
+        // provider row still falls back for Codex's built-in OpenAI provider.
+        let environment = provider
+            .as_ref()
+            .is_none_or(|provider| provider.env_key.is_some())
+            .then(|| std::env::var(&env_key).ok())
+            .flatten();
+        let credential = resolve_agent_provider_credential(
+            provider
+                .as_ref()
+                .and_then(|provider| provider.api_key.as_deref()),
+            environment.as_deref(),
+        );
+        Ok(credential.map(|credential| (env_key, credential)))
+    }
+
+    /// Names the provider a launch will use: the project's override, then the
+    /// CLT-wide default, then the provider selected in the user's Codex config.
+    pub(crate) fn resolve_credential_provider_blocking(
+        &self,
+        project: &AgentProject,
+    ) -> Result<Option<String>> {
+        if project.codex_provider.is_some() || project.codex_model.is_some() {
+            return Ok(Some(
+                project
+                    .codex_provider
+                    .clone()
+                    .unwrap_or_else(|| "openai".to_string()),
+            ));
+        }
+        if let Some(provider) = self.model_defaults_blocking()?.provider_id {
+            return Ok(Some(provider));
+        }
+        Ok(crate::agent::codex_config_path()
+            .ok()
+            .and_then(|path| crate::agent::read_codex_default_config_at(&path).ok())
+            .and_then(|(provider, _)| provider))
     }
 
     pub(crate) fn set_model_target_flags_blocking(

@@ -338,6 +338,9 @@ pub(super) fn launch_agent_runner_stage(
             .arg(format!("model_provider={provider:?}"));
         command.arg("--model").arg(model);
     }
+    if let Some(provider) = store.resolve_credential_provider_blocking(project)? {
+        configure_agent_provider_credential(&mut command, store, &provider)?;
+    }
     let model_reasoning_effort = if project.codex_reasoning_effort.is_none() {
         match (
             model_target.provider_id.as_deref(),
@@ -624,6 +627,22 @@ Interactive handoff recovery:
 
 pub(super) fn agent_codex_command() -> PathBuf {
     agent_codex_path_env().unwrap_or_else(|| PathBuf::from("codex"))
+}
+
+/// Gives the launched Codex process the credential for its selected provider.
+/// CLT's stored key wins over the provider's environment variable, and both are
+/// passed as the provider's `env_key` so only that provider sees a secret.
+pub(super) fn configure_agent_provider_credential(
+    command: &mut Command,
+    store: &agent::TursoAgentStore,
+    provider_id: &str,
+) -> Result<()> {
+    let Some((env_key, credential)) = store.resolve_provider_credential_blocking(provider_id)?
+    else {
+        return Ok(());
+    };
+    command.env(&env_key, credential.value);
+    Ok(())
 }
 
 pub(super) fn configure_automated_codex_subcommand(

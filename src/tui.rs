@@ -1331,6 +1331,10 @@ pub(super) enum TuiModelInputKind {
     AddModel {
         provider_id: String,
     },
+    ProviderApiKey {
+        provider_id: String,
+        provider_name: String,
+    },
     CustomProvider {
         step: usize,
         provider_id: String,
@@ -1359,6 +1363,16 @@ impl TuiModelInput {
         }
     }
 
+    pub(super) fn provider_api_key(provider: &agent::AgentModelProvider) -> Self {
+        Self {
+            kind: TuiModelInputKind::ProviderApiKey {
+                provider_id: provider.id.clone(),
+                provider_name: provider.name.clone(),
+            },
+            input: Input::default(),
+        }
+    }
+
     pub(super) fn custom_provider() -> Self {
         Self {
             kind: TuiModelInputKind::CustomProvider {
@@ -1375,11 +1389,25 @@ impl TuiModelInput {
         match &self.kind {
             TuiModelInputKind::SearchModels => " Search Models: ",
             TuiModelInputKind::AddModel { .. } => " Model ID: ",
+            TuiModelInputKind::ProviderApiKey { .. } => " API Key (hidden): ",
             TuiModelInputKind::CustomProvider { step, .. } => match step {
                 0 => " Endpoint Name: ",
                 1 => " API Base URL (usually .../v1): ",
                 _ => " API Key Env Var (optional): ",
             },
+        }
+    }
+
+    pub(super) fn is_secret(&self) -> bool {
+        matches!(self.kind, TuiModelInputKind::ProviderApiKey { .. })
+    }
+
+    /// Display text for the buffer. Stored API keys never render in clear text.
+    pub(super) fn display_value(&self) -> String {
+        if self.is_secret() {
+            "*".repeat(self.input.value().chars().count())
+        } else {
+            self.input.value().to_string()
         }
     }
 
@@ -1389,6 +1417,9 @@ impl TuiModelInput {
                 "Enter filters by model name or ID; submit an empty search to show every model"
             }
             TuiModelInputKind::AddModel { .. } => "Enter the exact model ID used by the endpoint",
+            TuiModelInputKind::ProviderApiKey { .. } => {
+                "Enter stores the key in the CLT registry for this provider; it outranks the provider's environment variable. Submit an empty value to remove a stored key"
+            }
             TuiModelInputKind::CustomProvider { step, .. } => match step {
                 0 => "Enter a friendly name, for example My Local Server",
                 1 => {
@@ -2193,21 +2224,21 @@ pub(super) fn discover_tui_provider_models(panel: &mut TuiModelsPanel) -> Result
         .base_url
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("{} uses Codex's built-in model catalog", provider.name))?;
-    let api_key = match provider.env_key.as_deref() {
-        Some(env_key) => Some(
-            std::env::var(env_key)
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "{env_key} is not set; export it, restart CLT, then press r again"
-                    )
-                })?,
-        ),
-        None => None,
+    // Discovery authenticates with the same credential a run would use, so a
+    // key stored in CLT works without exporting the environment variable.
+    let store = open_agent_store()?;
+    let api_key = match store.resolve_provider_credential_blocking(&provider.id)? {
+        Some((_, credential)) => Some(credential.value),
+        None => match provider.env_key.as_deref() {
+            Some(env_key) => {
+                anyhow::bail!(
+                    "{env_key} is not set and no key is stored in CLT; press k to store one, then press r again"
+                )
+            }
+            None => None,
+        },
     };
     let model_ids = discover_openai_model_ids(base_url, api_key.as_deref())?;
-    let store = open_agent_store()?;
     let added = save_discovered_model_ids(&store, &provider.id, &model_ids)?;
     panel.refresh_models();
     panel.focus = TuiModelsFocus::Models;
@@ -2241,6 +2272,7 @@ pub(super) fn add_tui_model_provider_preset(
         name: preset.name.to_string(),
         base_url: preset.base_url.map(str::to_string),
         env_key: preset.env_key.map(str::to_string),
+        api_key: None,
         built_in: preset.built_in,
         enabled: true,
     })?;
@@ -2498,6 +2530,58 @@ pub(super) fn submit_tui_model_input(
             panel.refresh_models();
             Ok(Some(format!("Added model {provider_id}/{entered}")))
         }
+        TuiModelInputKind::ProviderApiKey {
+            provider_id,
+            provider_name,
+        } => {
+            let store = open_agent_store()?;
+            let stored = (!entered.is_empty()).then_some(entered.as_str());
+            let had_stored_key = store
+                .model_provider_blocking(provider_id)?
+                .and_then(|provider| provider.api_key)
+                .is_some_and(|key| !key.trim().is_empty());
+            if !store.set_model_provider_api_key_blocking(provider_id, stored)? {
+                anyhow::bail!("Provider {provider_name} no longer exists");
+            }
+            // A custom endpoint whose Codex provider entry names no environment
+            // variable would silently ignore the stored key. Name the variable
+            // CLT injects so the credential actually reaches the endpoint. Only
+            // do this while storing a key, never when clearing one.
+            if stored.is_some()
+                && let Some(provider) = store.model_provider_blocking(provider_id)?
+                && provider.env_key.is_none()
+                && let Some(base_url) = provider.base_url.as_deref()
+            {
+                store.upsert_model_provider_blocking(&agent::AgentModelProvider {
+                    env_key: Some(agent::AGENT_DEFAULT_PROVIDER_ENV_KEY.to_string()),
+                    ..provider.clone()
+                })?;
+                upsert_codex_provider_config_at(
+                    &codex_config_path()?,
+                    provider_id,
+                    &provider.name,
+                    base_url,
+                    Some(agent::AGENT_DEFAULT_PROVIDER_ENV_KEY),
+                )?;
+            }
+            panel.refresh();
+            let env_key = agent::agent_provider_env_key(
+                panel
+                    .providers
+                    .iter()
+                    .find(|provider| provider.id == *provider_id)
+                    .and_then(|provider| provider.env_key.as_deref()),
+            );
+            Ok(Some(match stored {
+                Some(_) => format!(
+                    "Stored API key for {provider_name} in the CLT registry; it outranks {env_key}"
+                ),
+                None if had_stored_key => {
+                    format!("Removed the stored API key for {provider_name}")
+                }
+                None => format!("{provider_name} has no stored API key to remove"),
+            }))
+        }
         TuiModelInputKind::CustomProvider {
             step,
             provider_id,
@@ -2535,6 +2619,7 @@ pub(super) fn submit_tui_model_input(
                             name: name.clone(),
                             base_url: Some(base_url.clone()),
                             env_key: env_key.map(str::to_string),
+                            api_key: None,
                             built_in: false,
                             enabled: true,
                         },
@@ -4468,22 +4553,60 @@ pub(super) fn render_tui_agent_panel(
 }
 
 pub(super) fn tui_models_instructions() -> &'static str {
-    "n adds a provider. Select a non-built-in provider on the left and press x/Delete to remove it. Local endpoints discover /models automatically; r refreshes. New models start OFF: Right, Up/Down, PageUp/PageDown, Home/End, then Space chooses them. / searches model names and IDs. a manually adds an ID. f favorites; t cycles model reasoning; d sets CLT; c sets Codex. M, Tab, or Esc returns to the previous pane. API keys come only from environment variables."
+    "n adds a provider. Select a non-built-in provider on the left and press x/Delete to remove it. k stores or clears the selected provider's API key in CLT; a stored key outranks its environment variable. Local endpoints discover /models automatically; r refreshes. New models start OFF: Right, Up/Down, PageUp/PageDown, Home/End, then Space chooses them. / searches model names and IDs. a manually adds an ID. f favorites; t cycles model reasoning; d sets CLT; c sets Codex. M, Tab, or Esc returns to the previous pane."
 }
 
-pub(super) fn provider_env_status(provider: &agent::AgentModelProvider) -> String {
-    match provider.env_key.as_deref() {
-        Some(key) => {
-            let visible = std::env::var_os(key)
-                .is_some_and(|value| !value.to_string_lossy().trim().is_empty());
-            format!("{key}:{}", if visible { "visible" } else { "missing" })
-        }
-        None => "no API key".to_string(),
+/// Availability of a provider credential without revealing any value. CLT's
+/// stored key is checked first because it takes priority when Codex launches.
+pub(super) fn provider_auth_status(provider: &agent::AgentModelProvider) -> String {
+    if provider
+        .api_key
+        .as_deref()
+        .is_some_and(|key| !key.trim().is_empty())
+    {
+        return "clt".to_string();
+    }
+    let Some(key) = provider
+        .env_key
+        .as_deref()
+        .filter(|key| !key.trim().is_empty())
+    else {
+        return "none".to_string();
+    };
+    if std::env::var_os(key).is_some_and(|value| !value.to_string_lossy().trim().is_empty()) {
+        "env".to_string()
+    } else {
+        "env-missing".to_string()
+    }
+}
+
+/// Longer description used in the provider detail line.
+pub(super) fn provider_auth_detail(provider: &agent::AgentModelProvider) -> String {
+    let key = agent::agent_provider_env_key(provider.env_key.as_deref());
+    if provider
+        .api_key
+        .as_deref()
+        .is_some_and(|key| !key.trim().is_empty())
+    {
+        return format!("stored in CLT (injected as {key})");
+    }
+    let Some(configured) = provider
+        .env_key
+        .as_deref()
+        .filter(|key| !key.trim().is_empty())
+    else {
+        return "Codex login or none".to_string();
+    };
+    if std::env::var_os(configured).is_some_and(|value| !value.to_string_lossy().trim().is_empty())
+    {
+        format!("environment {configured}")
+    } else {
+        format!("{configured} not set")
     }
 }
 
 pub(super) fn tui_models_provider_header() -> &'static str {
-    "USE TYPE    PROVIDER (ID)"
+    "USE TYPE    KEY         PROVIDER (ID)"
 }
 
 pub(super) fn tui_models_add_provider_hint() -> &'static str {
@@ -4532,13 +4655,14 @@ pub(super) fn include_codex_default_model_target(
 
 pub(super) fn tui_models_provider_row(provider: &agent::AgentModelProvider) -> String {
     format!(
-        "{:<3} {:<7} {} ({})",
+        "{:<3} {:<7} {:<11} {} ({})",
         if provider.enabled { "ON" } else { "OFF" },
         if provider.built_in {
             "BUILTIN"
         } else {
             "CUSTOM"
         },
+        provider_auth_status(provider),
         provider.name,
         provider.id
     )
@@ -4600,7 +4724,6 @@ pub(super) fn render_tui_models_panel(
     panel: &TuiModelsPanel,
     text_color: Color,
     c_highlight: Color,
-    provider_env_statuses: &HashMap<String, String>,
 ) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -4753,10 +4876,7 @@ pub(super) fn render_tui_models_panel(
                 format!(
                     "Provider: {}  Auth: {}  Endpoint: {}  [r] discover  Wire: responses",
                     provider.id,
-                    provider_env_statuses
-                        .get(&provider.id)
-                        .map(String::as_str)
-                        .unwrap_or("unknown"),
+                    provider_auth_detail(provider),
                     provider.base_url.as_deref().unwrap_or("Codex built-in")
                 )
             })
@@ -5728,7 +5848,6 @@ pub(super) struct TuiApp {
     pub(super) archive_scroll_offset: usize,
     pub(super) task_snapshot: TuiTaskSnapshot,
     pub(super) current_time: String,
-    pub(super) provider_env_statuses: HashMap<String, String>,
 }
 
 impl TuiApp {
@@ -5778,7 +5897,6 @@ impl TuiApp {
                 ..TuiTaskSnapshot::default()
             },
             current_time: String::new(),
-            provider_env_statuses: HashMap::new(),
         }
     }
 
@@ -6250,12 +6368,6 @@ pub(super) fn execute_tui_effect(
         }
         TuiEffect::RefreshModels => {
             app.models_panel.refresh();
-            app.provider_env_statuses = app
-                .models_panel
-                .providers
-                .iter()
-                .map(|provider| (provider.id.clone(), provider_env_status(provider)))
-                .collect();
         }
         TuiEffect::RefreshSelectedProviderModels => app.models_panel.refresh_models(),
         TuiEffect::SyncAgentLog => {
@@ -6368,14 +6480,7 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
             &app.current_time,
         );
     } else if app.current_pane == TuiPane::Models {
-        render_tui_models_panel(
-            f,
-            content_area,
-            &app.models_panel,
-            text_color,
-            c_highlight,
-            &app.provider_env_statuses,
-        );
+        render_tui_models_panel(f, content_area, &app.models_panel, text_color, c_highlight);
     } else if app.archive_view {
         let selected_idx = app.archive_state.selected();
         let col_width = content_area.width as usize;
@@ -6603,7 +6708,7 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
 
     if let Some(model_input) = app.model_input.as_ref() {
         let label = model_input.label();
-        let input_text = format!("{}{}", label, model_input.input.value());
+        let input_text = format!("{}{}", label, model_input.display_value());
         let input_paragraph = Paragraph::new(input_text.as_str())
             .block(
                 Block::default()
@@ -7005,6 +7110,27 @@ pub(super) fn execute_tui_key_effect(
                         } else {
                             app.feedback_buffer =
                                 "Add a provider before adding a model".to_string();
+                        }
+                    }
+                    KeyCode::Char('k') | KeyCode::Char('K') => {
+                        if let Some(provider) = app.models_panel.selected_provider() {
+                            let has_stored_key = provider
+                                .api_key
+                                .as_deref()
+                                .is_some_and(|key| !key.trim().is_empty());
+                            app.model_input = Some(TuiModelInput::provider_api_key(provider));
+                            app.feedback_buffer = format!(
+                                "{} API key for {}: {}",
+                                if has_stored_key { "Replace" } else { "Store" },
+                                provider.name,
+                                app.model_input
+                                    .as_ref()
+                                    .expect("API key input was just created")
+                                    .guidance()
+                            );
+                        } else {
+                            app.feedback_buffer =
+                                "Add a provider before storing an API key".to_string();
                         }
                     }
                     KeyCode::Char('r') | KeyCode::Char('R') => {

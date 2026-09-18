@@ -6,6 +6,10 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+### Added
+
+- Let the Models page store a provider API key in the CLT registry with `k`. A stored key is injected into the Codex child as that provider's `env_key`, outranks the environment variable, is used for model discovery, and is shown only as its source (`clt`, `env`, `env-missing`, or `none`). Keys are kept in the owner-only agent state directory and retained by registry recovery snapshots.
+
 ### Fixed
 
 - Allow automated Git tasks to start with existing staged changes; preserve staged entries through task-board checkpoints, freeze the launch index, and skip startup pulls in dirty checkouts.

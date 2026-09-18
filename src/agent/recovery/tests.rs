@@ -273,6 +273,7 @@ fn registry_recovery_restores_preferences_and_exact_git_journals_from_snapshot()
         name: "Recovery provider".into(),
         base_url: Some("https://example.invalid/v1".into()),
         env_key: Some("RECOVERY_TEST_KEY".into()),
+        api_key: Some("recovery-stored-secret".into()),
         built_in: false,
         enabled: true,
     };
@@ -446,6 +447,16 @@ fn registry_recovery_restores_preferences_and_exact_git_journals_from_snapshot()
             .list_model_providers_blocking()
             .unwrap()
             .contains(&provider)
+    );
+    assert_eq!(
+        reopened
+            .model_provider_blocking(&provider.id)
+            .unwrap()
+            .unwrap()
+            .api_key
+            .as_deref(),
+        Some("recovery-stored-secret"),
+        "Recovery must retain a stored provider key"
     );
     assert!(
         reopened

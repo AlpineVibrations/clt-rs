@@ -2087,6 +2087,7 @@ fn codex_runner_resolves_the_latest_clt_default_for_new_runs() {
             name: "OpenRouter".to_string(),
             base_url: Some("https://openrouter.ai/api/v1".to_string()),
             env_key: Some("OPENROUTER_API_KEY".to_string()),
+            api_key: None,
             built_in: false,
             enabled: true,
         })
@@ -2150,6 +2151,91 @@ fn codex_runner_resolves_the_latest_clt_default_for_new_runs() {
     assert!(stderr.contains("arg=model_provider=\"openrouter\"\n"));
     assert!(stderr.contains("arg=--model\narg=anthropic/claude-sonnet-4\n"));
     assert!(stderr.contains("arg=model_reasoning_effort=\"high\"\n"));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_runner_injects_the_stored_provider_api_key_into_the_child() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = temp_root("agent-codex-runner-stored-key");
+    let state_dir = root.join("state/clt");
+    let project_root = root.join("project");
+    fs::create_dir_all(&project_root).unwrap();
+    let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
+    store
+        .upsert_model_provider_blocking(&agent::AgentModelProvider {
+            id: "openrouter".to_string(),
+            name: "OpenRouter".to_string(),
+            base_url: Some("https://openrouter.ai/api/v1".to_string()),
+            env_key: Some("CLT_RUNNER_STORED_KEY".to_string()),
+            api_key: None,
+            built_in: false,
+            enabled: true,
+        })
+        .unwrap();
+    store
+        .upsert_model_target_blocking(&agent::AgentModelTarget {
+            provider_id: "openrouter".to_string(),
+            model_id: "anthropic/claude-sonnet-4".to_string(),
+            label: "Claude Sonnet 4".to_string(),
+            enabled: true,
+            favorite: true,
+            reasoning_effort: None,
+        })
+        .unwrap();
+    store
+        .set_model_default_blocking("openrouter", "anthropic/claude-sonnet-4")
+        .unwrap();
+    store
+        .set_model_provider_api_key_blocking("openrouter", Some("stored-runner-secret"))
+        .unwrap();
+
+    let fake_codex = root.join("fake-codex");
+    fs::write(
+        &fake_codex,
+        "#!/bin/sh\nprintf 'key=%s\\n' \"$CLT_RUNNER_STORED_KEY\" >&2\nprintf 'NO_TASKS_LEFT\\n'\n",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&fake_codex).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_codex, permissions).unwrap();
+
+    let project = agent::AgentProject {
+        id: 45,
+        path: project_root,
+        name: "Stored Key Project".to_string(),
+        enabled: true,
+        git_mode: AgentGitMode::Off,
+        codex_provider: None,
+        codex_model: None,
+        codex_reasoning_effort: None,
+        codex_fast_enabled: false,
+        last_scan_at: None,
+        last_daemon_scan_status: None,
+        last_daemon_scan_error: None,
+        last_run_at: None,
+        last_success_at: None,
+        last_failure_at: None,
+        last_blocked_recovery_at: None,
+        failure_count: 0,
+    };
+    let runner = CodexAgentRunner::with_command(state_dir, Duration::from_secs(5), fake_codex);
+    let result = runner
+        .run_project(
+            &project,
+            AgentTaskSelection::NextTodo,
+            None,
+            "test-holder",
+            None,
+            &new_agent_shutdown_signal(),
+        )
+        .unwrap();
+    let stderr = fs::read_to_string(result.stderr_path).unwrap();
+
+    assert!(stderr.contains("key=stored-runner-secret\n"), "{stderr}");
 
     fs::remove_dir_all(root).unwrap();
 }

@@ -753,7 +753,7 @@ fn agent_store_concurrent_virgin_opens_apply_each_migration_once() {
             .copied()
             .unwrap()
     });
-    assert_eq!(migration_count, 17);
+    assert_eq!(migration_count, 18);
 
     fs::remove_dir_all(root).unwrap();
 }
@@ -1497,6 +1497,7 @@ fn agent_store_persists_provider_catalog_favorites_and_clt_default() {
         name: "OpenRouter".to_string(),
         base_url: Some("https://openrouter.ai/api/v1".to_string()),
         env_key: Some("OPENROUTER_API_KEY".to_string()),
+        api_key: None,
         built_in: false,
         enabled: true,
     };
@@ -1539,6 +1540,214 @@ fn agent_store_persists_provider_catalog_favorites_and_clt_default() {
 }
 
 #[test]
+fn stored_provider_api_key_round_trips_and_outranks_the_environment() {
+    let root = temp_root("agent-provider-api-key");
+    let state_dir = root.join("state/clt");
+    let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
+    let provider = agent::AgentModelProvider {
+        id: "key-provider".to_string(),
+        name: "Key Provider".to_string(),
+        base_url: Some("https://example.invalid/v1".to_string()),
+        env_key: Some("CLT_TEST_PROVIDER_API_KEY".to_string()),
+        api_key: None,
+        built_in: false,
+        enabled: true,
+    };
+    store.upsert_model_provider_blocking(&provider).unwrap();
+    assert!(
+        store
+            .list_model_providers_blocking()
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == provider.id)
+            .unwrap()
+            .api_key
+            .is_none()
+    );
+
+    store
+        .set_model_provider_api_key_blocking(&provider.id, Some("  stored-secret  "))
+        .unwrap();
+    let stored = store
+        .model_provider_blocking(&provider.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.api_key.as_deref(), Some("  stored-secret  "));
+
+    // The stored key wins over any environment value for the provider's variable.
+    let resolved = store
+        .resolve_provider_credential_blocking(&provider.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(resolved.0, "CLT_TEST_PROVIDER_API_KEY");
+    assert_eq!(resolved.1.source, agent::AgentProviderCredentialSource::Clt);
+    assert_eq!(resolved.1.value, "stored-secret");
+
+    // Later provider edits keep the stored credential.
+    store
+        .upsert_model_provider_blocking(&agent::AgentModelProvider {
+            name: "Key Provider Renamed".to_string(),
+            api_key: None,
+            ..provider.clone()
+        })
+        .unwrap();
+    assert_eq!(
+        store
+            .model_provider_blocking(&provider.id)
+            .unwrap()
+            .unwrap()
+            .api_key
+            .as_deref(),
+        Some("  stored-secret  ")
+    );
+
+    store
+        .set_model_provider_api_key_blocking(&provider.id, None)
+        .unwrap();
+    assert!(
+        store
+            .model_provider_blocking(&provider.id)
+            .unwrap()
+            .unwrap()
+            .api_key
+            .is_none()
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn provider_credential_resolution_prefers_the_stored_key_and_never_debugs_values() {
+    let environment = agent::resolve_agent_provider_credential(None, Some("env-secret"));
+    assert_eq!(
+        environment,
+        Some(agent::AgentProviderCredential {
+            source: agent::AgentProviderCredentialSource::Environment,
+            value: "env-secret".to_string(),
+        })
+    );
+    let both = agent::resolve_agent_provider_credential(Some("stored-secret"), Some("env-secret"));
+    assert_eq!(
+        both,
+        Some(agent::AgentProviderCredential {
+            source: agent::AgentProviderCredentialSource::Clt,
+            value: "stored-secret".to_string(),
+        })
+    );
+    assert_eq!(agent::resolve_agent_provider_credential(None, None), None);
+    assert_eq!(
+        agent::resolve_agent_provider_credential(Some("   "), Some("\t")),
+        None
+    );
+    assert_eq!(
+        agent::resolve_agent_provider_credential(Some("spaced"), None)
+            .unwrap()
+            .value,
+        "spaced"
+    );
+
+    let provider = agent::AgentModelProvider {
+        id: "openai".to_string(),
+        name: "OpenAI".to_string(),
+        base_url: None,
+        env_key: None,
+        api_key: Some("super-secret".to_string()),
+        built_in: true,
+        enabled: true,
+    };
+    let debugged = format!("{provider:?}");
+    assert!(!debugged.contains("super-secret"), "{debugged}");
+    assert!(debugged.contains("<redacted>"), "{debugged}");
+    assert_eq!(agent::agent_provider_env_key(None), "OPENAI_API_KEY");
+    assert_eq!(
+        agent::agent_provider_env_key(Some("OPENROUTER_API_KEY")),
+        "OPENROUTER_API_KEY"
+    );
+    assert_eq!(agent::agent_provider_env_key(Some("  ")), "OPENAI_API_KEY");
+}
+
+#[test]
+fn provider_credential_resolution_reads_the_environment_only_as_a_fallback() {
+    const CHILD_ENV: &str = "CLT_TEST_PROVIDER_CREDENTIAL_CHILD";
+    if std::env::var_os(CHILD_ENV).is_none() {
+        // Use a subprocess so the variable never leaks into parallel tests.
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "agent::tests::provider_credential_resolution_reads_the_environment_only_as_a_fallback",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .env("CLT_TEST_ENV_ONLY_KEY", "env-only-secret")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "provider credential subprocess failed: stdout={}; stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let root = temp_root("agent-provider-credential-environment");
+    let state_dir = root.join("state/clt");
+    let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
+    let provider = agent::AgentModelProvider {
+        id: "env-provider".to_string(),
+        name: "Environment Provider".to_string(),
+        base_url: Some("https://example.invalid/v1".to_string()),
+        env_key: Some("CLT_TEST_ENV_ONLY_KEY".to_string()),
+        api_key: None,
+        built_in: false,
+        enabled: true,
+    };
+    store.upsert_model_provider_blocking(&provider).unwrap();
+
+    let (env_key, from_environment) = store
+        .resolve_provider_credential_blocking(&provider.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(env_key, "CLT_TEST_ENV_ONLY_KEY");
+    assert_eq!(
+        from_environment.source,
+        agent::AgentProviderCredentialSource::Environment
+    );
+    assert_eq!(from_environment.value, "env-only-secret");
+
+    store
+        .set_model_provider_api_key_blocking(&provider.id, Some("stored-secret"))
+        .unwrap();
+    let (_, stored) = store
+        .resolve_provider_credential_blocking(&provider.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.source, agent::AgentProviderCredentialSource::Clt);
+    assert_eq!(stored.value, "stored-secret");
+
+    // A local endpoint that names no environment variable has no fallback.
+    store
+        .upsert_model_provider_blocking(&agent::AgentModelProvider {
+            id: "local-provider".to_string(),
+            name: "Local Provider".to_string(),
+            base_url: Some("http://127.0.0.1:9090/v1".to_string()),
+            env_key: None,
+            api_key: None,
+            built_in: false,
+            enabled: true,
+        })
+        .unwrap();
+    assert!(
+        store
+            .resolve_provider_credential_blocking("local-provider")
+            .unwrap()
+            .is_none()
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn agent_store_deletes_provider_models_and_dependent_selections() {
     let root = temp_root("agent-model-provider-delete");
     let state_dir = root.join("state/clt");
@@ -1555,6 +1764,7 @@ fn agent_store_deletes_provider_models_and_dependent_selections() {
         name: "Local Delete".to_string(),
         base_url: Some("http://localhost:9090/v1".to_string()),
         env_key: None,
+        api_key: None,
         built_in: false,
         enabled: true,
     };

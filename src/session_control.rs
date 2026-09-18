@@ -33,7 +33,7 @@ use crate::{
     runner::{
         CodexAgentRunner, agent_codex_command, agent_timestamp, agent_timestamp_after,
         agent_timestamp_seconds, automated_exec_gate_is_released,
-        configure_automated_exec_gate_inheritance,
+        configure_agent_provider_credential, configure_automated_exec_gate_inheritance,
     },
     scheduler::{
         agent_failure_backoff, agent_lease_holder, agent_lease_is_reclaimable,
@@ -1106,6 +1106,9 @@ pub(super) fn run_guarded_interactive_codex(
     let codex_command = agent_codex_command();
     let mut target = Command::new(&codex_command);
     configure_interactive_codex_resume_command(&mut target, &project.path, session_id);
+    if let Some(provider) = store.resolve_credential_provider_blocking(project)? {
+        configure_agent_provider_credential(&mut target, store, &provider)?;
+    }
     let mut command = interactive_exec_gate_command(&target)?;
     configure_interactive_child_command(command.command_mut());
     let (mut child, mut launch_gate) = match command.spawn() {

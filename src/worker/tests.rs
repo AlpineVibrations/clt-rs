@@ -2370,7 +2370,7 @@ fn successful_worker_reservation_atomically_supersedes_old_abandonment() {
 
 #[test]
 fn incompatible_schema_migration_is_deferred_for_pinned_workers() {
-    let future_migration_version = 18;
+    let future_migration_version = 19;
     let root = temp_root("agent-worker-migration-barrier");
     let state_dir = root.join("state/clt");
     let project_root = root.join("project");
@@ -2434,6 +2434,43 @@ fn incompatible_schema_migration_is_deferred_for_pinned_workers() {
             .request_session_stop_blocking(project.id, "migration-session", 123, "migration-token",)
             .unwrap()
     );
+    {
+        // Compatibility mode must keep the pre-key provider surface working
+        // until the deferred migration can apply.
+        let providers = compatibility_store.list_model_providers_blocking().unwrap();
+        assert!(
+            providers
+                .iter()
+                .any(|provider| provider.id == "openai" && provider.api_key.is_none())
+        );
+        compatibility_store
+            .upsert_model_provider_blocking(&agent::AgentModelProvider {
+                id: "compatibility-provider".to_string(),
+                name: "Compatibility Provider".to_string(),
+                base_url: Some("https://example.invalid/v1".to_string()),
+                env_key: Some("COMPATIBILITY_KEY".to_string()),
+                api_key: None,
+                built_in: false,
+                enabled: true,
+            })
+            .unwrap();
+        let provider = compatibility_store
+            .model_provider_blocking("compatibility-provider")
+            .unwrap()
+            .unwrap();
+        assert!(provider.api_key.is_none());
+        assert!(
+            compatibility_store
+                .set_model_provider_api_key_blocking("compatibility-provider", Some("secret"))
+                .is_err()
+        );
+        assert!(
+            compatibility_store
+                .resolve_provider_credential_blocking("compatibility-provider")
+                .unwrap()
+                .is_none()
+        );
+    }
     assert!(
         store
             .abandon_worker_blocking(agent::AgentWorkerAbandonment {

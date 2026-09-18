@@ -2787,6 +2787,38 @@ fn tui_update_handlers_are_pure_and_effect_execution_is_separate() {
 }
 
 #[test]
+fn models_pane_forwards_the_api_key_key_to_the_pane_handler() {
+    let root = temp_root("models-pane-api-key-key");
+    fs::create_dir_all(&root).unwrap();
+    let mut app = TuiApp::new(&root, true);
+    app.current_pane = TuiPane::Models;
+    app.models_panel.providers = vec![agent::AgentModelProvider {
+        id: "forwarded".to_string(),
+        name: "Forwarded".to_string(),
+        base_url: Some("https://example.invalid/v1".to_string()),
+        env_key: Some("CLT_FORWARDED_KEY".to_string()),
+        api_key: None,
+        built_in: false,
+        enabled: true,
+    }];
+    app.models_panel.provider_state.select(Some(0));
+
+    // `k` is not a navigation key, so the pane reducer must pass it through to
+    // the key handler that opens the hidden API key prompt.
+    let effects = update_tui_models_pane(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+    )
+    .expect("models pane handles the key");
+    assert!(matches!(
+        effects.as_slice(),
+        [TuiEffect::PaneKey(key)] if key.code == KeyCode::Char('k')
+    ));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn tui_models_navigation_pages_and_searches_visible_models() {
     let mut panel = TuiModelsPanel {
         providers: Vec::new(),
@@ -2857,12 +2889,141 @@ fn tui_models_navigation_pages_and_searches_visible_models() {
 }
 
 #[test]
+fn tui_provider_api_key_input_stores_masks_and_clears_the_key() {
+    // `open_agent_store()` resolves this test's isolated registry directory.
+    let state_dir = agent::isolated_unit_test_agent_state_dir();
+    let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
+    store
+        .upsert_model_provider_blocking(&agent::AgentModelProvider {
+            id: "key-store-tui".to_string(),
+            name: "Key Store TUI".to_string(),
+            base_url: Some("https://example.invalid/v1".to_string()),
+            env_key: Some("CLT_TUI_TEST_KEY".to_string()),
+            api_key: None,
+            built_in: false,
+            enabled: true,
+        })
+        .unwrap();
+    let mut panel = TuiModelsPanel::new();
+    panel.refresh();
+    let provider = panel
+        .providers
+        .iter()
+        .find(|provider| provider.id == "key-store-tui")
+        .unwrap()
+        .clone();
+    assert_eq!(provider_auth_status(&provider), "env-missing");
+
+    let mut input = TuiModelInput::provider_api_key(&provider);
+    assert!(input.is_secret());
+    assert_eq!(input.display_value(), "");
+    input.insert_paste("sk-live-secret");
+    assert_eq!(input.display_value(), "**************");
+    assert!(!input.display_value().contains("secret"));
+    assert_eq!(input.label(), " API Key (hidden): ");
+
+    let message = submit_tui_model_input(&mut input, &mut panel)
+        .unwrap()
+        .unwrap();
+    assert!(message.contains("Stored API key for Key Store TUI"));
+    assert!(message.contains("outranks CLT_TUI_TEST_KEY"));
+    let stored = store
+        .model_provider_blocking("key-store-tui")
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.api_key.as_deref(), Some("sk-live-secret"));
+    assert_eq!(provider_auth_status(&stored), "clt");
+    assert!(provider_auth_detail(&stored).contains("stored in CLT"));
+    assert!(!provider_auth_detail(&stored).contains("sk-live-secret"));
+
+    let mut clear = TuiModelInput::provider_api_key(&stored);
+    let message = submit_tui_model_input(&mut clear, &mut panel)
+        .unwrap()
+        .unwrap();
+    assert!(message.contains("Removed the stored API key"));
+    assert!(
+        store
+            .model_provider_blocking("key-store-tui")
+            .unwrap()
+            .unwrap()
+            .api_key
+            .is_none()
+    );
+    let mut clear_again = TuiModelInput::provider_api_key(&stored);
+    let message = submit_tui_model_input(&mut clear_again, &mut panel)
+        .unwrap()
+        .unwrap();
+    assert!(
+        message.contains("has no stored API key to remove"),
+        "{message}"
+    );
+
+    fs::remove_dir_all(state_dir).unwrap();
+}
+
+#[test]
+fn models_page_renders_the_key_source_without_the_stored_secret() {
+    let root = temp_root("models-page-key-source");
+    fs::create_dir_all(&root).unwrap();
+    let mut providers = vec![agent::AgentModelProvider {
+        id: "rendered-key".to_string(),
+        name: "Rendered Key".to_string(),
+        base_url: Some("https://example.invalid/v1".to_string()),
+        env_key: Some("CLT_RENDERED_TEST_KEY".to_string()),
+        api_key: Some("rendered-secret-value".to_string()),
+        built_in: false,
+        enabled: true,
+    }];
+    providers.push(agent::AgentModelProvider {
+        id: "no-key".to_string(),
+        name: "No Key".to_string(),
+        base_url: None,
+        env_key: None,
+        api_key: None,
+        built_in: true,
+        enabled: true,
+    });
+
+    let backend = ratatui::backend::TestBackend::new(110, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut app = TuiApp::new(&root, true);
+    app.current_pane = TuiPane::Models;
+    app.models_panel.providers = providers;
+    app.models_panel.provider_state.select(Some(0));
+    app.model_input = Some(TuiModelInput::provider_api_key(
+        &app.models_panel.providers[0],
+    ));
+    app.model_input
+        .as_mut()
+        .unwrap()
+        .insert_paste("typed-secret-value");
+    terminal.draw(|frame| render_tui(frame, &app)).unwrap();
+    let rendered = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+
+    assert!(rendered.contains("KEY"), "{rendered}");
+    assert!(rendered.contains("clt"), "{rendered}");
+    assert!(rendered.contains("stored in CLT"), "{rendered}");
+    assert!(rendered.contains("API Key (hidden)"), "{rendered}");
+    assert!(!rendered.contains("rendered-secret-value"), "{rendered}");
+    assert!(!rendered.contains("typed-secret-value"), "{rendered}");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn tui_models_rows_have_labeled_columns_and_independent_defaults() {
     let provider = agent::AgentModelProvider {
         id: "openai".to_string(),
         name: "OpenAI".to_string(),
         base_url: None,
         env_key: None,
+        api_key: None,
         built_in: true,
         enabled: true,
     };
@@ -2870,13 +3031,13 @@ fn tui_models_rows_have_labeled_columns_and_independent_defaults() {
         tui_models_provider_header()
             .split_whitespace()
             .collect::<Vec<_>>(),
-        ["USE", "TYPE", "PROVIDER", "(ID)"]
+        ["USE", "TYPE", "KEY", "PROVIDER", "(ID)"]
     );
     assert_eq!(
         tui_models_provider_row(&provider)
             .split_whitespace()
             .collect::<Vec<_>>(),
-        ["ON", "BUILTIN", "OpenAI", "(openai)"]
+        ["ON", "BUILTIN", "none", "OpenAI", "(openai)"]
     );
 
     let model = agent::AgentModelTarget {
@@ -2979,6 +3140,7 @@ fn local_model_endpoint_helpers_create_stable_ids_and_parse_openai_catalogs() {
         name: "Existing".to_string(),
         base_url: None,
         env_key: None,
+        api_key: None,
         built_in: false,
         enabled: true,
     }];
@@ -3054,6 +3216,7 @@ fn discovered_models_start_off_and_existing_choices_are_preserved() {
         name: "Local Test".to_string(),
         base_url: Some("http://localhost:8080/v1".to_string()),
         env_key: None,
+        api_key: None,
         built_in: false,
         enabled: true,
     };

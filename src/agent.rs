@@ -23,6 +23,8 @@ const _: () = assert!(turso::core::CLT_WAL_PATCH_LEVEL >= 1);
 
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 pub(crate) mod recovery;
 mod repositories;
@@ -65,7 +67,16 @@ pub(super) fn ensure_agent_state_dir() -> Result<PathBuf> {
 
 pub(super) fn ensure_agent_state_dir_at(state_dir: &Path) -> Result<()> {
     fs::create_dir_all(state_dir)
-        .with_context(|| format!("Failed to create agent state directory {:?}", state_dir))
+        .with_context(|| format!("Failed to create agent state directory {:?}", state_dir))?;
+    #[cfg(unix)]
+    {
+        // The registry can hold provider API keys, and its WAL and snapshot
+        // files sit beside it. Keep the directory owner-only so those files are
+        // never reachable by other local accounts.
+        fs::set_permissions(state_dir, fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("Failed to secure agent state directory {state_dir:?}"))?;
+    }
+    Ok(())
 }
 
 #[cfg(not(test))]
@@ -423,6 +434,50 @@ pub(super) fn valid_environment_variable_name(name: &str) -> bool {
         .next()
         .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
         && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+/// Environment variable Codex reads for the built-in OpenAI provider when a
+/// provider row has no explicit `env_key`.
+pub(super) const AGENT_DEFAULT_PROVIDER_ENV_KEY: &str = "OPENAI_API_KEY";
+
+pub(super) fn agent_provider_env_key(env_key: Option<&str>) -> &str {
+    env_key
+        .filter(|key| !key.trim().is_empty())
+        .unwrap_or(AGENT_DEFAULT_PROVIDER_ENV_KEY)
+}
+
+/// Where a provider's API key came from. Resolution order is CLT's stored key,
+/// then the provider's environment variable, then Codex's own configured
+/// authentication (ChatGPT login or `codex login --with-api-key`), which CLT
+/// leaves untouched.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum AgentProviderCredentialSource {
+    Clt,
+    Environment,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct AgentProviderCredential {
+    pub(crate) source: AgentProviderCredentialSource,
+    pub(crate) value: String,
+}
+
+pub(super) fn resolve_agent_provider_credential(
+    stored: Option<&str>,
+    environment: Option<&str>,
+) -> Option<AgentProviderCredential> {
+    for (source, value) in [
+        (AgentProviderCredentialSource::Clt, stored),
+        (AgentProviderCredentialSource::Environment, environment),
+    ] {
+        if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
+            return Some(AgentProviderCredential {
+                source,
+                value: value.to_string(),
+            });
+        }
+    }
+    None
 }
 
 pub(super) fn mutate_codex_config_at(
@@ -1062,6 +1117,10 @@ const AGENT_MIGRATIONS: &[AgentMigration<'static>] = &[
             )",
         ],
     },
+    AgentMigration {
+        version: 18,
+        statements: &["ALTER TABLE model_providers ADD COLUMN api_key TEXT"],
+    },
 ];
 
 pub(super) struct TursoAgentStore {
@@ -1103,14 +1162,31 @@ pub(super) struct AgentProject {
     pub(crate) failure_count: i64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub(super) struct AgentModelProvider {
     pub(crate) id: String,
     pub(crate) name: String,
     pub(crate) base_url: Option<String>,
     pub(crate) env_key: Option<String>,
+    pub(crate) api_key: Option<String>,
     pub(crate) built_in: bool,
     pub(crate) enabled: bool,
+}
+
+impl std::fmt::Debug for AgentModelProvider {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AgentModelProvider")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("base_url", &self.base_url)
+            .field("env_key", &self.env_key)
+            // Never let a stored credential reach a log, panic message, or test failure.
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("built_in", &self.built_in)
+            .field("enabled", &self.enabled)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
