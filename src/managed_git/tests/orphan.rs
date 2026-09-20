@@ -613,8 +613,11 @@ fn abandoned_unbound_journal_from_a_finished_run_is_retired() {
 fn abandoned_unbound_journal_with_a_live_owner_is_preserved() {
     let session_id: &'static str = "01a0b017-aaaa-7940-8327-edc1ee07b90c";
     let journal_owner = "1789660716-959806000-p20-live";
-    let fixture =
-        abandoned_unbound_journal_fixture("abandoned-unbound-live-owner", session_id, journal_owner);
+    let fixture = abandoned_unbound_journal_fixture(
+        "abandoned-unbound-live-owner",
+        session_id,
+        journal_owner,
+    );
     // A worker that is still running proves the owner is live.
     assert!(
         fixture
