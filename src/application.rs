@@ -1173,11 +1173,25 @@ pub(super) fn move_task_to_doing_with_agent_session(
     let board_dir = get_tasks_dir(&root);
     let _mutation_lock = acquire_board_mutation_lock(&board_dir)?;
     let entry = task_entry_at(&board_dir, TaskStatus::Todo, task_index)?;
-    anyhow::ensure!(
-        recoverable_codex_session_id_from_task_content(&entry.content)
-            .is_none_or(|existing| existing == session_id),
-        "Selected Todo task already belongs to a different Codex session"
-    );
+    if let Some(previous) = recoverable_codex_session_id_from_task_content(&entry.content)
+        && previous != session_id
+    {
+        // Planning never owns an automated run or Git boundary. A fresh worker
+        // may claim that Todo while retaining the ordinary ownership checks for
+        // interrupted or completed automated sessions.
+        let planning = store.session_control_blocking(project.id, previous)?;
+        anyhow::ensure!(
+            planning.is_some_and(|control| {
+                control.state == AgentSessionControlState::Stopped
+                    && control.run_token.is_none()
+                    && control.child_pid.is_none()
+                    && control.interactive_holder.is_none()
+            }) && store
+                .git_finalization_blocking(project.id, previous)?
+                .is_none(),
+            "Selected Todo task already belongs to a different Codex session"
+        );
+    }
     if let Some((status, linked)) = task_for_codex_session_in_board(&board_dir, &session_id)? {
         anyhow::ensure!(
             status == TaskStatus::Todo

@@ -846,6 +846,29 @@ impl TursoAgentStore {
         })
     }
 
+    /// Record an interactive-only conversation before publishing its task link.
+    /// A null run token proves that no automated run has owned this session.
+    pub(crate) fn register_planning_session_blocking(
+        &self,
+        project_id: i64,
+        session_id: &str,
+        lease_holder: &str,
+    ) -> Result<bool> {
+        self.blocking.block_on_persist(async {
+            let conn = self.repositories.sessions_runs.connect().await?;
+            let changed = conn.execute(
+                "INSERT INTO session_controls (project_id, codex_session_id, state, updated_at)
+                 SELECT ?1, ?2, 'stopped', ?3
+                 WHERE EXISTS (SELECT 1 FROM leases WHERE project_id = ?1 AND holder = ?4
+                    AND CAST(expires_at AS INTEGER) > CAST(?3 AS INTEGER))
+                 AND NOT EXISTS (SELECT 1 FROM session_controls WHERE project_id = ?1 AND state <> 'stopped')
+                 ON CONFLICT(project_id, codex_session_id) DO NOTHING",
+                params![project_id, session_id, agent_timestamp(), lease_holder],
+            ).await.context("Failed to record the new planning session")?;
+            Ok(changed == 1)
+        })
+    }
+
     pub(crate) fn reserve_idle_session_interactive_blocking(
         &self,
         project_id: i64,

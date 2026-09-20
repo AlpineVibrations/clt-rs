@@ -38,12 +38,12 @@ use crate::{
     scheduler::{
         agent_failure_backoff, agent_lease_holder, agent_lease_is_reclaimable,
         agent_lease_renew_interval, agent_lease_timeout, agent_max_global_jobs,
-        reconcile_stale_agent_session_controls, scan_agent_project,
+        reconcile_stale_agent_session_controls, scan_agent_project, task_status_for_codex_session,
     },
     session_recovery::ensure_orphaned_session_supervision,
     task::{
         TaskEntry, TaskSource, TaskStatus, get_tasks_dir, read_task_entries,
-        recoverable_codex_session_id_from_task_content, task_entry_is_blocked,
+        recoverable_codex_session_id_from_task_content,
     },
     tui::{
         TUI_LEASE_RELEASE_ATTEMPTS, TUI_LEASE_RELEASE_RETRY_MILLIS,
@@ -53,6 +53,8 @@ use crate::{
         blocked_task_snapshots, completed_task_contents, print_agent_run_completion, run_agent_job,
     },
 };
+
+pub(super) mod planning;
 
 #[cfg(all(unix, test))]
 use crate::application::TEST_INTERACTIVE_EXEC_GATE_ENV;
@@ -1485,9 +1487,14 @@ pub(super) fn stop_interactive_child_until_reaped(
     }
 }
 
-pub(super) fn task_supports_interactive_codex_resume(status: TaskStatus, task: &TaskEntry) -> bool {
-    matches!(status, TaskStatus::Done | TaskStatus::Doing)
-        || status == TaskStatus::Todo && task_entry_is_blocked(task)
+pub(super) fn task_supports_interactive_codex_resume(
+    status: TaskStatus,
+    _task: &TaskEntry,
+) -> bool {
+    matches!(
+        status,
+        TaskStatus::Todo | TaskStatus::Doing | TaskStatus::Done
+    )
 }
 
 pub(super) fn codex_session_task_supports_interactive_resume(
@@ -1574,6 +1581,16 @@ pub(super) fn toggle_tui_codex_session_stop_at(
             Ok("This Codex task session is already stopping.".to_string())
         }
         AgentSessionControlState::Stopped => {
+            if control.run_token.is_none()
+                && let Some(project) = store
+                    .list_projects_blocking()?
+                    .into_iter()
+                    .find(|project| project.id == project_id)
+                && task_status_for_codex_session(&project.path, session_id)?
+                    == Some(TaskStatus::Todo)
+            {
+                return Ok("This planning session has no automated run to resume; press c to continue the conversation. Todo automation can start the task normally.".to_string());
+            }
             if store.request_stopped_session_resume_blocking(
                 project_id,
                 session_id,

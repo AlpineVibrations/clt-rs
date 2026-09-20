@@ -59,11 +59,11 @@ use crate::{
         InteractiveAgentLease, InteractiveCodexResumeMode, InteractiveGuardianDisposition,
         agent_session_resume_worker_log_path, cancel_tui_idle_codex_session_interactive,
         codex_session_for_task, codex_session_task_supports_interactive_resume,
-        prepare_tui_codex_session_interrupt, queue_tui_codex_session_exec_resume,
-        reserve_tui_idle_codex_session_interactive, reserve_tui_shared_codex_session_interactive,
-        resume_codex_session_interactively, spawn_agent_session_resume_worker,
-        task_supports_interactive_codex_resume, toggle_tui_codex_session_stop,
-        tui_inactive_codex_session_control,
+        planning::prepare_todo_planning_session, prepare_tui_codex_session_interrupt,
+        queue_tui_codex_session_exec_resume, reserve_tui_idle_codex_session_interactive,
+        reserve_tui_shared_codex_session_interactive, resume_codex_session_interactively,
+        spawn_agent_session_resume_worker, task_supports_interactive_codex_resume,
+        toggle_tui_codex_session_stop, tui_inactive_codex_session_control,
     },
     task::{
         TASK_STATUSES, TaskBoard, TaskEntry, TaskSource, TaskStatus, acquire_board_mutation_lock,
@@ -1140,7 +1140,7 @@ impl TuiTaskSnapshot {
 }
 
 pub(super) fn tui_task_board_instructions() -> &'static str {
-    "Arrows navigate boards and tasks, Enter opens subtasks, e edits, n or + creates a subtask under the selected task, and Space creates a task. Press r to reorganize; use Shift+Arrows to move tasks. Tab opens Agent Projects, M opens Models, and h/? opens Help. Codex: s stops/resumes, i interrupts for interaction, c opens linked sessions (taking over active runs), and l shows logs."
+    "Arrows navigate boards and tasks, Enter opens subtasks, e edits, n or + creates a subtask under the selected task, and Space creates a task. Press r to reorganize; use Shift+Arrows to move tasks. Tab opens Agent Projects, M opens Models, and h/? opens Help. Codex: s stops/resumes, i interrupts for interaction, c plans Todo tasks or opens linked sessions (taking over active runs), and l shows logs."
 }
 
 pub(super) fn tui_start_state(active_board: bool) -> TuiStartState {
@@ -5645,15 +5645,29 @@ pub(super) fn run_tui_codex_session_interrupt(
     })
 }
 
+pub(super) enum TuiCodexContinuation {
+    Existing {
+        shares_project: bool,
+        require_resumable_task: bool,
+    },
+    NewPlanning(InteractiveAgentLease),
+}
+
 pub(super) fn run_tui_codex_session_continue(
     terminal: &mut TuiTerminal,
     terminal_session: &mut TerminalSession,
     return_title: &str,
     target: &TuiCodexSessionTarget,
     label: &str,
-    shares_project: bool,
-    require_resumable_task: bool,
+    continuation: TuiCodexContinuation,
 ) -> Result<String> {
+    let (shares_project, require_resumable_task, prepared_lease) = match continuation {
+        TuiCodexContinuation::Existing {
+            shares_project,
+            require_resumable_task,
+        } => (shares_project, require_resumable_task, None),
+        TuiCodexContinuation::NewPlanning(lease) => (false, true, Some(lease)),
+    };
     draw_tui_codex_handoff_status(
         terminal,
         if shares_project {
@@ -5671,10 +5685,11 @@ pub(super) fn run_tui_codex_session_continue(
             InteractiveAgentLease::holder_for_shared_session(restore_stopped),
         )
     } else {
-        let lease = InteractiveAgentLease::try_acquire_idle(target.project_id, restore_stopped)?
-            .context(
-                "Another Codex task began using this project; press c again to open this session alongside it",
-            )?;
+        let lease = match prepared_lease {
+            Some(lease) => lease,
+            None => InteractiveAgentLease::try_acquire_idle(target.project_id, restore_stopped)?
+                .context("Another Codex task began using this project; press c again to open this session alongside it")?,
+        };
         let holder = lease.holder.clone();
         (Some(lease), holder)
     };
@@ -5731,7 +5746,7 @@ pub(super) fn run_tui_codex_session_continue(
             let release_result = interactive_lease.map_or(Ok(()), InteractiveAgentLease::release);
             return match (task_is_resumable, cancel_result, release_result) {
                 (Ok(false), Ok(true), Ok(())) => anyhow::bail!(
-                    "This task changed before its Codex session could open; c is only available from Done, Doing, or currently blocked Todo tasks"
+                    "This task changed before its Codex session could open; c is only available from Todo, Doing, or Done tasks"
                 ),
                 (Err(error), Ok(true), Ok(())) => Err(error)
                     .context("Unable to revalidate the Codex task before interactive resume"),
@@ -6808,7 +6823,7 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
                                  [g]            - Cycle selected project's Git mode: off/commit/push\n\
                                  [s]            - Stop/resume linked task or displayed Agent Output session\n\
                                  [i]            - Take over linked/displayed live session, then auto-restart exec\n\
-                                 [c]            - Open linked/displayed session; take over if active\n\
+                                 [c]            - Plan a Todo / open linked session; take over if active\n\
                                  [l]            - Toggle active/selected project's live/current agent output\n\
                                  [a]            - Move selected task to archive\n\
                                  [A]            - Toggle archive view\n\
@@ -7526,8 +7541,10 @@ pub(super) fn execute_tui_key_effect(
                                     &app_title(&app.active_root),
                                     &target,
                                     &label,
-                                    shares_project,
-                                    false,
+                                    TuiCodexContinuation::Existing {
+                                        shares_project,
+                                        require_resumable_task: false,
+                                    },
                                 )
                             };
                         match resume_result {
@@ -7882,14 +7899,61 @@ pub(super) fn execute_tui_key_effect(
 
                         if !task_supports_interactive_codex_resume(selected_status, &task) {
                             app.feedback_buffer =
-                                                "Codex sessions can be resumed from linked Doing, Done, or blocked Todo tasks."
-                                                    .to_string();
+                                "Codex sessions are available from Todo, Doing, or Done tasks."
+                                    .to_string();
                             return Ok(false);
                         }
 
                         let Some(session_id) = codex_session_for_task(&task) else {
-                            app.feedback_buffer =
-                                "No Codex session linked to this task.".to_string();
+                            if selected_status != TaskStatus::Todo {
+                                app.feedback_buffer =
+                                    "No Codex session linked to this task.".to_string();
+                                return Ok(false);
+                            }
+                            app.agent_panel.refresh(&app.active_root);
+                            if !app.agent_panel.select_project_for_path(&app.active_root) {
+                                app.feedback_buffer = "Register this project before opening a Codex planning session.".to_string();
+                                return Ok(false);
+                            }
+                            let project = app
+                                .agent_panel
+                                .selected_project()
+                                .context("No registered project selected")?
+                                .project
+                                .clone();
+                            draw_tui_codex_handoff_status(
+                                terminal,
+                                TuiCodexHandoffStage::PreparingIdleSession,
+                            )?;
+                            let result = ensure_agent_state_dir()
+                                .and_then(|state_dir| {
+                                    prepare_todo_planning_session(
+                                        &state_dir, &project, &board_dir, &task,
+                                    )
+                                })
+                                .and_then(|prepared| {
+                                    let target =
+                                        TuiCodexSessionTarget::new(&project, prepared.session_id);
+                                    run_tui_codex_session_continue(
+                                        terminal,
+                                        terminal_session,
+                                        &app_title(&app.active_root),
+                                        &target,
+                                        &task_display_text(&task),
+                                        TuiCodexContinuation::NewPlanning(prepared.lease),
+                                    )
+                                });
+                            match result {
+                                Ok(message) => app.feedback_buffer = message,
+                                Err(error) if !terminal_session.active => return Err(error),
+                                Err(error) => {
+                                    app.feedback_buffer =
+                                        format!("Unable to open a Codex planning session: {error}")
+                                }
+                            }
+                            app.agent_panel.refresh(&app.active_root);
+                            *last_agent_panel_refresh = Instant::now();
+                            app.refresh_task_snapshot();
                             return Ok(false);
                         };
                         app.agent_panel.refresh(&app.active_root);
@@ -7937,8 +8001,10 @@ pub(super) fn execute_tui_key_effect(
                                     &app_title(&app.active_root),
                                     &target,
                                     &label,
-                                    shares_project,
-                                    true,
+                                    TuiCodexContinuation::Existing {
+                                        shares_project,
+                                        require_resumable_task: true,
+                                    },
                                 )
                             };
                         match resume_result {

@@ -2871,7 +2871,7 @@ fn live_session_attachment_does_not_guess_between_multiple_new_doing_tasks() {
 }
 
 #[test]
-fn interactive_codex_resume_accepts_doing_done_and_currently_blocked_todo_tasks() {
+fn interactive_codex_resume_accepts_doing_done_and_all_todo_tasks() {
     let done = task_entry_from_text(
         TaskSource::MarkdownLine { line_index: 1 },
         "finished task",
@@ -2907,7 +2907,7 @@ fn interactive_codex_resume_accepts_doing_done_and_currently_blocked_todo_tasks(
         TaskStatus::Doing,
         &unblocked
     ));
-    assert!(!task_supports_interactive_codex_resume(
+    assert!(task_supports_interactive_codex_resume(
         TaskStatus::Todo,
         &unblocked
     ));
@@ -2918,7 +2918,7 @@ fn interactive_codex_resume_accepts_doing_done_and_currently_blocked_todo_tasks(
 }
 
 #[test]
-fn interactive_resume_revalidation_rejects_an_unblocked_or_duplicate_session_task() {
+fn interactive_resume_revalidation_accepts_todo_but_rejects_duplicate_session_tasks() {
     let root = temp_root("interactive-session-task-revalidation");
     init_tasks(&root, false).unwrap();
     fs::write(
@@ -2942,7 +2942,7 @@ fn interactive_resume_revalidation_rejects_an_unblocked_or_duplicate_session_tas
         "# Todo Tasks\n- now unblocked codex:session-123\n",
     )
     .unwrap();
-    assert!(!codex_session_task_supports_interactive_resume(&root, "session-123").unwrap());
+    assert!(codex_session_task_supports_interactive_resume(&root, "session-123").unwrap());
 
     fs::write(
         root.join("tasks/done.md"),

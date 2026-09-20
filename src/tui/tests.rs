@@ -2511,7 +2511,10 @@ fn tui_task_board_instructions_only_describe_task_page_controls() {
     assert!(instructions.contains("e edits"));
     assert!(instructions.contains("Codex: s stops/resumes"));
     assert!(instructions.contains("i interrupts for interaction"));
-    assert!(instructions.contains("c opens linked sessions (taking over active runs)"));
+    assert!(
+        instructions
+            .contains("c plans Todo tasks or opens linked sessions (taking over active runs)")
+    );
     assert!(instructions.contains("l shows logs"));
     assert!(instructions.contains("Press r to reorganize"));
     assert!(instructions.contains("Tab opens Agent Projects"));

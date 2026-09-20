@@ -8,6 +8,8 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ### Added
 
+- Press `c` on an unlinked Todo to create a Codex planning conversation with its full task context, save its session link, and return to the same Todo. Linked Todos can reopen their conversation, and normal automation can still claim a planned task.
+
 - Let the Models page store a provider API key in the CLT registry with `k`. A stored key is injected into the Codex child as that provider's `env_key`, outranks the environment variable, is used for model discovery, and is shown only as its source (`clt`, `env`, `env-missing`, or `none`). Keys are kept in the owner-only agent state directory and retained by registry recovery snapshots.
 
 ### Fixed

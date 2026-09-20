@@ -1,1 +1,0 @@
-ok new feature when a task is in fresh in todo and there is no codex id associated with it when a use presses c they shuold jump into a new codex session that gets crated for that task and appended like the other tasks. this allows the user to plan and chat before creating the single tssk or if they have a task created they can chat about it and maybe update the task.
