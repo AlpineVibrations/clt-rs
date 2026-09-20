@@ -34,17 +34,18 @@ use crate::{
     },
     scheduler::{agent_lease_holder_liveness, scan_agent_project},
     task::{
-        ExpansionSummary, StatusStore, TASK_STATUSES, TaskBoard, TaskEntry, TaskSource, TaskStatus,
-        acquire_board_mutation_lock, attach_codex_session_to_task_after_lock,
-        cleanup_clt_atomic_task_temporaries, codex_session_id_from_task_content,
-        convert_archive_to_directory, durable_task_identity, ensure_existing_board,
-        expand_status_for_command, follow_up_matches_status, follow_up_session,
-        get_or_create_archive_status_store, get_tasks_dir, insert_content_into_directory,
-        insert_content_into_directory_without_reordering, insert_content_into_markdown,
-        move_path_into_directory, move_task_without_reordering_after_lock, normalize_status_arg,
-        parse_one_based_task_index, read_markdown_entries,
-        recoverable_codex_session_id_from_task_content, remove_task_entry, reorder_directory_task,
-        reorder_markdown_task, task_content_with_codex_session, task_entry_at,
+        ExpansionSummary, StatusStore, TASK_STATUSES, TASK_STOPPED_MARKER, TaskBoard, TaskEntry,
+        TaskSource, TaskStatus, acquire_board_mutation_lock,
+        attach_codex_session_to_task_after_lock, cleanup_clt_atomic_task_temporaries,
+        codex_session_id_from_task_content, convert_archive_to_directory, durable_task_identity,
+        ensure_existing_board, expand_status_for_command, follow_up_matches_status,
+        follow_up_session, get_or_create_archive_status_store, get_tasks_dir,
+        insert_content_into_directory, insert_content_into_directory_without_reordering,
+        insert_content_into_markdown, move_path_into_directory,
+        move_task_without_reordering_after_lock, normalize_status_arg, parse_one_based_task_index,
+        read_markdown_entries, recoverable_codex_session_id_from_task_content, remove_task_entry,
+        reorder_directory_task, reorder_markdown_task, task_content_with_codex_session,
+        task_content_without_stop_marker, task_entry_at, task_entry_is_stopped,
         task_for_codex_session_in_board,
     },
     tui::{
@@ -173,6 +174,7 @@ pub(super) struct AgentProjectScan {
     pub(super) status: AgentProjectScanStatus,
     pub(super) todo_count: usize,
     pub(super) blocked_todo_count: usize,
+    pub(super) stopped_todo_count: usize,
     pub(super) doing_count: usize,
     pub(super) blocked_doing_count: usize,
 }
@@ -1173,6 +1175,7 @@ pub(super) fn move_task_to_doing_with_agent_session(
     let board_dir = get_tasks_dir(&root);
     let _mutation_lock = acquire_board_mutation_lock(&board_dir)?;
     let entry = task_entry_at(&board_dir, TaskStatus::Todo, task_index)?;
+    ensure_task_not_stopped(&entry)?;
     if let Some(previous) = recoverable_codex_session_id_from_task_content(&entry.content)
         && previous != session_id
     {
@@ -1262,6 +1265,7 @@ pub(super) fn move_task_to_doing_with_agent_git_journal(
     cleanup_clt_atomic_task_temporaries(&board_dir)?;
     let board = TaskBoard::new(&board_dir);
     let entry = board.entry(TaskStatus::Todo, task_index)?;
+    ensure_task_not_stopped(&entry)?;
     let task_identity = durable_task_identity(&entry.content)
         .context("Automated Git task has no durable task payload")?;
     let existing = store
@@ -1745,6 +1749,44 @@ pub(super) fn move_task_to_archive_in_board(
     }
 
     Ok(())
+}
+
+pub(super) fn ensure_task_not_stopped(entry: &TaskEntry) -> Result<()> {
+    anyhow::ensure!(
+        !task_entry_is_stopped(entry),
+        "This task is stopped; press s on it to allow it to start again"
+    );
+    Ok(())
+}
+
+pub(super) fn toggle_unlinked_task_stop_in_board(
+    board_dir: &Path,
+    status: TaskStatus,
+    selected: &TaskEntry,
+) -> Result<bool> {
+    anyhow::ensure!(
+        status != TaskStatus::Done,
+        "Completed tasks cannot be stopped"
+    );
+    let _mutation_lock = acquire_board_mutation_lock(board_dir)?;
+    let board = TaskBoard::new(board_dir);
+    let entry = board
+        .entries(status)?
+        .into_iter()
+        .find(|entry| entry.source == selected.source && entry.content == selected.content)
+        .context("The selected task changed; select it again before stopping or starting it")?;
+    anyhow::ensure!(
+        recoverable_codex_session_id_from_task_content(&entry.content).is_none(),
+        "This task has a Codex session; use its session stop/resume control"
+    );
+    let stopped = !task_entry_is_stopped(&entry);
+    let content = if stopped {
+        format!("{} {TASK_STOPPED_MARKER}", entry.content.trim_end())
+    } else {
+        task_content_without_stop_marker(&entry.content).to_string()
+    };
+    board.write_entry_content(status, &entry, &content)?;
+    Ok(stopped)
 }
 
 pub(super) fn update_task_in_board(

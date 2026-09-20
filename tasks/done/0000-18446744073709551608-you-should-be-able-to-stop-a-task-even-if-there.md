@@ -1,0 +1,6 @@
+you should be able to stop a task even if there is no codex session yet. because that should also stop clt and codex from starting that until its started again..
+
+Completion note:
+COMPLETED 2026-09-20: Added persistent stop/start with s for tasks without a Codex session, visible STOPPED flags, scheduler and blocked-recovery exclusion, and guarded activation/planning. Preserved task details and existing linked-session controls; updated help and agent guidance. Checks passed: cargo test --locked --all-targets --all-features (660 passed, 1 ignored); cargo clippy --no-deps --locked --all-targets --all-features -- -D warnings; rustfmt --edition 2024 --check --config skip_children=true on all changed Rust files; git diff --check; isolated TUI s stop/start and clt --local list todo smoke test. Repository rustfmt gate still reports identical pre-existing failures in src/agent.rs:175 and src/managed_git/tests/orphan.rs:613, reproduced with git archive of frozen e5b779fcebc096786c2723f506ef7701fd51a54f in an isolated directory. Queued linked follow-up tasks/todo/0004-resolve-the-remaining-orphan-journal-rustfmt-fai.md with the exact command, matching baseline evidence, and remaining work.
+
+codex:01a0bf7f-086f-7852-aee6-6895af66f83c

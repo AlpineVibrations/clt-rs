@@ -47,7 +47,8 @@ use crate::{
     task::{
         TaskEntry, TaskStatus, acquire_board_mutation_lock,
         attach_codex_session_to_task_after_lock, durable_task_identity, get_tasks_dir,
-        read_task_entries, task_entry_is_blocked, terminal_task_for_codex_session_in_board,
+        read_task_entries, task_entry_is_blocked, task_entry_is_stopped,
+        terminal_task_for_codex_session_in_board,
     },
 };
 
@@ -1227,8 +1228,8 @@ pub(super) fn run_agent_job_inner(
                 let durably_blocked = linked_task.as_ref().is_some_and(|(task_status, task)| {
                     task_status.is_active() && task_entry_is_blocked(task)
                 });
-                let unbound = finalization.task_identity.is_none()
-                    && finalization.commit_oid.is_none();
+                let unbound =
+                    finalization.task_identity.is_none() && finalization.commit_oid.is_none();
                 if durably_blocked {
                     status = "blocked";
                     summary = "The linked task recorded a durable blocker; its pre-run Git journal remains available for a later recovery without finalizing the task.".to_string();
@@ -1757,7 +1758,7 @@ pub(super) fn blocked_tasks(project_root: &Path) -> Result<Vec<(TaskStatus, Task
         tasks.extend(
             read_task_entries(&board_dir, status)?
                 .into_iter()
-                .filter(task_entry_is_blocked)
+                .filter(|entry| task_entry_is_blocked(entry) && !task_entry_is_stopped(entry))
                 .map(|entry| (status, entry)),
         );
     }

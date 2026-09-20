@@ -218,6 +218,32 @@ pub(super) fn task_entry_is_blocked(entry: &TaskEntry) -> bool {
     task_content_is_blocked(&entry.content)
 }
 
+pub(super) const TASK_STOPPED_MARKER: &str = "clt:stopped";
+
+pub(super) fn task_content_is_stopped(content: &str) -> bool {
+    content.split_whitespace().next_back() == Some(TASK_STOPPED_MARKER)
+}
+
+pub(super) fn task_content_without_stop_marker(content: &str) -> &str {
+    if task_content_is_stopped(content) {
+        content
+            .trim_end()
+            .strip_suffix(TASK_STOPPED_MARKER)
+            .unwrap()
+            .trim_end()
+    } else {
+        content
+    }
+}
+
+pub(super) fn task_entry_is_stopped(entry: &TaskEntry) -> bool {
+    task_content_is_stopped(&entry.content)
+}
+
+pub(super) fn task_entry_is_ready(entry: &TaskEntry) -> bool {
+    !task_entry_is_stopped(entry) && !task_entry_is_blocked(entry)
+}
+
 pub(super) fn task_content_is_blocked(content: &str) -> bool {
     let mut state = None;
 
@@ -918,14 +944,15 @@ pub(super) fn split_description_metadata(value: &str) -> (&str, Option<&str>) {
 }
 
 pub(super) fn task_display_text(entry: &TaskEntry) -> String {
+    let summary = task_content_without_stop_marker(&entry.summary);
     match &entry.metadata {
-        Some(metadata) => format!("{} ({})", entry.summary, metadata),
-        None => entry.summary.clone(),
+        Some(metadata) => format!("{summary} ({metadata})"),
+        None => summary.to_string(),
     }
 }
 
 pub(super) fn task_full_display_text(entry: &TaskEntry) -> String {
-    let content = normalize_task_text(&entry.content);
+    let content = normalize_task_text(task_content_without_stop_marker(&entry.content));
     if content.is_empty() {
         task_display_text(entry)
     } else {

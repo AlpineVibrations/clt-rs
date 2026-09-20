@@ -43,7 +43,8 @@ use crate::{
     application::{
         AgentLeaseHolderLiveness, AgentProjectScan, delete_task_in_board,
         ensure_status_conversion_allowed, move_task_in_board, move_task_to_archive_in_board,
-        project_display_name, reorder_task_in_board, update_task_in_board,
+        project_display_name, reorder_task_in_board, toggle_unlinked_task_stop_in_board,
+        update_task_in_board,
     },
     platform::{agent_service_status, restart_running_agent_service},
     runner::{
@@ -72,7 +73,7 @@ use crate::{
         read_archived_task_entries, read_task_entries, read_tasks_in_board,
         recoverable_codex_session_id_from_task_content, strip_order_prefix,
         task_content_without_recoverable_codex_session, task_display_text, task_entry_at,
-        task_full_display_text, title_from_path,
+        task_entry_is_stopped, task_full_display_text, title_from_path,
     },
 };
 
@@ -187,6 +188,9 @@ pub(super) fn task_has_stopped_agent_flag(
 ) -> bool {
     if status == TaskStatus::Done {
         return false;
+    }
+    if task_entry_is_stopped(entry) {
+        return true;
     }
 
     let Some(session_id) = recoverable_codex_session_id_from_task_content(&entry.content) else {
@@ -1140,7 +1144,7 @@ impl TuiTaskSnapshot {
 }
 
 pub(super) fn tui_task_board_instructions() -> &'static str {
-    "Arrows navigate boards and tasks, Enter opens subtasks, e edits, n or + creates a subtask under the selected task, and Space creates a task. Press r to reorganize; use Shift+Arrows to move tasks. Tab opens Agent Projects, M opens Models, and h/? opens Help. Codex: s stops/resumes, i interrupts for interaction, c plans Todo tasks or opens linked sessions (taking over active runs), and l shows logs."
+    "Arrows navigate boards and tasks, Enter opens subtasks, e edits, n or + creates a subtask under the selected task, and Space creates a task. Press r to reorganize; use Shift+Arrows to move tasks. Tab opens Agent Projects, M opens Models, and h/? opens Help. Task control: s stops/starts tasks, i interrupts for interaction, c plans Todo tasks or opens linked sessions (taking over active runs), and l shows logs."
 }
 
 pub(super) fn tui_start_state(active_board: bool) -> TuiStartState {
@@ -6850,7 +6854,7 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
                                  [Enter]        - Open subtasks, edit selected task, or open selected agent project\n\
                                  [e]            - Edit selected task\n\
                                  [g]            - Cycle selected project's Git mode: off/commit/push\n\
-                                 [s]            - Stop/resume linked task or displayed Agent Output session\n\
+                                 [s]            - Stop/start task or stop/resume displayed Agent Output session\n\
                                  [i]            - Take over linked/displayed live session, then auto-restart exec\n\
                                  [c]            - Plan a Todo / open linked session; take over if active\n\
                                  [l]            - Toggle active/selected project's live/current agent output\n\
@@ -7820,8 +7824,21 @@ pub(super) fn execute_tui_key_effect(
                             return Ok(false);
                         };
                         let Some(session_id) = codex_session_for_task(&task) else {
-                            app.feedback_buffer =
-                                "No Codex session linked to this task.".to_string();
+                            app.feedback_buffer = match toggle_unlinked_task_stop_in_board(
+                                &board_dir,
+                                selected_status,
+                                &task,
+                            ) {
+                                Ok(true) => {
+                                    "Task stopped. CLT will skip it until you press s again."
+                                        .to_string()
+                                }
+                                Ok(false) => {
+                                    "Task started. CLT may pick it up when it is ready in Todo."
+                                        .to_string()
+                                }
+                                Err(error) => format!("Unable to stop or start the task: {error}"),
+                            };
                             return Ok(false);
                         };
                         app.agent_panel.refresh(&app.active_root);

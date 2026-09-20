@@ -441,3 +441,43 @@ fn installed_codex_planning_session_is_durable() -> Result<()> {
     assert!(!rollout.contains("\"type\":\"turn_started\""));
     Ok(())
 }
+
+#[test]
+fn stopped_todo_cannot_launch_a_planning_session() {
+    for folders in [false, true] {
+        let f = Fixture::new(folders);
+        crate::task::add_task(&f.project.path, "Keep this task stopped. clt:stopped", None)
+            .unwrap();
+        let board = get_tasks_dir(&f.project.path);
+        let selected = read_task_entries(&board, TaskStatus::Todo)
+            .unwrap()
+            .remove(0);
+        let result =
+            prepare_todo_planning_session_with(&f.state, &f.project, &board, &selected, |_| {
+                panic!("Stopped tasks must not start Codex")
+            });
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("task is stopped")
+        );
+        assert!(
+            f.store
+                .lease_for_project_blocking(f.project.id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            f.store
+                .session_controls_for_project_blocking(f.project.id)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            read_task_entries(&board, TaskStatus::Todo).unwrap()[0].content,
+            selected.content
+        );
+    }
+}

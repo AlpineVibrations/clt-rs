@@ -819,3 +819,170 @@ fn completed_and_blocked_outcomes_are_jointly_ambiguous_for_session_attachment()
 
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn unlinked_stop_persists_and_skips_automation_until_restarted() {
+    for folders in [false, true] {
+        for blocked in [false, true] {
+            let root = temp_root("unlinked-stop");
+            init_tasks(&root, folders).unwrap();
+            let board = get_tasks_dir(&root);
+            let content = if blocked {
+                "Wait for input. — BLOCKED 2026-09-20: missing fixture"
+            } else {
+                "Implement the feature. Preserve its detailed requirements."
+            };
+            add_task(&root, content, None).unwrap();
+            let original = task_entry_at(&board, TaskStatus::Todo, 1).unwrap();
+            assert!(
+                toggle_unlinked_task_stop_in_board(&board, TaskStatus::Todo, &original).unwrap()
+            );
+            let stopped = task_entry_at(&board, TaskStatus::Todo, 1).unwrap();
+            assert!(task_entry_is_stopped(&stopped));
+            assert_eq!(task_entry_is_blocked(&stopped), blocked);
+            assert!(codex_session_for_task(&stopped).is_none());
+            assert!(
+                task_display_text_with_agent_flag(&stopped, TaskStatus::Todo, &Default::default())
+                    .starts_with("[STOPPED] ")
+            );
+            assert!(
+                !task_tui_display_text_with_agent_flag(
+                    &stopped,
+                    TaskStatus::Todo,
+                    true,
+                    &Default::default()
+                )
+                .contains(TASK_STOPPED_MARKER)
+            );
+            let scan = scan_agent_project(&root);
+            assert_eq!(scan.todo_count, 1);
+            assert_eq!(scan.stopped_todo_count, 1);
+            assert_eq!(scan.available_todo_count(), 0);
+            assert!(!scan.has_schedulable_work());
+            assert!(blocked_tasks(&root).unwrap().is_empty());
+            // Other ready work is still eligible while this task remains stopped.
+            add_task(&root, "Another ready task.", None).unwrap();
+            assert_eq!(scan_agent_project(&root).available_todo_count(), 1);
+            assert!(
+                !toggle_unlinked_task_stop_in_board(&board, TaskStatus::Todo, &stopped).unwrap()
+            );
+            let restarted = task_entry_at(&board, TaskStatus::Todo, 1).unwrap();
+            assert_eq!(restarted.content, original.content);
+            assert_eq!(
+                scan_agent_project(&root).available_todo_count(),
+                if blocked { 1 } else { 2 }
+            );
+            assert_eq!(blocked_tasks(&root).unwrap().len(), usize::from(blocked));
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+}
+
+#[test]
+fn unlinked_stop_revalidates_selection_and_preserves_other_tasks() {
+    for folders in [false, true] {
+        let root = temp_root("unlinked-stop-stale-selection");
+        init_tasks(&root, folders).unwrap();
+        let board = get_tasks_dir(&root);
+        add_task(&root, "Selected task.", None).unwrap();
+        add_task(&root, "Another task.", None).unwrap();
+        let selected = task_entry_at(&board, TaskStatus::Todo, 1).unwrap();
+        update_task_in_board(&board, TaskStatus::Todo, 1, "New human details.").unwrap();
+        assert!(toggle_unlinked_task_stop_in_board(&board, TaskStatus::Todo, &selected).is_err());
+        update_task_in_board(&board, TaskStatus::Todo, 1, "Selected task. codex:claimed").unwrap();
+        let linked = task_entry_at(&board, TaskStatus::Todo, 1).unwrap();
+        assert!(toggle_unlinked_task_stop_in_board(&board, TaskStatus::Todo, &linked).is_err());
+        assert_eq!(
+            task_entry_at(&board, TaskStatus::Todo, 2)
+                .unwrap()
+                .content
+                .trim_end(),
+            "Another task."
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn stopped_unlinked_task_cannot_be_claimed_in_any_git_mode() {
+    for folders in [false, true] {
+        let root = temp_root("stopped-task-claim");
+        init_tasks(&root, folders).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let board = get_tasks_dir(&root);
+        add_task(&root, "Do not start this task. clt:stopped", None).unwrap();
+        let store = agent::TursoAgentStore::open_blocking(&root.join("state")).unwrap();
+        store.register_project_blocking(&root, "project").unwrap();
+        let mut project = store.list_projects_blocking().unwrap().remove(0);
+        store
+            .mark_session_running_blocking(
+                project.id,
+                "claim-session",
+                4242,
+                "claim-run",
+                &root.join("out"),
+                &root.join("err"),
+            )
+            .unwrap();
+        let context = AutomatedAgentChildContext {
+            project_id: project.id,
+            run_token: "claim-run".into(),
+        };
+        for mode in [
+            AgentGitMode::Off,
+            AgentGitMode::Commit,
+            AgentGitMode::CommitAndPush,
+        ] {
+            project.git_mode = mode;
+            let result = if mode == AgentGitMode::Off {
+                move_task_to_doing_with_agent_session(&root, "1", &context, &project, &store)
+            } else {
+                move_task_to_doing_with_agent_git_journal(&root, "1", &context, &project, &store)
+            };
+            assert!(result.unwrap_err().to_string().contains("task is stopped"));
+            assert!(
+                read_task_entries(&board, TaskStatus::Doing)
+                    .unwrap()
+                    .is_empty()
+            );
+            let todo = task_entry_at(&board, TaskStatus::Todo, 1).unwrap();
+            assert!(task_entry_is_stopped(&todo));
+            assert!(codex_session_for_task(&todo).is_none());
+        }
+        project.git_mode = AgentGitMode::Off;
+        let stopped = task_entry_at(&board, TaskStatus::Todo, 1).unwrap();
+        assert!(!toggle_unlinked_task_stop_in_board(&board, TaskStatus::Todo, &stopped).unwrap());
+        move_task_to_doing_with_agent_session(&root, "1", &context, &project, &store).unwrap();
+        assert_eq!(
+            codex_session_for_task(&task_entry_at(&board, TaskStatus::Doing, 1).unwrap())
+                .as_deref(),
+            Some("claim-session")
+        );
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn unlinked_stop_survives_board_moves_and_skips_blocked_doing_recovery() {
+    let root = temp_root("unlinked-stop-moves");
+    init_tasks(&root, true).unwrap();
+    let board = get_tasks_dir(&root);
+    add_task(
+        &root,
+        "Deferred task. — BLOCKED 2026-09-20: needs input",
+        None,
+    )
+    .unwrap();
+    let task = task_entry_at(&board, TaskStatus::Todo, 1).unwrap();
+    toggle_unlinked_task_stop_in_board(&board, TaskStatus::Todo, &task).unwrap();
+    move_task_in_board(&board, TaskStatus::Todo, TaskStatus::Backlog, "1").unwrap();
+    move_task_in_board(&board, TaskStatus::Backlog, TaskStatus::Doing, "1").unwrap();
+    let stopped = task_entry_at(&board, TaskStatus::Doing, 1).unwrap();
+    assert!(task_entry_is_stopped(&stopped));
+    assert!(!scan_agent_project(&root).has_schedulable_work());
+    assert!(blocked_tasks(&root).unwrap().is_empty());
+    toggle_unlinked_task_stop_in_board(&board, TaskStatus::Doing, &stopped).unwrap();
+    assert_eq!(blocked_tasks(&root).unwrap().len(), 1);
+    fs::remove_dir_all(root).unwrap();
+}

@@ -2518,7 +2518,7 @@ fn tui_task_board_instructions_only_describe_task_page_controls() {
     assert!(instructions.contains("Space creates a task"));
     assert!(instructions.contains("n or + creates a subtask under the selected task"));
     assert!(instructions.contains("e edits"));
-    assert!(instructions.contains("Codex: s stops/resumes"));
+    assert!(instructions.contains("Task control: s stops/starts tasks"));
     assert!(instructions.contains("i interrupts for interaction"));
     assert!(
         instructions

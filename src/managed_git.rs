@@ -34,7 +34,7 @@ use crate::{
         durable_task_identity, follow_up_matches_status, follow_up_session, get_status_store,
         get_tasks_dir, move_task_without_reordering_after_lock, read_task_entries,
         remove_task_entry_without_reordering, starts_with_task_note_date, task_content_is_blocked,
-        task_entry_is_blocked, task_tree_contains_session_marker,
+        task_entry_is_ready, task_tree_contains_session_marker,
         terminal_task_for_codex_session_in_board, title_from_path,
     },
 };
@@ -1250,7 +1250,7 @@ pub(super) fn require_agent_git_todo_candidates_committed(
 ) -> Result<()> {
     let candidates = read_task_entries(&get_tasks_dir(project_root), TaskStatus::Todo)?
         .into_iter()
-        .filter(|entry| !task_entry_is_blocked(entry))
+        .filter(task_entry_is_ready)
         .collect::<Vec<_>>();
     if candidates.is_empty() {
         anyhow::bail!("Fresh Git-enabled automation has no unblocked Todo task to start");

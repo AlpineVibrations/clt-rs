@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 
 use crate::{
     agent::{AgentProject, AgentSessionControlState, TursoAgentStore, open_agent_store_at},
+    application::ensure_task_not_stopped,
     platform::{configure_agent_child_command, stop_agent_child_process},
     runner::{agent_codex_command, configure_agent_provider_credential},
     session_control::{InteractiveAgentLease, codex_session_for_task},
@@ -122,14 +123,16 @@ fn prepare_todo_planning_session_with(
 }
 
 fn revalidate_todo(board_dir: &Path, selected: &TaskEntry) -> Result<TaskEntry> {
-    read_task_entries(board_dir, TaskStatus::Todo)?
+    let current = read_task_entries(board_dir, TaskStatus::Todo)?
         .into_iter()
         .find(|current| {
             current.source == selected.source
                 && current.content == selected.content
                 && codex_session_for_task(current).is_none()
         })
-        .context("The selected Todo changed or already has a Codex session; select it again")
+        .context("The selected Todo changed or already has a Codex session; select it again")?;
+    ensure_task_not_stopped(&current)?;
+    Ok(current)
 }
 
 fn valid_session_id(id: &str) -> bool {

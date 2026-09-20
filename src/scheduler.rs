@@ -32,9 +32,9 @@ use crate::{
     },
     managed_git::{
         agent_git_push_retry_backoff_remaining, reconcile_pending_agent_git_finalizations,
-        retire_abandoned_unbound_git_journals,
         record_agent_git_push_retry_error, record_agent_git_push_retry_error_message,
-        repair_working_git_task_link, try_acquire_agent_git_finalization_lease,
+        repair_working_git_task_link, retire_abandoned_unbound_git_journals,
+        try_acquire_agent_git_finalization_lease,
     },
     platform::{
         AgentPlatform, automated_agent_process_group_is_running, local_process_is_running,
@@ -49,7 +49,8 @@ use crate::{
     task::{
         TaskStatus, ensure_existing_board, get_tasks_dir, read_task_entries,
         recoverable_codex_session_id_from_task_content, task_entry_is_blocked,
-        task_status_for_codex_session_in_board, terminal_task_for_codex_session_in_board,
+        task_entry_is_stopped, task_status_for_codex_session_in_board,
+        terminal_task_for_codex_session_in_board,
     },
     tui::TUI_SESSION_HANDOFF_TIMEOUT_SECONDS,
     worker::{
@@ -1117,6 +1118,7 @@ pub(super) fn run_agent_scheduler_pass_with_max_global_jobs(
                 continue;
             };
             let eligible = status.is_active()
+                && !task_entry_is_stopped(&task)
                 && (!task_entry_is_blocked(&task) || !blocked_recovery_backoff_active);
             if eligible {
                 working_git_finalization = Some(finalization);
@@ -1625,7 +1627,7 @@ fn interrupted_codex_session_in_doing(
     let doing = read_task_entries(&get_tasks_dir(&project.path), TaskStatus::Doing)?;
     with_agent_store_at(state_dir, |store| {
         for task in doing {
-            if task_entry_is_blocked(&task) {
+            if task_entry_is_blocked(&task) || task_entry_is_stopped(&task) {
                 continue;
             }
             let Some(session_id) = recoverable_codex_session_id_from_task_content(&task.content)
@@ -1962,19 +1964,24 @@ pub(super) fn scan_agent_project(project_root: &Path) -> AgentProjectScan {
         Err(err) => return AgentProjectScan::unavailable(err),
     };
     let todo_count = todo_entries.len();
+    let stopped_todo_count = todo_entries
+        .iter()
+        .filter(|entry| task_entry_is_stopped(entry))
+        .count();
     let blocked_todo_count = todo_entries
         .iter()
-        .filter(|entry| task_entry_is_blocked(entry))
+        .filter(|entry| task_entry_is_blocked(entry) && !task_entry_is_stopped(entry))
         .count();
     let doing_count = doing_entries.len();
     let blocked_doing_count = doing_entries
         .iter()
-        .filter(|entry| task_entry_is_blocked(entry))
+        .filter(|entry| task_entry_is_blocked(entry) && !task_entry_is_stopped(entry))
         .count();
 
     AgentProjectScan::from_counts(
         todo_count,
         blocked_todo_count,
+        stopped_todo_count,
         doing_count,
         blocked_doing_count,
     )
@@ -1988,21 +1995,24 @@ pub(super) fn has_pending_agent_task(project_root: &Path) -> bool {
 impl AgentProjectScan {
     #[cfg(test)]
     pub(super) fn pending(todo_count: usize) -> Self {
-        Self::from_counts(todo_count, 0, 0, 0)
+        Self::from_counts(todo_count, 0, 0, 0, 0)
     }
 
     #[cfg(test)]
     pub(super) fn pending_with_doing(todo_count: usize, doing_count: usize) -> Self {
-        Self::from_counts(todo_count, 0, doing_count, 0)
+        Self::from_counts(todo_count, 0, 0, doing_count, 0)
     }
 
     pub(super) fn from_counts(
         todo_count: usize,
         blocked_todo_count: usize,
+        stopped_todo_count: usize,
         doing_count: usize,
         blocked_doing_count: usize,
     ) -> Self {
-        let available_todo_count = todo_count.saturating_sub(blocked_todo_count);
+        let available_todo_count = todo_count
+            .saturating_sub(blocked_todo_count)
+            .saturating_sub(stopped_todo_count);
         let task_count = todo_count.saturating_add(doing_count);
         let blocked_task_count = blocked_todo_count.saturating_add(blocked_doing_count);
         let status = if available_todo_count > 0 {
@@ -2017,6 +2027,7 @@ impl AgentProjectScan {
             status,
             todo_count,
             blocked_todo_count,
+            stopped_todo_count,
             doing_count,
             blocked_doing_count,
         }
@@ -2024,7 +2035,7 @@ impl AgentProjectScan {
 
     #[cfg(test)]
     pub(super) fn empty() -> Self {
-        Self::from_counts(0, 0, 0, 0)
+        Self::from_counts(0, 0, 0, 0, 0)
     }
 
     pub(super) fn missing() -> Self {
@@ -2032,6 +2043,7 @@ impl AgentProjectScan {
             status: AgentProjectScanStatus::Missing,
             todo_count: 0,
             blocked_todo_count: 0,
+            stopped_todo_count: 0,
             doing_count: 0,
             blocked_doing_count: 0,
         }
@@ -2042,6 +2054,7 @@ impl AgentProjectScan {
             status: AgentProjectScanStatus::Uninitialized,
             todo_count: 0,
             blocked_todo_count: 0,
+            stopped_todo_count: 0,
             doing_count: 0,
             blocked_doing_count: 0,
         }
@@ -2052,6 +2065,7 @@ impl AgentProjectScan {
             status: AgentProjectScanStatus::Unavailable(err.to_string()),
             todo_count: 0,
             blocked_todo_count: 0,
+            stopped_todo_count: 0,
             doing_count: 0,
             blocked_doing_count: 0,
         }
@@ -2071,7 +2085,9 @@ impl AgentProjectScan {
     }
 
     pub(super) fn available_todo_count(&self) -> usize {
-        self.todo_count.saturating_sub(self.blocked_todo_count)
+        self.todo_count
+            .saturating_sub(self.blocked_todo_count)
+            .saturating_sub(self.stopped_todo_count)
     }
 
     pub(super) fn blocked_task_count(&self) -> usize {
