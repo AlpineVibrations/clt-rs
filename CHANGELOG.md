@@ -6,6 +6,8 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+## [0.6.19] - 2026-09-20
+
 ### Added
 
 - Press `c` on an unlinked Todo to create a Codex planning conversation with its full task context, save its session link, and return to the same Todo. Linked Todos can reopen their conversation, and normal automation can still claim a planned task.
