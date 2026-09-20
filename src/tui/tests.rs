@@ -2,11 +2,20 @@ use crate::test_support::prelude::*;
 use crate::test_support::*;
 
 #[test]
-fn tui_requests_unambiguous_reporting_for_every_key() {
-    let flags = tui_keyboard_enhancement_flags();
+fn tui_requests_unambiguous_reporting_for_board_shortcuts() {
+    let flags = tui_keyboard_enhancement_flags(false);
 
     assert!(flags.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
     assert!(flags.contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES));
+    assert!(!flags.contains(KeyboardEnhancementFlags::REPORT_EVENT_TYPES));
+}
+
+#[test]
+fn tui_text_entry_preserves_terminal_shift_and_text_processing() {
+    let flags = tui_keyboard_enhancement_flags(true);
+
+    assert!(flags.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
+    assert!(!flags.contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES));
     assert!(!flags.contains(KeyboardEnhancementFlags::REPORT_EVENT_TYPES));
 }
 

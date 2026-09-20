@@ -14,6 +14,8 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ### Fixed
 
+- Preserve normal Shift capitalization and keyboard-layout text while adding or editing tasks; restore extended shortcut reporting when text entry closes.
+
 - Allow automated Git tasks to start with existing staged changes; preserve staged entries through task-board checkpoints, freeze the launch index, and skip startup pulls in dirty checkouts.
 
 - Keep the Kanban console title's agent status visible for registered projects whose agent is `OFF`; omit it only for unregistered projects.

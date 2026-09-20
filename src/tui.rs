@@ -5003,13 +5003,17 @@ pub(super) fn tui_console_content<'a>(
     (feedback, Color::Gray)
 }
 
-pub(super) fn tui_keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
-    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-        | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+pub(super) fn tui_keyboard_enhancement_flags(text_input: bool) -> KeyboardEnhancementFlags {
+    let mut flags = KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES;
+    if !text_input {
+        flags |= KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES;
+    }
+    flags
 }
 
 pub(super) struct TerminalSession {
     pub(super) keyboard_enhancement_enabled: bool,
+    text_input_enabled: bool,
     pub(super) active: bool,
 }
 
@@ -5032,7 +5036,7 @@ impl TerminalSession {
         // them, which keeps Shift+Up/Down distinct from plain task navigation.
         #[cfg(not(windows))]
         if let Err(err) = stdout.execute(PushKeyboardEnhancementFlags(
-            tui_keyboard_enhancement_flags(),
+            tui_keyboard_enhancement_flags(false),
         )) {
             let _ = stdout.execute(DisableBracketedPaste);
             let _ = stdout.execute(LeaveAlternateScreen);
@@ -5053,8 +5057,29 @@ impl TerminalSession {
 
         Ok(Self {
             keyboard_enhancement_enabled,
+            text_input_enabled: false,
             active: true,
         })
+    }
+
+    fn set_text_input(&mut self, text_input: bool) -> Result<()> {
+        if !self.active
+            || !self.keyboard_enhancement_enabled
+            || self.text_input_enabled == text_input
+        {
+            return Ok(());
+        }
+        if text_input {
+            // Let the terminal produce layout-correct text (including held Shift),
+            // instead of reporting unshifted key codes and standalone modifiers.
+            stdout().execute(PushKeyboardEnhancementFlags(
+                tui_keyboard_enhancement_flags(true),
+            ))?;
+        } else {
+            stdout().execute(PopKeyboardEnhancementFlags)?;
+        }
+        self.text_input_enabled = text_input;
+        Ok(())
     }
 
     pub(super) fn suspend(&mut self) {
@@ -5062,6 +5087,10 @@ impl TerminalSession {
             return;
         }
         if self.keyboard_enhancement_enabled {
+            if self.text_input_enabled {
+                let _ = stdout().execute(PopKeyboardEnhancementFlags);
+                self.text_input_enabled = false;
+            }
             let _ = stdout().execute(PopKeyboardEnhancementFlags);
         }
         let _ = stdout().execute(DisableBracketedPaste);
@@ -8529,6 +8558,9 @@ pub(super) fn tui_view_with_active_board(
             );
         }
 
+        terminal_session.set_text_input(
+            matches!(app.current_mode, Mode::Input | Mode::Edit) || app.model_input.is_some(),
+        )?;
         app.prepare_render(terminal.size()?.into());
         terminal.draw(|f| render_tui(f, &app))?;
 

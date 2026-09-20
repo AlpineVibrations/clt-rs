@@ -1,0 +1,6 @@
+when entering a task or editing a task clt should not capture the shift key. in some terminals we cannot hold shift to uppercase when editing a task
+
+Completion note:
+COMPLETED 2026-09-20: Use normal terminal text reporting during task add/edit and other text prompts, restoring extended board shortcuts afterward and balancing keyboard state on exit. Added regression coverage and changelog entry. Passed: cargo test --locked --bin clt tui::tests:: (112 tests); cargo test --locked --all-targets --all-features (655 passed, one optional test ignored); cargo clippy --no-deps --locked --all-targets --all-features -- -D warnings; rustfmt --edition 2024 --check src/tui.rs; git diff --check; cargo build --locked --bin clt; cargo test --locked --test cli (14 passed against a source-current binary); python3 /tmp/clt-shift-pty.py (add/edit uppercase, punctuation and Unicode; Esc/Ctrl-C cancellation; Shift+Down reorder; balanced keyboard stack). The full repository rustfmt command produces exactly the same four pre-existing diffs on frozen revision 7e5d2782dba669d319f6e98b2f224ee98e777ee2 extracted with git archive. Queued linked Todo follow-up tasks/todo/0004-restore-the-repository-wide-formatting-gate-in-t.md with baseline evidence; follow-up work was not started.
+
+codex:01a0bf6d-5677-7e50-8f3f-7e74d3c689b7
