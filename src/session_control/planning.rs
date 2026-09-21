@@ -96,7 +96,18 @@ fn prepare_todo_planning_session_with(
         store
             .session_controls_for_project_blocking(project.id)?
             .iter()
-            .all(|control| control.state == AgentSessionControlState::Stopped),
+            .all(|control| {
+                matches!(
+                    control.state,
+                    AgentSessionControlState::Stopped | AgentSessionControlState::ResumeRequested
+                ) && control.child_pid.is_none()
+                    && control.interactive_holder.is_none()
+                    && control.interactive_launch_token.is_none()
+            })
+            && !store
+                .list_active_workers_blocking()?
+                .iter()
+                .any(|worker| worker.project_id == project.id),
         "This project already has an active Codex session"
     );
     {

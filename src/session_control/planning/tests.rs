@@ -5,8 +5,13 @@ use serde_json::{Value, json};
 
 use super::{create_planning_thread, planning_protocol, prepare_todo_planning_session_with};
 use crate::{
-    agent::{AgentProject, TursoAgentStore},
-    session_control::{InteractiveAgentLease, codex_session_for_task},
+    agent::{
+        AgentGitMode, AgentProject, AgentSessionControlState, NewGitFinalization, TursoAgentStore,
+    },
+    session_control::{
+        InteractiveAgentLease, InteractiveGuardianDisposition, codex_session_for_task,
+        interactive_guardian_holder,
+    },
     task::{TaskStatus, get_tasks_dir, init_tasks, read_task_entries},
 };
 
@@ -259,6 +264,51 @@ fn planning_does_not_start_or_change_tasks_in_a_busy_project() {
     busy.release().unwrap();
 }
 
+#[test]
+fn planning_rechecks_session_ownership_before_publishing_the_task_link() {
+    for during_creation in [false, true] {
+        let f = Fixture::new(false);
+        let board = get_tasks_dir(&f.project.path);
+        fs::write(board.join("todo.md"), "- Plan this\n").unwrap();
+        let selected = read_task_entries(&board, TaskStatus::Todo)
+            .unwrap()
+            .remove(0);
+        let claim = || {
+            f.store.set_session_control_state_blocking(
+                f.project.id,
+                "other-session",
+                AgentSessionControlState::Running,
+            )
+        };
+        if !during_creation {
+            claim().unwrap();
+        }
+        let result =
+            prepare_todo_planning_session_with(&f.state, &f.project, &board, &selected, |_| {
+                assert!(during_creation, "busy preflight must not create a session");
+                claim()?;
+                Ok("planning-123".into())
+            });
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read_to_string(board.join("todo.md")).unwrap(),
+            "- Plan this\n"
+        );
+        assert!(
+            f.store
+                .session_control_blocking(f.project.id, "planning-123")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            f.store
+                .lease_for_project_blocking(f.project.id)
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn planning_process_handles_success_failure_and_timeout() -> Result<()> {
@@ -354,6 +404,163 @@ fn planning_reservation_can_reopen_after_cancel_and_cannot_resume_automation() {
             .unwrap()
             .state,
         crate::agent::AgentSessionControlState::Stopped
+    );
+}
+
+#[test]
+fn planning_preserves_queued_recovery_through_interactive_exit_and_reopen() {
+    let f = Fixture::new(false);
+    f.store
+        .set_project_enabled_blocking(f.project.id, false)
+        .unwrap();
+    f.store
+        .mark_session_running_blocking(
+            f.project.id,
+            "queued-recovery",
+            1234,
+            "original-run",
+            &f.project.path.join("out"),
+            &f.project.path.join("err"),
+        )
+        .unwrap();
+    assert!(
+        f.store
+            .create_git_finalization_blocking(NewGitFinalization {
+                project_id: f.project.id,
+                codex_session_id: "queued-recovery",
+                git_mode: AgentGitMode::CommitAndPush,
+                starting_head: Some("1111111111111111111111111111111111111111"),
+                branch_ref: Some("refs/heads/main"),
+                upstream_ref: Some("refs/remotes/origin/main"),
+                worktree_baseline: "preserved baseline",
+                task_identity: Some("recovery-task"),
+                owner_run_token: Some("original-run"),
+                created_at: "100",
+            })
+            .unwrap()
+    );
+    f.store
+        .set_session_control_recovery_token_blocking(
+            f.project.id,
+            "queued-recovery",
+            "original-run",
+        )
+        .unwrap();
+    let recovery = f
+        .store
+        .session_control_blocking(f.project.id, "queued-recovery")
+        .unwrap();
+    let journal = f
+        .store
+        .git_finalization_blocking(f.project.id, "queued-recovery")
+        .unwrap();
+    let board = get_tasks_dir(&f.project.path);
+    fs::write(board.join("todo.md"), "- Plan this\n").unwrap();
+    let doing = "- Recover this codex:queued-recovery\n";
+    fs::write(board.join("doing.md"), doing).unwrap();
+    let selected = read_task_entries(&board, TaskStatus::Todo)
+        .unwrap()
+        .remove(0);
+    let prepared =
+        prepare_todo_planning_session_with(&f.state, &f.project, &board, &selected, |_| {
+            Ok("planning-123".into())
+        })
+        .unwrap();
+    let mut lease = prepared.lease;
+    for visit in 0..2 {
+        if visit > 0 {
+            lease = InteractiveAgentLease::try_acquire_with_holder_at(
+                &f.state,
+                f.project.id,
+                &InteractiveAgentLease::holder_for_stopped_session(),
+                60,
+            )
+            .unwrap()
+            .unwrap();
+        }
+        assert!(
+            f.store
+                .reserve_idle_session_interactive_blocking(
+                    f.project.id,
+                    &prepared.session_id,
+                    &lease.holder,
+                    None,
+                )
+                .unwrap()
+        );
+        let disposition = InteractiveGuardianDisposition::RestoreStopped;
+        let guardian = interactive_guardian_holder(disposition);
+        assert!(
+            f.store
+                .adopt_interactive_guardian_blocking(
+                    f.project.id,
+                    Some(&prepared.session_id),
+                    &lease.holder,
+                    &guardian,
+                    60,
+                )
+                .unwrap()
+        );
+        assert!(
+            !f.store
+                .try_acquire_lease_blocking(f.project.id, "scheduler", "100", "9999999999",)
+                .unwrap()
+        );
+        assert!(
+            f.store
+                .register_interactive_guardian_child_blocking(
+                    f.project.id,
+                    &prepared.session_id,
+                    &guardian,
+                    std::process::id(),
+                    60,
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            f.store
+                .session_control_blocking(f.project.id, "queued-recovery")
+                .unwrap(),
+            recovery
+        );
+        assert!(
+            f.store
+                .finish_interactive_guardian_blocking(
+                    f.project.id,
+                    &prepared.session_id,
+                    &guardian,
+                    disposition,
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            f.store
+                .session_control_blocking(f.project.id, "queued-recovery")
+                .unwrap(),
+            recovery
+        );
+        assert_eq!(
+            f.store
+                .git_finalization_blocking(f.project.id, "queued-recovery")
+                .unwrap(),
+            journal
+        );
+        assert_eq!(
+            f.store
+                .session_control_blocking(f.project.id, &prepared.session_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            AgentSessionControlState::Stopped
+        );
+    }
+    lease.release().unwrap();
+    assert_eq!(fs::read_to_string(board.join("doing.md")).unwrap(), doing);
+    let todo = read_task_entries(&board, TaskStatus::Todo).unwrap();
+    assert_eq!(todo.len(), 1);
+    assert_eq!(
+        codex_session_for_task(&todo[0]).as_deref(),
+        Some("planning-123")
     );
 }
 

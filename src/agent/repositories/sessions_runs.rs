@@ -848,6 +848,7 @@ impl TursoAgentStore {
 
     /// Record an interactive-only conversation before publishing its task link.
     /// A null run token proves that no automated run has owned this session.
+    /// Unclaimed recovery requests remain queued behind the exclusive lease.
     pub(crate) fn register_planning_session_blocking(
         &self,
         project_id: i64,
@@ -856,15 +857,25 @@ impl TursoAgentStore {
     ) -> Result<bool> {
         self.blocking.block_on_persist(async {
             let conn = self.repositories.sessions_runs.connect().await?;
-            let changed = conn.execute(
-                "INSERT INTO session_controls (project_id, codex_session_id, state, updated_at)
+            let changed = conn
+                .execute(
+                    "INSERT INTO session_controls (project_id, codex_session_id, state, updated_at)
                  SELECT ?1, ?2, 'stopped', ?3
                  WHERE EXISTS (SELECT 1 FROM leases WHERE project_id = ?1 AND holder = ?4
                     AND CAST(expires_at AS INTEGER) > CAST(?3 AS INTEGER))
-                 AND NOT EXISTS (SELECT 1 FROM session_controls WHERE project_id = ?1 AND state <> 'stopped')
+                 AND NOT EXISTS (
+                    SELECT 1 FROM agent_workers WHERE project_id = ?1
+                    AND state IN ('dispatching', 'running', 'finalizing'))
+                 AND NOT EXISTS (
+                    SELECT 1 FROM session_controls WHERE project_id = ?1
+                    AND (state NOT IN ('stopped', 'resume_requested')
+                        OR child_pid IS NOT NULL OR interactive_holder IS NOT NULL
+                        OR interactive_launch_token IS NOT NULL))
                  ON CONFLICT(project_id, codex_session_id) DO NOTHING",
-                params![project_id, session_id, agent_timestamp(), lease_holder],
-            ).await.context("Failed to record the new planning session")?;
+                    params![project_id, session_id, agent_timestamp(), lease_holder],
+                )
+                .await
+                .context("Failed to record the new planning session")?;
             Ok(changed == 1)
         })
     }
@@ -886,23 +897,19 @@ impl TursoAgentStore {
                                 interactive_holder = ?1,
                                 interactive_launch_token = NULL, updated_at = ?2
                           WHERE project_id = ?3 AND codex_session_id = ?4
-                            AND (
-                                state = 'stopped'
-                                OR (
-                                    state = 'resume_requested'
-                                    AND child_pid IS NULL
-                                    AND interactive_holder IS NULL
-                                    AND EXISTS (
-                                        SELECT 1 FROM leases
-                                         WHERE project_id = ?3 AND holder = ?1
-                                           AND CAST(expires_at AS INTEGER) > CAST(?2 AS INTEGER)
-                                    )
-                                    AND NOT EXISTS (
-                                        SELECT 1 FROM agent_workers
-                                         WHERE project_id = ?3
-                                           AND state IN ('dispatching', 'running', 'finalizing')
-                                    )
-                                )
+                            AND state IN ('stopped', 'resume_requested')
+                            AND child_pid IS NULL
+                            AND interactive_holder IS NULL
+                            AND interactive_launch_token IS NULL
+                            AND EXISTS (
+                                SELECT 1 FROM leases
+                                 WHERE project_id = ?3 AND holder = ?1
+                                   AND CAST(expires_at AS INTEGER) > CAST(?2 AS INTEGER)
+                            )
+                            AND NOT EXISTS (
+                                SELECT 1 FROM agent_workers
+                                 WHERE project_id = ?3
+                                   AND state IN ('dispatching', 'running', 'finalizing')
                             )
                             AND (
                                 run_token = ?5
@@ -912,7 +919,9 @@ impl TursoAgentStore {
                                 SELECT 1 FROM session_controls
                                  WHERE project_id = ?3
                                    AND codex_session_id <> ?4
-                                   AND state <> 'stopped'
+                                   AND (state NOT IN ('stopped', 'resume_requested')
+                                       OR child_pid IS NOT NULL OR interactive_holder IS NOT NULL
+                                       OR interactive_launch_token IS NOT NULL)
                             )",
                     params![
                         interactive_holder,

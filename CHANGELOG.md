@@ -6,6 +6,12 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+## [0.6.20] - 2026-09-21
+
+### Fixed
+
+- Allow Todo planning conversations while another Codex session is queued for recovery without a worker or interactive owner; preserve the queued session and its Git journal.
+
 ## [0.6.19] - 2026-09-20
 
 ### Added

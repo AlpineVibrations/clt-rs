@@ -46,6 +46,128 @@ fn current_control(
 }
 
 #[test]
+fn planning_reservations_reject_live_owners_and_unfinished_workers() {
+    for blocker in [
+        "running",
+        "stop_requested",
+        "interrupt_requested",
+        "ready_interactive",
+        "interactive",
+        "queued-pid",
+        "queued-holder",
+        "queued-launch",
+        "worker",
+        "missing-lease",
+        "expired-lease",
+    ] {
+        let (root, _, store, expected) = supervision_fixture("planning-reservation-blocker");
+        let project = expected.project_id;
+        store
+            .set_session_control_recovery_token_blocking(
+                project,
+                &expected.codex_session_id,
+                "original-run",
+            )
+            .unwrap();
+        store
+            .set_session_control_state_blocking(
+                project,
+                "planning",
+                AgentSessionControlState::Stopped,
+            )
+            .unwrap();
+        let holder = "clt-stopped-interactive-planning";
+        if blocker != "missing-lease" {
+            let expiry = if blocker == "expired-lease" {
+                "101"
+            } else {
+                "9999999999"
+            };
+            assert!(
+                store
+                    .try_acquire_lease_blocking(project, holder, "100", expiry)
+                    .unwrap()
+            );
+        }
+        match blocker {
+            "queued-pid" | "queued-holder" | "queued-launch" => {
+                store
+                    .blocking
+                    .block_on_persist(async {
+                        let conn = store.repositories.sessions_runs.connect().await?;
+                        conn.execute(
+                            "UPDATE session_controls SET child_pid = ?1, interactive_holder = ?2,
+                            interactive_launch_token = ?3
+                         WHERE project_id = ?4 AND codex_session_id = ?5",
+                            params![
+                                (blocker == "queued-pid").then_some(123_i64),
+                                (blocker == "queued-holder").then_some("other-owner"),
+                                (blocker == "queued-launch").then_some("other-launch"),
+                                project,
+                                expected.codex_session_id.as_str(),
+                            ],
+                        )
+                        .await?;
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            "worker" => {
+                assert!(reserve_test_worker(
+                    &store,
+                    project,
+                    "unfinished",
+                    holder,
+                    "100",
+                    1
+                ));
+                assert!(
+                    store
+                        .release_lease_blocking(project, "clt-worker-unfinished")
+                        .unwrap()
+                );
+                assert!(
+                    store
+                        .try_acquire_lease_blocking(project, holder, "100", "9999999999")
+                        .unwrap()
+                );
+            }
+            "missing-lease" | "expired-lease" => {}
+            state => store
+                .set_session_control_state_blocking(
+                    project,
+                    &expected.codex_session_id,
+                    AgentSessionControlState::from_database(state).unwrap(),
+                )
+                .unwrap(),
+        }
+        let before = store
+            .session_controls_for_project_blocking(project)
+            .unwrap();
+        assert!(
+            !store
+                .register_planning_session_blocking(project, "new-planning", holder)
+                .unwrap(),
+            "{blocker}"
+        );
+        assert!(
+            !store
+                .reserve_idle_session_interactive_blocking(project, "planning", holder, None)
+                .unwrap(),
+            "{blocker}"
+        );
+        assert_eq!(
+            store
+                .session_controls_for_project_blocking(project)
+                .unwrap(),
+            before,
+            "{blocker}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
 fn queued_interactive_reservation_refuses_an_unfinished_worker() {
     let (root, _state_dir, store, expected) = supervision_fixture("queued-interactive-worker");
     store
