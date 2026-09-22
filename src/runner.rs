@@ -428,8 +428,7 @@ pub(super) fn launch_agent_runner_stage(
             stderr_file,
         )?;
         if let Err(error) = persist_git_launch_state() {
-            drop(control);
-            wait_for_automated_supervisor_reaped(&mut process, &mut proof).with_context(|| {
+            cancel_automated_supervisor_launch(&mut process, control, &mut proof).with_context(|| {
                 format!(
                     "Persisting the prelaunch Git state failed ({error:#}), and the automated supervisor did not prove Codex stopped"
                 )
@@ -481,7 +480,7 @@ pub(super) fn launch_agent_runner_stage(
         Ok(process) => Ok(AgentRunnerLaunchResult::Launched(process)),
         Err(error) => {
             let summary = format!(
-                "Failed to start Codex command {} in {}: {error}",
+                "Failed to start Codex command {} in {}: {error:#}",
                 runner.command.display(),
                 project.path.display()
             );
@@ -672,16 +671,52 @@ pub(super) fn configure_automated_codex_subcommand(
     Ok(session_id)
 }
 
-pub(super) fn automated_exec_gate_is_released(reader: &mut impl Read) -> io::Result<bool> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AutomatedLaunchAction {
+    Release,
+    Cancel,
+    Disconnected,
+}
+
+fn read_automated_launch_action(reader: &mut impl Read) -> io::Result<AutomatedLaunchAction> {
     let mut release = [0_u8; 1];
     loop {
         return match reader.read(&mut release) {
-            Ok(0) => Ok(false),
-            Ok(_) => Ok(release[0] == b'x'),
+            Ok(0) => Ok(AutomatedLaunchAction::Disconnected),
+            Ok(_) => Ok(match release[0] {
+                b'x' => AutomatedLaunchAction::Release,
+                b's' => AutomatedLaunchAction::Cancel,
+                _ => AutomatedLaunchAction::Disconnected,
+            }),
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => Err(error),
         };
     }
+}
+
+pub(super) fn automated_exec_gate_is_released(reader: &mut impl Read) -> io::Result<bool> {
+    Ok(read_automated_launch_action(reader)? == AutomatedLaunchAction::Release)
+}
+
+#[cfg(unix)]
+fn cancel_automated_supervisor_launch(
+    process: &mut Child,
+    mut control: std::process::ChildStdin,
+    proof: &mut BufReader<std::process::ChildStdout>,
+) -> Result<ExitStatus> {
+    // A deliberate cancellation leaves durable finalization with the runner.
+    // EOF still means the owner disappeared and requires supervisor recovery.
+    if control
+        .write_all(b"s")
+        .and_then(|_| control.flush())
+        .is_err()
+    {
+        drop(control);
+        return wait_for_automated_supervisor_reaped(process, proof);
+    }
+    let result = wait_for_automated_supervisor_reaped(process, proof);
+    drop(control);
+    result
 }
 
 #[cfg(unix)]
@@ -1010,8 +1045,8 @@ pub(super) fn run_automated_session_supervisor(
     }
 
     let mut parent_input = io::stdin().lock();
-    let parent_released = match automated_exec_gate_is_released(&mut parent_input) {
-        Ok(released) => released,
+    let launch_action = match read_automated_launch_action(&mut parent_input) {
+        Ok(action) => action,
         Err(error) => {
             drop(parent_input);
             drop(launch_gate);
@@ -1030,20 +1065,22 @@ pub(super) fn run_automated_session_supervisor(
             return report_automated_supervisor_reaped(status);
         }
     };
-    if !parent_released {
+    if launch_action != AutomatedLaunchAction::Release {
         drop(parent_input);
         drop(launch_gate);
         let status = stop_supervised_automated_child_until_reaped(
             &mut child,
-            "its parent disconnected before launch",
+            "its parent cancelled or disconnected before launch",
         );
-        finalize_disconnected_automated_supervisor(
-            spec.state_dir,
-            spec.project_id,
-            child_pid,
-            spec.run_token,
-            spec.lease_holder,
-        );
+        if launch_action == AutomatedLaunchAction::Disconnected {
+            finalize_disconnected_automated_supervisor(
+                spec.state_dir,
+                spec.project_id,
+                child_pid,
+                spec.run_token,
+                spec.lease_holder,
+            );
+        }
         return report_automated_supervisor_reaped(status);
     }
     drop(parent_input);
@@ -1760,9 +1797,9 @@ impl CodexAgentRunner {
             if let Some(error) = registration_error {
                 #[cfg(unix)]
                 {
-                    supervisor_control.take();
-                    wait_for_automated_supervisor_reaped(
+                    cancel_automated_supervisor_launch(
                         &mut child,
+                        supervisor_control.take().expect("Unix automated supervisor has a control pipe"),
                         &mut supervisor_proof,
                     )
                     .with_context(|| {

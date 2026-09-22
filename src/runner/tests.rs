@@ -588,6 +588,169 @@ fn assert_disconnected_no_session_launch_recovery(mutate_checkout: bool) {
 
 #[cfg(unix)]
 #[test]
+fn rejected_prelaunch_preserves_runner_fence_and_records_original_error() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = temp_root("rejected-prelaunch-runner-fence");
+    let state_dir = root.join("state");
+    let project_root = root.join("project");
+    add_task(&project_root, "committed task", None).unwrap();
+    initialize_test_git_repository(&project_root);
+    let project_root = fs::canonicalize(project_root).unwrap();
+    let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
+    store
+        .register_project_blocking(&project_root, "project")
+        .unwrap();
+    store
+        .set_project_git_mode_for_path_blocking(&project_root, AgentGitMode::Commit)
+        .unwrap();
+    let project = store.list_projects_blocking().unwrap().remove(0);
+    assert!(
+        store
+            .try_acquire_lease_blocking(
+                project.id,
+                "scheduler",
+                &agent_timestamp(),
+                &agent_timestamp_after(60)
+            )
+            .unwrap()
+    );
+    let run_token = "rejected-prelaunch";
+    assert!(reserve_test_inline_worker(
+        &store,
+        project.id,
+        run_token,
+        "scheduler",
+        std::process::id(),
+        &agent_timestamp(),
+    ));
+    let lease_holder = agent_worker_lease_holder(run_token);
+    let start = capture_agent_git_start_state(&project_root, project.git_mode).unwrap();
+    // Reproduce a real checkout edit between freezing the baseline and opening
+    // the launch gate. Codex must never execute with the stale baseline.
+    fs::write(
+        project_root.join("concurrent-edit.txt"),
+        "preserve this edit\n",
+    )
+    .unwrap();
+    let marker = root.join("codex-launched");
+    let fake_codex = root.join("fake-codex");
+    fs::write(
+        &fake_codex,
+        format!("#!/bin/sh\nprintf launched > '{}'\n", marker.display()),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&fake_codex).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_codex, permissions).unwrap();
+    let runner =
+        CodexAgentRunner::with_command(state_dir.clone(), Duration::from_secs(5), fake_codex);
+
+    let result = match launch_agent_runner_stage(AgentRunnerLaunchRequest {
+        runner: &runner,
+        store: &store,
+        project: &project,
+        task_selection: AgentTaskSelection::NextTodo,
+        resume_session_id: None,
+        lease_holder: &lease_holder,
+        run_file_stem: run_token,
+        git_start_state: Some(&start),
+    })
+    .unwrap()
+    {
+        AgentRunnerLaunchResult::Failed(result) => result,
+        AgentRunnerLaunchResult::Launched(_) => panic!("stale baseline must prevent launch"),
+    };
+    assert_eq!(result.status, "failure");
+    assert!(
+        result
+            .summary
+            .contains("Failed to persist the prelaunch Git state behind the Codex launch gate")
+    );
+    assert!(
+        result
+            .summary
+            .contains("worktree changed after CLT froze the automated run")
+    );
+    assert!(
+        fs::read_to_string(&result.stderr_path)
+            .unwrap()
+            .contains(&result.summary)
+    );
+    assert!(!marker.exists());
+    assert_eq!(
+        fs::read_to_string(project_root.join("concurrent-edit.txt")).unwrap(),
+        "preserve this edit\n"
+    );
+    assert_eq!(
+        store
+            .lease_for_project_blocking(project.id)
+            .unwrap()
+            .unwrap()
+            .holder,
+        lease_holder
+    );
+    assert_eq!(store.list_active_workers_blocking().unwrap().len(), 1);
+    assert!(store.list_recent_runs_blocking(10).unwrap().is_empty());
+    assert!(
+        store
+            .git_launch_state_blocking(project.id, run_token)
+            .unwrap()
+            .is_none()
+    );
+
+    // The supervisor must leave the exact worker fence to the connected runner,
+    // which records one useful failure with its log paths and releases the lease.
+    assert!(
+        store
+            .finalize_worker_blocking(agent::AgentWorkerFinalization {
+                worker_token: run_token,
+                expected_worker_pid: Some(std::process::id()),
+                expected_lease_holder: &lease_holder,
+                status: result.status,
+                finished_at: &agent_timestamp(),
+                exit_code: result.exit_code,
+                log_dir: Some(result.log_dir.to_str().unwrap()),
+                stdout_path: Some(result.stdout_path.to_str().unwrap()),
+                stderr_path: Some(result.stderr_path.to_str().unwrap()),
+                summary: Some(&result.summary),
+                codex_session_id: None,
+                error: None,
+            })
+            .unwrap()
+            .is_some()
+    );
+    let runs = store.list_recent_runs_blocking(10).unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].summary.as_deref(), Some(result.summary.as_str()));
+    assert_eq!(
+        runs[0].stderr_path.as_deref(),
+        Some(result.stderr_path.to_str().unwrap())
+    );
+    assert!(
+        store
+            .lease_for_project_blocking(project.id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(store.list_active_workers_blocking().unwrap().is_empty());
+    assert!(
+        prepare_agent_git_start_state_for_run(
+            &store,
+            &project,
+            AgentTaskSelection::NextTodo,
+            false,
+            false,
+            "retry-run",
+        )
+        .unwrap()
+        .is_some()
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
 fn disconnected_no_session_reclaims_unchanged_launch_after_worker_abandonment() {
     assert_disconnected_no_session_launch_recovery(false);
 }

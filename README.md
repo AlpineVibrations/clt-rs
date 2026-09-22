@@ -295,6 +295,8 @@ The first upgrade from a CLT release that predates independent workers cannot de
 
 Worker startup and heartbeat records are fenced and bounded. If a worker fails before claiming its service or later stops checking in, the scheduler first drains and verifies that worker's exact launchd/systemd service, records one crash outcome, and only then releases its lease for recovery. This prevents a replacement Codex process from overlapping the old process group.
 
+If prelaunch Git validation or persistence fails, the runner explicitly cancels the gated Codex launch and waits for its process group to stop. The runner then records the original error and log paths and releases its lease for the normal failure-backoff retry. This cancellation is distinct from an unexpected runner disconnect, which still triggers supervisor crash recovery.
+
 Worker launch contracts are versioned. A newer scheduler can recover older persisted contracts, while an older scheduler leaves an unknown newer worker untouched. If a future database migration cannot safely coexist with pinned workers, it is deferred: status and task controls remain available, and the scheduler continues crash recovery in compatibility mode until those workers finish.
 
 `clt agent stop` does not open the database, so it remains available when Turso is unhealthy. For a shared-WAL ownership or frame-index failure, CLT records a recovery-required state and stops scheduling database retries. Once their Codex process groups have been reaped, interactive guardians and disconnected automated supervisors also exit instead of retrying finalization indefinitely; they preserve the session and lease records for recovery.
