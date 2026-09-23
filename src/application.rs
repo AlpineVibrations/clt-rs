@@ -1825,6 +1825,14 @@ pub(super) fn update_task_in_board_after_lock(
         Some(session_id) => task_content_with_codex_session(new_description, session_id),
         None => new_description.trim_end().to_string(),
     };
+    let updated_content = if task_entry_is_stopped(&entry) {
+        format!(
+            "{} {TASK_STOPPED_MARKER}",
+            task_content_without_stop_marker(&updated_content)
+        )
+    } else {
+        updated_content
+    };
     ensure_managed_git_task_mutation_allowed(board_dir, &entry, true, Some(&updated_content))?;
 
     board.write_entry_content(status, &entry, &updated_content)

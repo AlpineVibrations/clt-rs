@@ -879,6 +879,28 @@ fn unlinked_stop_persists_and_skips_automation_until_restarted() {
 }
 
 #[test]
+fn editing_stopped_task_hides_and_preserves_stop_marker() {
+    for folders in [false, true] {
+        let root = temp_root("edit-stopped-task");
+        init_tasks(&root, folders).unwrap();
+        let board = get_tasks_dir(&root);
+        add_task(&root, "Original task.", None).unwrap();
+        let original = task_entry_at(&board, TaskStatus::Todo, 1).unwrap();
+        toggle_unlinked_task_stop_in_board(&board, TaskStatus::Todo, &original).unwrap();
+        let stopped = task_entry_at(&board, TaskStatus::Todo, 1).unwrap();
+
+        assert_eq!(task_content_for_edit(&stopped.content), "Original task.");
+        update_task_in_board(&board, TaskStatus::Todo, 1, "Edited task.").unwrap();
+
+        let edited = task_entry_at(&board, TaskStatus::Todo, 1).unwrap();
+        assert_eq!(edited.content.trim_end(), "Edited task. clt:stopped");
+        assert!(task_entry_is_stopped(&edited));
+        assert_eq!(scan_agent_project(&root).available_todo_count(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
 fn unlinked_stop_revalidates_selection_and_preserves_other_tasks() {
     for folders in [false, true] {
         let root = temp_root("unlinked-stop-stale-selection");

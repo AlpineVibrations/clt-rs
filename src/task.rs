@@ -849,6 +849,10 @@ pub(super) fn task_content_without_recoverable_codex_session(content: &str) -> S
     }
 }
 
+pub(super) fn task_content_for_edit(content: &str) -> String {
+    task_content_without_recoverable_codex_session(task_content_without_stop_marker(content))
+}
+
 pub(super) fn task_content_with_codex_session(content: &str, session_id: &str) -> String {
     let content = task_content_without_codex_session(content);
     let content = task_content_without_matching_codex_sessions(content, session_id);

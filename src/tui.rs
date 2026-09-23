@@ -71,9 +71,9 @@ use crate::{
         content_with_metadata, ensure_board_store, ensure_existing_board,
         ensure_subtask_board_after_lock, get_tasks_dir, insert_task_in_board,
         read_archived_task_entries, read_task_entries, read_tasks_in_board,
-        recoverable_codex_session_id_from_task_content, strip_order_prefix,
-        task_content_without_recoverable_codex_session, task_display_text, task_entry_at,
-        task_entry_is_stopped, task_full_display_text, title_from_path,
+        recoverable_codex_session_id_from_task_content, strip_order_prefix, task_content_for_edit,
+        task_display_text, task_entry_at, task_entry_is_stopped, task_full_display_text,
+        title_from_path,
     },
 };
 
@@ -8169,11 +8169,8 @@ pub(super) fn execute_tui_key_effect(
                                 _ => {
                                     app.current_mode = Mode::Edit;
                                     app.editing_task_idx = Some(idx + 1);
-                                    app.task_input = TaskInput::new(
-                                        task_content_without_recoverable_codex_session(
-                                            &entry.content,
-                                        ),
-                                    );
+                                    app.task_input =
+                                        TaskInput::new(task_content_for_edit(&entry.content));
                                 }
                             }
                         } else {
@@ -8191,9 +8188,7 @@ pub(super) fn execute_tui_key_effect(
                         ) {
                             app.current_mode = Mode::Edit;
                             app.editing_task_idx = Some(idx + 1);
-                            app.task_input = TaskInput::new(
-                                task_content_without_recoverable_codex_session(&entry.content),
-                            );
+                            app.task_input = TaskInput::new(task_content_for_edit(&entry.content));
                         } else {
                             app.feedback_buffer = "No task selected".to_string();
                         }
