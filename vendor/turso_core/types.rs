@@ -59,7 +59,10 @@ impl Display for ValueType {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-#[cfg_attr(clt_turso_feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    clt_turso_feature = "serde",
+    derive(serde::Serialize, serde::Deserialize)
+)]
 pub enum TextSubtype {
     Text,
     #[cfg(clt_turso_feature = "json")]
@@ -67,7 +70,10 @@ pub enum TextSubtype {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(clt_turso_feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    clt_turso_feature = "serde",
+    derive(serde::Serialize, serde::Deserialize)
+)]
 pub struct Text {
     pub value: Cow<'static, str>,
     pub subtype: TextSubtype,
@@ -262,7 +268,10 @@ impl From<Text> for String {
 // constructed from registers and extracted directly into registers.
 
 #[derive(Debug, Clone)]
-#[cfg_attr(clt_turso_feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    clt_turso_feature = "serde",
+    derive(serde::Serialize, serde::Deserialize)
+)]
 pub enum Value {
     Null,
     Numeric(Numeric),

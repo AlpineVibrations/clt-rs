@@ -114,12 +114,12 @@ impl From<crate::turso_sdk_kit::rsapi::Value> for Value {
     fn from(val: crate::turso_sdk_kit::rsapi::Value) -> Self {
         match val {
             crate::turso_sdk_kit::rsapi::Value::Null => Value::Null,
-            crate::turso_sdk_kit::rsapi::Value::Numeric(crate::turso_sdk_kit::rsapi::Numeric::Integer(n)) => {
-                Value::Integer(n)
-            }
-            crate::turso_sdk_kit::rsapi::Value::Numeric(crate::turso_sdk_kit::rsapi::Numeric::Float(n)) => {
-                Value::Real(f64::from(n))
-            }
+            crate::turso_sdk_kit::rsapi::Value::Numeric(
+                crate::turso_sdk_kit::rsapi::Numeric::Integer(n),
+            ) => Value::Integer(n),
+            crate::turso_sdk_kit::rsapi::Value::Numeric(
+                crate::turso_sdk_kit::rsapi::Numeric::Float(n),
+            ) => Value::Real(f64::from(n)),
             crate::turso_sdk_kit::rsapi::Value::Text(t) => Value::Text(t.into()),
             crate::turso_sdk_kit::rsapi::Value::Blob(items) => Value::Blob(items),
         }

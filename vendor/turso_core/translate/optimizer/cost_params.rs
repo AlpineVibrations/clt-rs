@@ -10,7 +10,10 @@
 /// from a JSON file via the `TURSO_OPTIMIZER_PARAMS` environment variable.
 /// The JSON file does not need to specify all fields, and unspecified fields will use the default values.
 #[derive(Debug, Clone)]
-#[cfg_attr(clt_turso_feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    clt_turso_feature = "serde",
+    derive(serde::Serialize, serde::Deserialize)
+)]
 #[cfg_attr(clt_turso_feature = "serde", serde(default))]
 pub struct CostModelParams {
     // === Cardinality Fallbacks (when no ANALYZE stats) ===

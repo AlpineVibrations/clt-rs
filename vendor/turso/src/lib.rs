@@ -42,8 +42,8 @@ mod rows;
 pub mod transaction;
 pub mod value;
 
-pub use connection::Connection;
 use crate::turso_sdk_kit::rsapi::TursoError;
+pub use connection::Connection;
 pub use value::Value;
 
 pub use params::params_from_iter;
@@ -290,8 +290,8 @@ impl Builder {
     #[allow(unused_variables, clippy::arc_with_non_send_sync)]
     pub async fn build(self) -> Result<Database> {
         let features = self.build_features_string();
-        let db =
-            crate::turso_sdk_kit::rsapi::TursoDatabase::new(crate::turso_sdk_kit::rsapi::TursoDatabaseConfig {
+        let db = crate::turso_sdk_kit::rsapi::TursoDatabase::new(
+            crate::turso_sdk_kit::rsapi::TursoDatabaseConfig {
                 path: self.path,
                 experimental_features: features,
                 async_io: true,
@@ -299,7 +299,8 @@ impl Builder {
                 vfs: self.vfs,
                 io: self.io,
                 db_file: None,
-            });
+            },
+        );
         while let Some(io_c) = db.open()?.io() {
             // At this point IO must already be created
             let io = db
@@ -864,4 +865,4 @@ mod tests {
     }
 }
 
-pub use crate::{params, named_params};
+pub use crate::{named_params, params};

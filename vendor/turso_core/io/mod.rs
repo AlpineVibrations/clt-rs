@@ -1027,12 +1027,22 @@ mod shuttle_tests {
         }
     }
 
-    #[cfg(all(target_os = "linux", clt_turso_feature = "io_uring", clt_turso_feature = "fs", not(miri)))]
+    #[cfg(all(
+        target_os = "linux",
+        clt_turso_feature = "io_uring",
+        clt_turso_feature = "fs",
+        not(miri)
+    ))]
     struct UringIOFactory {
         temp_dir: tempfile::TempDir,
     }
 
-    #[cfg(all(target_os = "linux", clt_turso_feature = "io_uring", clt_turso_feature = "fs", not(miri)))]
+    #[cfg(all(
+        target_os = "linux",
+        clt_turso_feature = "io_uring",
+        clt_turso_feature = "fs",
+        not(miri)
+    ))]
     impl UringIOFactory {
         fn new() -> Self {
             Self {
@@ -1041,7 +1051,12 @@ mod shuttle_tests {
         }
     }
 
-    #[cfg(all(target_os = "linux", clt_turso_feature = "io_uring", clt_turso_feature = "fs", not(miri)))]
+    #[cfg(all(
+        target_os = "linux",
+        clt_turso_feature = "io_uring",
+        clt_turso_feature = "fs",
+        not(miri)
+    ))]
     impl IOFactory for UringIOFactory {
         fn create(&self) -> Arc<dyn IO> {
             Arc::new(UringIO::new().unwrap())

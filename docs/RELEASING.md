@@ -12,14 +12,15 @@ Use a recent stable Rust toolchain and Python 3.11 or newer. From the repository
 root, run:
 
 ```sh
-rustfmt --edition 2024 --check build.rs src/main.rs src/lib.rs tests/architecture.rs tests/cli.rs
+cargo fmt --all -- --check
 cargo clippy --package clt-rs --no-deps --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-targets --all-features
 python3 scripts/check_release.py
 ```
 
-Formatting and strict lints apply to CLT; the bundled engine retains upstream
-formatting and lint policy. Its library keeps Rust 2021 while CLT uses Rust 2024.
+Formatting applies to the whole package, including the bundled engine. Strict
+lints apply to CLT; the bundled engine retains its upstream lint policy. Its
+library keeps Rust 2021 while CLT uses Rust 2024.
 Cargo currently accepts this target edition override with a deprecation warning.
 
 During preparation, use `python3 scripts/check_release.py --allow-dirty`.

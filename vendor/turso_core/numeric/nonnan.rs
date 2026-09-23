@@ -1,6 +1,9 @@
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq)]
-#[cfg_attr(clt_turso_feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    clt_turso_feature = "serde",
+    derive(serde::Serialize, serde::Deserialize)
+)]
 pub struct NonNan(f64);
 
 impl NonNan {

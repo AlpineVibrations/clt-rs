@@ -81,12 +81,12 @@ impl Row {
             ))
         })?;
         match val {
-            crate::turso_sdk_kit::rsapi::Value::Numeric(crate::turso_sdk_kit::rsapi::Numeric::Integer(i)) => {
-                Ok(Value::Integer(*i))
-            }
-            crate::turso_sdk_kit::rsapi::Value::Numeric(crate::turso_sdk_kit::rsapi::Numeric::Float(f)) => {
-                Ok(Value::Real(f64::from(*f)))
-            }
+            crate::turso_sdk_kit::rsapi::Value::Numeric(
+                crate::turso_sdk_kit::rsapi::Numeric::Integer(i),
+            ) => Ok(Value::Integer(*i)),
+            crate::turso_sdk_kit::rsapi::Value::Numeric(
+                crate::turso_sdk_kit::rsapi::Numeric::Float(f),
+            ) => Ok(Value::Real(f64::from(*f))),
             crate::turso_sdk_kit::rsapi::Value::Null => Ok(Value::Null),
             crate::turso_sdk_kit::rsapi::Value::Text(text) => {
                 Ok(Value::Text(text.value.clone().into_owned()))

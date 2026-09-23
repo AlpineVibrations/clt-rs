@@ -28,8 +28,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Check formatting
-        # The bundled engine retains its upstream formatting.
-        run: rustfmt --edition 2024 --check build.rs src/main.rs src/lib.rs tests/architecture.rs tests/cli.rs
+        run: cargo fmt --all -- --check
 
       - name: Run Clippy
         run: cargo clippy --package clt-rs --no-deps --locked --all-targets --all-features -- -D warnings

@@ -26,13 +26,19 @@ pub mod dbpage;
 pub mod functions;
 pub mod index_method;
 pub mod io;
-#[cfg(all(clt_turso_feature = "json", any(clt_turso_feature = "fuzz", clt_turso_feature = "bench")))]
+#[cfg(all(
+    clt_turso_feature = "json",
+    any(clt_turso_feature = "fuzz", clt_turso_feature = "bench")
+))]
 pub mod json;
 #[cfg(all(
     clt_turso_tests,
     clt_turso_feature = "fs",
     host_shared_wal,
-    any(not(target_os = "windows"), clt_turso_feature = "experimental_win_iocp")
+    any(
+        not(target_os = "windows"),
+        clt_turso_feature = "experimental_win_iocp"
+    )
 ))]
 mod multiprocess_tests;
 pub mod mvcc;
@@ -63,7 +69,10 @@ mod function;
 mod functions;
 mod incremental;
 mod info;
-#[cfg(all(clt_turso_feature = "json", not(any(clt_turso_feature = "fuzz", clt_turso_feature = "bench"))))]
+#[cfg(all(
+    clt_turso_feature = "json",
+    not(any(clt_turso_feature = "fuzz", clt_turso_feature = "bench"))
+))]
 mod json;
 #[cfg(not(any(clt_turso_feature = "fuzz", clt_turso_feature = "bench")))]
 mod numeric;
@@ -148,7 +157,12 @@ pub use function::ContextCollationFunction;
 pub use io::MemoryYieldIO;
 #[cfg(all(clt_turso_feature = "fs", target_family = "unix", not(miri)))]
 pub use io::UnixIO;
-#[cfg(all(clt_turso_feature = "fs", target_os = "linux", clt_turso_feature = "io_uring", not(miri)))]
+#[cfg(all(
+    clt_turso_feature = "fs",
+    target_os = "linux",
+    clt_turso_feature = "io_uring",
+    not(miri)
+))]
 pub use io::UringIO;
 #[cfg(all(
     clt_turso_feature = "fs",
@@ -2832,7 +2846,11 @@ impl Database {
                 "syscall" => Arc::new(SyscallIO::new()?),
                 #[cfg(all(target_os = "linux", clt_turso_feature = "io_uring", not(miri)))]
                 "io_uring" => Arc::new(UringIO::new()?),
-                #[cfg(all(target_os = "windows", clt_turso_feature = "experimental_win_iocp", not(miri)))]
+                #[cfg(all(
+                    target_os = "windows",
+                    clt_turso_feature = "experimental_win_iocp",
+                    not(miri)
+                ))]
                 "experimental_win_iocp" => Arc::new(WindowsIOCP::new()?),
 
                 other => {
@@ -3300,7 +3318,7 @@ mod database_tests {
 
 // The engine and SDK are targets/modules of CLT's single Cargo package.
 pub extern crate self as turso_core;
-#[path = "../turso_sdk_kit/src/lib.rs"]
-pub mod turso_sdk_kit;
 #[path = "../turso/src/lib.rs"]
 pub mod turso;
+#[path = "../turso_sdk_kit/src/lib.rs"]
+pub mod turso_sdk_kit;

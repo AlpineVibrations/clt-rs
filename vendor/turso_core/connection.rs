@@ -2476,7 +2476,11 @@ impl Connection {
             .block(|| pager.checkpoint(mode, SyncMode::Full, true))
     }
 
-    #[cfg(all(clt_turso_feature = "simulator", target_pointer_width = "64", host_shared_wal))]
+    #[cfg(all(
+        clt_turso_feature = "simulator",
+        target_pointer_width = "64",
+        host_shared_wal
+    ))]
     pub fn install_unpublished_backfill_proof_for_testing(
         &self,
         upper_bound_inclusive: u64,
