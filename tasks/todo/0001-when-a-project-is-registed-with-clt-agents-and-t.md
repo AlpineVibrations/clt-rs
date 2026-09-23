@@ -1,1 +1,0 @@
-when a project is registed with clt agents and the user is in the kanban tui they see the agent status in the console title, add the on/off state after the word agent and before the current running state.

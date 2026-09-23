@@ -4052,7 +4052,8 @@ pub(super) fn format_kanban_console_title(
     // Keep the title from colliding with the right-aligned Backlog status.
     let reserved = 2 + right_title.map_or(0, |title| title.chars().count());
     let available = width.saturating_sub(reserved);
-    let status = format!(" | Agent: {}", project.runtime_state.label());
+    let enabled = if project.project.enabled { "ON" } else { "OFF" };
+    let status = format!(" | Agent: {enabled} {}", project.runtime_state.label());
     let settings = format!(" | {}", format_agent_project_codex_settings_label(project));
 
     let full = format!("{base}{status}{settings}");

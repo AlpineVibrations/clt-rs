@@ -3489,7 +3489,7 @@ fn kanban_console_title_shows_agent_status_and_codex_settings() {
     let title = format_kanban_console_title("clt", Some(&project), 200, None);
     assert_eq!(
         title,
-        "clt Console | Agent: RUNNING | Model: default | Thinking: default"
+        "clt Console | Agent: ON RUNNING | Model: default | Thinking: default"
     );
 
     // "default" names what CLT actually resolves to.
@@ -3501,7 +3501,7 @@ fn kanban_console_title_shows_agent_status_and_codex_settings() {
     let title = format_kanban_console_title("clt", Some(&project), 200, None);
     assert_eq!(
         title,
-        "clt Console | Agent: RUNNING | Model: default (gpt-5.6-sol) | Thinking: default (high)"
+        "clt Console | Agent: ON RUNNING | Model: default (gpt-5.6-sol) | Thinking: default (high)"
     );
 
     project.project.codex_provider = Some("openrouter".to_string());
@@ -3512,7 +3512,7 @@ fn kanban_console_title_shows_agent_status_and_codex_settings() {
     let title = format_kanban_console_title("clt", Some(&project), 200, None);
     assert_eq!(
         title,
-        "clt Console | Agent: RUNNING | Model: openrouter/gpt-6-astra | Thinking: xhigh | Fast: on"
+        "clt Console | Agent: ON RUNNING | Model: openrouter/gpt-6-astra | Thinking: xhigh | Fast: on"
     );
 
     // An explicit project model never shows the resolved default in parens.
@@ -3528,6 +3528,18 @@ fn kanban_console_title_omits_settings_without_a_registered_project() {
 }
 
 #[test]
+fn kanban_console_title_shows_disabled_agent_before_runtime_state() {
+    let mut project = tui_agent_project_for_test(1, "alpha");
+    project.project.enabled = false;
+    project.runtime_state = TuiAgentRuntimeState::Idle;
+
+    assert_eq!(
+        format_kanban_console_title("clt", Some(&project), 200, None),
+        "clt Console | Agent: OFF IDLE | Model: default | Thinking: default"
+    );
+}
+
+#[test]
 fn kanban_console_title_skips_the_provider_prefix_for_openai() {
     let mut project = tui_agent_project_for_test(1, "alpha");
     project.project.codex_provider = Some("openai".to_string());
@@ -3536,7 +3548,7 @@ fn kanban_console_title_skips_the_provider_prefix_for_openai() {
 
     assert_eq!(
         format_kanban_console_title("clt", Some(&project), 200, None),
-        "clt Console | Agent: IDLE | Model: gpt-5.6-sol | Thinking: default"
+        "clt Console | Agent: ON IDLE | Model: gpt-5.6-sol | Thinking: default"
     );
 }
 
@@ -3590,7 +3602,7 @@ fn kanban_console_title_names_the_resolved_default_thinking() {
 
     assert_eq!(
         format_kanban_console_title("clt", Some(&project), 200, None),
-        "clt Console | Agent: IDLE | Model: default (openrouter/gpt-6-astra) | Thinking: default (low)"
+        "clt Console | Agent: ON IDLE | Model: default (openrouter/gpt-6-astra) | Thinking: default (low)"
     );
 }
 
@@ -3624,7 +3636,7 @@ fn kanban_render_shows_registered_project_codex_settings_in_the_console_title() 
         .find(|line| line.contains("Console"))
         .expect("console title row rendered");
     assert!(
-        console_title.contains("Agent: RUNNING"),
+        console_title.contains("Agent: ON RUNNING"),
         "missing agent status: {console_title}"
     );
     assert!(
@@ -3682,8 +3694,8 @@ fn kanban_console_title_yields_settings_before_colliding_with_the_right_title() 
     project.project.codex_reasoning_effort = Some("xhigh".to_string());
 
     let right_title = " Backlog: 12 [B] ";
-    let full = "clt Console | Agent: RUNNING | Model: openrouter/gpt-6-astra | Thinking: xhigh";
-    let with_status = "clt Console | Agent: RUNNING";
+    let full = "clt Console | Agent: ON RUNNING | Model: openrouter/gpt-6-astra | Thinking: xhigh";
+    let with_status = "clt Console | Agent: ON RUNNING";
 
     assert_eq!(
         format_kanban_console_title(
