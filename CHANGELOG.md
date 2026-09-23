@@ -6,6 +6,13 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+## [0.6.21] - 2026-09-23
+
+### Fixed
+
+- Cancel failed agent launches while preserving their diagnostics and allowing the scheduler to continue.
+- Show agent enablement in the Kanban console title for registered projects.
+
 ## [0.6.20] - 2026-09-21
 
 ### Fixed
