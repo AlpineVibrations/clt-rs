@@ -36,7 +36,8 @@ use crate::{
     },
     runner::{
         AgentRunRequest, AgentRunner, CodexAgentRunner, agent_timestamp, agent_timestamp_after,
-        agent_timestamp_seconds, print_agent_log_tail_with_limit, tail_lines,
+        agent_timestamp_seconds, effective_agent_git_mode, print_agent_log_tail_with_limit,
+        tail_lines,
     },
     scheduler::{
         agent_heartbeat_tail_enabled, agent_lease_holder_liveness, agent_lease_timeout,
@@ -1027,24 +1028,30 @@ pub(super) fn ensure_durable_inline_git_worker(
 }
 
 pub(super) fn agent_job_uses_git(job: &AgentRunJob) -> Result<bool> {
-    if job.project.git_mode != AgentGitMode::Off {
-        return Ok(true);
-    }
-    let Some(session_id) = job.resume_session_id.as_deref() else {
-        return Ok(false);
+    let session_id = match &job.resume_session_id {
+        Some(session_id) => Some(session_id.clone()),
+        None => automated_codex_session_to_resume(&job.project.path, job.task_selection)?,
     };
     with_agent_store_at(&job.state_dir, |store| {
-        Ok(store
-            .git_finalization_blocking(job.project.id, session_id)?
-            .is_some_and(|finalization| finalization.git_mode != AgentGitMode::Off))
+        Ok(
+            effective_agent_git_mode(store, &job.project, session_id.as_deref())?
+                != AgentGitMode::Off,
+        )
     })
 }
 
 pub(super) fn run_agent_job_inner(
-    job: AgentRunJob,
+    mut job: AgentRunJob,
     runner: &dyn AgentRunner,
     shutdown: &AgentShutdownSignal,
 ) -> Result<AgentRunCompletion> {
+    let session_id = match &job.resume_session_id {
+        Some(session_id) => Some(session_id.clone()),
+        None => automated_codex_session_to_resume(&job.project.path, job.task_selection)?,
+    };
+    job.project.git_mode = with_agent_store_at(&job.state_dir, |store| {
+        effective_agent_git_mode(store, &job.project, session_id.as_deref())
+    })?;
     if job.worker_token.is_none() && job.task_selection == AgentTaskSelection::ResumeDoing {
         with_agent_store_at(&job.state_dir, |store| {
             store

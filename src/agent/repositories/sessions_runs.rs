@@ -440,6 +440,7 @@ impl TursoAgentStore {
 }
 
 impl TursoAgentStore {
+    #[cfg(test)]
     pub(crate) fn mark_session_running_blocking(
         &self,
         project_id: i64,
@@ -461,7 +462,7 @@ impl TursoAgentStore {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn mark_session_running_with_git_finalization_blocking(
+    pub(crate) fn mark_session_running_with_git_mode_blocking(
         &self,
         project_id: i64,
         codex_session_id: &str,
@@ -586,9 +587,35 @@ impl TursoAgentStore {
             );
         }
         if let Some(git_mode) = git_mode {
+            transaction.execute(
+                "INSERT OR IGNORE INTO session_git_modes (project_id, codex_session_id, git_mode)
+                 VALUES (?1, ?2, ?3)",
+                params![project_id, codex_session_id, git_mode.database_value()],
+            ).await?;
+            anyhow::ensure!(
+                query_count(
+                    &transaction,
+                    "SELECT COUNT(*) FROM session_git_modes
+                 WHERE project_id = ?1 AND codex_session_id = ?2 AND git_mode = ?3",
+                    params![project_id, codex_session_id, git_mode.database_value()],
+                )
+                .await?
+                    == 1,
+                "Codex session {codex_session_id} cannot change its original Git mode"
+            );
             if git_mode == AgentGitMode::Off {
-                anyhow::bail!("An atomic Git session registration cannot use Git mode off");
+                anyhow::ensure!(query_count(
+                    &transaction,
+                    "SELECT COUNT(*) FROM git_finalizations WHERE project_id = ?1 AND codex_session_id = ?2",
+                    params![project_id, codex_session_id],
+                ).await? == 0 && query_count(
+                    &transaction,
+                    "SELECT COUNT(*) FROM agent_git_launch_states WHERE project_id = ?1 AND run_token = ?2",
+                    params![project_id, run_token],
+                ).await? == 0, "Codex session {codex_session_id} has managed Git evidence and cannot register with Git off");
             }
+        }
+        if let Some(git_mode) = git_mode.filter(|mode| *mode != AgentGitMode::Off) {
             let created_at = agent_timestamp();
             let inserted = transaction
                 .execute(

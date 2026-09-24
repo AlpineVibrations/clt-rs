@@ -34,6 +34,7 @@ const TABLES: &[(&str, &str)] = &[
     ("session_controls", "*"),
     ("agent_git_launch_states", "*"),
     ("git_finalizations", "*"),
+    ("session_git_modes", "*"),
 ];
 
 pub(super) struct RegistryAccess {
@@ -209,7 +210,30 @@ pub(super) async fn snapshot(db: &Database, state_dir: &Path) -> Result<()> {
         }
     }
     let mut tables = Map::new();
+    let has_session_modes = super::query_count(
+        &transaction,
+        "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'session_git_modes'",
+        (),
+    )
+    .await?
+        == 1;
+    anyhow::ensure!(
+        has_session_modes
+            || super::query_count(
+                &transaction,
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 19",
+                ()
+            )
+            .await?
+                == 0,
+        "The session Git mode table is missing after its migration was applied"
+    );
     for (name, columns) in TABLES {
+        if *name == "session_git_modes" && !has_session_modes {
+            // Live older workers defer migration 19. Their registry updates
+            // must still produce a usable snapshot while they finish.
+            continue;
+        }
         let mut rows = transaction
             .query(&format!("SELECT {columns} FROM {name}"), ())
             .await?;
@@ -242,7 +266,8 @@ pub(super) async fn snapshot(db: &Database, state_dir: &Path) -> Result<()> {
         tables.insert((*name).to_string(), json!(records));
     }
     transaction.commit().await?;
-    let bytes = serde_json::to_vec_pretty(&json!({"version": 1, "tables": tables}))?;
+    let version = if has_session_modes { 2 } else { 1 };
+    let bytes = serde_json::to_vec_pretty(&json!({"version": version, "tables": tables}))?;
     let path = state_dir.join(SNAPSHOT_FILE);
     if fs::read(&path).ok().as_deref() != Some(bytes.as_slice()) {
         atomic_write(&path, &bytes)?;
@@ -255,12 +280,17 @@ pub(crate) fn read_snapshot(state_dir: &Path) -> Result<Option<Json>> {
     if !path.exists() {
         return Ok(None);
     }
-    let snapshot: Json = serde_json::from_slice(&fs::read(&path)?)
+    let mut snapshot: Json = serde_json::from_slice(&fs::read(&path)?)
         .with_context(|| format!("Invalid external registry snapshot {}", path.display()))?;
     anyhow::ensure!(
-        snapshot["version"] == 1,
+        snapshot["version"] == 1 || snapshot["version"] == 2,
         "Unsupported registry snapshot version"
     );
+    // Older snapshots have no session-mode evidence. Preserve that uncertainty;
+    // in particular, absence of a Git journal does not prove Git was disabled.
+    if snapshot["version"] == 1 && snapshot["tables"].get("session_git_modes").is_none() {
+        snapshot["tables"]["session_git_modes"] = json!([]);
+    }
     for (table, _) in TABLES {
         anyhow::ensure!(
             snapshot["tables"][table].is_array(),

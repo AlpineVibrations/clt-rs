@@ -753,7 +753,7 @@ fn agent_store_concurrent_virgin_opens_apply_each_migration_once() {
             .copied()
             .unwrap()
     });
-    assert_eq!(migration_count, 18);
+    assert_eq!(migration_count, 19);
 
     fs::remove_dir_all(root).unwrap();
 }

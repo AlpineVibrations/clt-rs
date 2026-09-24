@@ -13,6 +13,86 @@ const ORPHAN_REASON: &str =
     "Abandoned unbound Git journal: no task identity or board marker remains";
 const FINALIZER: &str = "orphan-journal-test-finalizer";
 
+#[test]
+fn lost_managed_journal_cannot_be_reclassified_from_an_old_unmanaged_log() {
+    let root = temp_root("lost-managed-session-mode");
+    let state_dir = root.join("state");
+    let project_root = root.join("project");
+    init_tasks(&project_root, false).unwrap();
+    let store = TursoAgentStore::open_blocking(&state_dir).unwrap();
+    store
+        .register_project_blocking(&project_root, "project")
+        .unwrap();
+    let project = store.list_projects_blocking().unwrap().remove(0);
+    store
+        .mark_session_running_blocking(
+            project.id,
+            "managed",
+            123,
+            "run",
+            &root.join("out"),
+            &root.join("err"),
+        )
+        .unwrap();
+    store
+        .set_session_control_recovery_token_blocking(project.id, "managed", "run")
+        .unwrap();
+    store
+        .set_project_git_mode_blocking(project.id, AgentGitMode::Commit)
+        .unwrap();
+    store
+        .blocking
+        .block_on_persist(async {
+            let conn = store.repositories.git_journals.connect().await?;
+            conn.execute(
+                "UPDATE session_git_modes SET git_mode = 'commit' WHERE project_id = ?1",
+                [project.id],
+            )
+            .await?;
+            Ok(())
+        })
+        .unwrap();
+    store
+        .recover_unmanaged_session_git_mode_blocking(
+            project.id,
+            "managed",
+            root.join("err").to_str().unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .session_git_mode_blocking(project.id, "managed")
+            .unwrap(),
+        Some(AgentGitMode::Commit)
+    );
+    store
+        .try_acquire_lease_blocking(
+            project.id,
+            "owner",
+            &agent_timestamp(),
+            &agent_timestamp_after(60),
+        )
+        .unwrap();
+    assert!(
+        !store
+            .can_enable_session_git_blocking(project.id, "managed", "owner")
+            .unwrap()
+    );
+    let project = store.list_projects_blocking().unwrap().remove(0);
+    let error = crate::managed_git::prepare_agent_git_start_state_for_run(
+        &store,
+        &project,
+        crate::application::AgentTaskSelection::ResumeSession,
+        true,
+        false,
+        "run",
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("no frozen Git start journal"));
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
 fn assert_registry_is_clean(state_dir: &Path) {
     assert!(!state_dir.join("registry-dirty").exists());
     assert!(!state_dir.join("recovery-required").exists());

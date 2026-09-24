@@ -3,6 +3,196 @@ use crate::test_support::*;
 use crate::tui::tests::tui_agent_project_for_test;
 use crate::worker::tests::reserve_test_inline_worker;
 
+#[test]
+fn enabling_project_git_records_the_unmanaged_session_before_resumption() {
+    for by_path in [false, true] {
+        let root = temp_root("resume-original-git-mode");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        store
+            .mark_session_running_blocking(
+                project.id,
+                "unmanaged",
+                123,
+                "original-run",
+                &root.join("run.out"),
+                &root.join("run.err"),
+            )
+            .unwrap();
+        store
+            .set_session_control_recovery_token_blocking(project.id, "unmanaged", "original-run")
+            .unwrap();
+        if by_path {
+            store
+                .set_project_git_mode_for_path_blocking(&project_root, AgentGitMode::CommitAndPush)
+                .unwrap();
+        } else {
+            store
+                .set_project_git_mode_blocking(project.id, AgentGitMode::CommitAndPush)
+                .unwrap();
+        }
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert_eq!(
+            store
+                .session_git_mode_blocking(project.id, "unmanaged")
+                .unwrap(),
+            Some(AgentGitMode::Off)
+        );
+        assert_eq!(
+            effective_agent_git_mode(&store, &project, Some("unmanaged")).unwrap(),
+            AgentGitMode::CommitAndPush
+        );
+        assert_eq!(
+            effective_agent_git_mode(&store, &project, None).unwrap(),
+            AgentGitMode::CommitAndPush
+        );
+        assert!(
+            store
+                .git_finalization_blocking(project.id, "unmanaged")
+                .unwrap()
+                .is_none()
+        );
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn legacy_git_mode_requires_the_complete_matching_launch_prompt() {
+    let root = temp_root("legacy-session-git-mode");
+    fs::create_dir_all(&root).unwrap();
+    let store = agent::TursoAgentStore::open_blocking(&root.join("state")).unwrap();
+    store.register_project_blocking(&root, "project").unwrap();
+    let mut project = store.list_projects_blocking().unwrap().remove(0);
+    project.git_mode = AgentGitMode::Off;
+    let prompt = build_agent_codex_prompt(&project, AgentTaskSelection::NextTodo, false, true);
+    let header = format!(
+        "Reading additional input from stdin...\nOpenAI Codex v0.156.1\n--------\nworkdir: {}\nsession id: legacy\n--------\nuser\n",
+        root.display()
+    );
+    let log = format!("{header}{prompt}\ncodex\nStarting work\n");
+    let path = root.join("original.err");
+    fs::write(&path, &log).unwrap();
+    project.git_mode = AgentGitMode::CommitAndPush;
+    assert!(super::legacy_agent_log_proves_git_off(&path, &project, "legacy").unwrap());
+    assert!(!super::legacy_agent_log_proves_git_off(&path, &project, "other").unwrap());
+    for bad in [
+        format!("{header}{prompt}"),
+        log.replace("workdir: ", "wrong directory: "),
+        format!("unrelated output\n{log}"),
+        format!(
+            "{header}{}\ncodex\n{log}",
+            build_agent_codex_prompt(&project, AgentTaskSelection::NextTodo, false, false)
+        ),
+    ] {
+        fs::write(&path, bad).unwrap();
+        assert!(!super::legacy_agent_log_proves_git_off(&path, &project, "legacy").unwrap());
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn legacy_paused_session_launches_with_git_enabled_on_restart() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = temp_root("legacy-session-enables-git");
+    let state_dir = root.join("state");
+    let project_root = root.join("project");
+    init_tasks(&project_root, false).unwrap();
+    fs::write(
+        project_root.join("tasks/doing.md"),
+        "# Doing Tasks\n- Resume feature codex:legacy\n",
+    )
+    .unwrap();
+    let head = initialize_test_git_repository(&project_root);
+    let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
+    store
+        .register_project_blocking(&project_root, "project")
+        .unwrap();
+    let original = store.list_projects_blocking().unwrap().remove(0);
+    let prompt = build_agent_codex_prompt(&original, AgentTaskSelection::NextTodo, false, true);
+    let old_log = root.join("old.err");
+    fs::write(&old_log, format!("OpenAI Codex v0.156.1\n--------\nworkdir: {}\nsession id: legacy\n--------\nuser\n{prompt}\ncodex\nStarting\n", project_root.display())).unwrap();
+    // This models an older release: the mode was changed, but no durable
+    // session-mode field was ever recorded for its interrupted run.
+    store
+        .set_project_git_mode_blocking(original.id, AgentGitMode::Commit)
+        .unwrap();
+    store
+        .mark_session_running_blocking(
+            original.id,
+            "legacy",
+            123,
+            "old-run",
+            &root.join("old.out"),
+            &old_log,
+        )
+        .unwrap();
+    store
+        .set_session_control_recovery_token_blocking(original.id, "legacy", "old-run")
+        .unwrap();
+    assert_eq!(
+        store
+            .session_git_mode_blocking(original.id, "legacy")
+            .unwrap(),
+        None
+    );
+    store
+        .try_acquire_lease_blocking(
+            original.id,
+            "resume-holder",
+            &agent_timestamp(),
+            &agent_timestamp_after(60),
+        )
+        .unwrap();
+    let fake_codex = root.join("fake-codex");
+    fs::write(
+        &fake_codex,
+        "#!/bin/sh\nprintf 'arg=%s\\n' \"$@\" >&2\nprintf 'NO_TASKS_LEFT\\n'\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o755)).unwrap();
+    let project = store.list_projects_blocking().unwrap().remove(0);
+    let runner = CodexAgentRunner::with_command(state_dir, Duration::from_secs(5), fake_codex);
+    let result = runner
+        .run_project(
+            &project,
+            AgentTaskSelection::ResumeSession,
+            Some("legacy"),
+            "resume-holder",
+            None,
+            &new_agent_shutdown_signal(),
+        )
+        .unwrap();
+    assert_eq!(result.codex_session_id.as_deref(), Some("legacy"));
+    let stderr = fs::read_to_string(result.stderr_path).unwrap();
+    assert!(stderr.contains("arg=resume\n"));
+    assert!(stderr.contains(AGENT_GIT_COMMIT_PROMPT_APPENDIX));
+    let journal = store
+        .git_finalization_blocking(project.id, "legacy")
+        .unwrap()
+        .unwrap();
+    assert_eq!(journal.starting_head.as_deref(), Some(head.as_str()));
+    assert_eq!(journal.git_mode, AgentGitMode::Commit);
+    assert_eq!(
+        store
+            .session_git_mode_blocking(project.id, "legacy")
+            .unwrap(),
+        Some(AgentGitMode::Commit)
+    );
+    assert_eq!(read_tasks(&project_root, "doing").unwrap().len(), 1);
+    assert!(run_test_git(&project_root, &["status", "--porcelain"]).is_empty());
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[cfg(unix)]
 #[test]
 fn reaped_automated_supervisor_exits_when_registry_recovery_is_required() {

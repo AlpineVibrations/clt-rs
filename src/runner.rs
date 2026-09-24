@@ -27,8 +27,9 @@ use crate::{
     },
     managed_git::{
         AgentGitStartState, bind_agent_git_working_task_identity, configure_agent_git_identity,
-        ensure_agent_git_index_preflight, ensure_agent_git_working_record,
-        prepare_agent_git_start_state_for_run, verify_agent_git_start_state_unchanged,
+        enable_agent_git_for_resumed_session, ensure_agent_git_index_preflight,
+        ensure_agent_git_working_record, prepare_agent_git_start_state_for_run,
+        verify_agent_git_start_state_unchanged,
     },
     platform::{
         agent_codex_path_env, agent_process_group_exists, configure_agent_child_command,
@@ -561,7 +562,8 @@ pub(super) const AGENT_GIT_COMMIT_PROMPT_APPENDIX: &str = r#"
 Git commit:
 - This finalization contract is authoritative for the automated run and overrides older installed skill guidance when they differ.
 - Before this process was released, CLT completed the scheduler-owned startup preparation, using a safe fast-forward-only sync only when the checkout was clean and no older WORKING journal required preserving its history, then froze HEAD, the exact index tree, the worktree baseline, branch, and upstream state and persisted that launch record. The selected task must already be committed exactly once on the board. Do not pull, fetch or otherwise synchronize, merge, rebase, switch branches, reset history, or reconfigure Git after release.
-- Move the selected Todo task to Doing before implementation. CLT rechecks the frozen launch record and binds it to the session's durable WORKING journal at that transition; do not edit or commit implementation first.
+- For a fresh task, move the selected Todo task to Doing before implementation. CLT rechecks the frozen launch record and binds it to the session's durable WORKING journal at that transition; do not edit or commit implementation first.
+- For a resumed Doing task, keep its existing identity and continue its work. If Git was enabled while the task was paused, CLT established the managed boundary before this restart, preserving earlier implementation and staged work. Review that earlier work for task scope and include the verified task changes in the completion commit.
 - Pre-existing staged changes are accepted and preserved at launch. After moving the task to Doing, review them for task scope; they are not a blocker by themselves. Include only verified changes belonging to this task. If unrelated work is already staged, use a separate GIT_INDEX_FILE initialized from current HEAD for task staging, every clt done/reseal invocation, and the task commit, keeping it available across retries. After the commit, reconcile only the task changes into the shared index while preserving unrelated staged entries and same-file hunks. Never clear the shared index or commit unrelated staged work just to proceed.
 - Once the task is Doing, ordinary user commits (such as a patch-version bump) and CLT board checkpoints may advance the same branch. Preserve them, re-read the affected files, reconcile compatible changes, and rerun affected checks; HEAD movement alone is not a blocker. CLT keeps the original launch history and seals against the current parent. Unproven agent commits, task claims, merges, branch switches, and rewritten history still require resolution.
 - After completing and verifying the task, run all formatting, lint, signing, and hook checks that can mutate files before sealing. Add its dated COMPLETED note. Stage the implementation, any linked follow-up created for an independent failure, and the active Doing task, including its terminal `codex:<session-id>` marker, then inspect the staged diff.
@@ -1547,14 +1549,105 @@ pub(super) fn effective_agent_git_mode(
     let Some(session_id) = resume_session_id else {
         return Ok(project.git_mode);
     };
-    let Some(finalization) = store.git_finalization_blocking(project.id, session_id)? else {
+    let finalization = store.git_finalization_blocking(project.id, session_id)?;
+    if let Some(finalization) = &finalization {
+        return Ok(if finalization.state.is_terminal() {
+            project.git_mode
+        } else {
+            finalization.git_mode
+        });
+    }
+    if store
+        .pending_migration_version()
+        .is_some_and(|version| version <= 19)
+    {
         return Ok(project.git_mode);
+    }
+    if let Some(mode) = store.session_git_mode_blocking(project.id, session_id)? {
+        return Ok(if mode == AgentGitMode::Off {
+            project.git_mode
+        } else {
+            mode
+        });
+    }
+    if finalization.is_none()
+        && let Some(control) = store.session_control_blocking(project.id, session_id)?
+        && let Some(path) = control.stderr_path
+        && legacy_agent_log_proves_git_off(Path::new(&path), project, session_id)?
+    {
+        store.recover_unmanaged_session_git_mode_blocking(project.id, session_id, &path)?;
+        if let Some(mode) = store.session_git_mode_blocking(project.id, session_id)? {
+            return Ok(if mode == AgentGitMode::Off {
+                project.git_mode
+            } else {
+                mode
+            });
+        }
+    }
+    Ok(project.git_mode)
+}
+
+fn legacy_agent_log_proves_git_off(
+    path: &Path,
+    project: &agent::AgentProject,
+    session_id: &str,
+) -> Result<bool> {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).context("Failed to inspect the original session launch log");
+        }
     };
-    Ok(if finalization.state.is_terminal() {
-        project.git_mode
-    } else {
-        finalization.git_mode
-    })
+    let mut bytes = Vec::new();
+    file.take(256 * 1024).read_to_end(&mut bytes)?;
+    let log = String::from_utf8_lossy(&bytes).replace("\r\n", "\n");
+    let log = log
+        .strip_prefix("Reading additional input from stdin...\n")
+        .unwrap_or(&log);
+    let Some((banner, rest)) = log.split_once("\n--------\n") else {
+        return Ok(false);
+    };
+    if !banner.starts_with("OpenAI Codex v") || banner.contains('\n') {
+        return Ok(false);
+    }
+    let Some((header, prompt)) = rest.split_once("\n--------\nuser\n") else {
+        return Ok(false);
+    };
+    let sessions: Vec<_> = header
+        .lines()
+        .filter_map(|line| line.strip_prefix("session id: "))
+        .collect();
+    let workdirs: Vec<_> = header
+        .lines()
+        .filter_map(|line| line.strip_prefix("workdir: "))
+        .collect();
+    if sessions != [session_id] || workdirs != [project.path.to_string_lossy().as_ref()] {
+        return Ok(false);
+    }
+    let mut original = project.clone();
+    original.git_mode = AgentGitMode::Off;
+    for selection in [
+        AgentTaskSelection::NextTodo,
+        AgentTaskSelection::ResumeDoing,
+        AgentTaskSelection::RecoverBlocked,
+        AgentTaskSelection::ResumeSession,
+    ] {
+        for skill_available in [false, true] {
+            let expected = build_agent_codex_prompt(&original, selection, skill_available, true);
+            // Require a complete, recognized CLT prompt followed by the first
+            // response boundary. Truncation or the absence of a Git appendix
+            // alone is not evidence, nor is matching text later in the log.
+            if let Some(response) = prompt.strip_prefix(expected.trim_end())
+                && ["\ncodex\n", "\nthinking\n", "\nexec\n"]
+                    .iter()
+                    .any(|boundary| response.starts_with(boundary))
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 pub(super) fn build_agent_codex_prompt(
@@ -1724,6 +1817,15 @@ impl CodexAgentRunner {
             .clone()
             .unwrap_or_else(|| agent_log_file_stem(project.id));
         ensure_agent_git_index_preflight(project, known_session_id.is_some())?;
+        if let Some(session_id) = known_session_id.as_deref() {
+            enable_agent_git_for_resumed_session(
+                &store,
+                project,
+                session_id,
+                &run_file_stem,
+                lease_holder,
+            )?;
+        }
         let existing_git_finalization = known_session_id
             .as_deref()
             .map(|session_id| store.git_finalization_blocking(project.id, session_id))
@@ -1897,26 +1999,15 @@ impl CodexAgentRunner {
                 if let Some(session_id) = observed_session_id.as_deref()
                     && !session_registered
                 {
-                    if project.git_mode == AgentGitMode::Off {
-                        store.mark_session_running_blocking(
-                            project.id,
-                            session_id,
-                            child_pid,
-                            &run_file_stem,
-                            &stdout_path,
-                            &stderr_path,
-                        )?;
-                    } else {
-                        store.mark_session_running_with_git_finalization_blocking(
-                            project.id,
-                            session_id,
-                            child_pid,
-                            &run_file_stem,
-                            &stdout_path,
-                            &stderr_path,
-                            project.git_mode,
-                        )?;
-                    }
+                    store.mark_session_running_with_git_mode_blocking(
+                        project.id,
+                        session_id,
+                        child_pid,
+                        &run_file_stem,
+                        &stdout_path,
+                        &stderr_path,
+                        project.git_mode,
+                    )?;
                     session_registered = true;
                 }
                 if let Some(session_id) = observed_session_id.as_deref()

@@ -6,6 +6,13 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+## [0.6.22] - 2026-09-24
+
+### Fixed
+
+- Allow unfinished tasks started with Git off to resume with commit or commit-and-push after Git is enabled while paused, preserving their session, existing implementation, and staged work.
+- Persist session Git modes and recover older unmanaged sessions from verified launch logs, while retaining protection against missing managed Git journals.
+
 ## [0.6.21] - 2026-09-23
 
 ### Fixed

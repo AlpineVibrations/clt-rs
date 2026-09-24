@@ -165,6 +165,12 @@ impl TursoAgentStore {
     }
 
     async fn set_project_git_mode(&self, project_id: i64, mode: AgentGitMode) -> Result<bool> {
+        anyhow::ensure!(
+            !self
+                .pending_migration_version()
+                .is_some_and(|version| version <= 19),
+            "The session Git mode upgrade is waiting for active workers to finish; retry after they stop"
+        );
         let mut conn = self.repositories.projects_models.connect().await?;
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -200,6 +206,21 @@ impl TursoAgentStore {
                 "Cannot change project {project_id} Git mode while an agent run or Git journal is active"
             );
         }
+        // Preserve an idle pre-upgrade automated session's unmanaged contract
+        // before changing the setting used for new sessions.
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO session_git_modes (project_id, codex_session_id, git_mode)
+             SELECT sc.project_id, sc.codex_session_id, 'off'
+             FROM session_controls sc JOIN projects p ON p.id = sc.project_id
+             WHERE p.id = ?1 AND p.git_mode = 'off' AND sc.run_token IS NOT NULL
+               AND NOT EXISTS (SELECT 1 FROM git_finalizations g
+                   WHERE g.project_id = sc.project_id AND g.codex_session_id = sc.codex_session_id)
+               AND NOT EXISTS (SELECT 1 FROM agent_git_launch_states l
+                   WHERE l.project_id = sc.project_id)",
+                [project_id],
+            )
+            .await?;
         let changed = transaction
             .execute(
                 "UPDATE projects SET git_mode = ?1, updated_at = ?2 WHERE id = ?3",
@@ -229,6 +250,12 @@ impl TursoAgentStore {
         project_root: &Path,
         mode: AgentGitMode,
     ) -> Result<bool> {
+        anyhow::ensure!(
+            !self
+                .pending_migration_version()
+                .is_some_and(|version| version <= 19),
+            "The session Git mode upgrade is waiting for active workers to finish; retry after they stop"
+        );
         let mut conn = self.repositories.projects_models.connect().await?;
         let path = project_root.display().to_string();
         let transaction = conn
@@ -266,6 +293,19 @@ impl TursoAgentStore {
                 "Cannot change project {path} Git mode while an agent run or Git journal is active"
             );
         }
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO session_git_modes (project_id, codex_session_id, git_mode)
+             SELECT sc.project_id, sc.codex_session_id, 'off'
+             FROM session_controls sc JOIN projects p ON p.id = sc.project_id
+             WHERE p.path = ?1 AND p.git_mode = 'off' AND sc.run_token IS NOT NULL
+               AND NOT EXISTS (SELECT 1 FROM git_finalizations g
+                   WHERE g.project_id = sc.project_id AND g.codex_session_id = sc.codex_session_id)
+               AND NOT EXISTS (SELECT 1 FROM agent_git_launch_states l
+                   WHERE l.project_id = sc.project_id)",
+                [path.as_str()],
+            )
+            .await?;
         let changed = transaction
             .execute(
                 "UPDATE projects SET git_mode = ?1, updated_at = ?2 WHERE path = ?3",

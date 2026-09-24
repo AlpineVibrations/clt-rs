@@ -29,8 +29,8 @@ use crate::{
     runner::{
         AgentRunner, AutomatedAgentChildContext, agent_timestamp, agent_timestamp_after,
         agent_timestamp_seconds, automated_agent_child_context, canonicalize_existing_path,
-        format_agent_run_line, format_agent_timestamp, format_optional_agent_timestamp,
-        print_agent_log_tail, resolve_agent_project_root,
+        effective_agent_git_mode, format_agent_run_line, format_agent_timestamp,
+        format_optional_agent_timestamp, print_agent_log_tail, resolve_agent_project_root,
     },
     scheduler::{agent_lease_holder_liveness, scan_agent_project},
     task::{
@@ -962,7 +962,8 @@ pub(super) fn reseal_provisional_done_task(root: &Path, task_index_str: &str) ->
                 context.project_id
             )
         })?;
-    if project.git_mode == AgentGitMode::Off {
+    let session_id = running_session_for_automated_child(&store, &context)?;
+    if effective_agent_git_mode(&store, &project, Some(&session_id))? == AgentGitMode::Off {
         return Ok(false);
     }
     let root = canonicalize_existing_path(root)?;
@@ -1121,7 +1122,7 @@ pub(super) fn move_task(
         && let Some(context) = automated_agent_child_context()?
     {
         let store = open_agent_store()?;
-        let project = store
+        let mut project = store
             .list_projects_blocking()?
             .into_iter()
             .find(|project| project.id == context.project_id)
@@ -1131,6 +1132,8 @@ pub(super) fn move_task(
                     context.project_id
                 )
             })?;
+        let session_id = running_session_for_automated_child(&store, &context)?;
+        project.git_mode = effective_agent_git_mode(&store, &project, Some(&session_id))?;
         if project.git_mode != AgentGitMode::Off {
             return move_task_to_doing_with_agent_git_journal(
                 root,
@@ -1407,7 +1410,7 @@ pub(super) fn move_task_to_done_with_agent_store(
         );
     }
     let Some(mut finalization) = store.git_finalization_blocking(project.id, session_id)? else {
-        if project.git_mode == AgentGitMode::Off {
+        if effective_agent_git_mode(store, &project, Some(session_id))? == AgentGitMode::Off {
             move_task_in_board_after_lock(&board_dir, from, TaskStatus::Done, task_index)?;
             return Ok(false);
         }

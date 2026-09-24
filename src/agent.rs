@@ -1122,6 +1122,19 @@ const AGENT_MIGRATIONS: &[AgentMigration<'static>] = &[
         version: 18,
         statements: &["ALTER TABLE model_providers ADD COLUMN api_key TEXT"],
     },
+    AgentMigration {
+        version: 19,
+        statements: &[
+            "CREATE TABLE IF NOT EXISTS session_git_modes (
+                project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                codex_session_id TEXT NOT NULL,
+                git_mode TEXT NOT NULL,
+                PRIMARY KEY (project_id, codex_session_id)
+            )",
+            "INSERT INTO session_git_modes (project_id, codex_session_id, git_mode)
+             SELECT project_id, codex_session_id, git_mode FROM git_finalizations",
+        ],
+    },
 ];
 
 pub(super) struct TursoAgentStore {

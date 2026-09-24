@@ -4,6 +4,7 @@ use crate::test_support::*;
 use crate::worker::tests::reserve_test_worker;
 
 mod advanced_branch;
+mod enable_on_resume;
 mod follow_up;
 mod orphan;
 mod projection;
@@ -620,7 +621,7 @@ fn scheduler_owned_git_launch_state_is_required_and_consumed_at_activation() {
         Some((AgentGitMode::Commit, launch.clone()))
     );
     store
-        .mark_session_running_with_git_finalization_blocking(
+        .mark_session_running_with_git_mode_blocking(
             project.id,
             "session-launch-state",
             123,
@@ -933,7 +934,7 @@ fn atomic_git_session_registration_rolls_back_without_a_launch_boundary() {
     let project = store.list_projects_blocking().unwrap().remove(0);
 
     let error = store
-        .mark_session_running_with_git_finalization_blocking(
+        .mark_session_running_with_git_mode_blocking(
             project.id,
             "session-without-launch",
             123,

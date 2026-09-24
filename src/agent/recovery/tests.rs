@@ -24,6 +24,107 @@ const CHECKPOINT_CHILD_STATE: &str = "CLT_REGISTRY_RECOVERY_CHECKPOINT_TEST_STAT
 const REOPEN_CHILD_STATE: &str = "CLT_REGISTRY_RECOVERY_REOPEN_TEST_STATE";
 
 #[test]
+fn registry_recovery_preserves_session_git_modes_and_accepts_older_snapshots() {
+    let (root, state_dir, store, project) = registered_store("recover-session-git-mode");
+    store
+        .mark_session_running_with_git_mode_blocking(
+            project.id,
+            "unmanaged",
+            123,
+            "run",
+            &root.join("out"),
+            &root.join("err"),
+            AgentGitMode::Off,
+        )
+        .unwrap();
+    let snapshot = read_snapshot(&state_dir).unwrap().unwrap();
+    assert_eq!(
+        snapshot["tables"]["session_git_modes"][0]["git_mode"],
+        "off"
+    );
+    store
+        .blocking
+        .block_on_persist(restore_snapshot(&store.recovery_db, &snapshot))
+        .unwrap();
+    assert_eq!(
+        store
+            .session_git_mode_blocking(project.id, "unmanaged")
+            .unwrap(),
+        Some(AgentGitMode::Off)
+    );
+    let mut old = snapshot.clone();
+    old["version"] = json!(1);
+    old["tables"]
+        .as_object_mut()
+        .unwrap()
+        .remove("session_git_modes");
+    fs::write(
+        state_dir.join(SNAPSHOT_FILE),
+        serde_json::to_vec(&old).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        read_snapshot(&state_dir).unwrap().unwrap()["tables"]["session_git_modes"],
+        json!([])
+    );
+    old["version"] = json!(2);
+    fs::write(
+        state_dir.join(SNAPSHOT_FILE),
+        serde_json::to_vec(&old).unwrap(),
+    )
+    .unwrap();
+    assert!(read_snapshot(&state_dir).is_err());
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn deferred_session_git_migration_keeps_registry_updates_available() {
+    let (root, state_dir, store, project) = registered_store("deferred-session-mode-migration");
+    store
+        .try_acquire_lease_blocking(project.id, "scheduler", "100", "9999999999")
+        .unwrap();
+    assert!(reserve_test_worker(
+        &store,
+        project.id,
+        "old-worker",
+        "scheduler",
+        "101",
+        1
+    ));
+    let db_path = store.db_path().to_path_buf();
+    drop(store);
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let db = clt_database::turso::Builder::new_local(db_path.to_str().unwrap())
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("DROP TABLE session_git_modes", ())
+            .await
+            .unwrap();
+        conn.execute("DELETE FROM schema_migrations WHERE version = 19", ())
+            .await
+            .unwrap();
+    });
+    let store = TursoAgentStore::open_blocking(&state_dir).unwrap();
+    assert_eq!(store.pending_migration_version(), Some(19));
+    assert_eq!(
+        store
+            .session_git_mode_blocking(project.id, "legacy")
+            .unwrap(),
+        None
+    );
+    store
+        .record_project_daemon_scan_blocking(project.id, "pending", None)
+        .unwrap();
+    assert_eq!(read_snapshot(&state_dir).unwrap().unwrap()["version"], 1);
+    assert!(!state_dir.join(REQUIRED_FILE).exists());
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn exited_registry_owners_release_locks_even_with_inherited_handles() {
     let root = temp_root("registry-inherited-locks");
     let first = RegistryAccess::shared(&root).unwrap();

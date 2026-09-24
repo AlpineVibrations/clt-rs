@@ -30,7 +30,134 @@ impl GitJournalsRepository {
     }
 }
 
+async fn session_can_enable_git(
+    conn: &Connection,
+    project_id: i64,
+    session_id: &str,
+    lease_holder: &str,
+) -> Result<bool> {
+    Ok(query_count(conn,
+        "SELECT COUNT(*) FROM session_git_modes m
+         JOIN projects p ON p.id = m.project_id
+         JOIN leases l ON l.project_id = m.project_id
+         WHERE m.project_id = ?1 AND m.codex_session_id = ?2 AND m.git_mode = 'off'
+           AND p.git_mode <> 'off' AND l.holder = ?3
+           AND CAST(l.expires_at AS INTEGER) > CAST(?4 AS INTEGER)
+           AND NOT EXISTS (SELECT 1 FROM git_finalizations g
+               WHERE g.project_id = m.project_id AND g.codex_session_id = m.codex_session_id)
+           AND NOT EXISTS (SELECT 1 FROM agent_git_launch_states a WHERE a.project_id = m.project_id)
+           AND NOT EXISTS (SELECT 1 FROM agent_workers w WHERE w.project_id = m.project_id
+               AND w.state IN ('dispatching', 'running', 'finalizing') AND w.lease_holder <> ?3)
+           AND NOT EXISTS (SELECT 1 FROM session_controls sc WHERE sc.project_id = m.project_id
+               AND (sc.state NOT IN ('stopped', 'resume_requested') OR sc.child_pid IS NOT NULL
+                   OR sc.interactive_holder IS NOT NULL OR sc.interactive_launch_token IS NOT NULL))",
+        params![project_id, session_id, lease_holder, agent_timestamp()],
+    ).await? == 1)
+}
+
 impl TursoAgentStore {
+    pub(crate) fn can_enable_session_git_blocking(
+        &self,
+        project_id: i64,
+        session_id: &str,
+        lease_holder: &str,
+    ) -> Result<bool> {
+        self.blocking.block_on(async {
+            let conn = self.repositories.git_journals.connect().await?;
+            session_can_enable_git(&conn, project_id, session_id, lease_holder).await
+        })
+    }
+
+    pub(crate) fn enable_session_git_blocking(
+        &self,
+        journal: NewGitFinalization<'_>,
+        lease_holder: &str,
+    ) -> Result<bool> {
+        self.blocking.block_on_persist(async {
+            anyhow::ensure!(journal.git_mode != AgentGitMode::Off
+                && journal.starting_head.is_some() && journal.task_identity.is_some()
+                && journal.owner_run_token.is_some(), "Enabling session Git requires a complete boundary and owner");
+            let mut conn = self.repositories.git_journals.connect().await?;
+            let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate).await?;
+            if !session_can_enable_git(&transaction, journal.project_id, journal.codex_session_id, lease_holder).await? {
+                transaction.rollback().await?;
+                return Ok(false);
+            }
+            let inserted = transaction.execute(
+                "INSERT INTO git_finalizations (
+                    project_id, codex_session_id, state, git_mode, starting_head,
+                    branch_ref, upstream_ref, worktree_baseline, task_identity,
+                    owner_run_token, generation, created_at, updated_at
+                 ) SELECT ?1, ?2, 'working', ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?10
+                   WHERE EXISTS (SELECT 1 FROM projects WHERE id = ?1 AND git_mode = ?3)",
+                params![journal.project_id, journal.codex_session_id, journal.git_mode.database_value(),
+                    journal.starting_head, journal.branch_ref, journal.upstream_ref,
+                    journal.worktree_baseline, journal.task_identity, journal.owner_run_token, journal.created_at],
+            ).await?;
+            if inserted != 1 {
+                transaction.rollback().await?;
+                return Ok(false);
+            }
+            transaction.execute(
+                "UPDATE session_git_modes SET git_mode = ?3 WHERE project_id = ?1 AND codex_session_id = ?2",
+                params![journal.project_id, journal.codex_session_id, journal.git_mode.database_value()],
+            ).await?;
+            transaction.commit().await?;
+            Ok(true)
+        })
+    }
+
+    /// Restore only the unmanaged contract proven by the exact control's launch
+    /// log. Never replace stored mode or any surviving managed Git boundary.
+    pub(crate) fn recover_unmanaged_session_git_mode_blocking(
+        &self,
+        project_id: i64,
+        session_id: &str,
+        stderr_path: &str,
+    ) -> Result<()> {
+        self.blocking.block_on_persist(async {
+            let conn = self.repositories.git_journals.connect().await?;
+            conn.execute(
+                "INSERT OR IGNORE INTO session_git_modes (project_id, codex_session_id, git_mode)
+                 SELECT project_id, codex_session_id, 'off' FROM session_controls sc
+                 WHERE project_id = ?1 AND codex_session_id = ?2 AND stderr_path = ?3
+                   AND NOT EXISTS (SELECT 1 FROM git_finalizations g
+                       WHERE g.project_id = sc.project_id AND g.codex_session_id = sc.codex_session_id)
+                   AND NOT EXISTS (SELECT 1 FROM agent_git_launch_states l
+                       WHERE l.project_id = sc.project_id)",
+                params![project_id, session_id, stderr_path],
+            ).await?;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn session_git_mode_blocking(
+        &self,
+        project_id: i64,
+        session_id: &str,
+    ) -> Result<Option<AgentGitMode>> {
+        if self
+            .pending_migration_version()
+            .is_some_and(|version| version <= 19)
+        {
+            return Ok(None);
+        }
+        self.blocking.block_on(async {
+            let conn = self.repositories.git_journals.connect().await?;
+            let mut rows = conn
+                .query(
+                    "SELECT git_mode FROM session_git_modes
+                 WHERE project_id = ?1 AND codex_session_id = ?2",
+                    params![project_id, session_id],
+                )
+                .await?;
+            rows.next()
+                .await?
+                .map(|row| AgentGitMode::from_database(&row_text(&row, 0, "git_mode")?))
+                .transpose()
+        })
+    }
+
     /// Cancel an unbound journal only after the caller has locked the board and
     /// proved that no task or nested board still references its exact session.
     pub(crate) fn cancel_orphaned_working_git_finalization_blocking(

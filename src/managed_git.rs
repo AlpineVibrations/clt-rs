@@ -1009,6 +1009,92 @@ pub(super) fn prepare_agent_git_start_state_for_run(
     Ok(Some(start))
 }
 
+/// Enabling Git on paused unmanaged work starts a new managed phase. Its
+/// boundary is captured before resuming the child, without synchronizing a
+/// checkout that already contains task work. A lost managed journal cannot
+/// take this path: it requires durable evidence that the session used Git off.
+pub(super) fn enable_agent_git_for_resumed_session(
+    store: &agent::TursoAgentStore,
+    project: &agent::AgentProject,
+    session_id: &str,
+    run_token: &str,
+    lease_holder: &str,
+) -> Result<()> {
+    if project.git_mode == AgentGitMode::Off
+        || store
+            .git_finalization_blocking(project.id, session_id)?
+            .is_some()
+        || store.session_git_mode_blocking(project.id, session_id)? != Some(AgentGitMode::Off)
+    {
+        return Ok(());
+    }
+    let board_dir = get_tasks_dir(&project.path);
+    let _lock = acquire_board_mutation_lock(&board_dir)?;
+    let (status, task) = terminal_task_for_codex_session_in_board(&board_dir, session_id)?
+        .context("Enabling Git on a paused session requires its linked Doing task")?;
+    anyhow::ensure!(
+        status == TaskStatus::Doing && !task_content_has_completed_note(&task.content),
+        "Enabling Git on a paused session requires unfinished Doing work; completed work cannot acquire a new Git boundary"
+    );
+    let identity =
+        durable_task_identity(&task.content).context("The paused task has no durable identity")?;
+    let claims = git_stdout(
+        &project.path,
+        &[
+            "log",
+            "--all",
+            "--format=%H",
+            "--fixed-strings",
+            &format!("--grep=CLT-Task: codex:{session_id}"),
+        ],
+        "check for an existing task commit before enabling Git",
+    )?;
+    anyhow::ensure!(
+        claims.is_empty(),
+        "Codex session {session_id} already has task-commit evidence; CLT will not establish another Git boundary"
+    );
+    anyhow::ensure!(
+        store.can_enable_session_git_blocking(project.id, session_id, lease_holder)?,
+        "The paused session is no longer idle or its resuming worker lost ownership before enabling Git"
+    );
+    cleanup_clt_atomic_task_temporaries(&board_dir)?;
+    require_agent_git_board_storage_compatible(&project.path)?;
+    // Validate branch/index/upstream before any board checkpoint mutation.
+    capture_agent_git_start_state(&project.path, project.git_mode)?;
+    checkpoint_agent_git_task_board_before_launch(&project.path)?;
+    let start = capture_agent_git_start_state(&project.path, project.git_mode)?;
+    require_agent_git_start_task_identity(&project.path, &start.starting_head, &identity)?;
+    anyhow::ensure!(
+        git_ref_has_one_active_session_task(
+            &project.path,
+            &start.starting_head,
+            session_id,
+            &identity
+        )?,
+        "The paused session must have exactly one committed active task before enabling Git"
+    );
+    verify_agent_git_start_state_unchanged(&project.path, project.git_mode, &start)?;
+    anyhow::ensure!(
+        store.enable_session_git_blocking(
+            agent::NewGitFinalization {
+                project_id: project.id,
+                codex_session_id: session_id,
+                git_mode: project.git_mode,
+                starting_head: Some(&start.starting_head),
+                branch_ref: start.branch_ref.as_deref(),
+                upstream_ref: start.upstream_ref.as_deref(),
+                worktree_baseline: &start.worktree_baseline,
+                task_identity: Some(&identity),
+                owner_run_token: Some(run_token),
+                created_at: &agent_timestamp(),
+            },
+            lease_holder
+        )?,
+        "The paused session changed while CLT was recording its new Git boundary"
+    );
+    Ok(())
+}
+
 pub(super) fn checkpoint_agent_git_task_board_before_launch(
     project_root: &Path,
 ) -> Result<Option<String>> {
