@@ -43,8 +43,7 @@ use crate::{
     application::{
         AgentLeaseHolderLiveness, AgentProjectScan, delete_task_in_board,
         ensure_status_conversion_allowed, move_task_in_board, move_task_to_archive_in_board,
-        project_display_name, reorder_task_in_board, toggle_task_stop_marker_in_board,
-        update_task_in_board,
+        project_display_name, reorder_task_in_board, update_task_in_board,
     },
     platform::{agent_service_status, restart_running_agent_service},
     runner::{
@@ -64,7 +63,7 @@ use crate::{
         queue_tui_codex_session_exec_resume, reserve_tui_idle_codex_session_interactive,
         reserve_tui_shared_codex_session_interactive, resume_codex_session_interactively,
         spawn_agent_session_resume_worker, task_supports_interactive_codex_resume,
-        toggle_tui_codex_session_stop, tui_inactive_codex_session_control,
+        toggle_tui_codex_session_stop, toggle_tui_task_stop_at, tui_inactive_codex_session_control,
     },
     task::{
         TASK_STATUSES, TaskBoard, TaskEntry, TaskSource, TaskStatus, acquire_board_mutation_lock,
@@ -5711,7 +5710,7 @@ pub(super) enum TuiCodexContinuation {
         shares_project: bool,
         require_resumable_task: bool,
     },
-    NewPlanning(InteractiveAgentLease),
+    NewPlanning(Option<InteractiveAgentLease>),
 }
 
 pub(super) fn run_tui_codex_session_continue(
@@ -5727,7 +5726,7 @@ pub(super) fn run_tui_codex_session_continue(
             shares_project,
             require_resumable_task,
         } => (shares_project, require_resumable_task, None),
-        TuiCodexContinuation::NewPlanning(lease) => (false, true, Some(lease)),
+        TuiCodexContinuation::NewPlanning(lease) => (lease.is_none(), true, lease),
     };
     draw_tui_codex_handoff_status(
         terminal,
@@ -7853,52 +7852,25 @@ pub(super) fn execute_tui_key_effect(
                             app.feedback_buffer = "No task selected".to_string();
                             return Ok(false);
                         };
-                        let session_id = codex_session_for_task(&task);
-                        if task_entry_is_stopped(&task) || session_id.is_none() {
-                            app.feedback_buffer = match toggle_task_stop_marker_in_board(
+                        app.agent_panel.refresh(&app.active_root);
+                        *last_agent_panel_refresh = Instant::now();
+                        let project_id = app
+                            .agent_panel
+                            .select_project_for_path(&app.active_root)
+                            .then(|| app.agent_panel.selected_project().map(|p| p.project.id))
+                            .flatten();
+                        app.feedback_buffer = match agent_state_dir().and_then(|state_dir| {
+                            toggle_tui_task_stop_at(
+                                &state_dir,
+                                project_id,
                                 &board_dir,
                                 selected_status,
                                 &task,
-                            ) {
-                                Ok(true) => {
-                                    "Task stopped. CLT will skip it until you press s again."
-                                        .to_string()
-                                }
-                                Ok(false) => {
-                                    "Task started. CLT may pick it up when it is ready in Todo."
-                                        .to_string()
-                                }
-                                Err(error) => format!("Unable to stop or start the task: {error}"),
-                            };
-                            return Ok(false);
-                        }
-                        let session_id =
-                            session_id.context("No Codex session linked to this task")?;
-                        app.agent_panel.refresh(&app.active_root);
-                        *last_agent_panel_refresh = Instant::now();
-                        if !app.agent_panel.select_project_for_path(&app.active_root) {
-                            app.feedback_buffer =
-                                "Register this project before controlling its Codex session."
-                                    .to_string();
-                            return Ok(false);
-                        }
-                        let Some(project_id) = app
-                            .agent_panel
-                            .selected_project()
-                            .map(|selected| selected.project.id)
-                        else {
-                            app.feedback_buffer =
-                                "Register this project before controlling its Codex session."
-                                    .to_string();
-                            return Ok(false);
+                            )
+                        }) {
+                            Ok(message) => message,
+                            Err(error) => format!("Unable to stop or start the task: {error}"),
                         };
-                        app.feedback_buffer =
-                            match toggle_tui_codex_session_stop(project_id, &session_id) {
-                                Ok(message) => message,
-                                Err(error) => {
-                                    format!("Unable to stop or resume the Codex session: {error}")
-                                }
-                            };
                     }
                     KeyCode::Char('i') => {
                         let selected_status = statuses[app.selected_board];

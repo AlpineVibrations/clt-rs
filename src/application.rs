@@ -1779,11 +1779,6 @@ pub(super) fn toggle_task_stop_marker_in_board(
         .into_iter()
         .find(|entry| entry.source == selected.source && entry.content == selected.content)
         .context("The selected task changed; select it again before stopping or starting it")?;
-    anyhow::ensure!(
-        task_entry_is_stopped(&entry)
-            || recoverable_codex_session_id_from_task_content(&entry.content).is_none(),
-        "This task has a Codex session; use its session stop/resume control"
-    );
     let stopped = !task_entry_is_stopped(&entry);
     let content = if stopped {
         format!("{} {TASK_STOPPED_MARKER}", entry.content.trim_end())

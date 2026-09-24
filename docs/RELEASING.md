@@ -58,8 +58,8 @@ After publication, test both installation modes outside this repository, using
 separate temporary Cargo/install directories:
 
 ```sh
-CARGO_HOME="$(mktemp -d)" cargo install clt-rs --version 0.7.0 --locked --root /tmp/clt-release-locked
-CARGO_HOME="$(mktemp -d)" cargo install clt-rs --version 0.7.0 --root /tmp/clt-release-unlocked
+CARGO_HOME="$(mktemp -d)" cargo install clt-rs --version 0.7.1 --locked --root /tmp/clt-release-locked
+CARGO_HOME="$(mktemp -d)" cargo install clt-rs --version 0.7.1 --root /tmp/clt-release-unlocked
 /tmp/clt-release-locked/bin/clt --version
 /tmp/clt-release-unlocked/bin/clt --version
 ```

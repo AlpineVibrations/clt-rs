@@ -6,8 +6,12 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-09-24
+
 ### Fixed
 
+- Let `s` persistently stop tasks with saved Codex links but no CLT session control, and idle Todo planning conversations.
+- Allow new Todo planning conversations alongside a busy project’s existing run, preserving its session and lease.
 - Show the full `INTERACTIVE` agent status in Agent Projects and explain why queued tasks wait when a project is reserved.
 
 ## [0.7.0] - 2026-09-24
@@ -308,7 +312,8 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 - Fixed task moves so destination write failures do not remove the source task.
 - Fixed TUI navigation on empty boards.
 
-[Unreleased]: https://github.com/AlpineVibrations/clt-rs/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/AlpineVibrations/clt-rs/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/AlpineVibrations/clt-rs/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/AlpineVibrations/clt-rs/compare/v0.6.22...v0.7.0
 [0.6.14]: https://github.com/AlpineVibrations/clt-rs/releases/tag/v0.6.14
 [0.6.8]: https://github.com/AlpineVibrations/clt-rs/releases/tag/v0.6.8

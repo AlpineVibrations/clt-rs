@@ -21,6 +21,7 @@ use crate::{
     },
     application::{
         AgentRunJob, AgentTaskSelection, INTERACTIVE_LEASE_GENERATION, new_agent_shutdown_signal,
+        toggle_task_stop_marker_in_board,
     },
     platform::{
         InteractiveTerminalForeground, agent_process_group_exists,
@@ -43,7 +44,7 @@ use crate::{
     session_recovery::ensure_orphaned_session_supervision,
     task::{
         TaskEntry, TaskSource, TaskStatus, get_tasks_dir, read_task_entries,
-        recoverable_codex_session_id_from_task_content,
+        recoverable_codex_session_id_from_task_content, task_entry_is_stopped,
     },
     tui::{
         TUI_LEASE_RELEASE_ATTEMPTS, TUI_LEASE_RELEASE_RETRY_MILLIS,
@@ -1532,6 +1533,40 @@ pub(super) fn collect_codex_session_tasks_in_board(
 
 pub(super) fn codex_session_for_task(task: &TaskEntry) -> Option<String> {
     recoverable_codex_session_id_from_task_content(&task.content).map(str::to_string)
+}
+
+/// A saved conversation link does not imply that CLT owns a controllable run.
+/// Keep task scheduling controls available for external and planning sessions.
+pub(super) fn toggle_tui_task_stop_at(
+    state_dir: &Path,
+    project_id: Option<i64>,
+    board_dir: &Path,
+    status: TaskStatus,
+    task: &TaskEntry,
+) -> Result<String> {
+    if !task_entry_is_stopped(task)
+        && let (Some(project_id), Some(session_id)) = (project_id, codex_session_for_task(task))
+    {
+        let store = open_agent_store_at(state_dir)?;
+        if let Some(control) = store.session_control_blocking(project_id, &session_id)? {
+            let idle_planning = status == TaskStatus::Todo
+                && control.state == AgentSessionControlState::Stopped
+                && control.run_token.is_none()
+                && control.child_pid.is_none()
+                && control.interactive_holder.is_none()
+                && control.interactive_launch_token.is_none();
+            if !idle_planning {
+                return toggle_tui_codex_session_stop_at(state_dir, project_id, &session_id);
+            }
+        }
+    }
+    Ok(
+        if toggle_task_stop_marker_in_board(board_dir, status, task)? {
+            "Task stopped. CLT will skip it until you press s again.".to_string()
+        } else {
+            "Task started. CLT may pick it up when it is ready.".to_string()
+        },
+    )
 }
 
 pub(super) fn toggle_tui_codex_session_stop(project_id: i64, session_id: &str) -> Result<String> {

@@ -909,7 +909,10 @@ fn unlinked_stop_revalidates_selection_and_preserves_other_tasks() {
         assert!(toggle_task_stop_marker_in_board(&board, TaskStatus::Todo, &selected).is_err());
         update_task_in_board(&board, TaskStatus::Todo, 1, "Selected task. codex:claimed").unwrap();
         let linked = task_entry_at(&board, TaskStatus::Todo, 1).unwrap();
-        assert!(toggle_task_stop_marker_in_board(&board, TaskStatus::Todo, &linked).is_err());
+        assert!(toggle_task_stop_marker_in_board(&board, TaskStatus::Todo, &linked).unwrap());
+        let stopped = task_entry_at(&board, TaskStatus::Todo, 1).unwrap();
+        assert_eq!(codex_session_for_task(&stopped).as_deref(), Some("claimed"));
+        assert!(task_entry_is_stopped(&stopped));
         assert_eq!(
             task_entry_at(&board, TaskStatus::Todo, 2)
                 .unwrap()

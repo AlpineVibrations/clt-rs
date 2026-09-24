@@ -24,7 +24,7 @@ use crate::{
 
 pub(crate) struct PreparedPlanningSession {
     pub(crate) session_id: String,
-    pub(crate) lease: InteractiveAgentLease,
+    pub(crate) lease: Option<InteractiveAgentLease>,
 }
 
 pub(crate) fn prepare_todo_planning_session(
@@ -88,27 +88,27 @@ fn prepare_todo_planning_session_with(
     create: impl FnOnce(&TursoAgentStore) -> Result<String>,
 ) -> Result<PreparedPlanningSession> {
     let holder = InteractiveAgentLease::holder_for_stopped_session();
-    let lease = InteractiveAgentLease::try_acquire_with_holder_at(state_dir, project.id, &holder, 60)?
-        .context("This project is busy; wait for its current run to finish before creating a planning session")?;
+    let mut lease =
+        InteractiveAgentLease::try_acquire_with_holder_at(state_dir, project.id, &holder, 60)?;
     let store = open_agent_store_at(state_dir)?;
-    anyhow::ensure!(
-        store
-            .session_controls_for_project_blocking(project.id)?
+    let idle = store
+        .session_controls_for_project_blocking(project.id)?
+        .iter()
+        .all(|control| {
+            matches!(
+                control.state,
+                AgentSessionControlState::Stopped | AgentSessionControlState::ResumeRequested
+            ) && control.child_pid.is_none()
+                && control.interactive_holder.is_none()
+                && control.interactive_launch_token.is_none()
+        })
+        && !store
+            .list_active_workers_blocking()?
             .iter()
-            .all(|control| {
-                matches!(
-                    control.state,
-                    AgentSessionControlState::Stopped | AgentSessionControlState::ResumeRequested
-                ) && control.child_pid.is_none()
-                    && control.interactive_holder.is_none()
-                    && control.interactive_launch_token.is_none()
-            })
-            && !store
-                .list_active_workers_blocking()?
-                .iter()
-                .any(|worker| worker.project_id == project.id),
-        "This project already has an active Codex session"
-    );
+            .any(|worker| worker.project_id == project.id);
+    if !idle && let Some(reservation) = lease.take() {
+        reservation.release()?;
+    }
     {
         let _lock = acquire_board_mutation_lock(board_dir)?;
         revalidate_todo(board_dir, selected)?;
@@ -120,8 +120,13 @@ fn prepare_todo_planning_session_with(
     );
     let _lock = acquire_board_mutation_lock(board_dir)?;
     let current = revalidate_todo(board_dir, selected)?;
+    let registered = if lease.is_some() {
+        store.register_planning_session_blocking(project.id, &session_id, &holder)?
+    } else {
+        store.register_shared_planning_session_blocking(project.id, &session_id)?
+    };
     anyhow::ensure!(
-        store.register_planning_session_blocking(project.id, &session_id, &holder)?,
+        registered,
         "The project reservation changed before the planning session could be linked"
     );
     TaskBoard::new(board_dir).write_entry_content(

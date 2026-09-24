@@ -173,7 +173,7 @@ fn planning_links_exact_todo_in_markdown_folder_and_nested_boards() {
                     panic!("must not create twice")
                 });
             assert!(second.is_err());
-            prepared.lease.release().unwrap();
+            prepared.lease.unwrap().release().unwrap();
             let second =
                 prepare_todo_planning_session_with(&f.state, &f.project, &board, &tasks[0], |_| {
                     panic!("must reuse linked session")
@@ -230,43 +230,95 @@ fn planning_preserves_edits_and_releases_lease_on_failure_or_stale_selection() {
 }
 
 #[test]
-fn planning_does_not_start_or_change_tasks_in_a_busy_project() {
-    let f = Fixture::new(false);
-    let board = get_tasks_dir(&f.project.path);
-    fs::write(board.join("todo.md"), "- Plan this\n").unwrap();
-    let selected = read_task_entries(&board, TaskStatus::Todo)
+fn planning_can_open_alongside_a_busy_project_without_changing_its_run() {
+    for folders in [false, true] {
+        let f = Fixture::new(folders);
+        let board = get_tasks_dir(&f.project.path);
+        crate::task::add_task(&f.project.path, "Plan this. clt:stopped", None).unwrap();
+        let selected = read_task_entries(&board, TaskStatus::Todo)
+            .unwrap()
+            .remove(0);
+        let busy = InteractiveAgentLease::try_acquire_with_holder_at(
+            &f.state,
+            f.project.id,
+            "other-owner",
+            60,
+        )
         .unwrap()
-        .remove(0);
-    let busy = InteractiveAgentLease::try_acquire_with_holder_at(
-        &f.state,
-        f.project.id,
-        "other-owner",
-        60,
-    )
-    .unwrap()
-    .unwrap();
-    let result =
-        prepare_todo_planning_session_with(&f.state, &f.project, &board, &selected, |_| {
-            panic!("must not launch")
-        });
-    assert!(result.is_err());
-    assert_eq!(
+        .unwrap();
         f.store
-            .lease_for_project_blocking(f.project.id)
+            .mark_session_running_blocking(
+                f.project.id,
+                "active-session",
+                1234,
+                "active-run",
+                &f.project.path.join("out"),
+                &f.project.path.join("err"),
+            )
+            .unwrap();
+        let active = f
+            .store
+            .session_control_blocking(f.project.id, "active-session")
+            .unwrap();
+        let prepared =
+            prepare_todo_planning_session_with(&f.state, &f.project, &board, &selected, |_| {
+                Ok("planning-123".into())
+            })
+            .unwrap();
+        assert!(prepared.lease.is_none());
+        let holder = InteractiveAgentLease::holder_for_shared_session(true);
+        assert!(
+            f.store
+                .reserve_shared_session_interactive_blocking(
+                    f.project.id,
+                    &prepared.session_id,
+                    &holder,
+                    None,
+                )
+                .unwrap()
+        );
+        assert!(
+            f.store
+                .cancel_idle_session_interactive_blocking(
+                    f.project.id,
+                    &prepared.session_id,
+                    &holder,
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            f.store
+                .session_control_blocking(f.project.id, "active-session")
+                .unwrap(),
+            active
+        );
+        assert_eq!(
+            f.store
+                .lease_for_project_blocking(f.project.id)
+                .unwrap()
+                .unwrap()
+                .holder,
+            "other-owner"
+        );
+        let planned = read_task_entries(&board, TaskStatus::Todo)
             .unwrap()
-            .unwrap()
-            .holder,
-        "other-owner"
-    );
-    assert_eq!(
-        fs::read_to_string(board.join("todo.md")).unwrap(),
-        "- Plan this\n"
-    );
-    busy.release().unwrap();
+            .remove(0);
+        assert_eq!(
+            codex_session_for_task(&planned).as_deref(),
+            Some("planning-123")
+        );
+        assert!(crate::task::task_entry_is_stopped(&planned));
+        assert!(
+            read_task_entries(&board, TaskStatus::Doing)
+                .unwrap()
+                .is_empty()
+        );
+        busy.release().unwrap();
+    }
 }
 
 #[test]
-fn planning_rechecks_session_ownership_before_publishing_the_task_link() {
+fn planning_rechecks_exclusive_ownership_and_shares_existing_sessions_without_a_lease() {
     for during_creation in [false, true] {
         let f = Fixture::new(false);
         let board = get_tasks_dir(&f.project.path);
@@ -286,21 +338,30 @@ fn planning_rechecks_session_ownership_before_publishing_the_task_link() {
         }
         let result =
             prepare_todo_planning_session_with(&f.state, &f.project, &board, &selected, |_| {
-                assert!(during_creation, "busy preflight must not create a session");
                 claim()?;
                 Ok("planning-123".into())
             });
-        assert!(result.is_err());
-        assert_eq!(
-            fs::read_to_string(board.join("todo.md")).unwrap(),
-            "- Plan this\n"
-        );
-        assert!(
-            f.store
-                .session_control_blocking(f.project.id, "planning-123")
-                .unwrap()
-                .is_none()
-        );
+        if during_creation {
+            assert!(result.is_err());
+            assert_eq!(
+                fs::read_to_string(board.join("todo.md")).unwrap(),
+                "- Plan this\n"
+            );
+            assert!(
+                f.store
+                    .session_control_blocking(f.project.id, "planning-123")
+                    .unwrap()
+                    .is_none()
+            );
+        } else {
+            assert!(result.unwrap().lease.is_none());
+            assert!(
+                f.store
+                    .session_control_blocking(f.project.id, "planning-123")
+                    .unwrap()
+                    .is_some()
+            );
+        }
         assert!(
             f.store
                 .lease_for_project_blocking(f.project.id)
@@ -375,7 +436,7 @@ fn planning_reservation_can_reopen_after_cancel_and_cannot_resume_automation() {
                 .reserve_idle_session_interactive_blocking(
                     f.project.id,
                     &prepared.session_id,
-                    &prepared.lease.holder,
+                    &prepared.lease.as_ref().unwrap().holder,
                     None
                 )
                 .unwrap()
@@ -385,12 +446,12 @@ fn planning_reservation_can_reopen_after_cancel_and_cannot_resume_automation() {
                 .cancel_idle_session_interactive_blocking(
                     f.project.id,
                     &prepared.session_id,
-                    &prepared.lease.holder
+                    &prepared.lease.as_ref().unwrap().holder
                 )
                 .unwrap()
         );
     }
-    prepared.lease.release().unwrap();
+    prepared.lease.unwrap().release().unwrap();
     let message = crate::session_control::toggle_tui_codex_session_stop_at(
         &f.state,
         f.project.id,
@@ -398,6 +459,32 @@ fn planning_reservation_can_reopen_after_cancel_and_cannot_resume_automation() {
     )
     .unwrap();
     assert!(message.contains("press c"));
+    for expected_stopped in [true, false] {
+        let task = read_task_entries(&board, TaskStatus::Todo)
+            .unwrap()
+            .remove(0);
+        let message = crate::session_control::toggle_tui_task_stop_at(
+            &f.state,
+            Some(f.project.id),
+            &board,
+            TaskStatus::Todo,
+            &task,
+        )
+        .unwrap();
+        assert!(message.starts_with(if expected_stopped {
+            "Task stopped."
+        } else {
+            "Task started."
+        }));
+        let task = read_task_entries(&board, TaskStatus::Todo)
+            .unwrap()
+            .remove(0);
+        assert_eq!(crate::task::task_entry_is_stopped(&task), expected_stopped);
+        assert_eq!(
+            codex_session_for_task(&task).as_deref(),
+            Some("planning-123")
+        );
+    }
     assert_eq!(
         f.store
             .session_control_blocking(f.project.id, &prepared.session_id)
@@ -467,7 +554,7 @@ fn planning_preserves_queued_recovery_through_interactive_exit_and_reopen() {
             Ok("planning-123".into())
         })
         .unwrap();
-    let mut lease = prepared.lease;
+    let mut lease = prepared.lease.unwrap();
     for visit in 0..2 {
         if visit > 0 {
             lease = InteractiveAgentLease::try_acquire_with_holder_at(
@@ -578,7 +665,7 @@ fn planned_todo_can_be_claimed_by_a_fresh_git_off_worker() {
             Ok("planning-123".into())
         })
         .unwrap();
-    prepared.lease.release().unwrap();
+    prepared.lease.unwrap().release().unwrap();
     f.store
         .mark_session_running_blocking(
             f.project.id,
@@ -694,7 +781,7 @@ fn stopped_todo_can_plan_and_reopen_but_requires_explicit_restart_for_automation
                     .reserve_idle_session_interactive_blocking(
                         f.project.id,
                         &prepared.session_id,
-                        &prepared.lease.holder,
+                        &prepared.lease.as_ref().unwrap().holder,
                         None
                     )
                     .unwrap()
@@ -704,12 +791,12 @@ fn stopped_todo_can_plan_and_reopen_but_requires_explicit_restart_for_automation
                     .cancel_idle_session_interactive_blocking(
                         f.project.id,
                         &prepared.session_id,
-                        &prepared.lease.holder
+                        &prepared.lease.as_ref().unwrap().holder
                     )
                     .unwrap()
             );
         }
-        prepared.lease.release().unwrap();
+        prepared.lease.unwrap().release().unwrap();
         assert!(
             f.store
                 .lease_for_project_blocking(f.project.id)

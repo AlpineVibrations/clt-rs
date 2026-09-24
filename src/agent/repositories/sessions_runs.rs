@@ -907,6 +907,29 @@ impl TursoAgentStore {
         })
     }
 
+    /// A new planning thread has no process or automated run. Publishing its
+    /// identity needs no ownership of another task's project lease. The shared
+    /// interactive handoff separately reserves this exact session before launch.
+    pub(crate) fn register_shared_planning_session_blocking(
+        &self,
+        project_id: i64,
+        session_id: &str,
+    ) -> Result<bool> {
+        self.blocking.block_on_persist(async {
+            let conn = self.repositories.sessions_runs.connect().await?;
+            let changed = conn
+                .execute(
+                    "INSERT INTO session_controls (project_id, codex_session_id, state, updated_at)
+                 VALUES (?1, ?2, 'stopped', ?3)
+                 ON CONFLICT(project_id, codex_session_id) DO NOTHING",
+                    params![project_id, session_id, agent_timestamp()],
+                )
+                .await
+                .context("Failed to record the new shared planning session")?;
+            Ok(changed == 1)
+        })
+    }
+
     pub(crate) fn reserve_idle_session_interactive_blocking(
         &self,
         project_id: i64,

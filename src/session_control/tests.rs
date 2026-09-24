@@ -5,6 +5,57 @@ use crate::tui::tests::tui_agent_project_for_test;
 use clt_database::turso;
 
 #[test]
+fn task_stop_without_a_control_record_preserves_links_and_skips_scheduling() {
+    for folders in [false, true] {
+        for registered in [false, true] {
+            for status in [TaskStatus::Backlog, TaskStatus::Todo, TaskStatus::Doing] {
+                let root = temp_root("linked-task-stop");
+                let state = root.join("state");
+                init_tasks(&root, folders).unwrap();
+                let board = get_tasks_dir(&root);
+                add_task(&root, "Keep these details. codex:external-session", None).unwrap();
+                if status != TaskStatus::Todo {
+                    move_task_in_board(&board, TaskStatus::Todo, status, "1").unwrap();
+                }
+                let store = agent::TursoAgentStore::open_blocking(&state).unwrap();
+                let project_id = if registered {
+                    store.register_project_blocking(&root, "project").unwrap();
+                    Some(store.list_projects_blocking().unwrap().remove(0).id)
+                } else {
+                    None
+                };
+                let task = task_entry_at(&board, status, 1).unwrap();
+                let message =
+                    super::toggle_tui_task_stop_at(&state, project_id, &board, status, &task)
+                        .unwrap();
+                assert!(message.starts_with("Task stopped."));
+                let stopped = task_entry_at(&board, status, 1).unwrap();
+                assert!(task_entry_is_stopped(&stopped));
+                assert_eq!(
+                    codex_session_for_task(&stopped).as_deref(),
+                    Some("external-session")
+                );
+                assert!(!scan_agent_project(&root).has_schedulable_work());
+                assert!(
+                    super::toggle_tui_task_stop_at(&state, project_id, &board, status, &task,)
+                        .is_err()
+                );
+                let message =
+                    super::toggle_tui_task_stop_at(&state, project_id, &board, status, &stopped)
+                        .unwrap();
+                assert!(message.starts_with("Task started."));
+                assert_eq!(
+                    task_entry_at(&board, status, 1).unwrap().content.trim_end(),
+                    task.content.trim_end()
+                );
+                drop(store);
+                fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
 fn interactive_codex_resume_command_is_always_writable() {
     let project_root = PathBuf::from("/tmp/project with spaces");
     let mut command = Command::new("codex");
@@ -550,6 +601,10 @@ fn tui_stop_key_toggles_running_session_to_stop_then_resume_requested() {
         .register_project_blocking(&project_root, "project")
         .unwrap();
     let project_id = store.list_projects_blocking().unwrap().remove(0).id;
+    init_tasks(&project_root, false).unwrap();
+    add_task(&project_root, "Active task. codex:session-123", None).unwrap();
+    let board = get_tasks_dir(&project_root);
+    let task = task_entry_at(&board, TaskStatus::Todo, 1).unwrap();
     store
         .mark_session_running_blocking(
             project_id,
@@ -561,7 +616,14 @@ fn tui_stop_key_toggles_running_session_to_stop_then_resume_requested() {
         )
         .unwrap();
 
-    let message = toggle_tui_codex_session_stop_at(&state_dir, project_id, "session-123").unwrap();
+    let message = super::toggle_tui_task_stop_at(
+        &state_dir,
+        Some(project_id),
+        &board,
+        TaskStatus::Todo,
+        &task,
+    )
+    .unwrap();
     assert!(message.starts_with("Stopping this Codex task session"));
     assert_eq!(
         store
@@ -577,7 +639,14 @@ fn tui_stop_key_toggles_running_session_to_stop_then_resume_requested() {
             .unwrap()
     );
 
-    let message = toggle_tui_codex_session_stop_at(&state_dir, project_id, "session-123").unwrap();
+    let message = super::toggle_tui_task_stop_at(
+        &state_dir,
+        Some(project_id),
+        &board,
+        TaskStatus::Todo,
+        &task,
+    )
+    .unwrap();
     assert!(message.starts_with("Resuming this stopped Codex task session"));
     assert_eq!(
         store
