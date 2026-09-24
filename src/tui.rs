@@ -93,6 +93,7 @@ pub(super) const TUI_LEASE_RELEASE_ATTEMPTS: usize = 3;
 pub(super) const TUI_LEASE_RELEASE_RETRY_MILLIS: u64 = 50;
 pub(super) const TUI_AGENT_TABLE_CODEX_LAST_RUN_GAP: &str = "   ";
 pub(super) const TUI_AGENT_TABLE_CODEX_MAX_WIDTH: usize = 20;
+pub(super) const TUI_AGENT_TABLE_RUNTIME_WIDTH: usize = 11;
 pub(super) const TUI_MODEL_DISCOVERY_TIMEOUT_SECONDS: u64 = 5;
 pub(super) const TUI_NO_ACTIVE_BOARD_MESSAGE: &str =
     "No active board. Open a project from Agent Projects, or press M for Models.";
@@ -1218,6 +1219,21 @@ impl TuiAgentRuntimeState {
 
     pub(super) fn is_running(self) -> bool {
         self == Self::Running
+    }
+
+    pub(super) fn explanation(self) -> Option<&'static str> {
+        match self {
+            Self::Interactive => Some(
+                "Interactive Codex session is open. Queued tasks wait until it releases this project. Press s to stop the session, or l to view its output.",
+            ),
+            Self::Fenced => Some(
+                "CLT is preserving a session reservation. Queued tasks wait until the handoff finishes or the reservation is safely released. Press l to inspect the session.",
+            ),
+            Self::Stale => Some(
+                "The reservation's owner has exited. Queued tasks wait while the daemon checks and reclaims it.",
+            ),
+            _ => None,
+        }
     }
 }
 
@@ -4148,10 +4164,11 @@ pub(super) fn agent_project_column_width(
         .max()
         .unwrap_or(0)
         .max("PROJECT".len());
-    let fixed_width = if table_width < 120 { 52 } else { 53 } + codex_width;
+    let fixed_width = if table_width < 120 { 56 } else { 57 } + codex_width;
     let available_width = table_width.saturating_sub(fixed_width);
-    let max_project_width = if available_width > "PATH".len() {
-        available_width - "PATH".len()
+    // Preserve project names on compact terminals; the path is lower priority.
+    let max_project_width = if available_width > 2 {
+        available_width - 2
     } else {
         available_width
     };
@@ -4185,7 +4202,7 @@ pub(super) fn format_agent_project_table_row(
         .unwrap_or_else(|| item.project.path.to_str().unwrap_or("<non-UTF-8 path>"));
 
     if width < 120 {
-        let path_width = width.saturating_sub(52 + project_width + codex_width);
+        let path_width = width.saturating_sub(56 + project_width + codex_width);
         return truncate_to_width(
             &format!(
                 "{}{} {} {} {} {} {} {} {}{}{} {}",
@@ -4193,7 +4210,7 @@ pub(super) fn format_agent_project_table_row(
                 fit_cell_right(&(idx + 1).to_string(), 3),
                 fit_cell(state, 6),
                 fit_cell(git, 4),
-                fit_cell(runtime_state, 7),
+                fit_cell(runtime_state, TUI_AGENT_TABLE_RUNTIME_WIDTH),
                 fit_cell(&item.project.name, project_width),
                 fit_cell_right(&todo, 4),
                 fit_cell_right(&doing, 5),
@@ -4209,7 +4226,7 @@ pub(super) fn format_agent_project_table_row(
     let marker_width = 1;
     let number_width = 4;
     let state_width = 6;
-    let runtime_width = 7;
+    let runtime_width = TUI_AGENT_TABLE_RUNTIME_WIDTH;
     let git_width = 4;
     let todo_width = 4;
     let doing_width = 5;
@@ -4254,7 +4271,7 @@ pub(super) fn format_current_project_registration_row(
     codex_width: usize,
 ) -> String {
     if width < 120 {
-        let path_width = width.saturating_sub(52 + project_width + codex_width);
+        let path_width = width.saturating_sub(56 + project_width + codex_width);
         return truncate_to_width(
             &format!(
                 "{}{} {} {} {} {} {} {} {}{}{} {}",
@@ -4262,7 +4279,7 @@ pub(super) fn format_current_project_registration_row(
                 fit_cell_right("", 3),
                 fit_cell("ADD", 6),
                 fit_cell("-", 4),
-                fit_cell("-", 7),
+                fit_cell("-", TUI_AGENT_TABLE_RUNTIME_WIDTH),
                 fit_cell(&registration.name, project_width),
                 fit_cell_right("-", 4),
                 fit_cell_right("-", 5),
@@ -4278,7 +4295,7 @@ pub(super) fn format_current_project_registration_row(
     let marker_width = 1;
     let number_width = 4;
     let state_width = 6;
-    let runtime_width = 7;
+    let runtime_width = TUI_AGENT_TABLE_RUNTIME_WIDTH;
     let git_width = 4;
     let todo_width = 4;
     let doing_width = 5;
@@ -4322,7 +4339,7 @@ pub(super) fn format_agent_project_table_header(
     codex_width: usize,
 ) -> String {
     if width < 120 {
-        let path_width = width.saturating_sub(52 + project_width + codex_width);
+        let path_width = width.saturating_sub(56 + project_width + codex_width);
         return truncate_to_width(
             &format!(
                 "{}{} {} {} {} {} {} {} {}{}{} {}",
@@ -4330,7 +4347,7 @@ pub(super) fn format_agent_project_table_header(
                 fit_cell_right("#", 3),
                 fit_cell("STATUS", 6),
                 fit_cell("GIT", 4),
-                fit_cell("AGENT", 7),
+                fit_cell("AGENT", TUI_AGENT_TABLE_RUNTIME_WIDTH),
                 fit_cell("PROJECT", project_width),
                 fit_cell_right("TODO", 4),
                 fit_cell_right("DOING", 5),
@@ -4346,7 +4363,7 @@ pub(super) fn format_agent_project_table_header(
     let marker_width = 1;
     let number_width = 4;
     let state_width = 6;
-    let runtime_width = 7;
+    let runtime_width = TUI_AGENT_TABLE_RUNTIME_WIDTH;
     let git_width = 4;
     let todo_width = 4;
     let doing_width = 5;
@@ -5003,6 +5020,16 @@ pub(super) fn tui_console_content<'a>(
             .and_then(TuiAgentProject::displayed_problem)
     {
         return (problem, Color::LightRed);
+    }
+    if agent_pane
+        && (feedback.is_empty()
+            || feedback == tui_agent_panel_instructions()
+            || feedback == TUI_NO_ACTIVE_BOARD_MESSAGE)
+        && let Some(explanation) = panel
+            .selected_project()
+            .and_then(|project| project.runtime_state.explanation())
+    {
+        return (explanation, Color::Gray);
     }
 
     (feedback, Color::Gray)
@@ -7633,11 +7660,13 @@ pub(super) fn execute_tui_key_effect(
                     }
                     KeyCode::Up => {
                         app.agent_panel.select_previous();
+                        app.feedback_buffer = tui_agent_panel_instructions().to_string();
                         sync_open_tui_agent_log_view(&app.agent_panel, &mut app.agent_log_view);
                         *last_agent_log_refresh = Instant::now();
                     }
                     KeyCode::Down => {
                         app.agent_panel.select_next();
+                        app.feedback_buffer = tui_agent_panel_instructions().to_string();
                         sync_open_tui_agent_log_view(&app.agent_panel, &mut app.agent_log_view);
                         *last_agent_log_refresh = Instant::now();
                     }

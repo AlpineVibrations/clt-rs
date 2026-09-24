@@ -2407,6 +2407,45 @@ fn agent_project_table_shows_codex_settings() {
 }
 
 #[test]
+fn agent_project_table_shows_full_interactive_status_and_wait_reason() {
+    let mut project = tui_agent_project_for_test(17, "FISHDOME");
+    project.runtime_state = TuiAgentRuntimeState::Interactive;
+    project.scan = AgentProjectScan::pending(4);
+
+    let codex_width = agent_codex_column_width(std::slice::from_ref(&project), false);
+    for width in [80, 100, 160] {
+        let project_width =
+            agent_project_column_width(std::slice::from_ref(&project), None, width, codex_width);
+        let header = format_agent_project_table_header(width, project_width, codex_width);
+        let row =
+            format_agent_project_table_row(0, &project, width, project_width, codex_width, false);
+        let agent_column = header.find("AGENT").unwrap();
+
+        assert_eq!(row[agent_column..agent_column + 11].trim(), "INTERACTIVE");
+        assert_eq!(row.chars().count(), width);
+    }
+
+    let mut panel = TuiAgentPanel {
+        projects: vec![project],
+        current_project_registration: None,
+        daemon_status: "service active".to_string(),
+        state: ListState::default(),
+        scroll_offset: 0,
+        last_error: None,
+    };
+    panel.state.select(Some(0));
+    let (console, _) = tui_console_content(true, &panel, None, tui_agent_panel_instructions());
+    assert!(console.contains("Queued tasks wait"));
+    assert!(console.contains("Press s"));
+
+    let (initial_console, _) = tui_console_content(true, &panel, None, TUI_NO_ACTIVE_BOARD_MESSAGE);
+    assert_eq!(initial_console, console);
+
+    let (feedback, _) = tui_console_content(true, &panel, None, "Session stop requested");
+    assert_eq!(feedback, "Session stop requested");
+}
+
+#[test]
 fn agent_project_table_abbreviates_all_git_modes() {
     let mut project = tui_agent_project_for_test(1, "alpha");
 

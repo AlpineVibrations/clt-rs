@@ -6,6 +6,10 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+### Fixed
+
+- Show the full `INTERACTIVE` agent status in Agent Projects and explain why queued tasks wait when a project is reserved.
+
 ## [0.7.0] - 2026-09-24
 
 ### Added
