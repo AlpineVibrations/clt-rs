@@ -80,14 +80,13 @@ Restart the shell or reload its configuration. After opening another registered 
 
 The installed `clt` binary embeds both agent skills. Before an automated Codex run, `clt` looks for each required skill by its frontmatter name in the standard repository, user, and admin skill directories. If a skill is unavailable, `clt` adds its bundled instructions to that run's prompt automatically, so no separate skill installation is required for agent automation.
 
-To make the skills discoverable to Codex outside `clt` agent runs, clone this repository and copy the skill folders into the `skills` directory inside your home `.agents` directory. From the repository root, run:
+To make the bundled skills available to Codex outside `clt` agent runs, install them into the `skills` directory inside your user home `.agents` directory:
 
 ```bash
-mkdir -p ~/.agents/skills
-cp -R skills/clt-task-management skills/git-commit ~/.agents/skills/
+clt skills install
 ```
 
-Each copied folder contains the skill's `SKILL.md` file. Restart your agent after copying the folders so it can discover the new skills.
+This works on macOS, Linux, and Windows and does not require a repository checkout or an initialized task board. It creates both skill folders and their `SKILL.md` files from the installed binary. Matching files are left alone. When a file differs, `clt` asks `Overwrite ...? [y/N]`; press `y` to update that skill or Enter to keep it. In a non-interactive session, a changed file stops installation before either skill is written. Use `clt skills install --force` to update changed files without prompts. Other files in the skill folders are preserved. Restart your agent after installing so it can discover the new skills.
 
 ## Usage
 
@@ -274,9 +273,9 @@ Agent-facing workflow skills are included in the repository's `skills/` director
 - `skills/clt-task-management/`: task-board workflow guidance for using `clt`.
 - `skills/git-commit/`: git commit and optional push workflow guidance.
 
-Automated `clt` agent runs use embedded copies when these skills are not installed. Copy the folders into `~/.agents/skills/` using the commands in [Installation](#installation) only when you also want to invoke them directly in other Codex sessions.
+Automated `clt` agent runs use embedded copies when these skills are not installed. Run `clt skills install` as described in [Installation](#installation) when you also want to invoke them directly in other Codex sessions.
 
-The task-management skill also tells standalone Codex sessions to link a newly created task to their current conversation with a terminal `codex:<session-id>` token, even when project automation is disabled. The marker goes after all task text and tags and is hidden in task listings. Existing links are preserved, and additional tasks or independent follow-ups do not reuse a session already linked to another task. If Codex cannot determine its current session ID, it leaves the task unlinked and reports that limitation. Refresh an installed skill using the copy commands above to receive this guidance.
+The task-management skill also tells standalone Codex sessions to link a newly created task to their current conversation with a terminal `codex:<session-id>` token, even when project automation is disabled. The marker goes after all task text and tags and is hidden in task listings. Existing links are preserved, and additional tasks or independent follow-ups do not reuse a session already linked to another task. If Codex cannot determine its current session ID, it leaves the task unlinked and reports that limitation. Refresh an installed skill with `clt skills install` to receive this guidance.
 
 ### Scheduling and task recovery
 

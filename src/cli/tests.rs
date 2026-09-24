@@ -1,6 +1,6 @@
 use super::{
-    AgentCommands, AgentGitCommitCommands, Cli, Commands, ShellKind, shell_init_script,
-    write_tui_cwd_file,
+    AgentCommands, AgentGitCommitCommands, Cli, Commands, ShellKind, SkillsCommands,
+    shell_init_script, write_tui_cwd_file,
 };
 use crate::test_support::prelude::*;
 use crate::test_support::*;
@@ -44,6 +44,17 @@ fn no_args_still_parse_to_default_tui_path() {
     let cli = Cli::try_parse_from(["clt"]).unwrap();
 
     assert!(cli.command.is_none());
+}
+
+#[test]
+fn skills_install_and_force_parse() {
+    let cli = Cli::try_parse_from(["clt", "skills", "install", "--force"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Commands::Skills {
+            command: SkillsCommands::Install { force: true }
+        })
+    ));
 }
 
 #[test]

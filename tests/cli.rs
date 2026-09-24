@@ -83,6 +83,7 @@ fn help_is_reported_on_stdout_with_a_success_exit() {
         "delete",
         "list",
         "shell-init",
+        "skills",
         "agent",
     ] {
         assert!(
@@ -91,6 +92,57 @@ fn help_is_reported_on_stdout_with_a_success_exit() {
         );
     }
     assert!(stderr.is_empty(), "unexpected stderr:\n{stderr}");
+}
+
+#[test]
+fn skills_install_uses_embedded_files_without_a_task_board() {
+    let workspace = TestWorkspace::new("skills-install");
+    let home = workspace.path().join("user home");
+    let run = |force: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_clt"));
+        command
+            .current_dir(workspace.path())
+            .args(["skills", "install"])
+            .env("HOME", &home)
+            .env("USERPROFILE", &home);
+        if force {
+            command.arg("--force");
+        }
+        command.output().unwrap()
+    };
+
+    let first = run(false);
+    let (stdout, _) = assert_success(&first);
+    assert!(stdout.contains("Installed:"));
+    let skills_root = home.join(".agents/skills");
+    assert_eq!(
+        fs::read_to_string(skills_root.join("clt-task-management/SKILL.md")).unwrap(),
+        include_str!("../skills/clt-task-management/SKILL.md")
+    );
+    assert_eq!(
+        fs::read_to_string(skills_root.join("git-commit/SKILL.md")).unwrap(),
+        include_str!("../skills/git-commit/SKILL.md")
+    );
+    assert!(!workspace.path().join("tasks").exists());
+
+    let second = run(false);
+    let (stdout, _) = assert_success(&second);
+    assert!(stdout.contains("Already up to date:"));
+
+    let task_skill = skills_root.join("clt-task-management/SKILL.md");
+    fs::write(&task_skill, "user edition").unwrap();
+    let conflict = run(false);
+    assert!(!conflict.status.success());
+    assert!(output_text(&conflict).1.contains("--force"));
+    assert_eq!(fs::read_to_string(&task_skill).unwrap(), "user edition");
+
+    let forced = run(true);
+    let (stdout, _) = assert_success(&forced);
+    assert!(stdout.contains("Updated:"));
+    assert_eq!(
+        fs::read_to_string(&task_skill).unwrap(),
+        include_str!("../skills/clt-task-management/SKILL.md")
+    );
 }
 
 #[test]

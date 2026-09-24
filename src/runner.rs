@@ -39,6 +39,10 @@ use crate::{
         agent_lease_renew_interval, agent_lease_timeout, agent_poll_interval, agent_run_timeout,
     },
     session_control::automated_session_control_action_for_generation,
+    skills::{
+        CLT_TASK_MANAGEMENT_SKILL_NAME, EMBEDDED_CLT_TASK_MANAGEMENT_SKILL,
+        EMBEDDED_GIT_COMMIT_SKILL, GIT_COMMIT_SKILL_NAME,
+    },
     task::TaskStatus,
     worker::{
         attach_codex_session_to_active_task, automated_codex_session_to_resume,
@@ -512,11 +516,6 @@ pub(super) struct CodexAgentRunner {
 }
 
 pub(super) const AGENT_NO_TASKS_LEFT_MARKER: &str = "NO_TASKS_LEFT";
-pub(super) const CLT_TASK_MANAGEMENT_SKILL_NAME: &str = "clt-task-management";
-pub(super) const GIT_COMMIT_SKILL_NAME: &str = "git-commit";
-pub(super) const EMBEDDED_CLT_TASK_MANAGEMENT_SKILL: &str =
-    include_str!("../skills/clt-task-management/SKILL.md");
-pub(super) const EMBEDDED_GIT_COMMIT_SKILL: &str = include_str!("../skills/git-commit/SKILL.md");
 
 pub(super) const AGENT_CODEX_PROMPT_BASE: &str = r#"You are working in this repo.
 

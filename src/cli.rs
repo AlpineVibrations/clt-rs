@@ -25,6 +25,7 @@ use crate::{
         run_agent_session_resume_worker, run_interactive_exec_gate,
     },
     session_recovery::run_orphaned_session_supervisor,
+    skills::install_skills,
     task::{TaskStatus, add_task, ensure_existing_board, init_tasks, parse_add_task_args},
     tui::{prompt_to_initialize_tasks, tui_view, tui_view_without_active_board},
     worker::run_independent_agent_worker,
@@ -117,10 +118,25 @@ enum Commands {
         #[arg(value_enum)]
         shell: ShellKind,
     },
+    /// Installs bundled Codex skills into the user's agents directory
+    Skills {
+        #[command(subcommand)]
+        command: SkillsCommands,
+    },
     /// Manages Codex automation across registered projects
     Agent {
         #[command(subcommand)]
         command: AgentCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum SkillsCommands {
+    /// Installs or updates bundled skills in ~/.agents/skills
+    Install {
+        /// Overwrite changed skills without asking
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -316,6 +332,12 @@ pub(super) fn run() -> Result<()> {
         print!("{}", shell_init_script(*shell));
         return Ok(());
     }
+    if let Some(Commands::Skills {
+        command: SkillsCommands::Install { force },
+    }) = cli.command.as_ref()
+    {
+        return install_skills(*force);
+    }
     if let Some(Commands::Agent {
         command: AgentCommands::AutomatedExecGate { program, arguments },
     }) = cli.command.as_ref()
@@ -485,6 +507,7 @@ pub(super) fn run() -> Result<()> {
             list_tasks(&root, status)?;
         }
         Some(Commands::ShellInit { .. }) => unreachable!("shell init handled before root lookup"),
+        Some(Commands::Skills { .. }) => unreachable!("skills install handled before root lookup"),
         Some(Commands::Agent { command }) => {
             handle_agent_command(command, cli.local, &root)?;
         }

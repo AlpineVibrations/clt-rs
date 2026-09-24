@@ -9,6 +9,7 @@ mod runner;
 mod scheduler;
 mod session_control;
 mod session_recovery;
+mod skills;
 mod task;
 #[cfg(test)]
 mod test_support;

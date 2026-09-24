@@ -6,6 +6,12 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-24
+
+### Added
+
+- Add `clt skills install` to install bundled Codex skills into the user's `.agents/skills` directory on macOS, Linux, and Windows, with per-file overwrite prompts and a `--force` option.
+
 ### Fixed
 
 - Allow Codex planning conversations on stopped Todo tasks while preserving their stop marker and session link; press `s` to explicitly make the task available for automation afterward.
@@ -298,7 +304,8 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 - Fixed task moves so destination write failures do not remove the source task.
 - Fixed TUI navigation on empty boards.
 
-[Unreleased]: https://github.com/AlpineVibrations/clt-rs/compare/v0.6.14...HEAD
+[Unreleased]: https://github.com/AlpineVibrations/clt-rs/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/AlpineVibrations/clt-rs/compare/v0.6.22...v0.7.0
 [0.6.14]: https://github.com/AlpineVibrations/clt-rs/releases/tag/v0.6.14
 [0.6.8]: https://github.com/AlpineVibrations/clt-rs/releases/tag/v0.6.8
 [0.6.7]: https://github.com/AlpineVibrations/clt-rs/releases/tag/v0.6.7

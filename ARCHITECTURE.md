@@ -35,6 +35,7 @@ used Turso dependency. Application modules import its local API through
 | `runner` | Codex prompt/command construction, gated launch, supervision, logs, and outcome classification | process adapters and session/store services |
 | `session_control` | Stop, resume, interrupt, interactive handoff, guardian lifecycle, and durable Todo planning conversations via the local Codex app-server | agent store, runner, platform |
 | `session_recovery` | Reattach supervision to a surviving automated process, retain its logs and generation, and deliver controls through stable OS identities | agent store, platform, scheduler |
+| `skills` | Embed bundled Codex skills and install them into the user's home agents directory | standard-library filesystem and terminal I/O |
 | `tui` | `TuiApp` state, pane reducers, explicit effects, terminal ownership, and pure rendering | application services and cached snapshots |
 
 ## Boundary rules
@@ -55,6 +56,12 @@ Unit tests live under the module that owns the behavior, for example `src/task/t
 `src/agent/tests.rs`, and `src/tui/tests.rs`. Shared fixture helpers are in
 `src/test_support.rs` and are compiled only for tests. `tests/cli.rs` remains a black-box
 integration suite for the installed command contract.
+
+`clt skills install` is dispatched before task-root discovery. Its installer reads
+the same embedded skill text that the agent prompt fallback uses and resolves the
+user home from `HOME` on Unix or `USERPROFILE` (with a drive/path fallback) on
+Windows. Unit tests cover overwrite decisions; the CLI suite checks that the
+command works without a task board.
 
 The required verification gates are:
 
