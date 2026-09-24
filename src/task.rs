@@ -2058,6 +2058,11 @@ pub(super) fn move_task_in_board_after_lock(
     task_index: usize,
 ) -> Result<()> {
     let entry = task_entry_at(board_dir, from, task_index)?;
+    // Completion can reconcile a managed journal even when the board already
+    // records Done. Preserve both the task and its neighbors in that case.
+    if from == to {
+        return Ok(());
+    }
     let dest_index = (to == TaskStatus::Done).then_some(0);
 
     match (&entry.source, get_status_store(board_dir, to)?) {

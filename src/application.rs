@@ -879,10 +879,6 @@ impl ManagedTaskWorkflow {
         Ok(status)
     }
 
-    pub(super) fn reseal_completed_task(&self, task_index: &str) -> Result<bool> {
-        reseal_provisional_done_task(&self.root, task_index)
-    }
-
     pub(super) fn delete_task(&self, status: TaskStatus, task_index: &str) -> Result<()> {
         delete_task_in_board(self.board.path(), status, task_index)
     }
@@ -1348,13 +1344,16 @@ pub(super) fn move_task_to_done(
             },
         );
     };
-    Ok(
-        if move_task_to_done_with_agent_context(root, from, task_index_str, &context)? {
-            TaskDoneOutcome::Provisional
-        } else {
-            TaskDoneOutcome::Normal
-        },
-    )
+    let provisional = if from == TaskStatus::Done {
+        reseal_provisional_done_task(root, task_index_str)?
+    } else {
+        move_task_to_done_with_agent_context(root, from, task_index_str, &context)?
+    };
+    Ok(if provisional {
+        TaskDoneOutcome::Provisional
+    } else {
+        TaskDoneOutcome::Normal
+    })
 }
 
 pub(super) fn move_task_to_done_with_agent_context(
@@ -1712,7 +1711,9 @@ pub(super) fn move_task_in_board_after_lock(
     to: TaskStatus,
     task_index: usize,
 ) -> Result<()> {
-    ensure_status_conversion_allowed(board_dir, to)?;
+    if from != to {
+        ensure_status_conversion_allowed(board_dir, to)?;
+    }
     TaskBoard::new(board_dir).move_task_after_lock(from, to, task_index)
 }
 

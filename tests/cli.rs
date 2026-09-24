@@ -278,22 +278,54 @@ fn invalid_inputs_fail_on_stderr_without_mutating_the_board() {
 
 #[test]
 fn user_done_commands_accept_an_edited_task_with_an_idle_managed_journal() {
-    for arguments in [
-        vec!["done", "doing", "1"],
-        vec!["status", "doing", "1", "done"],
-    ] {
-        let workspace = TestWorkspace::new("external-completion");
-        assert_success(&workspace.run(&["init"]));
-        assert_success(&workspace.run(&["agent", "register"]));
-        fs::write(
-            workspace.path().join("tasks/doing.md"),
-            "# Doing Tasks\n- Externally completed work with user edits codex:cli-external-completion\n",
-        )
-        .unwrap();
-        // Seed the durable state left by a stopped managed run. Exercise the
-        // public CLI for the acceptance, including its user-visible outcome.
-        let database_path = workspace.path().join("agent-state/agent.db");
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
+    for folders in [false, true] {
+        for arguments in [
+            vec!["done", "doing", "1"],
+            vec!["status", "doing", "1", "done"],
+            vec!["done", "done", "2"],
+            vec!["status", "done", "2", "done"],
+        ] {
+            let workspace = TestWorkspace::new("external-completion");
+            assert_success(&workspace.run(&["init"]));
+            assert_success(&workspace.run(&["agent", "register"]));
+            let already_done = arguments[1] == "done";
+            let content = if already_done {
+                "# Done Tasks\n- Earlier task\n- Externally completed work with user edits codex:cli-external-completion\n- Later task\n"
+            } else {
+                "# Doing Tasks\n- Externally completed work with user edits codex:cli-external-completion\n"
+            };
+            fs::write(
+                workspace.path().join(format!("tasks/{}.md", arguments[1])),
+                content,
+            )
+            .unwrap();
+            if folders {
+                assert_success(&workspace.run(&["expand"]));
+            }
+            let done_snapshot = || {
+                let tasks = workspace.path().join("tasks");
+                let mut paths = if folders {
+                    fs::read_dir(tasks.join("done"))
+                        .unwrap()
+                        .map(|entry| entry.unwrap().path())
+                        .collect::<Vec<_>>()
+                } else {
+                    vec![tasks.join("done.md")]
+                };
+                paths.sort();
+                paths
+                    .into_iter()
+                    .map(|path| {
+                        let bytes = fs::read(&path).unwrap();
+                        (path, bytes)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let before = done_snapshot();
+            // Seed the durable state left by a stopped managed run. Exercise the
+            // public CLI for the acceptance, including its user-visible outcome.
+            let database_path = workspace.path().join("agent-state/agent.db");
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
             let database = turso::Builder::new_local(database_path.to_str().unwrap())
                 .experimental_multiprocess_wal(true).build().await.unwrap();
             let connection = database.connect().unwrap();
@@ -314,27 +346,68 @@ fn user_done_commands_accept_an_edited_task_with_an_idle_managed_journal() {
             ).await.unwrap();
         });
 
-        let (stdout, stderr) = assert_success(&workspace.run(&arguments));
-        assert!(
-            stdout.contains("marked as externally completed"),
-            "{stdout}"
-        );
-        assert!(stdout.contains(
-            "cancelled idle managed Git journal for Codex session cli-external-completion"
-        ));
-        assert!(stderr.is_empty(), "{stderr}");
-        assert!(
-            !fs::read_to_string(workspace.path().join("tasks/doing.md"))
-                .unwrap()
-                .contains("Externally completed work")
-        );
-        assert!(
-            fs::read_to_string(workspace.path().join("tasks/done.md"))
-                .unwrap()
-                .contains(
-                    "Externally completed work with user edits codex:cli-external-completion"
-                )
-        );
+            if already_done {
+                let update = |sql: &str| {
+                    tokio::runtime::Runtime::new().unwrap().block_on(async {
+                        let database = turso::Builder::new_local(database_path.to_str().unwrap())
+                            .experimental_multiprocess_wal(true)
+                            .build()
+                            .await
+                            .unwrap();
+                        database.connect().unwrap().execute(sql, ()).await.unwrap();
+                    });
+                };
+                update("UPDATE session_controls SET state = 'running'");
+                let refused = workspace.run(&arguments);
+                assert!(!refused.status.success());
+                assert!(output_text(&refused).1.contains("still active"));
+                assert_eq!(done_snapshot(), before);
+                update("UPDATE session_controls SET state = 'stopped'");
+                for state in ["tracking", "commit_pending", "push_pending"] {
+                    update(&format!("UPDATE git_finalizations SET state = '{state}'"));
+                    let refused = workspace.run(&arguments);
+                    assert!(!refused.status.success());
+                    assert!(
+                        output_text(&refused)
+                            .1
+                            .contains("commit proof is already sealed")
+                    );
+                    assert_eq!(done_snapshot(), before);
+                }
+                update("UPDATE git_finalizations SET state = 'working'");
+            }
+
+            let (stdout, stderr) = assert_success(&workspace.run(&arguments));
+            assert!(
+                stdout.contains("marked as externally completed"),
+                "{stdout}"
+            );
+            assert!(stdout.contains(
+                "cancelled idle managed Git journal for Codex session cli-external-completion"
+            ));
+            assert!(stderr.is_empty(), "{stderr}");
+            let (doing, _) = assert_success(&workspace.run(&["list", "doing"]));
+            assert!(!doing.contains("Externally completed work"));
+            let (done, _) = assert_success(&workspace.run(&["list", "done"]));
+            assert!(done.contains("Externally completed work with user edits"));
+            if already_done {
+                assert_eq!(done_snapshot(), before);
+                let (stdout, _) = assert_success(&workspace.run(&["done", "done", "2"]));
+                assert_eq!(stdout, "Task is already done.\n");
+                assert_eq!(done_snapshot(), before);
+            }
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let database = turso::Builder::new_local(database_path.to_str().unwrap())
+                .experimental_multiprocess_wal(true).build().await.unwrap();
+            let connection = database.connect().unwrap();
+            let mut rows = connection.query(
+                "SELECT state, generation FROM git_finalizations WHERE codex_session_id = 'cli-external-completion'", (),
+            ).await.unwrap();
+            let row = rows.next().await.unwrap().unwrap();
+            assert_eq!(row.get::<String>(0).unwrap(), "cancelled");
+            assert_eq!(row.get::<i64>(1).unwrap(), 1);
+        });
+        }
     }
 }
 

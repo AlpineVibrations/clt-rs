@@ -450,31 +450,29 @@ pub(super) fn run() -> Result<()> {
         Some(Commands::Done { status, task_index }) => {
             let task_status = TaskStatus::parse(&status)?;
             let workflow = ManagedTaskWorkflow::new(&root);
-            if task_status == TaskStatus::Done {
-                if workflow.reseal_completed_task(&task_index)? {
+            match workflow.complete_task(task_status, &task_index)? {
+                TaskDoneOutcome::Normal if task_status == TaskStatus::Done => {
+                    println!("Task is already done.");
+                }
+                TaskDoneOutcome::Provisional if task_status == TaskStatus::Done => {
                     println!(
                         "Task {} in done was resealed; Git finalization is pending.",
                         task_index
                     );
-                } else {
-                    println!("Task is already done.");
                 }
-            } else {
-                match workflow.complete_task(task_status, &task_index)? {
-                    TaskDoneOutcome::Normal => {
-                        println!("Task {} from {} marked as done.", task_index, status);
-                    }
-                    TaskDoneOutcome::Provisional => {
-                        println!(
-                            "Task {} from {} moved provisionally; Git finalization is pending.",
-                            task_index, status
-                        );
-                    }
-                    TaskDoneOutcome::ExternalCompletion(session_id) => {
-                        println!(
-                            "Task {task_index} from {status} marked as externally completed; cancelled idle managed Git journal for Codex session {session_id}."
-                        );
-                    }
+                TaskDoneOutcome::Normal => {
+                    println!("Task {} from {} marked as done.", task_index, status);
+                }
+                TaskDoneOutcome::Provisional => {
+                    println!(
+                        "Task {} from {} moved provisionally; Git finalization is pending.",
+                        task_index, status
+                    );
+                }
+                TaskDoneOutcome::ExternalCompletion(session_id) => {
+                    println!(
+                        "Task {task_index} from {status} marked as externally completed; cancelled idle managed Git journal for Codex session {session_id}."
+                    );
                 }
             }
         }
