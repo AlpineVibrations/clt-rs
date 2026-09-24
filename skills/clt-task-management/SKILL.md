@@ -93,6 +93,41 @@ Add a new task to the `todo` list.
 clt add "Task description" ["Optional metadata"]
 ```
 
+#### Link tasks created in standalone Codex sessions
+
+When Codex is working directly in a CLT-enabled project, outside a `clt agent`
+run, append the current Codex session ID to a task it creates so that CLT can
+reopen that conversation later. This applies even when project automation is
+disabled; the session link belongs in the task content.
+
+Use the exact current session ID supplied by the Codex runtime (for example,
+`CODEX_THREAD_ID` when available). Do not guess an ID, use a process ID, or take
+one from another task or the most recent session on disk. If the current ID is
+unavailable, create the task without a marker and report that its conversation
+could not be linked.
+
+Append exactly one `codex:<session-id>` token as the final non-whitespace token
+of the full task content, without backticks or trailing punctuation. Put tags
+before the marker in the same quoted argument: a separate metadata argument
+would be appended after it.
+
+```bash
+# Only after confirming CODEX_THREAD_ID identifies this Codex session:
+clt add "Fix memory leak in parser [BUG, HIGH] codex:${CODEX_THREAD_ID:?Current Codex session ID is required}"
+```
+
+Inspect the stored task after creation; `clt list` hides session markers. For a
+Markdown-backed status the marker ends the task's line; for a folder-backed
+status it ends the full task file, after any detail paragraphs. Keep it at the
+end when adding completion or blocked notes. Preserve an existing task's link
+instead of replacing it with the editing session's ID.
+
+A session must not be linked to multiple tasks on the board. If this session
+already belongs to a task, preserve that identity and leave additional tasks
+unlinked. In automated runs, CLT attaches the selected task's marker when moving
+it to Doing; preserve that marker. Independent `clt follow-up` tasks use their
+own follow-up reference and must not receive the parent's `codex:` marker.
+
 ### 3. Listing Tasks
 Always list the relevant status before performing index-based operations to ensure the correct `task_index` is used. Prefer status-scoped listings so unrelated tasks do not consume context.
 ```bash

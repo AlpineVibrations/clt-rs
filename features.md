@@ -276,6 +276,8 @@ Agent-facing workflow skills are included in the repository's `skills/` director
 
 Automated `clt` agent runs use embedded copies when these skills are not installed. Copy the folders into `~/.agents/skills/` using the commands in [Installation](#installation) only when you also want to invoke them directly in other Codex sessions.
 
+The task-management skill also tells standalone Codex sessions to link a newly created task to their current conversation with a terminal `codex:<session-id>` token, even when project automation is disabled. The marker goes after all task text and tags and is hidden in task listings. Existing links are preserved, and additional tasks or independent follow-ups do not reuse a session already linked to another task. If Codex cannot determine its current session ID, it leaves the task unlinked and reports that limitation. Refresh an installed skill using the copy commands above to receive this guidance.
+
 ### Scheduling and task recovery
 
 Run one foreground scheduler pass:
