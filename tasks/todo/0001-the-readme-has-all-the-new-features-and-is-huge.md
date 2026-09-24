@@ -1,0 +1,1 @@
+the readme has all the new features and is huge. we should move all tht reporting of new features and super extra detail to a features.md doc and update our agent and project files to note that only core readme stuff goes in hte readme. the rest of the new stuff goes into features. clean up the way toooo wordy readme
