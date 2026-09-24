@@ -9,6 +9,8 @@ fn fixture(mode: AgentGitMode) -> (PathBuf, TursoAgentStore, AgentProject) {
     let root = temp_root("enable-git-on-resume");
     let project_root = root.join("project");
     init_tasks(&project_root, false).unwrap();
+    // Match application registration, including macOS's /var -> /private/var alias.
+    let project_root = fs::canonicalize(project_root).unwrap();
     fs::write(
         project_root.join("tasks/todo.md"),
         "# Todo Tasks\n- Finish feature\n",
