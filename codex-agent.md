@@ -1,5 +1,9 @@
 # Codex Agent Feature
 
+Documentation policy: keep [README.md](README.md) limited to core onboarding.
+Document new features and detailed usage in [features.md](features.md), with
+release notes in [CHANGELOG.md](CHANGELOG.md). This file covers design.
+
 ## Goal
 
 Add a first-class `clt agent` command group that lets `clt` manage Codex automation across many registered projects while keeping each project's tasks in its own repository-local `tasks/` board.

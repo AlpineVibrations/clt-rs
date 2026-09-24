@@ -6,6 +6,10 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+### Changed
+
+- Keep README focused on installation and quick start; move detailed usage into `features.md`, preserve feature proposals in `docs/FEATURE_IDEAS.md`, and record the documentation split in project and agent guidance.
+
 ## [0.6.22] - 2026-09-24
 
 ### Fixed

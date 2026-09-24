@@ -17,10 +17,12 @@ include = [
     "Cargo.toml",
     "Cargo.lock",
     "README.md",
+    "features.md",
     "LICENSE*",
     "CHANGELOG.md",
     "ARCHITECTURE.md",
     "docs/RELEASING.md",
+    "docs/FEATURE_IDEAS.md",
     "scripts/check_release.py",
 ]
 

@@ -1,5 +1,8 @@
-# Readme 
-general github readme. living document that we update as we add features
+# Documentation
+Keep README.md focused on the project overview, installation, and quick start.
+Put new feature descriptions, detailed behavior, configuration, and troubleshooting
+in features.md. Record release notes in CHANGELOG.md; do not grow README.md with
+feature-by-feature reports. See AGENTS.md for repository documentation guidance.
 # Design and Concepts
 Design for the project is in design.md
 This is a living document. update it as we progress.

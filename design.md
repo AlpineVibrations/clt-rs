@@ -1,5 +1,9 @@
 ## Task Management CLI Design Specification
 
+Documentation policy: keep [README.md](README.md) limited to core onboarding.
+Document new features and detailed usage in [features.md](features.md), with
+release notes in [CHANGELOG.md](CHANGELOG.md). This file covers design.
+
 ### 1. Overview
 This CLI application, `lls-cli-task`, will provide a simple, file-system-backed task management system. It operates by initializing a standardized task structure in the current working directory.
 
