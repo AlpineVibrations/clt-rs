@@ -1,0 +1,1 @@
+we need to adjust our clt skills . if codex is running on its own and its in a clt enabled folder and it sees the clt skills file then it should know that if that codex session makes and a task then it should append its codex session to that task for later use.
