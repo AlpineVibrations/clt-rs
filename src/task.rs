@@ -775,6 +775,7 @@ pub(super) fn codex_session_markers_in_task_content(content: &str) -> Vec<(usize
 }
 
 pub(super) fn recoverable_codex_session_id_from_task_content(content: &str) -> Option<&str> {
+    let content = task_content_without_stop_marker(content);
     if let Some(session_id) = codex_session_id_from_task_content(content) {
         return Some(session_id);
     }
@@ -854,12 +855,18 @@ pub(super) fn task_content_for_edit(content: &str) -> String {
 }
 
 pub(super) fn task_content_with_codex_session(content: &str, session_id: &str) -> String {
-    let content = task_content_without_codex_session(content);
+    let stopped = task_content_is_stopped(content);
+    let content = task_content_without_codex_session(task_content_without_stop_marker(content));
     let content = task_content_without_matching_codex_sessions(content, session_id);
-    if content.is_empty() {
+    let linked = if content.is_empty() {
         format!("{CODEX_TASK_SESSION_PREFIX}{session_id}")
     } else {
         format!("{content} {CODEX_TASK_SESSION_PREFIX}{session_id}")
+    };
+    if stopped {
+        format!("{linked} {TASK_STOPPED_MARKER}")
+    } else {
+        linked
     }
 }
 

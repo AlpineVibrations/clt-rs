@@ -6,6 +6,10 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+### Fixed
+
+- Allow Codex planning conversations on stopped Todo tasks while preserving their stop marker and session link; press `s` to explicitly make the task available for automation afterward.
+
 ### Changed
 
 - Teach the task-management skill to link tasks created by standalone Codex sessions to their current conversation, preserving terminal marker placement and existing task identities.

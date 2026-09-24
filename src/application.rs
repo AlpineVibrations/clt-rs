@@ -1763,7 +1763,7 @@ pub(super) fn ensure_task_not_stopped(entry: &TaskEntry) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn toggle_unlinked_task_stop_in_board(
+pub(super) fn toggle_task_stop_marker_in_board(
     board_dir: &Path,
     status: TaskStatus,
     selected: &TaskEntry,
@@ -1780,7 +1780,8 @@ pub(super) fn toggle_unlinked_task_stop_in_board(
         .find(|entry| entry.source == selected.source && entry.content == selected.content)
         .context("The selected task changed; select it again before stopping or starting it")?;
     anyhow::ensure!(
-        recoverable_codex_session_id_from_task_content(&entry.content).is_none(),
+        task_entry_is_stopped(&entry)
+            || recoverable_codex_session_id_from_task_content(&entry.content).is_none(),
         "This task has a Codex session; use its session stop/resume control"
     );
     let stopped = !task_entry_is_stopped(&entry);

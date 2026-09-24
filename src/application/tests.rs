@@ -834,9 +834,7 @@ fn unlinked_stop_persists_and_skips_automation_until_restarted() {
             };
             add_task(&root, content, None).unwrap();
             let original = task_entry_at(&board, TaskStatus::Todo, 1).unwrap();
-            assert!(
-                toggle_unlinked_task_stop_in_board(&board, TaskStatus::Todo, &original).unwrap()
-            );
+            assert!(toggle_task_stop_marker_in_board(&board, TaskStatus::Todo, &original).unwrap());
             let stopped = task_entry_at(&board, TaskStatus::Todo, 1).unwrap();
             assert!(task_entry_is_stopped(&stopped));
             assert_eq!(task_entry_is_blocked(&stopped), blocked);
@@ -863,9 +861,7 @@ fn unlinked_stop_persists_and_skips_automation_until_restarted() {
             // Other ready work is still eligible while this task remains stopped.
             add_task(&root, "Another ready task.", None).unwrap();
             assert_eq!(scan_agent_project(&root).available_todo_count(), 1);
-            assert!(
-                !toggle_unlinked_task_stop_in_board(&board, TaskStatus::Todo, &stopped).unwrap()
-            );
+            assert!(!toggle_task_stop_marker_in_board(&board, TaskStatus::Todo, &stopped).unwrap());
             let restarted = task_entry_at(&board, TaskStatus::Todo, 1).unwrap();
             assert_eq!(restarted.content, original.content);
             assert_eq!(
@@ -886,7 +882,7 @@ fn editing_stopped_task_hides_and_preserves_stop_marker() {
         let board = get_tasks_dir(&root);
         add_task(&root, "Original task.", None).unwrap();
         let original = task_entry_at(&board, TaskStatus::Todo, 1).unwrap();
-        toggle_unlinked_task_stop_in_board(&board, TaskStatus::Todo, &original).unwrap();
+        toggle_task_stop_marker_in_board(&board, TaskStatus::Todo, &original).unwrap();
         let stopped = task_entry_at(&board, TaskStatus::Todo, 1).unwrap();
 
         assert_eq!(task_content_for_edit(&stopped.content), "Original task.");
@@ -910,10 +906,10 @@ fn unlinked_stop_revalidates_selection_and_preserves_other_tasks() {
         add_task(&root, "Another task.", None).unwrap();
         let selected = task_entry_at(&board, TaskStatus::Todo, 1).unwrap();
         update_task_in_board(&board, TaskStatus::Todo, 1, "New human details.").unwrap();
-        assert!(toggle_unlinked_task_stop_in_board(&board, TaskStatus::Todo, &selected).is_err());
+        assert!(toggle_task_stop_marker_in_board(&board, TaskStatus::Todo, &selected).is_err());
         update_task_in_board(&board, TaskStatus::Todo, 1, "Selected task. codex:claimed").unwrap();
         let linked = task_entry_at(&board, TaskStatus::Todo, 1).unwrap();
-        assert!(toggle_unlinked_task_stop_in_board(&board, TaskStatus::Todo, &linked).is_err());
+        assert!(toggle_task_stop_marker_in_board(&board, TaskStatus::Todo, &linked).is_err());
         assert_eq!(
             task_entry_at(&board, TaskStatus::Todo, 2)
                 .unwrap()
@@ -973,7 +969,7 @@ fn stopped_unlinked_task_cannot_be_claimed_in_any_git_mode() {
         }
         project.git_mode = AgentGitMode::Off;
         let stopped = task_entry_at(&board, TaskStatus::Todo, 1).unwrap();
-        assert!(!toggle_unlinked_task_stop_in_board(&board, TaskStatus::Todo, &stopped).unwrap());
+        assert!(!toggle_task_stop_marker_in_board(&board, TaskStatus::Todo, &stopped).unwrap());
         move_task_to_doing_with_agent_session(&root, "1", &context, &project, &store).unwrap();
         assert_eq!(
             codex_session_for_task(&task_entry_at(&board, TaskStatus::Doing, 1).unwrap())
@@ -997,14 +993,14 @@ fn unlinked_stop_survives_board_moves_and_skips_blocked_doing_recovery() {
     )
     .unwrap();
     let task = task_entry_at(&board, TaskStatus::Todo, 1).unwrap();
-    toggle_unlinked_task_stop_in_board(&board, TaskStatus::Todo, &task).unwrap();
+    toggle_task_stop_marker_in_board(&board, TaskStatus::Todo, &task).unwrap();
     move_task_in_board(&board, TaskStatus::Todo, TaskStatus::Backlog, "1").unwrap();
     move_task_in_board(&board, TaskStatus::Backlog, TaskStatus::Doing, "1").unwrap();
     let stopped = task_entry_at(&board, TaskStatus::Doing, 1).unwrap();
     assert!(task_entry_is_stopped(&stopped));
     assert!(!scan_agent_project(&root).has_schedulable_work());
     assert!(blocked_tasks(&root).unwrap().is_empty());
-    toggle_unlinked_task_stop_in_board(&board, TaskStatus::Doing, &stopped).unwrap();
+    toggle_task_stop_marker_in_board(&board, TaskStatus::Doing, &stopped).unwrap();
     assert_eq!(blocked_tasks(&root).unwrap().len(), 1);
     fs::remove_dir_all(root).unwrap();
 }

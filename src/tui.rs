@@ -43,7 +43,7 @@ use crate::{
     application::{
         AgentLeaseHolderLiveness, AgentProjectScan, delete_task_in_board,
         ensure_status_conversion_allowed, move_task_in_board, move_task_to_archive_in_board,
-        project_display_name, reorder_task_in_board, toggle_unlinked_task_stop_in_board,
+        project_display_name, reorder_task_in_board, toggle_task_stop_marker_in_board,
         update_task_in_board,
     },
     platform::{agent_service_status, restart_running_agent_service},
@@ -7824,8 +7824,9 @@ pub(super) fn execute_tui_key_effect(
                             app.feedback_buffer = "No task selected".to_string();
                             return Ok(false);
                         };
-                        let Some(session_id) = codex_session_for_task(&task) else {
-                            app.feedback_buffer = match toggle_unlinked_task_stop_in_board(
+                        let session_id = codex_session_for_task(&task);
+                        if task_entry_is_stopped(&task) || session_id.is_none() {
+                            app.feedback_buffer = match toggle_task_stop_marker_in_board(
                                 &board_dir,
                                 selected_status,
                                 &task,
@@ -7841,7 +7842,9 @@ pub(super) fn execute_tui_key_effect(
                                 Err(error) => format!("Unable to stop or start the task: {error}"),
                             };
                             return Ok(false);
-                        };
+                        }
+                        let session_id =
+                            session_id.context("No Codex session linked to this task")?;
                         app.agent_panel.refresh(&app.active_root);
                         *last_agent_panel_refresh = Instant::now();
                         if !app.agent_panel.select_project_for_path(&app.active_root) {

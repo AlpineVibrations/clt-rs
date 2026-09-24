@@ -191,7 +191,7 @@ fn planning_links_exact_todo_in_markdown_folder_and_nested_boards() {
 
 #[test]
 fn planning_preserves_edits_and_releases_lease_on_failure_or_stale_selection() {
-    for change in ["edit", "move", "link", "failure"] {
+    for change in ["edit", "move", "link", "stop", "failure"] {
         let f = Fixture::new(false);
         let board = get_tasks_dir(&f.project.path);
         fs::write(board.join("todo.md"), "- Plan this\n").unwrap();
@@ -209,6 +209,7 @@ fn planning_preserves_edits_and_releases_lease_on_failure_or_stale_selection() {
                     "link" => {
                         fs::write(board.join("todo.md"), "- Plan this codex:other-session\n")?
                     }
+                    "stop" => fs::write(board.join("todo.md"), "- Plan this clt:stopped\n")?,
                     _ => anyhow::bail!("app-server unavailable"),
                 }
                 Ok("planning-123".into())
@@ -650,7 +651,7 @@ fn installed_codex_planning_session_is_durable() -> Result<()> {
 }
 
 #[test]
-fn stopped_todo_cannot_launch_a_planning_session() {
+fn stopped_todo_can_plan_and_reopen_but_requires_explicit_restart_for_automation() {
     for folders in [false, true] {
         let f = Fixture::new(folders);
         crate::task::add_task(&f.project.path, "Keep this task stopped. clt:stopped", None)
@@ -659,32 +660,147 @@ fn stopped_todo_cannot_launch_a_planning_session() {
         let selected = read_task_entries(&board, TaskStatus::Todo)
             .unwrap()
             .remove(0);
-        let result =
+        let prepared =
             prepare_todo_planning_session_with(&f.state, &f.project, &board, &selected, |_| {
-                panic!("Stopped tasks must not start Codex")
-            });
-        assert!(
-            result
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("task is stopped")
+                Ok("planning-123".into())
+            })
+            .unwrap();
+        let planned = read_task_entries(&board, TaskStatus::Todo)
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            planned.content.trim_end(),
+            "Keep this task stopped. codex:planning-123 clt:stopped"
         );
+        assert_eq!(
+            codex_session_for_task(&planned).as_deref(),
+            Some("planning-123")
+        );
+        assert!(crate::task::task_entry_is_stopped(&planned));
+        assert_eq!(
+            crate::scheduler::scan_agent_project(&f.project.path).available_todo_count(),
+            0
+        );
+        assert!(
+            read_task_entries(&board, TaskStatus::Doing)
+                .unwrap()
+                .is_empty()
+        );
+
+        // Opening and cancelling the idle conversation retains the session and stop.
+        for _ in 0..2 {
+            assert!(
+                f.store
+                    .reserve_idle_session_interactive_blocking(
+                        f.project.id,
+                        &prepared.session_id,
+                        &prepared.lease.holder,
+                        None
+                    )
+                    .unwrap()
+            );
+            assert!(
+                f.store
+                    .cancel_idle_session_interactive_blocking(
+                        f.project.id,
+                        &prepared.session_id,
+                        &prepared.lease.holder
+                    )
+                    .unwrap()
+            );
+        }
+        prepared.lease.release().unwrap();
         assert!(
             f.store
                 .lease_for_project_blocking(f.project.id)
                 .unwrap()
                 .is_none()
         );
-        assert!(
+        assert_eq!(
             f.store
-                .session_controls_for_project_blocking(f.project.id)
+                .session_control_blocking(f.project.id, "planning-123")
                 .unwrap()
-                .is_empty()
+                .unwrap()
+                .state,
+            AgentSessionControlState::Stopped
+        );
+
+        // Refining the task preserves both markers, even for non-UUID session IDs.
+        crate::application::update_task_in_board(&board, TaskStatus::Todo, 1, "Refined plan.")
+            .unwrap();
+        let edited = read_task_entries(&board, TaskStatus::Todo)
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            edited.content.trim_end(),
+            "Refined plan. codex:planning-123 clt:stopped"
         );
         assert_eq!(
-            read_task_entries(&board, TaskStatus::Todo).unwrap()[0].content,
-            selected.content
+            crate::task::task_content_for_edit(&edited.content),
+            "Refined plan."
+        );
+        assert_eq!(
+            crate::scheduler::scan_agent_project(&f.project.path).available_todo_count(),
+            0
+        );
+        f.store
+            .mark_session_running_blocking(
+                f.project.id,
+                "implementation-456",
+                1234,
+                "run-456",
+                &f.project.path.join("out"),
+                &f.project.path.join("err"),
+            )
+            .unwrap();
+        let context = crate::runner::AutomatedAgentChildContext {
+            project_id: f.project.id,
+            run_token: "run-456".into(),
+        };
+        let error = crate::application::move_task_to_doing_with_agent_session(
+            &f.project.path,
+            "1",
+            &context,
+            &f.project,
+            &f.store,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("task is stopped"));
+
+        // The explicit board start action removes only the stop marker.
+        assert!(
+            !crate::application::toggle_task_stop_marker_in_board(
+                &board,
+                TaskStatus::Todo,
+                &edited
+            )
+            .unwrap()
+        );
+        let restarted = read_task_entries(&board, TaskStatus::Todo)
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            restarted.content.trim_end(),
+            "Refined plan. codex:planning-123"
+        );
+        assert_eq!(
+            crate::scheduler::scan_agent_project(&f.project.path).available_todo_count(),
+            1
+        );
+        crate::application::move_task_to_doing_with_agent_session(
+            &f.project.path,
+            "1",
+            &context,
+            &f.project,
+            &f.store,
+        )
+        .unwrap();
+        let doing = read_task_entries(&board, TaskStatus::Doing)
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            codex_session_for_task(&doing).as_deref(),
+            Some("implementation-456")
         );
     }
 }
