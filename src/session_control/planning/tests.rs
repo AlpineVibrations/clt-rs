@@ -854,14 +854,18 @@ fn stopped_todo_can_plan_and_reopen_but_requires_explicit_restart_for_automation
         .unwrap_err();
         assert!(error.to_string().contains("task is stopped"));
 
-        // The explicit board start action removes only the stop marker.
+        // A planning session remains stopped, but the task is ready after the
+        // explicit board start action and must not appear stopped in clt list.
         assert!(
-            !crate::application::toggle_task_stop_marker_in_board(
+            crate::session_control::toggle_tui_task_stop_at(
+                &f.state,
+                Some(f.project.id),
                 &board,
                 TaskStatus::Todo,
-                &edited
+                &edited,
             )
             .unwrap()
+            .starts_with("Task started.")
         );
         let restarted = read_task_entries(&board, TaskStatus::Todo)
             .unwrap()
@@ -873,6 +877,15 @@ fn stopped_todo_can_plan_and_reopen_but_requires_explicit_restart_for_automation
         assert_eq!(
             crate::scheduler::scan_agent_project(&f.project.path).available_todo_count(),
             1
+        );
+        let states = crate::tui::task_agent_session_states_from_controls(
+            f.store
+                .session_controls_for_project_blocking(f.project.id)
+                .unwrap(),
+        );
+        assert_eq!(
+            crate::tui::task_display_text_with_agent_flag(&restarted, TaskStatus::Todo, &states),
+            "Refined plan."
         );
         crate::application::move_task_to_doing_with_agent_session(
             &f.project.path,

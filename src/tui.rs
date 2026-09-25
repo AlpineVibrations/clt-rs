@@ -34,8 +34,8 @@ use tui_input::{Input, InputRequest};
 use crate::{
     agent::{
         self, AGENT_CODEX_REASONING_EFFORTS, AGENT_DB_FILE, AGENT_PROVIDER_PRESETS,
-        AgentSessionControlState, GitFinalizationState, agent_state_dir, codex_config_path,
-        ensure_agent_state_dir, open_agent_store, open_agent_store_at,
+        AgentSessionControlRecord, AgentSessionControlState, GitFinalizationState, agent_state_dir,
+        codex_config_path, ensure_agent_state_dir, open_agent_store, open_agent_store_at,
         read_codex_default_config_at, remove_codex_provider_config_at, set_codex_default_config_at,
         set_codex_model_reasoning_if_default_at, upsert_codex_provider_config_at,
         valid_environment_variable_name,
@@ -181,6 +181,20 @@ pub(super) fn task_tui_display_text(entry: &TaskEntry, is_selected: bool) -> Str
 
 pub(super) type TaskAgentSessionStates = HashMap<String, AgentSessionControlState>;
 
+pub(super) fn task_agent_session_states_from_controls(
+    controls: Vec<AgentSessionControlRecord>,
+) -> TaskAgentSessionStates {
+    controls
+        .into_iter()
+        // A planning conversation is stored as a stopped session without an
+        // automated run. Its task is stopped only when the board has a marker.
+        .filter(|control| {
+            control.state != AgentSessionControlState::Stopped || control.run_token.is_some()
+        })
+        .map(|control| (control.codex_session_id, control.state))
+        .collect()
+}
+
 pub(super) fn task_has_stopped_agent_flag(
     status: TaskStatus,
     entry: &TaskEntry,
@@ -254,11 +268,9 @@ pub(super) fn try_load_task_agent_session_states(root: &Path) -> Result<TaskAgen
         return Ok(TaskAgentSessionStates::default());
     };
 
-    Ok(store
-        .session_controls_for_project_blocking(project.id)?
-        .into_iter()
-        .map(|control| (control.codex_session_id, control.state))
-        .collect())
+    Ok(task_agent_session_states_from_controls(
+        store.session_controls_for_project_blocking(project.id)?,
+    ))
 }
 
 pub(super) fn insert_task_at_selection_in_board(

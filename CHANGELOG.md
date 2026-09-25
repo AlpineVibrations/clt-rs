@@ -6,6 +6,10 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+### Fixed
+
+- Show a started Todo with a saved planning conversation as ready in Kanban and `clt list`, so automated agents can select it; continue showing stopped automated sessions as `[STOPPED]`.
+
 ## [0.7.1] - 2026-09-24
 
 ### Fixed

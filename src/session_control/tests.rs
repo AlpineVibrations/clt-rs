@@ -638,6 +638,15 @@ fn tui_stop_key_toggles_running_session_to_stop_then_resume_requested() {
             .complete_session_stop_blocking(project_id, "session-123", "run-one")
             .unwrap()
     );
+    let states = crate::tui::task_agent_session_states_from_controls(
+        store
+            .session_controls_for_project_blocking(project_id)
+            .unwrap(),
+    );
+    assert_eq!(
+        crate::tui::task_display_text_with_agent_flag(&task, TaskStatus::Todo, &states),
+        "[STOPPED] Active task."
+    );
 
     let message = super::toggle_tui_task_stop_at(
         &state_dir,
