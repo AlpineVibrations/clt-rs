@@ -5767,36 +5767,36 @@ impl CreateBTreeFlags {
 }
 
 /*
-** The pointer map is a lookup table that identifies the parent page for
-** each child page in the database file.  The parent page is the page that
-** contains a pointer to the child.  Every page in the database contains
-** 0 or 1 parent pages. Each pointer map entry consists of a single byte 'type'
-** and a 4 byte parent page number.
-**
-** The PTRMAP_XXX identifiers below are the valid types.
-**
-** The purpose of the pointer map is to facilitate moving pages from one
-** position in the file to another as part of autovacuum.  When a page
-** is moved, the pointer in its parent must be updated to point to the
-** new location.  The pointer map is used to locate the parent page quickly.
-**
-** PTRMAP_ROOTPAGE: The database page is a root-page. The page-number is not
-**                  used in this case.
-**
-** PTRMAP_FREEPAGE: The database page is an unused (free) page. The page-number
-**                  is not used in this case.
-**
-** PTRMAP_OVERFLOW1: The database page is the first page in a list of
-**                   overflow pages. The page number identifies the page that
-**                   contains the cell with a pointer to this overflow page.
-**
-** PTRMAP_OVERFLOW2: The database page is the second or later page in a list of
-**                   overflow pages. The page-number identifies the previous
-**                   page in the overflow page list.
-**
-** PTRMAP_BTREE: The database page is a non-root btree page. The page number
-**               identifies the parent page in the btree.
-*/
+ ** The pointer map is a lookup table that identifies the parent page for
+ ** each child page in the database file.  The parent page is the page that
+ ** contains a pointer to the child.  Every page in the database contains
+ ** 0 or 1 parent pages. Each pointer map entry consists of a single byte 'type'
+ ** and a 4 byte parent page number.
+ **
+ ** The PTRMAP_XXX identifiers below are the valid types.
+ **
+ ** The purpose of the pointer map is to facilitate moving pages from one
+ ** position in the file to another as part of autovacuum.  When a page
+ ** is moved, the pointer in its parent must be updated to point to the
+ ** new location.  The pointer map is used to locate the parent page quickly.
+ **
+ ** PTRMAP_ROOTPAGE: The database page is a root-page. The page-number is not
+ **                  used in this case.
+ **
+ ** PTRMAP_FREEPAGE: The database page is an unused (free) page. The page-number
+ **                  is not used in this case.
+ **
+ ** PTRMAP_OVERFLOW1: The database page is the first page in a list of
+ **                   overflow pages. The page number identifies the page that
+ **                   contains the cell with a pointer to this overflow page.
+ **
+ ** PTRMAP_OVERFLOW2: The database page is the second or later page in a list of
+ **                   overflow pages. The page-number identifies the previous
+ **                   page in the overflow page list.
+ **
+ ** PTRMAP_BTREE: The database page is a non-root btree page. The page number
+ **               identifies the parent page in the btree.
+ */
 #[cfg(not(clt_turso_feature = "omit_autovacuum"))]
 pub(crate) mod ptrmap {
     #[allow(unused_imports)]

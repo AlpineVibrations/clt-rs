@@ -740,21 +740,19 @@ pub(super) fn working_git_history_is_safe(
         "HEAD",
         "verify the Working task repair history",
     )?;
-    if !git_commit_is_ancestor(project_root, starting_head, &current_head)?
-        || !agent_git_range_is_safe_before_manifest(
-            AgentGitProofContext {
-                store,
-                project_id: finalization.project_id,
-            },
-            project_root,
-            starting_head,
-            &current_head,
-            &finalization.codex_session_id,
-        )?
-    {
+    if !git_commit_is_ancestor(project_root, starting_head, &current_head)? {
         return Ok(false);
     }
-    Ok(true)
+    agent_git_range_is_safe_before_manifest(
+        AgentGitProofContext {
+            store,
+            project_id: finalization.project_id,
+        },
+        project_root,
+        starting_head,
+        &current_head,
+        &finalization.codex_session_id,
+    )
 }
 
 pub(super) fn configure_agent_git_identity(command: &mut Command, git_mode: AgentGitMode) {
@@ -2458,13 +2456,9 @@ pub(super) fn git_commit_matches_agent_staged_manifest(
         &["rev-parse", "--verify", &tree_reference],
         "resolve the committed task tree",
     )?;
-    if committed_tree != sealed_commit_tree
-        || git_ref_completed_task_identity(project_root, commit_oid, session_id)?.as_deref()
-            != Some(task_identity)
-    {
-        return Ok(false);
-    }
-    Ok(true)
+    Ok(committed_tree == sealed_commit_tree
+        && git_ref_completed_task_identity(project_root, commit_oid, session_id)?.as_deref()
+            == Some(task_identity))
 }
 
 pub(super) fn capture_agent_git_start_state(

@@ -6,6 +6,10 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+### Fixed
+
+- Restore nightly formatting and Clippy checks by formatting bundled engine comments and simplifying managed Git boolean guards without changing their behavior.
+
 ## [0.7.2] - 2026-09-28
 
 ### Fixed
