@@ -61,6 +61,9 @@ original dependency/features list, and run the WAL regressions and archive check
 
 ## Local changes
 
+`vdbe/value.rs` uses standard parentheses for the two `matches!` calls in unary
+math evaluation so current Clippy accepts them; their behavior is unchanged.
+
 The published 0.7.2 shared-WAL coordination source is unchanged from 0.7.0, so
 CLT retains the same reader ownership fix and checkpoint pin. The versioned
 shared-WAL header layout used by CLT's recovery workaround is also unchanged.

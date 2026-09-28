@@ -981,8 +981,10 @@ impl Value {
 
         // In case of some functions and integer input, return the input as is
         if let Some(Numeric::Integer(i)) = v {
-            if matches! { function, MathFunc::Ceil | MathFunc::Ceiling | MathFunc::Floor | MathFunc::Trunc }
-            {
+            if matches!(
+                function,
+                MathFunc::Ceil | MathFunc::Ceiling | MathFunc::Floor | MathFunc::Trunc
+            ) {
                 return Value::from_i64(i);
             }
         }
@@ -991,7 +993,7 @@ impl Value {
             return Value::Null;
         };
 
-        if matches! { function, MathFunc::Ln | MathFunc::Log10 | MathFunc::Log2 } && f <= 0.0 {
+        if matches!(function, MathFunc::Ln | MathFunc::Log10 | MathFunc::Log2) && f <= 0.0 {
             return Value::Null;
         }
 
