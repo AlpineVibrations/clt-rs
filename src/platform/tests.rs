@@ -2,6 +2,118 @@ use super::{manage_agent_service_at_with, stop_agent_services_for_recovery_with}
 use crate::test_support::prelude::*;
 use crate::test_support::*;
 
+#[cfg(unix)]
+mod launchd_start {
+    use std::{collections::VecDeque, os::unix::process::ExitStatusExt, process::Output};
+
+    use super::*;
+
+    fn run_script(script: &[(&[&str], i32)]) -> (Result<()>, usize) {
+        let mut steps = VecDeque::from(script.to_vec());
+        let mut sleeps = 0;
+        let result = super::super::start_launchd_service_with(
+            "gui/501",
+            "gui/501/test.agent",
+            Path::new("/tmp/test.agent.plist"),
+            |args| {
+                let (expected, code) = steps.pop_front().expect("unexpected launchctl call");
+                assert_eq!(args, expected);
+                Ok(Output {
+                    status: std::process::ExitStatus::from_raw(code << 8),
+                    stdout: Vec::new(),
+                    stderr: if code == 0 {
+                        Vec::new()
+                    } else {
+                        b"launchd diagnostic".to_vec()
+                    },
+                })
+            },
+            |duration| {
+                assert_eq!(duration, Duration::from_millis(250));
+                sleeps += 1;
+            },
+        );
+        assert!(steps.is_empty(), "missing launchctl calls: {steps:?}");
+        (result, sleeps)
+    }
+
+    const PRINT: &[&str] = &["print", "gui/501/test.agent"];
+    const BOOTOUT: &[&str] = &["bootout", "gui/501/test.agent"];
+    const BOOTSTRAP: &[&str] = &["bootstrap", "gui/501", "/tmp/test.agent.plist"];
+    const KICKSTART: &[&str] = &["kickstart", "gui/501/test.agent"];
+
+    #[test]
+    fn launchd_start_waits_for_unload_and_retries_transient_bootstrap() {
+        let (result, sleeps) = run_script(&[
+            (PRINT, 0),
+            (BOOTOUT, 0),
+            (PRINT, 0),
+            (PRINT, 113),
+            (BOOTSTRAP, 5),
+            (PRINT, 113),
+            (BOOTSTRAP, 0),
+            (KICKSTART, 0),
+        ]);
+        result.unwrap();
+        assert_eq!(sleeps, 2);
+    }
+
+    #[test]
+    fn launchd_start_fresh_service_needs_no_wait_or_forced_restart() {
+        let (result, sleeps) = run_script(&[(PRINT, 113), (BOOTSTRAP, 0), (KICKSTART, 0)]);
+        result.unwrap();
+        assert_eq!(sleeps, 0);
+    }
+
+    #[test]
+    fn launchd_start_retries_an_already_unloading_service() {
+        let (result, sleeps) = run_script(&[
+            (PRINT, 113),
+            (BOOTSTRAP, 5),
+            (PRINT, 113),
+            (BOOTSTRAP, 0),
+            (KICKSTART, 0),
+        ]);
+        result.unwrap();
+        assert_eq!(sleeps, 1);
+    }
+
+    #[test]
+    fn launchd_start_preserves_permanent_errors_and_never_kickstarts_after_failure() {
+        for script in [
+            vec![(PRINT, 113), (BOOTSTRAP, 78)],
+            vec![(PRINT, 113), (BOOTSTRAP, 5), (PRINT, 0)],
+            vec![(PRINT, 0), (BOOTOUT, 1)],
+            vec![(PRINT, 113), (BOOTSTRAP, 0), (KICKSTART, 1)],
+        ] {
+            let (result, sleeps) = run_script(&script);
+            assert!(format!("{:#}", result.unwrap_err()).contains("launchd diagnostic"));
+            assert_eq!(sleeps, 0);
+        }
+    }
+
+    #[test]
+    fn launchd_start_has_bounded_unload_and_bootstrap_retries() {
+        let mut script = vec![(PRINT, 0), (BOOTOUT, 0)];
+        script.extend(std::iter::repeat_n((PRINT, 0), 21));
+        let (result, sleeps) = run_script(&script);
+        assert!(result.unwrap_err().to_string().contains("Timed out"));
+        assert_eq!(sleeps, 20);
+
+        // The first wait consumes part of the same budget used for bootstrap.
+        let mut script = vec![(PRINT, 0), (BOOTOUT, 0), (PRINT, 0), (PRINT, 113)];
+        for _ in 0..19 {
+            script.extend([(BOOTSTRAP, 5), (PRINT, 113)]);
+        }
+        script.push((BOOTSTRAP, 5));
+        let (result, sleeps) = run_script(&script);
+        let message = format!("{:#}", result.unwrap_err());
+        assert!(message.contains("launchd diagnostic"));
+        assert!(message.contains("without sudo"));
+        assert_eq!(sleeps, 20);
+    }
+}
+
 #[test]
 fn stale_service_restart_is_exclusive_and_has_a_cross_client_cooldown() {
     let root = temp_root("agent-restart-claim");

@@ -905,6 +905,26 @@ pub(super) fn run_agent_scheduler_pass_with_max_global_jobs(
             )
         })?;
 
+        // Recovery reads can initialize a board as a side effect. Never enter
+        // them for a missing/unreadable project (for example an unmounted disk):
+        // that can fail the entire pass and starve unrelated ready projects.
+        if matches!(
+            scan.status,
+            AgentProjectScanStatus::Missing
+                | AgentProjectScanStatus::Uninitialized
+                | AgentProjectScanStatus::Unavailable(_)
+        ) {
+            eprintln!(
+                "Project {}: action=skip reason=board_unavailable scan_status={} error={} path={}",
+                project.name,
+                scan.status_label(),
+                scan.error_message()
+                    .unwrap_or("task board is not available"),
+                project.path.display()
+            );
+            continue;
+        }
+
         let mut existing_lease = agent_lease_for_project(state_dir, project.id)?;
         reconcile_stale_agent_session_controls(
             state_dir,

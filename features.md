@@ -323,6 +323,10 @@ clt agent stop
 
 On macOS, `start` installs a user `launchd` service named `com.alpinevibrations.clt.agent`. On Linux, it installs a user `systemd` service named `clt-agent.service`. Other platforms can still use `clt agent run --once` or `clt agent daemon`, but `start` and `stop` are unsupported.
 
+When replacing the macOS scheduler, `start` waits for the old service to unload and retries bootstrap error 5 while the service is absent, with up to five seconds of combined retry delays. Persistent failures retain the launchd diagnostic. Run the command as your normal user, without `sudo`.
+
+Missing, uninitialized, or unreadable project boards are skipped before task recovery. For example, a project on an unmounted drive does not block ready tasks in other projects. The scheduler logs the skipped project's name, path, and scan status, and checks it again on later passes.
+
 `clt agent stop` stops only that scheduler. It does not drain, wait for, or terminate independent workers already running. Their leases remain visible to a later scheduler, so `clt agent start` can be run immediately—even after installing a new CLT binary—without duplicating their projects. Task-level stop and interrupt controls continue to reach older workers through the durable session-control records in `agent.db`.
 
 The first upgrade from a CLT release that predates independent workers cannot detach a run that the old scheduler already owns in-process. To prevent accidentally terminating it, `start` and `stop` refuse while a live legacy scheduler lease exists; let that one-time legacy run finish and retry. Runs dispatched after this feature is installed are independent.

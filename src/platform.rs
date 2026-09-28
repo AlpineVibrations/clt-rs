@@ -4,7 +4,7 @@ use std::{
     fs,
     io::{self, Read, Seek, Write},
     path::{Path, PathBuf},
-    process::{Child, Command, ExitStatus, Stdio},
+    process::{Child, Command, ExitStatus, Output, Stdio},
     sync::atomic::{AtomicBool, Ordering},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -499,14 +499,22 @@ pub(super) fn manage_launchd_agent(
             )
             .with_context(|| format!("Failed to write launchd plist {:?}", plist_path))?;
 
-            if run_service_command_optional("launchctl", &["print", &service_target])? {
-                run_service_command("launchctl", &["bootout", &service_target])?;
-            }
-            run_service_command(
-                "launchctl",
-                &["bootstrap", &domain, plist_path.to_string_lossy().as_ref()],
+            start_launchd_service_with(
+                &domain,
+                &service_target,
+                &plist_path,
+                |args| {
+                    service_command("launchctl", args)?
+                        .output()
+                        .with_context(|| {
+                            format!(
+                                "Failed to run {}",
+                                service_command_display("launchctl", args)
+                            )
+                        })
+                },
+                thread::sleep,
             )?;
-            run_service_command("launchctl", &["kickstart", "-k", &service_target])?;
             println!(
                 "Started clt agent launchd service {} ({})",
                 AGENT_LAUNCHD_LABEL,
@@ -534,6 +542,70 @@ pub(super) fn manage_launchd_agent(
         }
     }
 
+    Ok(())
+}
+
+fn start_launchd_service_with(
+    domain: &str,
+    target: &str,
+    plist_path: &Path,
+    mut command: impl FnMut(&[&str]) -> Result<Output>,
+    mut sleep: impl FnMut(Duration),
+) -> Result<()> {
+    // Removing a launchd job and releasing its label need not finish together.
+    // Share a bounded retry budget between observing unload and bootstrapping;
+    // even an absent `print` result can precede the label becoming reusable.
+    let mut retries = 20;
+    let delay = Duration::from_millis(250);
+    if command(&["print", target])?.status.success() {
+        let args = ["bootout", target];
+        ensure_launchd_command_succeeded(&args, command(&args)?)?;
+        while command(&["print", target])?.status.success() {
+            anyhow::ensure!(
+                retries > 0,
+                "Timed out waiting for launchd service {target} to unload; retry `clt agent start` as your normal user"
+            );
+            retries -= 1;
+            sleep(delay);
+        }
+    }
+
+    let plist = plist_path.to_string_lossy();
+    let args = ["bootstrap", domain, plist.as_ref()];
+    loop {
+        let output = command(&args)?;
+        if output.status.success() {
+            break;
+        }
+        // Error 5 may be transient after bootout, but also reports permanent
+        // configuration errors. Retry only while no service is loaded, and
+        // preserve the final diagnostic instead of declaring a false success.
+        if output.status.code() != Some(5)
+            || retries == 0
+            || command(&["print", target])?.status.success()
+        {
+            return ensure_launchd_command_succeeded(&args, output).context(
+                "Could not load the CLT user service; inspect the launchd diagnostic and retry `clt agent start` without sudo",
+            );
+        }
+        retries -= 1;
+        sleep(delay);
+    }
+
+    // RunAtLoad may already have started the new scheduler. Do not kill it
+    // again as `kickstart -k` would do.
+    let args = ["kickstart", target];
+    ensure_launchd_command_succeeded(&args, command(&args)?)
+}
+
+fn ensure_launchd_command_succeeded(args: &[&str], output: Output) -> Result<()> {
+    anyhow::ensure!(
+        output.status.success(),
+        "{} failed with status {}: {}",
+        service_command_display("launchctl", args),
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
     Ok(())
 }
 

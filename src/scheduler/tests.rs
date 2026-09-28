@@ -3,8 +3,8 @@ use crate::test_support::prelude::*;
 use crate::test_support::*;
 
 #[test]
-fn failed_scheduler_pass_releases_jobs_that_were_never_dispatched() {
-    let root = temp_root("scheduler-failed-pass-leases");
+fn unreadable_board_does_not_discard_ready_jobs_or_block_later_projects() {
+    let root = temp_root("scheduler-unreadable-board");
     let state_dir = root.join("state");
     let first_root = root.join("first");
     let second_root = root.join("second");
@@ -32,22 +32,23 @@ fn failed_scheduler_pass_releases_jobs_that_were_never_dispatched() {
             )
             .unwrap()
     );
-    // Board scans report their errors, but inspecting interrupted Doing tasks
-    // subsequently fails the pass after the first two jobs acquired leases.
+    // A broken board must not discard jobs already acquired in this pass or
+    // prevent later projects from being considered.
     fs::write(broken_root.join("tasks/doing.md"), [0xff]).unwrap();
-    let error =
-        match run_agent_scheduler_pass_with_max_global_jobs(&state_dir, false, &[], 12, None) {
-            Ok(_) => panic!("an unreadable Doing board must fail the pass"),
-            Err(error) => error,
-        };
-    assert!(format!("{error:#}").contains("UTF-8"));
-    for project in &projects[..2] {
-        assert!(
-            store
-                .lease_for_project_blocking(project.id)
-                .unwrap()
-                .is_none()
-        );
+    let start =
+        run_agent_scheduler_pass_with_max_global_jobs(&state_dir, false, &[], 12, None).unwrap();
+    assert_eq!(start.jobs.len(), 2);
+    assert_eq!(start.pass.skipped_active_lease, 1);
+    let broken = store.list_projects_blocking().unwrap().remove(2);
+    assert_eq!(
+        broken.last_daemon_scan_status.as_deref(),
+        Some("unavailable")
+    );
+    let diagnostic = broken.last_daemon_scan_error.unwrap();
+    assert!(diagnostic.contains("Failed to read"));
+    assert!(diagnostic.contains("doing.md"));
+    for job in &start.jobs {
+        release_agent_job_lease_for_shutdown(job).unwrap();
     }
     assert_eq!(
         store
@@ -77,6 +78,51 @@ fn failed_scheduler_pass_releases_jobs_that_were_never_dispatched() {
         release_agent_job_lease_for_shutdown(job).unwrap();
     }
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn missing_or_uninitialized_project_does_not_create_a_board_or_starve_ready_work() {
+    for missing in [true, false] {
+        let root = temp_root("scheduler-missing-project");
+        let state_dir = root.join("state");
+        let missing_root = root.join("offline-volume/project");
+        let ready_root = root.join("ready");
+        add_task(&missing_root, "Preserved offline task", None).unwrap();
+        add_task(&ready_root, "Ready task", None).unwrap();
+        let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&missing_root, "a-offline")
+            .unwrap();
+        store
+            .register_project_blocking(&ready_root, "z-ready")
+            .unwrap();
+        if missing {
+            fs::rename(root.join("offline-volume"), root.join("unmounted-volume")).unwrap();
+        } else {
+            fs::rename(missing_root.join("tasks"), missing_root.join("saved-tasks")).unwrap();
+        }
+
+        let start = run_agent_scheduler_pass(&state_dir, false, &[]).unwrap();
+        assert_eq!(start.jobs.len(), 1);
+        assert_eq!(start.jobs[0].project.name, "z-ready");
+        assert!(!missing_root.join("tasks").exists());
+        if missing {
+            assert!(!root.join("offline-volume").exists());
+        }
+        let offline = store.list_projects_blocking().unwrap().remove(0);
+        assert_eq!(
+            offline.last_daemon_scan_status.as_deref(),
+            Some(if missing { "missing" } else { "uninitialized" })
+        );
+        assert!(
+            store
+                .lease_for_project_blocking(offline.id)
+                .unwrap()
+                .is_none()
+        );
+        release_agent_job_lease_for_shutdown(&start.jobs[0]).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 struct OrphanWorkingJournalFixture {

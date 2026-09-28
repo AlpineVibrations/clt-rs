@@ -44,6 +44,7 @@ used Turso dependency. Application modules import its local API through
 - CLI and TUI call application/store facades; they do not contain SQL.
 - TUI render functions read cached `TuiApp` state and perform no I/O.
 - Scheduler decision functions are separate from acquisition and worker effects.
+- Scheduler passes persist missing/uninitialized/unreadable board scans and skip those projects before recovery reads, so unavailable storage cannot initialize a replacement board or block unrelated jobs. Platform startup bounds launchd unload/bootstrap retries and retains permanent failure diagnostics.
 - Persistent agent commands use the store blocking adapter's durable update boundary. A writer lock and dirty marker cover the DB-to-snapshot interval; live stores hold shared access until every Turso handle is dropped. Recovery takes exclusive access, preserves DB and WAL together, and refuses ambiguous reconstruction.
 - Turso rows are mapped to agent-domain records inside `agent::repositories`.
 - The pinned Turso core carries a local reader-ownership fix under `vendor/`; its provenance and patch are documented there. Keep the checkpoint pin and partial-checkpoint, overlapping-store, and interrupted-WAL regressions when updating the dependency.
