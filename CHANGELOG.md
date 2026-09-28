@@ -6,8 +6,11 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-09-28
+
 ### Fixed
 
+- Accept current version-2 registry snapshots in `clt agent recover`, and avoid offering project registration while the TUI registry is loading or unavailable.
 - Show a started Todo with a saved planning conversation as ready in Kanban and `clt list`, so automated agents can select it; continue showing stopped automated sessions as `[STOPPED]`.
 
 ## [0.7.1] - 2026-09-24
@@ -316,7 +319,8 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 - Fixed task moves so destination write failures do not remove the source task.
 - Fixed TUI navigation on empty boards.
 
-[Unreleased]: https://github.com/AlpineVibrations/clt-rs/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/AlpineVibrations/clt-rs/compare/v0.7.2...HEAD
+[0.7.2]: https://github.com/AlpineVibrations/clt-rs/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/AlpineVibrations/clt-rs/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/AlpineVibrations/clt-rs/compare/v0.6.22...v0.7.0
 [0.6.14]: https://github.com/AlpineVibrations/clt-rs/releases/tag/v0.6.14

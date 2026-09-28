@@ -43,7 +43,7 @@ fn scheduler_service_stop_does_not_open_a_damaged_database() {
 
 fn recovery_service_test_manifest(platform: AgentPlatform) -> serde_json::Value {
     serde_json::json!({
-        "version": 1,
+        "version": 2,
         "tables": {
             "agent_workers": [{
                 "state": "running",
@@ -159,6 +159,42 @@ fn recovery_stops_verified_launchd_services() {
     .unwrap();
     assert_eq!(stopped.len(), 2);
     assert!(stopped.contains(&format!("gui/501/{AGENT_LAUNCHD_LABEL}")));
+}
+
+#[test]
+fn recovery_accepts_legacy_manifests_and_rejects_unknown_versions_before_stopping() {
+    for version in [
+        serde_json::json!(1),
+        serde_json::json!(3),
+        serde_json::Value::Null,
+    ] {
+        let mut manifest = recovery_service_test_manifest(AgentPlatform::Macos);
+        manifest["version"] = version.clone();
+        let mut calls = 0;
+        let result = stop_agent_services_for_recovery_with(
+            Path::new("/unused-agent-state"),
+            &manifest,
+            AgentPlatform::Macos,
+            Some("gui/501"),
+            |_, _| {
+                calls += 1;
+                Ok((false, String::new()))
+            },
+            |_| Some(false),
+        );
+        if version == 1 {
+            result.unwrap();
+            assert_eq!(calls, 2);
+        } else {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Unsupported agent recovery manifest")
+            );
+            assert_eq!(calls, 0);
+        }
+    }
 }
 
 #[test]

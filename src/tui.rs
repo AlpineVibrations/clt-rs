@@ -1562,10 +1562,10 @@ impl TuiAgentLogView {
 }
 
 impl TuiAgentPanel {
-    pub(super) fn new(active_root: &Path) -> Self {
+    pub(super) fn new(_active_root: &Path) -> Self {
         let mut panel = Self {
             projects: Vec::new(),
-            current_project_registration: current_project_registration(active_root, &[]),
+            current_project_registration: None,
             daemon_status: "loading".to_string(),
             state: ListState::default(),
             scroll_offset: 0,
@@ -1601,6 +1601,8 @@ impl TuiAgentPanel {
             }
             Err(err) => {
                 self.last_error = Some(format!("Agent registry unavailable: {err:#}"));
+                self.current_project_registration = None;
+                self.restore_or_normalize_selection(selected_row);
             }
         }
     }
@@ -4456,9 +4458,15 @@ pub(super) fn render_tui_agent_panel(
     }
 
     if row_count == 0 {
+        let message = if panel.last_error.is_some() {
+            "Agent registry unavailable. See the error below."
+        } else if panel.daemon_status == "loading" {
+            "Loading agent registry..."
+        } else {
+            "No registered projects. Run: clt agent register ."
+        };
         f.render_widget(
-            Paragraph::new("No registered projects. Run: clt agent register .")
-                .style(Style::default().fg(Color::Indexed(244))),
+            Paragraph::new(message).style(Style::default().fg(Color::Indexed(244))),
             inner_area,
         );
         return;

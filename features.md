@@ -335,6 +335,8 @@ Worker launch contracts are versioned. A newer scheduler can recover older persi
 
 ### Database recovery
 
+If the registry is unavailable, project registration cannot be determined. The TUI reports the registry error and offers registration only after a successful refresh. Recovery accepts both legacy version-1 snapshots and current version-2 snapshots containing session Git modes.
+
 `clt agent stop` does not open the database, so it remains available when Turso is unhealthy. For a shared-WAL ownership or frame-index failure, CLT records a recovery-required state and stops scheduling database retries. Once their Codex process groups have been reaped, interactive guardians and disconnected automated supervisors also exit instead of retrying finalization indefinitely; they preserve the session and lease records for recovery.
 
 Registry opens (including TUI refreshes and scheduler heartbeats) check database integrity at most once per minute. Readable but damaged indexes trigger recovery instead of leaving stale worker, failure, or heartbeat rows in circulation. A busy database is retried without being classified as corruption.

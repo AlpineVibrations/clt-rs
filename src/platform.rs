@@ -178,7 +178,10 @@ fn stop_agent_services_for_recovery_with(
     mut service_command: impl FnMut(&str, &[&str]) -> Result<(bool, String)>,
     mut process_is_running: impl FnMut(u32) -> Option<bool>,
 ) -> Result<()> {
-    if manifest.get("version").and_then(serde_json::Value::as_u64) != Some(1) {
+    if !matches!(
+        manifest.get("version").and_then(serde_json::Value::as_u64),
+        Some(1 | 2)
+    ) {
         anyhow::bail!(
             "Unsupported agent recovery manifest in {}",
             state_dir.display()

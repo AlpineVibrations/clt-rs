@@ -439,12 +439,77 @@ fn tui_agent_panel_starts_in_loading_state_without_fetching_a_snapshot() {
 
     assert!(panel.projects.is_empty());
     assert_eq!(panel.daemon_status, "loading");
-    assert_eq!(
-        panel
-            .selected_current_project_registration()
-            .map(|registration| registration.path.as_path()),
-        Some(active_root.as_path())
-    );
+    assert!(panel.current_project_registration.is_none());
+    assert_eq!(panel.state.selected(), None);
+}
+
+#[test]
+fn tui_agent_panel_only_offers_registration_after_a_successful_refresh() {
+    let active_root = Path::new("/tmp/current");
+    let mut panel = TuiAgentPanel::new(active_root);
+    for _ in 0..2 {
+        let selected = panel.selected_row_identity();
+        panel.apply_refresh_result(
+            active_root,
+            selected,
+            Err(anyhow::anyhow!("registry unavailable")),
+        );
+        assert!(panel.current_project_registration.is_none());
+        assert_eq!(panel.state.selected(), None);
+
+        panel.apply_refresh_result(
+            active_root,
+            None,
+            Ok(TuiAgentPanelSnapshot {
+                projects: Vec::new(),
+                daemon_status: "stopped".to_string(),
+            }),
+        );
+        assert_eq!(
+            panel.selected_current_project_registration().unwrap().path,
+            active_root
+        );
+        assert!(panel.last_error.is_none());
+    }
+}
+
+#[test]
+fn tui_agent_panel_does_not_render_missing_registration_when_unavailable() {
+    let root = Path::new("/tmp/current");
+    let mut panel = TuiAgentPanel::new(root);
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 12)).unwrap();
+    for failed in [false, true] {
+        if failed {
+            panel.apply_refresh_result(root, None, Err(anyhow::anyhow!("database locked")));
+        }
+        terminal
+            .draw(|frame| {
+                render_tui_agent_panel(
+                    frame,
+                    frame.area(),
+                    &panel,
+                    root,
+                    Color::White,
+                    Color::Yellow,
+                    "12:00",
+                );
+            })
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains(if failed {
+            "Agent registry unavailable"
+        } else {
+            "Loading agent registry"
+        }));
+        assert!(!rendered.contains("No registered projects"));
+        assert!(!rendered.contains("Enter/Space"));
+    }
 }
 
 #[test]
