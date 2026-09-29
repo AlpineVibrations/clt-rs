@@ -1847,7 +1847,9 @@ pub(super) fn reorder_task_in_board(
     let _mutation_lock = acquire_board_mutation_lock(board_dir)?;
     let board = TaskBoard::new(board_dir);
     let entry = board.entry(status, from_idx + 1)?;
-    ensure_managed_git_task_mutation_allowed(board_dir, &entry, false, None)?;
+    // Like a Todo/Doing move, changing priority preserves the task's content
+    // and session identity, so a Working journal remains resumable.
+    ensure_managed_git_task_mutation_allowed(board_dir, &entry, status.is_active(), None)?;
     match board.status_store(status)? {
         StatusStore::MarkdownFile(path) => reorder_markdown_task(&path, from_idx, to_idx),
         StatusStore::Directory(path) => reorder_directory_task(&path, from_idx, to_idx),

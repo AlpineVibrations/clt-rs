@@ -117,6 +117,8 @@ Press `r` to enter sticky Reorganize mode, then use the arrow keys as many times
 
 You can also use `Shift+Up` and `Shift+Down` to reorder the selected task, and `Shift+Left` and `Shift+Right` to move it between columns. `Ctrl-P` reorders the selected task up and `Ctrl-N` reorders it down; these portable alternatives work in stock macOS Terminal and through SSH or tmux.
 
+Tasks with a managed Git journal still in `WORKING` can be reordered within Todo or Doing, including blocked tasks moved back to Todo. Reordering preserves their content, session link, blocker state, and Git recovery journal. Tasks whose Git finalization has already started remain protected from reordering.
+
 Stock macOS Terminal does not encode Shift in its default Up/Down sequences, so the modifier is lost before `clt` receives it. To keep using Shift+Up/Down there, add these two mappings on the Mac under Terminal > Settings > Profiles > Keyboard:
 
 - Shift+Up: send `\033[1;2A`

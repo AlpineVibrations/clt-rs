@@ -3,6 +3,137 @@ use crate::test_support::*;
 use crate::tui::tests::tui_agent_project_for_test;
 
 #[test]
+fn reorder_working_task_preserves_recovery_after_returning_to_todo() {
+    for folders in [false, true] {
+        let root = temp_root("reorder-working-task");
+        init_tasks(&root, folders).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let board_dir = root.join("tasks");
+        let board = TaskBoard::new(&board_dir);
+        let content = "GPU-5 quality report. BLOCKED 2026-09-28: Waiting for terrain kernels. codex:session-blocked";
+        board
+            .insert_content(TaskStatus::Doing, None, "Other work")
+            .unwrap();
+        board
+            .insert_content(TaskStatus::Doing, None, content)
+            .unwrap();
+        board
+            .insert_content(TaskStatus::Todo, None, "Queued work")
+            .unwrap();
+        let identity = durable_task_identity(content).unwrap();
+        let store = open_agent_store().unwrap();
+        store.register_project_blocking(&root, "project").unwrap();
+        let project = store
+            .list_projects_blocking()
+            .unwrap()
+            .into_iter()
+            .find(|project| project.path == root)
+            .unwrap();
+        assert!(
+            store
+                .create_git_finalization_blocking(NewGitFinalization {
+                    project_id: project.id,
+                    codex_session_id: "session-blocked",
+                    git_mode: AgentGitMode::CommitAndPush,
+                    starting_head: Some("1111111111111111111111111111111111111111"),
+                    branch_ref: Some("refs/heads/main"),
+                    upstream_ref: Some("refs/remotes/origin/main"),
+                    worktree_baseline: "{}",
+                    task_identity: Some(&identity),
+                    owner_run_token: None,
+                    created_at: "100",
+                })
+                .unwrap()
+        );
+        // Another task can run while this blocked task retains its journal.
+        store
+            .mark_session_running_blocking(
+                project.id,
+                "session-other",
+                4242,
+                "other-run",
+                &root.join("other.out"),
+                &root.join("other.err"),
+            )
+            .unwrap();
+        let original = store
+            .git_finalization_blocking(project.id, "session-blocked")
+            .unwrap()
+            .unwrap();
+        reorder_task_in_board(&board_dir, TaskStatus::Doing, 1, 0).unwrap();
+        move_task_in_board(&board_dir, TaskStatus::Doing, TaskStatus::Todo, "1").unwrap();
+        reorder_task_in_board(&board_dir, TaskStatus::Todo, 1, 0).unwrap();
+        let reordered = board.entry(TaskStatus::Todo, 1).unwrap();
+        assert_eq!(reordered.content.trim(), content);
+        assert!(task_content_is_blocked(&reordered.content));
+        assert_eq!(durable_task_identity(&reordered.content), Some(identity));
+        assert_eq!(
+            board.entry(TaskStatus::Todo, 2).unwrap().summary,
+            "Queued work"
+        );
+        assert_eq!(
+            board.entry(TaskStatus::Doing, 1).unwrap().summary,
+            "Other work"
+        );
+        assert_eq!(
+            store
+                .git_finalization_blocking(project.id, "session-blocked")
+                .unwrap()
+                .unwrap(),
+            original
+        );
+
+        // Finalization seals still fence the same operation, without changing
+        // either storage format or the journal on a rejected reorder.
+        for (generation, state) in [
+            GitFinalizationState::Tracking,
+            GitFinalizationState::CommitPending,
+            GitFinalizationState::PushPending,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(
+                store
+                    .compare_and_set_git_finalization_blocking(
+                        project.id,
+                        "session-blocked",
+                        generation as i64,
+                        state,
+                        Some("old-run"),
+                        (state == GitFinalizationState::PushPending)
+                            .then_some("2222222222222222222222222222222222222222"),
+                        None,
+                        "101"
+                    )
+                    .unwrap()
+            );
+            let before = store
+                .git_finalization_blocking(project.id, "session-blocked")
+                .unwrap();
+            let error = reorder_task_in_board(&board_dir, TaskStatus::Todo, 0, 1).unwrap_err();
+            assert!(format!("{error:#}").contains("managed Git journal"));
+            assert_eq!(
+                board.entry(TaskStatus::Todo, 1).unwrap().content.trim(),
+                content
+            );
+            assert_eq!(
+                board.entry(TaskStatus::Todo, 2).unwrap().summary,
+                "Queued work"
+            );
+            assert_eq!(
+                store
+                    .git_finalization_blocking(project.id, "session-blocked")
+                    .unwrap(),
+                before
+            );
+        }
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
 fn git_off_activation_links_the_exact_task_and_exposes_its_live_log() {
     for folders in [false, true] {
         let root = temp_root("git-off-task-activation");
