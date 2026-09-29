@@ -6,6 +6,10 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+### Changed
+
+- Add minimal guidance to the task-management skill to check dependency chains and avoid circular task dependencies.
+
 ## [0.7.4] - 2026-09-29
 
 ### Fixed

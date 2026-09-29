@@ -93,6 +93,8 @@ Add a new task to the `todo` list.
 clt add "Task description" ["Optional metadata"]
 ```
 
+Before creating a task or adding a dependency, check the relevant dependency chain. Never make a task depend on itself, directly or through other tasks; split or reorder the work to avoid circular dependencies.
+
 #### Link tasks created in standalone Codex sessions
 
 When Codex is working directly in a CLT-enabled project, outside a `clt agent`
