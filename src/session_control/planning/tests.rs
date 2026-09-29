@@ -391,7 +391,7 @@ fn planning_process_handles_success_failure_and_timeout() -> Result<()> {
         "session-456"
     );
     let mut failed = Command::new("/bin/sh");
-    failed.args(["-c", "exit 1"]);
+    failed.args(["-c", "echo 'startup fixture failure' >&2; exit 1"]);
     assert!(
         create_planning_thread(
             &mut failed,
@@ -399,7 +399,9 @@ fn planning_process_handles_success_failure_and_timeout() -> Result<()> {
             "task".into(),
             Duration::from_secs(3)
         )
-        .is_err()
+        .unwrap_err()
+        .to_string()
+        .contains("startup fixture failure")
     );
     let mut hanging = Command::new("/bin/sh");
     hanging.args(["-c", "cat >/dev/null"]);

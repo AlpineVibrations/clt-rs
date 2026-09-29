@@ -1410,9 +1410,13 @@ impl TursoAgentStore {
     }
 
     pub(crate) fn open_blocking(state_dir: &Path) -> Result<Self> {
+        recovery::maintain_registry_if_idle(state_dir)?;
         let access = recovery::RegistryAccess::shared(state_dir)?;
         let _writer = recovery::write_lock(state_dir)?;
         recovery::check_clean(state_dir)?;
+        // Opening can apply migrations or repair indexes. Check before opening
+        // the engine as well as before each ordinary persistent operation.
+        recovery::check_wal_write_budget(state_dir)?;
         if state_dir.join(recovery::SNAPSHOT_FILE).exists()
             && !state_dir.join(AGENT_DB_FILE).exists()
         {

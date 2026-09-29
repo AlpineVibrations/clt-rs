@@ -121,6 +121,30 @@ fn missing_or_uninitialized_project_does_not_create_a_board_or_starve_ready_work
                 .is_none()
         );
         release_agent_job_lease_for_shutdown(&start.jobs[0]).unwrap();
+        if missing {
+            fs::rename(root.join("unmounted-volume"), root.join("offline-volume")).unwrap();
+        } else {
+            fs::rename(missing_root.join("saved-tasks"), missing_root.join("tasks")).unwrap();
+        }
+        let recovered = run_agent_scheduler_pass(&state_dir, false, &[]).unwrap();
+        assert!(
+            recovered
+                .jobs
+                .iter()
+                .any(|job| job.project.id == offline.id)
+        );
+        let restored = store.list_projects_blocking().unwrap().remove(0);
+        assert_eq!(restored.id, offline.id);
+        assert_eq!(restored.last_daemon_scan_status.as_deref(), Some("pending"));
+        assert_eq!(restored.last_daemon_scan_error, None);
+        assert!(
+            fs::read_to_string(missing_root.join("tasks/todo.md"))
+                .unwrap()
+                .contains("Preserved offline task")
+        );
+        for job in &recovered.jobs {
+            release_agent_job_lease_for_shutdown(job).unwrap();
+        }
         fs::remove_dir_all(root).unwrap();
     }
 }
@@ -795,6 +819,34 @@ fn agent_scan_reports_empty_missing_uninitialized_and_unavailable_projects() {
     ));
     assert!(!has_pending_agent_task(&unreadable_project));
 
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn agent_scan_reports_access_errors_and_recovers_after_access_is_restored() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = temp_root("agent-scan-access");
+    let volume = root.join("volume");
+    let project = volume.join("project");
+    add_task(&project, "Preserved task", None).unwrap();
+    for denied in [&volume, &project.join("tasks")] {
+        let original = fs::metadata(denied).unwrap().permissions();
+        fs::set_permissions(denied, fs::Permissions::from_mode(0o0)).unwrap();
+        let scan = scan_agent_project(&project);
+        fs::set_permissions(denied, original).unwrap();
+        // Root bypasses Unix discretionary permissions.
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(
+                matches!(scan.status, AgentProjectScanStatus::Unavailable(_)),
+                "{scan:?}"
+            );
+            let error = scan.error_message().unwrap();
+            assert!(error.contains("Permission denied"), "{error}");
+            assert!(error.contains(&denied.display().to_string()), "{error}");
+        }
+        assert_eq!(scan_agent_project(&project).todo_count, 1);
+    }
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -2176,6 +2228,39 @@ fn blocked_task_recovery_uses_failure_backoff_without_delaying_todo_work() {
         ),
         None
     );
+}
+
+#[test]
+fn daemon_automatically_repairs_an_interrupted_snapshot_and_resumes_scanning() {
+    let root = temp_root("daemon-repairs-interrupted-snapshot");
+    let state_dir = root.join("state/clt");
+    let project_root = root.join("project");
+    init_tasks(&project_root, false).unwrap();
+    let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
+    store
+        .register_project_blocking(&project_root, "recovered-project")
+        .unwrap();
+    drop(store);
+    fs::write(
+        state_dir.join("registry-dirty"),
+        "snapshot export interrupted",
+    )
+    .unwrap();
+    fs::write(
+        state_dir.join("recovery-required"),
+        "External registry snapshot failed: database is locked",
+    )
+    .unwrap();
+    let runner: Arc<dyn AgentRunner> = Arc::new(FakeAgentRunner::new(&state_dir, "success"));
+    run_agent_daemon_loop(&state_dir, runner, Duration::ZERO, Some(1)).unwrap();
+    let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
+    let project = store.list_projects_blocking().unwrap().remove(0);
+    assert_eq!(project.last_daemon_scan_status.as_deref(), Some("empty"));
+    assert!(project.last_scan_at.is_some());
+    assert!(!state_dir.join("registry-dirty").exists());
+    assert!(!state_dir.join("recovery-required").exists());
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

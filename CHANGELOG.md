@@ -6,6 +6,16 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+## [0.7.4] - 2026-09-29
+
+### Fixed
+
+- Automatically repair interrupted database-to-snapshot updates from the original DB/WAL, preserving newer committed settings and Git journals. Idle schedulers attempt guarded repair before stopping; stale snapshots never replace an unreadable original database automatically.
+- Checkpoint the registry WAL during guarded recovery and idle maintenance at 64 MiB. If busy clients prevent cleanup, stop new database updates at 128 MiB with recovery instructions before the shared frame index fills. Remove successful routine-maintenance backups, preserve manual/failed recovery bundles, and bound registry writer-lock waits.
+- Keep failed interactive Codex startup output visible until Enter is pressed, retain planning-server stderr in errors, and report registry failures instead of incorrectly asking registered projects to register again.
+- Preserve filesystem access errors when scanning projects and task boards, instead of reporting permission failures as a missing drive or uninitialized board. Show when a project is readable in the current TUI but its last background scan failed; automatically rescan reconnected drives on later scheduler passes.
+- Retry transient database lock conflicts while saving the external registry snapshot, without repeating the completed registry mutation. Exhausted retries still preserve the recovery fence.
+
 ## [0.7.3] - 2026-09-28
 
 ### Fixed
@@ -328,7 +338,8 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 - Fixed task moves so destination write failures do not remove the source task.
 - Fixed TUI navigation on empty boards.
 
-[Unreleased]: https://github.com/AlpineVibrations/clt-rs/compare/v0.7.3...HEAD
+[Unreleased]: https://github.com/AlpineVibrations/clt-rs/compare/v0.7.4...HEAD
+[0.7.4]: https://github.com/AlpineVibrations/clt-rs/compare/v0.7.3...v0.7.4
 [0.7.3]: https://github.com/AlpineVibrations/clt-rs/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/AlpineVibrations/clt-rs/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/AlpineVibrations/clt-rs/compare/v0.7.0...v0.7.1

@@ -22,6 +22,137 @@ mod idle_tests;
 
 const CHECKPOINT_CHILD_STATE: &str = "CLT_REGISTRY_RECOVERY_CHECKPOINT_TEST_STATE";
 const REOPEN_CHILD_STATE: &str = "CLT_REGISTRY_RECOVERY_REOPEN_TEST_STATE";
+const DIRTY_CHILD_STATE: &str = "CLT_REGISTRY_RECOVERY_DIRTY_TEST_STATE";
+
+#[test]
+fn idle_registry_maintenance_checkpoints_wal_and_preserves_project_settings() {
+    let (root, state_dir, store, project) = registered_store("idle-wal-maintenance");
+    store
+        .set_project_enabled_blocking(project.id, false)
+        .unwrap();
+    let wal_path = state_dir.join("agent.db-wal");
+    let wal = fs::read(&wal_path).unwrap();
+    assert!(!wal.is_empty());
+    // A live store must defer maintenance without replacing its WAL.
+    maintain_registry_if_idle_above(&state_dir, 1).unwrap();
+    assert_eq!(fs::read(&wal_path).unwrap(), wal);
+    assert!(!state_dir.join("quarantine").exists());
+    drop(store);
+    // A prior diagnostic backup must survive routine maintenance.
+    let diagnostic = state_dir.join("quarantine/prior-recovery");
+    fs::create_dir_all(&diagnostic).unwrap();
+    fs::write(diagnostic.join("agent.db-wal"), b"retained evidence").unwrap();
+    maintain_registry_if_idle_above(&state_dir, 1).unwrap();
+    assert!(fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0) < wal.len() as u64);
+    assert_eq!(
+        fs::read_dir(state_dir.join("quarantine")).unwrap().count(),
+        1
+    );
+    assert_eq!(
+        fs::read(diagnostic.join("agent.db-wal")).unwrap(),
+        b"retained evidence"
+    );
+    let reopened = TursoAgentStore::open_blocking(&state_dir).unwrap();
+    let restored = reopened.list_projects_blocking().unwrap().remove(0);
+    assert_eq!(restored.id, project.id);
+    assert!(!restored.enabled);
+    assert!(!state_dir.join(DIRTY_FILE).exists());
+    assert!(!state_dir.join(REQUIRED_FILE).exists());
+    drop(reopened);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn wal_limit_refuses_writes_and_opens_before_touching_durable_state() {
+    let (root, state_dir, store, project) = registered_store("wal-write-budget");
+    let wal_path = state_dir.join("agent.db-wal");
+    let wal_file = OpenOptions::new().write(true).open(&wal_path).unwrap();
+    let original_len = wal_file.metadata().unwrap().len();
+    let snapshot = fs::read(state_dir.join(SNAPSHOT_FILE)).unwrap();
+    // Sparse extension exercises the real production threshold without writing
+    // 128 MiB of data or ever asking Turso to interpret a fabricated WAL tail.
+    wal_file.set_len(WAL_WRITE_LIMIT_BYTES - 1).unwrap();
+    check_wal_write_budget(&state_dir).unwrap();
+    wal_file.set_len(WAL_WRITE_LIMIT_BYTES).unwrap();
+    let mut polled = false;
+    let mutation = store.blocking.block_on_persist(async {
+        polled = true;
+        Ok(())
+    });
+    let setting = store.set_project_enabled_blocking(project.id, !project.enabled);
+    let reopen = TursoAgentStore::open_blocking(&state_dir);
+    // Restore before any engine read or handle teardown, including assertions.
+    let after_len = wal_file.metadata().unwrap().len();
+    wal_file.set_len(original_len).unwrap();
+    assert!(!polled);
+    for error in [
+        mutation.unwrap_err(),
+        setting.unwrap_err(),
+        reopen.err().unwrap(),
+    ] {
+        let message = format!("{error:#}");
+        assert!(message.contains("128 MiB safety limit"), "{message}");
+        assert!(message.contains("clt agent recover"), "{message}");
+    }
+    assert_eq!(after_len, WAL_WRITE_LIMIT_BYTES);
+    assert_eq!(fs::read(state_dir.join(SNAPSHOT_FILE)).unwrap(), snapshot);
+    assert!(!state_dir.join(DIRTY_FILE).exists());
+    assert!(!state_dir.join(REQUIRED_FILE).exists());
+    assert_eq!(
+        store.list_projects_blocking().unwrap()[0].enabled,
+        project.enabled
+    );
+    // The guard doesn't poison the store: normal writes work once space is available.
+    store
+        .set_project_enabled_blocking(project.id, !project.enabled)
+        .unwrap();
+    assert_eq!(
+        store.list_projects_blocking().unwrap()[0].enabled,
+        !project.enabled
+    );
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn registry_snapshot_retries_contention_with_a_fresh_read_and_keeps_durable_state() {
+    let (root, state_dir, store, project) = registered_store("snapshot-contention-retry");
+    fs::remove_file(state_dir.join(SNAPSHOT_FILE)).unwrap();
+    let attempts = AtomicUsize::new(0);
+    store
+        .blocking
+        .block_on(retry_snapshot_on_contention(|| async {
+            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(
+                    anyhow::anyhow!("database is locked").context("reading registry snapshot")
+                );
+            }
+            snapshot_once(&store.recovery_db, &state_dir).await
+        }))
+        .unwrap();
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    let snapshot = read_snapshot(&state_dir).unwrap().unwrap();
+    assert_eq!(snapshot["tables"]["projects"][0]["id"], project.id);
+    assert!(check_required(&state_dir).is_ok());
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn registry_snapshot_retry_is_bounded_and_does_not_retry_other_failures() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    for (message, expected_attempts) in [("database is locked", 3), ("disk I/O error", 1)] {
+        let attempts = AtomicUsize::new(0);
+        let error = runtime
+            .block_on(retry_snapshot_on_contention(|| async {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(anyhow::anyhow!(message))
+            }))
+            .unwrap_err();
+        assert_eq!(attempts.load(Ordering::SeqCst), expected_attempts);
+        assert_eq!(error.to_string(), message);
+    }
+}
 
 #[test]
 fn registry_recovery_preserves_session_git_modes_and_accepts_older_snapshots() {
@@ -212,22 +343,168 @@ fn registry_auto_recovery_waits_for_live_store_and_session_process() {
 }
 
 #[test]
-fn registry_auto_recovery_refuses_interrupted_updates_and_repairs() {
-    for marker in [DIRTY_FILE, "recovery-in-progress.json"] {
-        let (root, state_dir, store, _) = registered_store("registry-auto-recovery-interrupted");
-        drop(store);
-        mark_required(&state_dir, "shared WAL ownership failure").unwrap();
-        fs::write(state_dir.join(marker), "interrupted").unwrap();
-        let original = bundle_contents(&state_dir);
-        assert!(recover_registry_automatically(&state_dir).is_err());
-        assert_eq!(bundle_contents(&state_dir), original);
-        assert!(!state_dir.join("quarantine").exists());
-        assert_eq!(
-            fs::read_to_string(state_dir.join(marker)).unwrap(),
-            "interrupted"
-        );
-        fs::remove_dir_all(root).unwrap();
-    }
+fn registry_auto_recovery_refuses_interrupted_repairs() {
+    let marker = "recovery-in-progress.json";
+    let (root, state_dir, store, _) = registered_store("registry-auto-recovery-interrupted");
+    drop(store);
+    mark_required(&state_dir, "shared WAL ownership failure").unwrap();
+    fs::write(state_dir.join(marker), "interrupted").unwrap();
+    let original = bundle_contents(&state_dir);
+    assert!(recover_registry_automatically(&state_dir).is_err());
+    assert_eq!(bundle_contents(&state_dir), original);
+    assert!(!state_dir.join("quarantine").exists());
+    assert_eq!(
+        fs::read_to_string(state_dir.join(marker)).unwrap(),
+        "interrupted"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn registry_open_repairs_a_crash_after_commit_without_reverting_to_the_snapshot() {
+    let (root, state_dir, store, project) = registered_store("registry-dirty-auto-recovery");
+    assert!(
+        store
+            .create_git_finalization_blocking(NewGitFinalization {
+                project_id: project.id,
+                codex_session_id: "committed-journal",
+                git_mode: AgentGitMode::CommitAndPush,
+                starting_head: Some("1111111111111111111111111111111111111111"),
+                branch_ref: Some("refs/heads/main"),
+                upstream_ref: Some("refs/remotes/origin/main"),
+                worktree_baseline: "{}",
+                task_identity: Some("preserved-task"),
+                owner_run_token: None,
+                created_at: "100",
+            })
+            .unwrap()
+    );
+    let old_snapshot = fs::read(state_dir.join(SNAPSHOT_FILE)).unwrap();
+    drop(store);
+    let child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "agent::recovery::tests::registry_dirty_commit_crash_child",
+            "--nocapture",
+        ])
+        .env(DIRTY_CHILD_STATE, &state_dir)
+        .output()
+        .unwrap();
+    assert_eq!(
+        child.status.code(),
+        Some(31),
+        "{}",
+        String::from_utf8_lossy(&child.stderr)
+    );
+    assert!(state_dir.join(DIRTY_FILE).exists());
+    assert_eq!(
+        fs::read(state_dir.join(SNAPSHOT_FILE)).unwrap(),
+        old_snapshot
+    );
+
+    let reopened = crate::agent::open_agent_store_at(&state_dir).unwrap();
+    let restored = reopened.list_projects_blocking().unwrap().remove(0);
+    assert_eq!(restored.id, project.id);
+    assert!(!restored.enabled);
+    let journal = reopened
+        .git_finalization_blocking(project.id, "committed-journal")
+        .unwrap()
+        .unwrap();
+    assert_eq!(journal.state, GitFinalizationState::PushPending);
+    assert_eq!(journal.generation, 3);
+    assert_eq!(
+        journal.commit_oid.as_deref(),
+        Some("2222222222222222222222222222222222222222")
+    );
+    let current = read_snapshot(&state_dir).unwrap().unwrap();
+    assert_eq!(
+        current["tables"]["git_finalizations"][0]["state"],
+        "push_pending"
+    );
+    assert_eq!(current["tables"]["git_finalizations"][0]["generation"], 3);
+    assert!(!state_dir.join(DIRTY_FILE).exists());
+    assert!(!state_dir.join(REQUIRED_FILE).exists());
+    let archive = fs::read_dir(state_dir.join("quarantine"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert_eq!(fs::read(archive.join(SNAPSHOT_FILE)).unwrap(), old_snapshot);
+    assert!(archive.join(DIRTY_FILE).exists());
+    drop(reopened);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn registry_dirty_commit_crash_child() {
+    let Some(state_dir) = std::env::var_os(DIRTY_CHILD_STATE) else {
+        return;
+    };
+    let state_dir = Path::new(&state_dir);
+    let store = TursoAgentStore::open_blocking(state_dir).unwrap();
+    let _writer = write_lock(state_dir).unwrap();
+    begin_update(state_dir).unwrap();
+    store.blocking.block_on_recovery(async {
+        let mut conn = store.recovery_db.connect()?;
+        let tx = conn.transaction().await?;
+        tx.execute("UPDATE projects SET enabled = 0", ()).await?;
+        tx.execute("UPDATE git_finalizations SET state = 'push_pending', generation = 3, commit_oid = '2222222222222222222222222222222222222222'", ()).await?;
+        tx.commit().await?;
+        Ok(())
+    }).unwrap();
+    // No snapshot export, lock release or graceful database teardown.
+    std::process::exit(31);
+}
+
+#[test]
+fn dirty_auto_recovery_checks_processes_missing_from_the_old_snapshot() {
+    let (root, state_dir, store, project) = registered_store("registry-dirty-live-process");
+    let old_snapshot = fs::read(state_dir.join(SNAPSHOT_FILE)).unwrap();
+    store
+        .mark_session_running_blocking(
+            project.id,
+            "unexported-session",
+            std::process::id(),
+            "live-run",
+            &root.join("out"),
+            &root.join("err"),
+        )
+        .unwrap();
+    drop(store);
+    fs::write(state_dir.join(SNAPSHOT_FILE), &old_snapshot).unwrap();
+    fs::write(state_dir.join(DIRTY_FILE), "snapshot export interrupted").unwrap();
+    let original = bundle_contents(&state_dir);
+    let error = crate::agent::open_agent_store_at(&state_dir).err().unwrap();
+    assert!(format!("{error:#}").contains("waiting for worker/session process"));
+    assert_eq!(bundle_contents(&state_dir), original);
+    assert_eq!(
+        fs::read(state_dir.join(SNAPSHOT_FILE)).unwrap(),
+        old_snapshot
+    );
+    assert!(state_dir.join(DIRTY_FILE).exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn dirty_auto_recovery_never_reconstructs_from_a_stale_snapshot() {
+    let (root, state_dir, store, _) = registered_store("registry-dirty-unrepairable");
+    drop(store);
+    fs::write(state_dir.join(DIRTY_FILE), "snapshot export interrupted").unwrap();
+    corrupt_database(&state_dir);
+    let original = bundle_contents(&state_dir);
+    let snapshot = fs::read(state_dir.join(SNAPSHOT_FILE)).unwrap();
+    assert!(crate::agent::open_agent_store_at(&state_dir).is_err());
+    assert!(crate::agent::open_agent_store_at(&state_dir).is_err());
+    assert_eq!(bundle_contents(&state_dir), original);
+    assert_eq!(fs::read(state_dir.join(SNAPSHOT_FILE)).unwrap(), snapshot);
+    assert!(state_dir.join(DIRTY_FILE).exists());
+    assert!(state_dir.join(REQUIRED_FILE).exists());
+    assert_eq!(
+        fs::read_dir(state_dir.join("quarantine")).unwrap().count(),
+        1
+    );
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

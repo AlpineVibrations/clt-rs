@@ -2,9 +2,10 @@
 use std::{
     collections::HashSet,
     fs::{self, File, OpenOptions},
+    future::Future,
     io::Write,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
@@ -20,6 +21,8 @@ const DIRTY_FILE: &str = "registry-dirty";
 const REQUIRED_FILE: &str = "recovery-required";
 const RECOVERING_REASON: &str = "Exclusive registry recovery in progress";
 const BUNDLE_FILES: [&str; 4] = ["agent.db", "agent.db-wal", "agent.db-tshm", "agent.db-shm"];
+const WAL_MAINTENANCE_BYTES: u64 = 64 * 1024 * 1024;
+const WAL_WRITE_LIMIT_BYTES: u64 = 128 * 1024 * 1024;
 
 // Retain identity, user choices and immutable Git boundaries, not run history or leases.
 const TABLES: &[(&str, &str)] = &[
@@ -86,9 +89,21 @@ fn lock_file(state_dir: &Path, name: &str) -> Result<File> {
 
 pub(super) fn write_lock(state_dir: &Path) -> Result<RegistryWriteLock> {
     let file = lock_file(state_dir, "agent-write.lock")?;
-    file.lock()
-        .context("Failed to serialize durable registry updates")?;
-    Ok(RegistryWriteLock(file))
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(RegistryWriteLock(file)),
+            Err(fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(fs::TryLockError::WouldBlock) => anyhow::bail!(
+                "Another CLT process is still updating the agent registry; retry shortly. If it stays busy, close other CLT windows and run `clt agent recover`."
+            ),
+            Err(fs::TryLockError::Error(error)) => {
+                return Err(error).context("Failed to serialize durable registry updates");
+            }
+        }
+    }
 }
 
 pub(crate) fn check_required(state_dir: &Path) -> Result<()> {
@@ -121,10 +136,35 @@ pub(super) fn mark_required(state_dir: &Path, reason: &str) -> Result<()> {
 
 pub(super) fn begin_update(state_dir: &Path) -> Result<()> {
     check_clean(state_dir)?;
+    check_wal_write_budget(state_dir)?;
     atomic_write(
         &state_dir.join(DIRTY_FILE),
         b"Registry update in progress; snapshot may lag the database",
     )
+}
+
+/// Checked while holding the writer lock, before polling a mutation or marking
+/// the snapshot dirty. Long-lived stores can pin the WAL indefinitely, so idle
+/// maintenance alone cannot keep it below the engine's shared-index capacity.
+pub(super) fn check_wal_write_budget(state_dir: &Path) -> Result<()> {
+    let path = state_dir.join("agent.db-wal");
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("Failed to check registry WAL size"),
+    };
+    anyhow::ensure!(
+        metadata.is_file(),
+        "Registry WAL is not a file: {}",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.len() < WAL_WRITE_LIMIT_BYTES,
+        "Registry WAL reached the 128 MiB safety limit ({} MiB); database updates are paused because automatic cleanup could not get exclusive access. Close other CLT windows and foreground sessions, then run `clt agent recover` followed by `clt agent start` (state: {}). No update was started.",
+        metadata.len() / (1024 * 1024),
+        state_dir.display()
+    );
+    Ok(())
 }
 
 pub(super) fn finish_update(state_dir: &Path) -> Result<()> {
@@ -197,6 +237,43 @@ fn remove_if_exists(path: &Path) -> Result<()> {
 }
 
 pub(super) async fn snapshot(db: &Database, state_dir: &Path) -> Result<()> {
+    retry_snapshot_on_contention(|| snapshot_once(db, state_dir)).await
+}
+
+async fn retry_snapshot_on_contention<F, Fut>(mut read_snapshot: F) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    for attempt in 0..3 {
+        match read_snapshot().await {
+            Err(error)
+                if attempt < 2
+                    && error
+                        .chain()
+                        .any(|cause| cause.to_string() == "database is locked") =>
+            {
+                // The DB mutation has already completed. Retry only the
+                // snapshot, with a fresh connection/transaction, while the
+                // caller retains the writer lock and dirty marker.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            result => return result,
+        }
+    }
+    unreachable!("the final snapshot attempt always returns")
+}
+
+async fn snapshot_once(db: &Database, state_dir: &Path) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(&read_database_snapshot(db).await?)?;
+    let path = state_dir.join(SNAPSHOT_FILE);
+    if fs::read(&path).ok().as_deref() != Some(bytes.as_slice()) {
+        atomic_write(&path, &bytes)?;
+    }
+    Ok(())
+}
+
+async fn read_database_snapshot(db: &Database) -> Result<Json> {
     let mut conn = db.connect()?;
     configure_agent_connection(&conn).await?;
     let transaction = conn.transaction().await?;
@@ -267,12 +344,7 @@ pub(super) async fn snapshot(db: &Database, state_dir: &Path) -> Result<()> {
     }
     transaction.commit().await?;
     let version = if has_session_modes { 2 } else { 1 };
-    let bytes = serde_json::to_vec_pretty(&json!({"version": version, "tables": tables}))?;
-    let path = state_dir.join(SNAPSHOT_FILE);
-    if fs::read(&path).ok().as_deref() != Some(bytes.as_slice()) {
-        atomic_write(&path, &bytes)?;
-    }
-    Ok(())
+    Ok(json!({"version": version, "tables": tables}))
 }
 
 pub(crate) fn read_snapshot(state_dir: &Path) -> Result<Option<Json>> {
@@ -469,7 +541,37 @@ pub(crate) fn recover_registry_with(
     state_dir: &Path,
     stop_services: impl Fn(&Json) -> Result<()>,
 ) -> Result<RecoveryReport> {
-    recover_registry_with_policy(state_dir, stop_services, false)
+    recover_registry_with_policy(state_dir, stop_services, false, false)
+}
+
+/// Compact between registry users, well before the shared frame index fills.
+/// Busy stores or live workers defer maintenance without affecting their work.
+pub(crate) fn maintain_registry_if_idle(state_dir: &Path) -> Result<()> {
+    maintain_registry_if_idle_above(state_dir, WAL_MAINTENANCE_BYTES)
+}
+
+fn maintain_registry_if_idle_above(state_dir: &Path, threshold: u64) -> Result<()> {
+    let wal = state_dir.join("agent.db-wal");
+    if !fs::metadata(wal).is_ok_and(|metadata| metadata.len() >= threshold)
+        || !state_dir.join(SNAPSHOT_FILE).exists()
+        || state_dir.join(DIRTY_FILE).exists()
+        || check_required(state_dir).is_err()
+    {
+        return Ok(());
+    }
+    let result = recover_registry_with_policy(
+        state_dir,
+        |manifest| {
+            crate::platform::ensure_agent_processes_stopped_for_recovery(state_dir, manifest)
+        },
+        true,
+        true,
+    );
+    match result {
+        Ok(_) => Ok(()),
+        Err(_) if check_required(state_dir).is_ok() => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 /// Opportunistic repair on a fresh open, after all unhealthy handles are gone.
@@ -484,6 +586,7 @@ pub(crate) fn recover_registry_automatically(state_dir: &Path) -> Result<()> {
             crate::platform::ensure_agent_processes_stopped_for_recovery(state_dir, manifest)
         },
         true,
+        false,
     );
     match result {
         Ok(report) => {
@@ -503,6 +606,7 @@ fn recover_registry_with_policy(
     state_dir: &Path,
     stop_services: impl Fn(&Json) -> Result<()>,
     automatic: bool,
+    maintenance: bool,
 ) -> Result<RecoveryReport> {
     if let Some(manifest) = read_snapshot(state_dir)? {
         stop_services(&manifest)?;
@@ -512,17 +616,16 @@ fn recover_registry_with_policy(
     let snapshot = read_snapshot(state_dir)?;
     if automatic {
         anyhow::ensure!(
-            check_required(state_dir).is_err(),
+            maintenance || check_required(state_dir).is_err(),
             "Registry already recovered"
         );
         anyhow::ensure!(
             snapshot.is_some(),
             "Automatic recovery requires an external registry snapshot; run clt agent recover"
         );
-        anyhow::ensure!(
-            !state_dir.join(DIRTY_FILE).exists(),
-            "An interrupted registry update requires manual recovery; run clt agent recover"
-        );
+        // A dirty snapshot is not evidence that the original DB is corrupt.
+        // Repair that DB and export its committed state; automatic recovery
+        // still never reconstructs from a potentially stale external snapshot.
         anyhow::ensure!(
             !state_dir.join("recovery-in-progress.json").exists(),
             "A previous registry repair did not finish; run clt agent recover"
@@ -561,11 +664,19 @@ fn recover_registry_with_policy(
             "The original agent database is missing or empty"
         );
         {
-            let store = TursoAgentStore::open_for_recovery(state_dir)?;
-            store.blocking.block_on_recovery(async {
-                health::repair_worker_indexes_if_needed(&store.recovery_db).await?;
-                snapshot_db(&store.recovery_db, state_dir).await
-            })?;
+            let mut store = TursoAgentStore::open_for_recovery(state_dir)?;
+            if automatic && dirty {
+                // The failed export may predate a newly registered process.
+                // Check authoritative rows too before completing the repair.
+                let committed = store
+                    .blocking
+                    .block_on_recovery(read_database_snapshot(&store.recovery_db))?;
+                stop_services(&committed)?;
+            }
+            checkpoint_exclusive_registry(&mut store)?;
+            store
+                .blocking
+                .block_on_recovery(snapshot_db(&store.recovery_db, state_dir))?;
         }
         verify_recovery_teardown(state_dir)
     };
@@ -610,9 +721,41 @@ fn recover_registry_with_policy(
     remove_if_exists(&progress)?;
     remove_if_exists(&state_dir.join(REQUIRED_FILE))?;
     sync_directory(state_dir)?;
+    if maintenance {
+        // Routine checkpoints must not turn a bounded WAL into unbounded
+        // archived WALs. Keep the backup until teardown and snapshot durability
+        // have succeeded. Manual/failed recovery archives are never pruned here.
+        fs::remove_dir_all(&quarantine)
+            .context("Failed to remove completed registry maintenance backup")?;
+        sync_directory(&state_dir.join("quarantine"))?;
+    }
     Ok(RecoveryReport {
         quarantine,
         rebuilt_registry,
+    })
+}
+
+fn checkpoint_exclusive_registry(store: &mut TursoAgentStore) -> Result<()> {
+    // The caller holds exclusive registry access and has quarantined DB + WAL.
+    // Ordinary stores retain their checkpoint pin; only this fenced maintenance
+    // path releases it after proving the original database is readable.
+    store
+        .blocking
+        .block_on_recovery(health::repair_worker_indexes_if_needed(&store.recovery_db))?;
+    let pin = store
+        .checkpoint_pin
+        .take()
+        .context("Recovery checkpoint pin is missing")?;
+    store.blocking.block_on_recovery(async {
+        pin.execute("ROLLBACK", ()).await?;
+        let mut rows = pin.query("PRAGMA wal_checkpoint(TRUNCATE)", ()).await?;
+        let row = rows
+            .next()
+            .await?
+            .context("Registry checkpoint returned no result")?;
+        anyhow::ensure!(row.get::<i64>(0)? == 0, "Registry checkpoint is still busy");
+        drop(rows);
+        integrity_check(&store.recovery_db).await
     })
 }
 

@@ -447,11 +447,21 @@ async fn run_agent_daemon_loop_inner(
 
     loop {
         if recovery_error.is_none()
+            // Let an in-flight pass return and release its handles before the
+            // failure branch below attempts exclusive recovery.
+            && active_passes.is_empty()
             && let Err(error) = agent::recovery::check_required(&state_dir)
         {
-            eprintln!("{error:#}; stopping the scheduler without further database retries");
-            recovery_error = Some(error);
-            shutdown.store(true, Ordering::SeqCst);
+            let repair = if active_runs.is_empty() && !shutdown.load(Ordering::SeqCst) {
+                repair_idle_scheduler_registry(&state_dir).await
+            } else {
+                Err(error)
+            };
+            if let Err(error) = repair {
+                eprintln!("{error:#}; stopping the scheduler without further database retries");
+                recovery_error = Some(error);
+                shutdown.store(true, Ordering::SeqCst);
+            }
         }
         let mut run_index = 0;
         while run_index < active_runs.len() {
@@ -487,7 +497,22 @@ async fn run_agent_daemon_loop_inner(
                 Ok(Ok(start)) => start,
                 Ok(Err(error)) => {
                     if agent::recovery::check_required(&state_dir).is_err() {
-                        recovery_error = Some(error);
+                        // The failed pass has returned and dropped its store.
+                        // Never retry a query through an unhealthy handle.
+                        if active_runs.is_empty() && !shutdown.load(Ordering::SeqCst) {
+                            match repair_idle_scheduler_registry(&state_dir).await {
+                                Ok(()) => {
+                                    next_sleep = poll_interval;
+                                    continue;
+                                }
+                                Err(repair_error) => {
+                                    recovery_error =
+                                        Some(repair_error.context(format!("{error:#}")));
+                                }
+                            }
+                        } else {
+                            recovery_error = Some(error);
+                        }
                         shutdown.store(true, Ordering::SeqCst);
                         continue;
                     }
@@ -576,6 +601,14 @@ async fn run_agent_daemon_loop_inner(
 
         wait_for_agent_daemon_sleep_or_shutdown(next_sleep, max_passes, &shutdown).await?;
     }
+}
+
+async fn repair_idle_scheduler_registry(state_dir: &Path) -> Result<()> {
+    let state_dir = state_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || agent::recovery::recover_registry_automatically(&state_dir))
+        .await
+        .context("Agent registry recovery task failed")?
+        .context("Agent registry recovery required; automatic repair could not proceed")
 }
 
 pub(super) async fn wait_for_agent_daemon_sleep_or_shutdown(
@@ -1964,8 +1997,23 @@ pub(super) fn agent_lease_holder_pid(holder: &str) -> Option<u32> {
 }
 
 pub(super) fn scan_agent_project(project_root: &Path) -> AgentProjectScan {
-    if !project_root.exists() {
-        return AgentProjectScan::missing();
+    match std::fs::metadata(project_root) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return AgentProjectScan::unavailable(anyhow::anyhow!(
+                "Project path is not a directory: {}",
+                project_root.display()
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return AgentProjectScan::missing();
+        }
+        Err(error) => {
+            return AgentProjectScan::unavailable(anyhow::Error::new(error).context(format!(
+                "Failed to access project directory {}",
+                project_root.display()
+            )));
+        }
     }
 
     match ensure_existing_board(project_root) {
@@ -2082,7 +2130,7 @@ impl AgentProjectScan {
 
     pub(super) fn unavailable(err: anyhow::Error) -> Self {
         Self {
-            status: AgentProjectScanStatus::Unavailable(err.to_string()),
+            status: AgentProjectScanStatus::Unavailable(format!("{err:#}")),
             todo_count: 0,
             blocked_todo_count: 0,
             stopped_todo_count: 0,

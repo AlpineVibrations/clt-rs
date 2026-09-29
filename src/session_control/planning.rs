@@ -1,6 +1,6 @@
 //! Create a durable planning conversation without starting an automated turn.
 use std::{
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::Path,
     process::{Command, Stdio},
     sync::mpsc,
@@ -162,10 +162,11 @@ fn create_planning_thread(
     prompt: String,
     timeout: Duration,
 ) -> Result<String> {
+    let mut diagnostics = tempfile::tempfile().context("Unable to capture Codex startup errors")?;
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(diagnostics.try_clone()?);
     configure_agent_child_command(command);
     let mut child = command
         .spawn()
@@ -195,7 +196,21 @@ fn create_planning_thread(
     // No model turn is launched. Reap the local server and any startup children on
     // success, protocol failure, or timeout before releasing the project fence.
     stop_agent_child_process(&mut child).context("Unable to stop the planning app-server")?;
-    result
+    result.map_err(|error| {
+        let mut tail = String::new();
+        let start = diagnostics
+            .metadata()
+            .map(|m| m.len().saturating_sub(8192))
+            .unwrap_or(0);
+        if diagnostics.seek(SeekFrom::Start(start)).is_ok()
+            && diagnostics.read_to_string(&mut tail).is_ok()
+            && !tail.trim().is_empty()
+        {
+            error.context(format!("Codex startup error: {}", tail.trim()))
+        } else {
+            error
+        }
+    })
 }
 
 fn planning_protocol(

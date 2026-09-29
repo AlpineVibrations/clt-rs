@@ -423,7 +423,32 @@ pub(super) fn acquire_board_mutation_lock_with_contention_callback(
 
 pub(super) fn ensure_existing_board(root: &Path) -> Result<bool> {
     let tasks_dir = get_tasks_dir(root);
-    if !tasks_dir.is_dir() || !board_has_any_status_store(&tasks_dir) {
+    let metadata = |path: &Path| -> Result<Option<fs::Metadata>> {
+        match fs::metadata(path) {
+            Ok(metadata) => Ok(Some(metadata)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => {
+                Err(error).with_context(|| format!("Failed to access {}", path.display()))
+            }
+        }
+    };
+    let Some(tasks_metadata) = metadata(&tasks_dir)? else {
+        return Ok(false);
+    };
+    anyhow::ensure!(
+        tasks_metadata.is_dir(),
+        "Task board path is not a directory: {}",
+        tasks_dir.display()
+    );
+    let mut has_status_store = false;
+    for status in TASK_STATUSES {
+        // Check every store before repair: an inaccessible status must never
+        // be treated as an absent store that needs initializing.
+        has_status_store |= metadata(&tasks_dir.join(status.as_str()))?.is_some_and(|m| m.is_dir());
+        has_status_store |=
+            metadata(&tasks_dir.join(status.filename()))?.is_some_and(|m| m.is_file());
+    }
+    if !has_status_store {
         return Ok(false);
     }
 

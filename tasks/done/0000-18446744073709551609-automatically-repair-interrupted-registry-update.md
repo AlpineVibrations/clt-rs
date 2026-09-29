@@ -1,0 +1,3 @@
+Automatically repair interrupted registry updates without losing committed state
+
+COMPLETED 2026-09-29: Automatically repair interrupted snapshot exports from the original DB/WAL, retaining committed settings and Git journals. Recheck process ownership against committed rows when the snapshot is stale. Idle schedulers attempt exclusive repair with fresh handles before stopping. Unreadable originals, live owners, and unfinished repairs retain their evidence and never trigger automatic snapshot reconstruction. Verified with a subprocess crash after commit, stale snapshot/live process and unreadable DB regressions, scheduler resumption, formatting, strict clippy, and the full test suite.

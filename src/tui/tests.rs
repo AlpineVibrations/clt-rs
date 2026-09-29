@@ -2278,7 +2278,9 @@ fn agent_project_table_surfaces_external_daemon_scan_errors() {
     item.project.path = PathBuf::from("/Volumes/External/FISHDOME");
     item.project.last_daemon_scan_status = Some("unavailable".to_string());
     item.project.last_daemon_scan_error = Some("Operation not permitted (os error 1)".to_string());
-    item.daemon_scan_problem = tui_agent_daemon_scan_problem(&item.project);
+    item.scan =
+        AgentProjectScan::unavailable(anyhow::anyhow!("Operation not permitted (os error 1)"));
+    item.daemon_scan_problem = tui_agent_daemon_scan_problem(&item.project, &item.scan);
     item.runtime_state = TuiAgentRuntimeState::Error;
 
     let codex_width = agent_codex_column_width(std::slice::from_ref(&item), false);
@@ -2301,6 +2303,23 @@ fn agent_project_table_surfaces_external_daemon_scan_errors() {
     assert!(console.contains("Full Disk Access"));
     assert!(console.contains("restart the agent"));
     assert_eq!(color, Color::LightRed);
+}
+
+#[test]
+fn readable_project_explains_previous_daemon_failure_without_claiming_drive_is_missing() {
+    let mut item = tui_agent_project_for_test(1, "fishdome");
+    item.project.path = PathBuf::from("/Volumes/External/FISHDOME");
+    for status in ["missing", "unavailable", "uninitialized"] {
+        item.project.last_daemon_scan_status = Some(status.to_string());
+        let problem =
+            tui_agent_daemon_scan_problem(&item.project, &AgentProjectScan::empty()).unwrap();
+        assert!(problem.contains("readable in this CLT window"));
+        assert!(problem.contains(&format!("Last background-agent scan reported {status}")));
+        assert!(problem.contains("clt agent status"));
+        assert!(!problem.contains("Make sure the drive is mounted"));
+    }
+    item.project.last_daemon_scan_status = Some("empty".to_string());
+    assert!(tui_agent_daemon_scan_problem(&item.project, &AgentProjectScan::empty()).is_none());
 }
 
 #[test]

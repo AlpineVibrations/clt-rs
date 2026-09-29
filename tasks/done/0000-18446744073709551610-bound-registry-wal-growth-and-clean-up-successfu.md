@@ -1,0 +1,3 @@
+Bound registry WAL growth and clean up successful maintenance backups
+
+COMPLETED 2026-09-29: Added a 128 MiB WAL admission guard before ordinary opens and durable updates, including already-open clients; retained idle checkpointing at 64 MiB. Successful routine maintenance removes only its own backup after verified durable completion. Regression tests verify refusal before mutation/dirty markers, unchanged settings/snapshot, resumed writes after space becomes available, checkpoint preservation, and retention of prior recovery evidence. Formatting, strict clippy, and the full test suite passed.

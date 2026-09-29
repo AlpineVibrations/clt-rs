@@ -41,7 +41,7 @@ use crate::{
         valid_environment_variable_name,
     },
     application::{
-        AgentLeaseHolderLiveness, AgentProjectScan, delete_task_in_board,
+        AgentLeaseHolderLiveness, AgentProjectScan, AgentProjectScanStatus, delete_task_in_board,
         ensure_status_conversion_allowed, move_task_in_board, move_task_to_archive_in_board,
         project_display_name, reorder_task_in_board, update_task_in_board,
     },
@@ -2768,7 +2768,7 @@ pub(super) fn load_tui_agent_panel_snapshot_inner(
         .into_iter()
         .map(|project| {
             let scan = scan_agent_project(&project.path);
-            let daemon_scan_problem = tui_agent_daemon_scan_problem(&project);
+            let daemon_scan_problem = tui_agent_daemon_scan_problem(&project, &scan);
             let latest_run = if project.enabled
                 && project.failure_count > 0
                 && (scan.todo_count > 0
@@ -2869,12 +2869,35 @@ pub(super) fn resolve_tui_agent_runtime_state(
     runtime_state
 }
 
-pub(super) fn tui_agent_daemon_scan_problem(project: &agent::AgentProject) -> Option<String> {
+pub(super) fn tui_agent_daemon_scan_problem(
+    project: &agent::AgentProject,
+    local_scan: &AgentProjectScan,
+) -> Option<String> {
     if !project.enabled {
         return None;
     }
 
     let status = project.last_daemon_scan_status.as_deref()?;
+    // The terminal and launchd can have different filesystem permissions. A
+    // successful local scan is not proof that the daemon can access the board,
+    // but an old daemon result is not proof that the drive is still missing.
+    if matches!(status, "missing" | "unavailable" | "uninitialized")
+        && matches!(
+            local_scan.status,
+            AgentProjectScanStatus::Pending
+                | AgentProjectScanStatus::Blocked
+                | AgentProjectScanStatus::Empty
+        )
+    {
+        return Some(format!(
+            "Project board is readable in this CLT window. Last background-agent scan reported {status}: {}. The agent will recheck on its next pass; if this persists, check `clt agent status` and the background service's access to {}.",
+            project
+                .last_daemon_scan_error
+                .as_deref()
+                .unwrap_or("the board was not accessible"),
+            project.path.display()
+        ));
+    }
     let external_project = project.path.starts_with("/Volumes");
     match status {
         "unavailable" if external_project => Some(format!(
@@ -5630,6 +5653,20 @@ pub(super) fn selected_tui_agent_session_target_at(
     ))
 }
 
+fn wait_after_failed_codex_handoff(result: &Result<std::process::ExitStatus>) {
+    if result.as_ref().is_ok_and(|status| status.success()) {
+        return;
+    }
+    match result {
+        Ok(status) => {
+            eprintln!("\nCodex failed to stay open ({status}). The startup error is shown above.")
+        }
+        Err(error) => eprintln!("\nCodex handoff failed: {error:#}"),
+    }
+    eprintln!("Press Enter to return to CLT.");
+    let _ = io::stdin().read_line(&mut String::new());
+}
+
 pub(super) fn run_tui_codex_session_interrupt(
     terminal: &mut TuiTerminal,
     terminal_session: &mut TerminalSession,
@@ -5653,6 +5690,7 @@ pub(super) fn run_tui_codex_session_interrupt(
         &provisional_holder,
         InteractiveCodexResumeMode::ResumeExec,
     );
+    wait_after_failed_codex_handoff(&resume_result);
     let _ = write_tui_codex_handoff_status(&mut stdout(), TuiCodexHandoffStage::QueueingExecResume);
     let guardian_completed = resume_result.as_ref().is_ok_and(|status| status.success());
     let queue_result = if guardian_completed {
@@ -5865,6 +5903,7 @@ pub(super) fn run_tui_codex_session_continue(
             InteractiveCodexResumeMode::WritableIdle
         },
     );
+    wait_after_failed_codex_handoff(&resume_result);
     let _ =
         write_tui_codex_handoff_status(&mut stdout(), TuiCodexHandoffStage::RestoringTaskControls);
     let guardian_completed = resume_result.as_ref().is_ok_and(|status| status.success());
@@ -7982,6 +8021,10 @@ pub(super) fn execute_tui_key_effect(
                                 return Ok(false);
                             }
                             app.agent_panel.refresh(&app.active_root);
+                            if let Some(error) = &app.agent_panel.last_error {
+                                app.feedback_buffer = error.clone();
+                                return Ok(false);
+                            }
                             if !app.agent_panel.select_project_for_path(&app.active_root) {
                                 app.feedback_buffer = "Register this project before opening a Codex planning session.".to_string();
                                 return Ok(false);
@@ -8018,8 +8061,9 @@ pub(super) fn execute_tui_key_effect(
                                 Ok(message) => app.feedback_buffer = message,
                                 Err(error) if !terminal_session.active => return Err(error),
                                 Err(error) => {
-                                    app.feedback_buffer =
-                                        format!("Unable to open a Codex planning session: {error}")
+                                    app.feedback_buffer = format!(
+                                        "Unable to open a Codex planning session: {error:#}"
+                                    )
                                 }
                             }
                             app.agent_panel.refresh(&app.active_root);
