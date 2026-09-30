@@ -1003,6 +1003,7 @@ fn exact_resume_claim_registers_child_and_extends_the_live_lease_atomically() {
                 lease_holder: "expired-holder",
                 lease_timeout_seconds: 120,
                 claim_requested_resume: true,
+                claim_planning_session: false,
             },)
             .unwrap()
     );
@@ -1031,6 +1032,7 @@ fn exact_resume_claim_registers_child_and_extends_the_live_lease_atomically() {
                 lease_holder: "wrong-holder",
                 lease_timeout_seconds: 120,
                 claim_requested_resume: true,
+                claim_planning_session: false,
             },)
             .unwrap()
     );
@@ -1055,6 +1057,7 @@ fn exact_resume_claim_registers_child_and_extends_the_live_lease_atomically() {
                 lease_holder: holder,
                 lease_timeout_seconds: 120,
                 claim_requested_resume: true,
+                claim_planning_session: false,
             },)
             .unwrap()
     );
@@ -1099,6 +1102,7 @@ fn unproven_spawned_child_keeps_an_exact_resume_claim_fenced() {
                     lease_holder: request.lease_holder,
                     lease_timeout_seconds: 60,
                     claim_requested_resume: true,
+                    claim_planning_session: false,
                 },
             )?);
             Err(anyhow::Error::new(AgentChildTerminationUnproven(

@@ -6,6 +6,12 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+## [0.7.5] - 2026-09-30
+
+### Fixed
+
+- Resume a Todo task’s attached Codex planning session when automation starts implementation, preserving the plan, conversation history, and task link across Git modes. Keep stopped tasks stopped and reject a different session trying to replace the planning link.
+
 ### Changed
 
 - Add minimal guidance to the task-management skill to check dependency chains and avoid circular task dependencies.

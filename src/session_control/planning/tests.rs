@@ -655,7 +655,7 @@ fn planning_preserves_queued_recovery_through_interactive_exit_and_reopen() {
 }
 
 #[test]
-fn planned_todo_can_be_claimed_by_a_fresh_git_off_worker() {
+fn planned_todo_cannot_be_claimed_by_a_different_git_off_session() {
     let f = Fixture::new(false);
     let board = get_tasks_dir(&f.project.path);
     fs::write(board.join("todo.md"), "- Plan this\n").unwrap();
@@ -678,7 +678,7 @@ fn planned_todo_can_be_claimed_by_a_fresh_git_off_worker() {
             &f.project.path.join("err"),
         )
         .unwrap();
-    crate::application::move_task_to_doing_with_agent_session(
+    let error = crate::application::move_task_to_doing_with_agent_session(
         &f.project.path,
         "1",
         &crate::runner::AutomatedAgentChildContext {
@@ -688,17 +688,15 @@ fn planned_todo_can_be_claimed_by_a_fresh_git_off_worker() {
         &f.project,
         &f.store,
     )
-    .unwrap();
+    .unwrap_err();
+    assert!(error.to_string().contains("different Codex session"));
     let doing = read_task_entries(&board, TaskStatus::Doing).unwrap();
-    assert_eq!(doing.len(), 1);
+    assert!(doing.is_empty());
+    let todo = read_task_entries(&board, TaskStatus::Todo).unwrap();
+    assert_eq!(todo.len(), 1);
     assert_eq!(
-        codex_session_for_task(&doing[0]).as_deref(),
-        Some("implementation-456")
-    );
-    assert!(
-        read_task_entries(&board, TaskStatus::Todo)
-            .unwrap()
-            .is_empty()
+        codex_session_for_task(&todo[0]).as_deref(),
+        Some("planning-123")
     );
 }
 
@@ -889,6 +887,29 @@ fn stopped_todo_can_plan_and_reopen_but_requires_explicit_restart_for_automation
             crate::tui::task_display_text_with_agent_flag(&restarted, TaskStatus::Todo, &states),
             "Refined plan."
         );
+        assert_eq!(
+            crate::worker::automated_codex_session_to_resume(
+                &f.project.path,
+                crate::application::AgentTaskSelection::NextTodo,
+            )
+            .unwrap()
+            .as_deref(),
+            Some("planning-123")
+        );
+        f.store
+            .mark_session_running_blocking(
+                f.project.id,
+                "planning-123",
+                1235,
+                "run-planned",
+                &f.project.path.join("planned.out"),
+                &f.project.path.join("planned.err"),
+            )
+            .unwrap();
+        let context = crate::runner::AutomatedAgentChildContext {
+            project_id: f.project.id,
+            run_token: "run-planned".into(),
+        };
         crate::application::move_task_to_doing_with_agent_session(
             &f.project.path,
             "1",
@@ -902,7 +923,7 @@ fn stopped_todo_can_plan_and_reopen_but_requires_explicit_restart_for_automation
             .remove(0);
         assert_eq!(
             codex_session_for_task(&doing).as_deref(),
-            Some("implementation-456")
+            Some("planning-123")
         );
     }
 }

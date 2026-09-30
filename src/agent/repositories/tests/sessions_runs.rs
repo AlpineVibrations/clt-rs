@@ -6,6 +6,107 @@ use std::fs;
 
 const OBSERVER: &str = "clt-reattached-123-claim";
 
+#[test]
+fn planning_session_launch_claim_requires_idle_unstarted_session_and_live_lease() {
+    for scenario in [
+        "planning",
+        "external",
+        "running",
+        "interactive",
+        "run-token",
+        "child",
+        "holder",
+        "launch-token",
+        "history",
+        "git-mode",
+        "wrong-lease",
+        "expired-lease",
+    ] {
+        let root = temp_root("planning-launch-claim");
+        fs::create_dir_all(&root).unwrap();
+        let store = TursoAgentStore::open_blocking(&root.join("state")).unwrap();
+        store.register_project_blocking(&root, "project").unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0).id;
+        if scenario != "external" {
+            assert!(
+                store
+                    .register_shared_planning_session_blocking(project, "plan")
+                    .unwrap()
+            );
+        }
+        store.blocking.block_on_persist(async {
+            let conn = store.repositories.sessions_runs.connect().await?;
+            let sql = match scenario {
+                "running" => Some("UPDATE session_controls SET state = 'running' WHERE project_id = ?1"),
+                "interactive" => Some("UPDATE session_controls SET state = 'interactive' WHERE project_id = ?1"),
+                "run-token" => Some("UPDATE session_controls SET run_token = 'old-run' WHERE project_id = ?1"),
+                "child" => Some("UPDATE session_controls SET child_pid = 123 WHERE project_id = ?1"),
+                "holder" => Some("UPDATE session_controls SET interactive_holder = 'other' WHERE project_id = ?1"),
+                "launch-token" => Some("UPDATE session_controls SET interactive_launch_token = 'other' WHERE project_id = ?1"),
+                "history" => Some("INSERT INTO runs (project_id, codex_session_id, status, started_at, finished_at) VALUES (?1, 'plan', 'success', '100', '101')"),
+                "git-mode" => Some("INSERT INTO session_git_modes (project_id, codex_session_id, git_mode) VALUES (?1, 'plan', 'off')"),
+                _ => None,
+            };
+            if let Some(sql) = sql { conn.execute(sql, [project]).await?; }
+            Ok(())
+        }).unwrap();
+        assert!(
+            store
+                .try_acquire_lease_blocking(
+                    project,
+                    "holder",
+                    "100",
+                    if scenario == "expired-lease" {
+                        "101"
+                    } else {
+                        "9999999999"
+                    }
+                )
+                .unwrap()
+        );
+        let before = store.session_control_blocking(project, "plan").unwrap();
+        let started = store
+            .register_known_session_with_child_blocking(AgentKnownSessionRegistration {
+                project_id: project,
+                codex_session_id: "plan",
+                child_pid: 456,
+                run_token: "new-run",
+                stdout_path: &root.join("out"),
+                stderr_path: &root.join("err"),
+                lease_holder: if scenario == "wrong-lease" {
+                    "other"
+                } else {
+                    "holder"
+                },
+                lease_timeout_seconds: 60,
+                claim_requested_resume: false,
+                claim_planning_session: true,
+            })
+            .unwrap();
+        assert_eq!(
+            started,
+            matches!(scenario, "planning" | "external"),
+            "{scenario}"
+        );
+        let after = store.session_control_blocking(project, "plan").unwrap();
+        if started {
+            let after = after.unwrap();
+            assert_eq!(after.state, AgentSessionControlState::Running);
+            assert_eq!(after.run_token.as_deref(), Some("new-run"));
+            assert_eq!(after.child_pid, Some(456));
+            assert!(
+                !store
+                    .planning_session_can_start_blocking(project, "plan")
+                    .unwrap()
+            );
+        } else {
+            assert_eq!(before, after, "{scenario}");
+        }
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
 fn supervision_fixture(
     label: &str,
 ) -> (PathBuf, PathBuf, TursoAgentStore, AgentSessionControlRecord) {

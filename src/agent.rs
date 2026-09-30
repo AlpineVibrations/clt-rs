@@ -1348,6 +1348,7 @@ pub(super) struct AgentKnownSessionRegistration<'a> {
     pub(crate) lease_holder: &'a str,
     pub(crate) lease_timeout_seconds: u64,
     pub(crate) claim_requested_resume: bool,
+    pub(crate) claim_planning_session: bool,
 }
 
 pub(super) struct AgentLeaseRecord {

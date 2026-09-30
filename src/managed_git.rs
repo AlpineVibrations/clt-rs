@@ -940,14 +940,14 @@ pub(super) fn prepare_agent_git_start_state_for_run(
     store: &agent::TursoAgentStore,
     project: &agent::AgentProject,
     task_selection: AgentTaskSelection,
-    has_known_session: bool,
+    has_started_session: bool,
     has_existing_session_finalization: bool,
     run_token: &str,
 ) -> Result<Option<AgentGitStartState>> {
     if project.git_mode == AgentGitMode::Off {
         return Ok(None);
     }
-    if has_known_session && !has_existing_session_finalization {
+    if has_started_session && !has_existing_session_finalization {
         anyhow::bail!(
             "Known Codex session has no frozen Git start journal; CLT will not reconstruct the task boundary from a later checkout"
         );

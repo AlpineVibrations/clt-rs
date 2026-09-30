@@ -48,7 +48,7 @@ use crate::{
     task::{
         TaskEntry, TaskStatus, acquire_board_mutation_lock,
         attach_codex_session_to_task_after_lock, durable_task_identity, get_tasks_dir,
-        read_task_entries, task_entry_is_blocked, task_entry_is_stopped,
+        read_task_entries, task_entry_is_blocked, task_entry_is_ready, task_entry_is_stopped,
         terminal_task_for_codex_session_in_board,
     },
 };
@@ -1673,7 +1673,17 @@ pub(super) fn automated_codex_session_to_resume(
     task_selection: AgentTaskSelection,
 ) -> Result<Option<String>> {
     let tasks = match task_selection {
-        AgentTaskSelection::NextTodo => return Ok(None),
+        AgentTaskSelection::NextTodo => {
+            let board = get_tasks_dir(project_root);
+            if !board.join("todo").try_exists()? && !board.join("todo.md").try_exists()? {
+                return Ok(None);
+            }
+            return Ok(read_task_entries(&board, TaskStatus::Todo)?
+                .into_iter()
+                .find(task_entry_is_ready)
+                .as_ref()
+                .and_then(codex_session_for_task));
+        }
         AgentTaskSelection::ResumeDoing => {
             read_task_entries(&get_tasks_dir(project_root), TaskStatus::Doing)?
         }

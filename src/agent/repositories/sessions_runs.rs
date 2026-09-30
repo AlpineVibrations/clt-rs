@@ -45,7 +45,38 @@ impl SessionsRunsRepository {
     }
 }
 
+async fn planning_session_can_start(
+    conn: &Connection,
+    project_id: i64,
+    session_id: &str,
+) -> Result<bool> {
+    Ok(query_count(
+        conn,
+        "SELECT NOT EXISTS (
+            SELECT 1 FROM session_controls WHERE project_id = ?1 AND codex_session_id = ?2
+              AND (state != 'stopped' OR run_token IS NOT NULL OR child_pid IS NOT NULL
+                   OR interactive_holder IS NOT NULL OR interactive_launch_token IS NOT NULL))
+         AND NOT EXISTS (SELECT 1 FROM runs WHERE project_id = ?1 AND codex_session_id = ?2)
+         AND NOT EXISTS (SELECT 1 FROM session_git_modes WHERE project_id = ?1 AND codex_session_id = ?2)
+         AND NOT EXISTS (SELECT 1 FROM git_finalizations WHERE project_id = ?1 AND codex_session_id = ?2)",
+        params![project_id, session_id],
+    ).await? == 1)
+}
+
 impl TursoAgentStore {
+    /// A planning or external conversation can begin its first automated run,
+    /// but prior automation must use the recovery path and its original journal.
+    pub(crate) fn planning_session_can_start_blocking(
+        &self,
+        project_id: i64,
+        session_id: &str,
+    ) -> Result<bool> {
+        self.blocking.block_on(async {
+            let conn = self.repositories.sessions_runs.connect().await?;
+            planning_session_can_start(&conn, project_id, session_id).await
+        })
+    }
+
     pub(crate) fn record_run_outcome_blocking(&self, outcome: AgentRunOutcome<'_>) -> Result<i64> {
         self.blocking
             .block_on_persist(self.record_run_outcome(outcome))
@@ -2575,6 +2606,7 @@ impl TursoAgentStore {
             lease_holder,
             lease_timeout_seconds,
             claim_requested_resume,
+            claim_planning_session,
         } = registration;
         self.blocking.block_on_persist(async {
             let mut conn = self.repositories.sessions_runs.connect().await?;
@@ -2602,6 +2634,13 @@ impl TursoAgentStore {
             if lease_changed != 1 {
                 return Ok(false);
             }
+            if claim_planning_session
+                && (claim_requested_resume
+                    || !planning_session_can_start(&transaction, project_id, codex_session_id)
+                        .await?)
+            {
+                return Ok(false);
+            }
             let control_changed = if claim_requested_resume {
                 transaction
                     .execute(
@@ -2626,10 +2665,19 @@ impl TursoAgentStore {
             } else {
                 transaction
                     .execute(
-                        "INSERT OR IGNORE INTO session_controls (
+                        "INSERT INTO session_controls (
                                 project_id, codex_session_id, state, child_pid, run_token,
                                 interactive_holder, stdout_path, stderr_path, updated_at
-                             ) VALUES (?1, ?2, 'running', ?3, ?4, NULL, ?5, ?6, ?7)",
+                             ) VALUES (?1, ?2, 'running', ?3, ?4, NULL, ?5, ?6, ?7)
+                             ON CONFLICT(project_id, codex_session_id) DO UPDATE SET
+                                state = excluded.state, child_pid = excluded.child_pid,
+                                run_token = excluded.run_token, stdout_path = excluded.stdout_path,
+                                stderr_path = excluded.stderr_path, updated_at = excluded.updated_at
+                             WHERE ?8 AND session_controls.state = 'stopped'
+                                AND session_controls.run_token IS NULL
+                                AND session_controls.child_pid IS NULL
+                                AND session_controls.interactive_holder IS NULL
+                                AND session_controls.interactive_launch_token IS NULL",
                         params![
                             project_id,
                             codex_session_id,
@@ -2638,6 +2686,7 @@ impl TursoAgentStore {
                             stdout_path.to_string_lossy().as_ref(),
                             stderr_path.to_string_lossy().as_ref(),
                             now.as_str(),
+                            claim_planning_session,
                         ],
                     )
                     .await

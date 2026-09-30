@@ -3,6 +3,9 @@ use crate::test_support::*;
 use crate::tui::tests::tui_agent_project_for_test;
 use crate::worker::tests::reserve_test_inline_worker;
 
+#[path = "tests/planning.rs"]
+mod planning;
+
 #[test]
 fn enabling_project_git_records_the_unmanaged_session_before_resumption() {
     for by_path in [false, true] {

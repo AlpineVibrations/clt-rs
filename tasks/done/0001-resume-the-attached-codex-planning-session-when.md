@@ -1,0 +1,4 @@
+Resume the attached Codex planning session when automation starts a Todo task. [BUG]
+
+Completion note:
+COMPLETED 2026-09-30: Todo automation resumes its attached Codex planning session, preserves the conversation and task link, and explicitly begins implementation. Added queue-order, stopped-task, ownership, session-claim, and all-Git-mode launch regressions; updated feature and architecture documentation. Checks: rustfmt --edition 2024 --check build.rs src/main.rs src/lib.rs tests/architecture.rs tests/cli.rs; cargo clippy --no-deps --locked --all-targets --all-features -- -D warnings; cargo test --locked --all-targets --all-features (705 passed, 1 existing ignored smoke test). Updated patch version to 0.7.5; cargo run --locked --bin clt -- --version reports clt 0.7.5. codex:01a0f294-35ba-7822-b691-612b8e4efaee

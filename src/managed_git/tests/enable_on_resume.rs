@@ -129,6 +129,7 @@ fn paused_task_can_enable_git_and_complete_with_commit_or_push() {
                     lease_holder: HOLDER,
                     lease_timeout_seconds: 300,
                     claim_requested_resume: true,
+                    claim_planning_session: false,
                 })
                 .unwrap()
         );
