@@ -30,6 +30,7 @@ used Turso dependency. Application modules import its local API through
 | `agent::repositories` | Projects/models, workers/leases, sessions/runs, and Git-journal persistence | Turso and agent-domain records |
 | `platform` | launchd/systemd, executable snapshots, process groups, and terminal/process adapters | operating-system APIs |
 | `managed_git` | Git preflight, immutable launch boundaries, commit proof, publication, and recovery | task services and agent journals |
+| `manual_sessions` | Atomic direct-session task creation, claiming, and explicit handoff | task board, application moves, agent ownership checks |
 | `scheduler` | Pure scheduling decisions, scans, cooldowns, lease acquisition, and daemon passes | agent store and worker orchestration |
 | `worker` | Worker reservation, dispatch, heartbeat, reconciliation, task/session linking, and result recording | scheduler decisions, runner, platform |
 | `runner` | Codex prompt/command construction, gated launch, supervision, logs, and outcome classification | process adapters and session/store services |
@@ -44,6 +45,7 @@ used Turso dependency. Application modules import its local API through
 - CLI and TUI call application/store facades; they do not contain SQL.
 - TUI render functions read cached `TuiApp` state and perform no I/O.
 - Scheduler decision functions are separate from acquisition and worker effects.
+- Direct-session ownership is persisted as `clt:manual` beside the task's terminal conversation marker. Creation publishes directly into Doing; claiming writes ownership before moving; handoff moves into Todo before removing ownership. The project board lock serializes claims with scheduler and interactive lease acquisition. Manual tasks anywhere on an unfinished board fence the project, including stale scheduler snapshots and interrupted Doing recovery. Editing and ordinary moves preserve claims; Done and deletion release them. Claims require an idle project and a conversation without prior automated work, leaving existing automated Git journals to their established controls.
 - Todo launch selection follows board order and skips blocked or stopped tasks. The runner resumes the first ready task’s attached conversation, validates its unique task link and lack of prior automated work, and holds the board lock through gated session registration. Planning sessions begin a fresh Git boundary; interrupted automated sessions retain their existing journal.
 - Scheduler passes persist missing/uninitialized/unreadable board scans and skip those projects before recovery reads, so unavailable storage cannot initialize a replacement board or block unrelated jobs. Platform startup bounds launchd unload/bootstrap retries and retains permanent failure diagnostics.
 - Project and existing-board probes preserve metadata errors; only not-found errors indicate missing storage. TUI snapshots distinguish local readability from the daemon's saved scan, without overwriting its access evidence. Reconnection tests restore the same registered path and verify scheduling resumes with the original board.

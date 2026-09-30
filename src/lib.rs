@@ -4,6 +4,7 @@ mod agent;
 mod application;
 mod cli;
 mod managed_git;
+mod manual_sessions;
 mod platform;
 mod runner;
 mod scheduler;

@@ -3,6 +3,131 @@ use crate::test_support::prelude::*;
 use crate::test_support::*;
 
 #[test]
+fn manual_claim_blocks_scheduler_recovery_and_stale_acquisition() {
+    let root = temp_root("manual-scheduler");
+    let state_dir = root.join("state");
+    let project_root = root.join("project");
+    init_tasks(&project_root, false).unwrap();
+    add_task(&project_root, "Unrelated ready task", None).unwrap();
+    let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
+    store
+        .register_project_blocking(&project_root, "manual")
+        .unwrap();
+    let project = store.list_projects_blocking().unwrap().remove(0);
+    let stale_scan = scan_agent_project(&project.path);
+    insert_task(
+        &project.path,
+        TaskStatus::Doing,
+        None,
+        "Direct work clt:manual codex:manual-session",
+        None,
+    )
+    .unwrap();
+    // No DB control or child exists: this is the former interrupted-Doing bug.
+    assert!(!project_has_resumable_doing_task(&state_dir, &project).unwrap());
+    for selection in [
+        AgentTaskSelection::NextTodo,
+        AgentTaskSelection::ResumeDoing,
+        AgentTaskSelection::RecoverBlocked,
+        AgentTaskSelection::ResumeSession,
+    ] {
+        let result = acquire_agent_job_stage(AgentJobAcquisitionRequest {
+            state_dir: &state_dir,
+            project: &project,
+            scan: &stale_scan,
+            holder: "stale-scheduler",
+            lease_timeout: Duration::from_secs(60),
+            reclaim_current_process_leases: false,
+            max_global_jobs: 1,
+            task_selection: selection,
+            resume_session_id: Some("manual-session".to_string()),
+        })
+        .unwrap();
+        assert!(matches!(
+            result,
+            AgentJobAcquisitionResult::SessionSuspended
+        ));
+    }
+    assert!(InteractiveAgentLease::try_acquire_at(&state_dir, project.id, 60).is_err());
+    assert!(
+        store
+            .lease_for_project_blocking(project.id)
+            .unwrap()
+            .is_none()
+    );
+    let runner = FakeAgentRunner::new(&state_dir, "success");
+    let pass = run_agent_once_with_runner(&state_dir, &runner).unwrap();
+    assert_eq!(pass.runs_started, 0);
+    assert_eq!(runner.ran_project_count(), 0);
+    // Completing direct work releases the board reservation for unrelated Todo.
+    move_task_in_board(
+        &get_tasks_dir(&project.path),
+        TaskStatus::Doing,
+        TaskStatus::Done,
+        "1",
+    )
+    .unwrap();
+    let pass = run_agent_once_with_runner(&state_dir, &runner).unwrap();
+    assert_eq!(pass.runs_started, 1);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn manual_marker_survives_editing_and_reserves_nested_boards() {
+    let root = temp_root("manual-edit-nested");
+    init_tasks(&root, true).unwrap();
+    let board = get_tasks_dir(&root);
+    let nested = board.join("doing/0001-parent");
+    fs::create_dir_all(&nested).unwrap();
+    for status in TASK_STATUSES {
+        fs::write(nested.join(format!("{}.md", status.as_str())), "").unwrap();
+    }
+    insert_task_in_board(
+        &nested,
+        TaskStatus::Todo,
+        None,
+        "Details clt:manual codex:direct-session",
+        None,
+    )
+    .unwrap();
+    assert!(board_has_manual_task(&board).unwrap());
+    update_task_in_board(
+        &nested,
+        TaskStatus::Todo,
+        1,
+        "Updated details.\nMore planning notes.",
+    )
+    .unwrap();
+    let entry = task_entry_at(&nested, TaskStatus::Todo, 1).unwrap();
+    assert!(task_content_is_manual(&entry.content));
+    assert_eq!(
+        recoverable_codex_session_id_from_task_content(&entry.content),
+        Some("direct-session")
+    );
+    assert!(!task_content_for_edit(&entry.content).contains("clt:manual"));
+    let display = prefix_task_agent_flag(
+        task_display_text(&entry),
+        TaskStatus::Todo,
+        &entry,
+        &[(
+            "direct-session".to_string(),
+            AgentSessionControlState::Stopped,
+        )]
+        .into_iter()
+        .collect(),
+    );
+    assert!(display.starts_with("[MANUAL]"));
+    assert!(!display.contains("STOPPED") && !display.contains("clt:manual"));
+    assert!(!task_supports_interactive_codex_resume(
+        TaskStatus::Todo,
+        &entry
+    ));
+    move_task_in_board(&nested, TaskStatus::Todo, TaskStatus::Done, "1").unwrap();
+    assert!(!board_has_manual_task(&board).unwrap());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn unreadable_board_does_not_discard_ready_jobs_or_block_later_projects() {
     let root = temp_root("scheduler-unreadable-board");
     let state_dir = root.join("state");

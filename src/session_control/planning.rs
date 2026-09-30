@@ -119,6 +119,10 @@ fn prepare_todo_planning_session_with(
         "Codex returned an invalid session ID"
     );
     let _lock = acquire_board_mutation_lock(board_dir)?;
+    anyhow::ensure!(
+        !crate::task::board_has_manual_task(&crate::task::get_tasks_dir(&project.path))?,
+        "Project was claimed by a directly opened Codex session before planning could be linked"
+    );
     let current = revalidate_todo(board_dir, selected)?;
     let registered = if lease.is_some() {
         store.register_planning_session_blocking(project.id, &session_id, &holder)?

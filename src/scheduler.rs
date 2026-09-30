@@ -47,10 +47,10 @@ use crate::{
     session_control::InteractiveGuardianDisposition,
     session_recovery::{ensure_orphaned_session_supervision, recovered_supervisor_pid},
     task::{
-        TaskStatus, ensure_existing_board, get_tasks_dir, read_task_entries,
-        recoverable_codex_session_id_from_task_content, task_entry_is_blocked,
-        task_entry_is_stopped, task_status_for_codex_session_in_board,
-        terminal_task_for_codex_session_in_board,
+        TaskStatus, acquire_board_mutation_lock, board_has_manual_task, ensure_existing_board,
+        get_tasks_dir, read_task_entries, recoverable_codex_session_id_from_task_content,
+        task_content_is_manual, task_entry_is_blocked, task_entry_is_stopped,
+        task_status_for_codex_session_in_board, terminal_task_for_codex_session_in_board,
     },
     tui::TUI_SESSION_HANDOFF_TIMEOUT_SECONDS,
     worker::{
@@ -168,6 +168,12 @@ pub(super) fn acquire_agent_job_stage(
         task_selection,
         resume_session_id,
     } = request;
+    // Serialize the manual claim/lease boundary. A stale scheduling snapshot
+    // must not create a worker after a direct Codex session has claimed work.
+    let _board_lock = acquire_board_mutation_lock(&get_tasks_dir(&project.path))?;
+    if board_has_manual_task(&get_tasks_dir(&project.path))? {
+        return Ok(AgentJobAcquisitionResult::SessionSuspended);
+    }
     let mut acquired_at = agent_timestamp();
     let mut expires_at = agent_timestamp_after(lease_timeout.as_secs());
     let mut acquired = with_agent_store_at(state_dir, |store| {
@@ -958,6 +964,33 @@ pub(super) fn run_agent_scheduler_pass_with_max_global_jobs(
             continue;
         }
 
+        let has_manual_task = match board_has_manual_task(&get_tasks_dir(&project.path)) {
+            Ok(manual) => manual,
+            Err(error) => {
+                let error = format!("Unable to check manual task ownership: {error:#}");
+                with_agent_store_at(state_dir, |store| {
+                    store.record_project_daemon_scan_blocking(
+                        project.id,
+                        "unavailable",
+                        Some(&error),
+                    )
+                })?;
+                eprintln!(
+                    "Project {}: action=skip reason=board_unavailable error={error} path={}",
+                    project.name,
+                    project.path.display()
+                );
+                continue;
+            }
+        };
+        if has_manual_task {
+            println!(
+                "Project {}: action=skip reason=manual_session path={}",
+                project.name,
+                project.path.display()
+            );
+            continue;
+        }
         let mut existing_lease = agent_lease_for_project(state_dir, project.id)?;
         reconcile_stale_agent_session_controls(
             state_dir,
@@ -1653,6 +1686,9 @@ pub(super) fn project_has_resumable_doing_task(
     let doing = read_task_entries(&get_tasks_dir(&project.path), TaskStatus::Doing)?;
     with_agent_store_at(state_dir, |store| {
         for task in doing {
+            if task_content_is_manual(&task.content) {
+                continue;
+            }
             let Some(session_id) = recoverable_codex_session_id_from_task_content(&task.content)
             else {
                 // A project lease does not establish ownership of a human's
@@ -1680,7 +1716,10 @@ fn interrupted_codex_session_in_doing(
     let doing = read_task_entries(&get_tasks_dir(&project.path), TaskStatus::Doing)?;
     with_agent_store_at(state_dir, |store| {
         for task in doing {
-            if task_entry_is_blocked(&task) || task_entry_is_stopped(&task) {
+            if task_entry_is_blocked(&task)
+                || task_entry_is_stopped(&task)
+                || task_content_is_manual(&task.content)
+            {
                 continue;
             }
             let Some(session_id) = recoverable_codex_session_id_from_task_content(&task.content)

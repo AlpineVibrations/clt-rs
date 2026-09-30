@@ -167,6 +167,24 @@ pub(super) fn is_stopped_shared_interactive_holder(holder: &str) -> bool {
         || holder.starts_with("clt-stopped-readonly-interactive-")
 }
 
+fn lock_project_without_manual_claim(
+    store: &agent::TursoAgentStore,
+    project_id: i64,
+) -> Result<crate::task::BoardMutationLock> {
+    let project = store
+        .list_projects_blocking()?
+        .into_iter()
+        .find(|project| project.id == project_id)
+        .context("Project is no longer registered")?;
+    let board = get_tasks_dir(&project.path);
+    let lock = crate::task::acquire_board_mutation_lock(&board)?;
+    anyhow::ensure!(
+        !board.is_dir() || !crate::task::board_has_manual_task(&board)?,
+        "Project is reserved by a directly opened Codex session; use clt handoff to release it"
+    );
+    Ok(lock)
+}
+
 pub(super) fn automated_session_control_action_for_generation(
     control: &agent::AgentSessionControlRecord,
     child_pid: u32,
@@ -563,6 +581,7 @@ impl InteractiveAgentLease {
         let acquired_at = agent_timestamp();
         let expires_at = agent_timestamp_after(timeout_seconds);
         let acquired = with_agent_store_at(state_dir, |store| {
+            let _lock = lock_project_without_manual_claim(store, project_id)?;
             store.try_acquire_lease_blocking(project_id, holder, &acquired_at, &expires_at)
         })?;
 
@@ -1488,14 +1507,12 @@ pub(super) fn stop_interactive_child_until_reaped(
     }
 }
 
-pub(super) fn task_supports_interactive_codex_resume(
-    status: TaskStatus,
-    _task: &TaskEntry,
-) -> bool {
-    matches!(
-        status,
-        TaskStatus::Todo | TaskStatus::Doing | TaskStatus::Done
-    )
+pub(super) fn task_supports_interactive_codex_resume(status: TaskStatus, task: &TaskEntry) -> bool {
+    (status == TaskStatus::Done || !crate::task::task_content_is_manual(&task.content))
+        && matches!(
+            status,
+            TaskStatus::Todo | TaskStatus::Doing | TaskStatus::Done
+        )
 }
 
 pub(super) fn codex_session_task_supports_interactive_resume(
@@ -1544,6 +1561,9 @@ pub(super) fn toggle_tui_task_stop_at(
     status: TaskStatus,
     task: &TaskEntry,
 ) -> Result<String> {
+    if status != TaskStatus::Done && crate::task::task_content_is_manual(&task.content) {
+        return Ok("This task is owned by a directly opened Codex session. Use clt handoff to release it to automation.".to_string());
+    }
     if !task_entry_is_stopped(task)
         && let (Some(project_id), Some(session_id)) = (project_id, codex_session_for_task(task))
     {
@@ -1851,6 +1871,7 @@ pub(super) fn reserve_tui_idle_codex_session_interactive(
 ) -> Result<bool> {
     let state_dir = ensure_agent_state_dir()?;
     with_agent_store_at(&state_dir, |store| {
+        let _lock = lock_project_without_manual_claim(store, project_id)?;
         store.reserve_idle_session_interactive_blocking(
             project_id,
             session_id,
@@ -1868,6 +1889,7 @@ pub(super) fn reserve_tui_shared_codex_session_interactive(
 ) -> Result<bool> {
     let state_dir = ensure_agent_state_dir()?;
     with_agent_store_at(&state_dir, |store| {
+        let _lock = lock_project_without_manual_claim(store, project_id)?;
         store.reserve_shared_session_interactive_blocking(
             project_id,
             session_id,

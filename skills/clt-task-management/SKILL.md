@@ -61,6 +61,10 @@ The agent must adhere to the following state transition pipeline:
 3. **Activate**: Inspect the selected task and applicable repository instructions, then move it from `todo` to `doing` before editing implementation files. For ordinary interactive work, finish pre-task Git sync/branch selection first. In an automated Git-enabled run, CLT already completed and froze that preparation before release; do not repeat or alter it.
 4. **Complete**: Once the task is verified and finished, move it from `doing` to `done`.
 
+For work started in a directly opened Codex session, use the manual workflow below:
+`clt start` creates and reserves a Doing task atomically; `clt claim` activates an
+existing task. Do not briefly expose direct work as an eligible Todo.
+
 For an automated CLT run whose project Git mode is `commit` or `commit-and-push`, the final move has stronger semantics. `clt done` records a durable finalization intent before it moves the board entry. The entry in the Done store is provisional while CLT reports it as `FINALIZING`; it becomes terminal only after CLT proves the task-specific commit, and, in push mode, proves that commit is present on the configured upstream. The same linked Codex session resumes an interrupted finalization. Do not select another task, create a replacement task, or move the provisional entry back to Doing.
 
 ## Command Reference
@@ -95,28 +99,43 @@ clt add "Task description" ["Optional metadata"]
 
 Before creating a task or adding a dependency, check the relevant dependency chain. Never make a task depend on itself, directly or through other tasks; split or reorder the work to avoid circular dependencies.
 
-#### Link tasks created in standalone Codex sessions
+#### Reserve tasks in standalone Codex sessions
 
 When Codex is working directly in a CLT-enabled project, outside a `clt agent`
-run, append the current Codex session ID to a task it creates so that CLT can
-reopen that conversation later. This applies even when project automation is
-disabled; the session link belongs in the task content.
+run, create and claim the task directly in Doing with `clt start`. This attaches
+the current conversation and reserves the project against automated pickup and
+interrupted-task recovery. Use it even when project automation is disabled.
 
 Use the exact current session ID supplied by the Codex runtime (for example,
 `CODEX_THREAD_ID` when available). Do not guess an ID, use a process ID, or take
 one from another task or the most recent session on disk. If the current ID is
-unavailable, create the task without a marker and report that its conversation
-could not be linked.
-
-Append exactly one `codex:<session-id>` token as the final non-whitespace token
-of the full task content, without backticks or trailing punctuation. Put tags
-before the marker in the same quoted argument: a separate metadata argument
-would be appended after it.
+unavailable, create a stopped tracking task ending in `clt:stopped` and report that
+it cannot be linked or claimed yet. Do not leave an eligible Todo for this work.
 
 ```bash
 # Only after confirming CODEX_THREAD_ID identifies this Codex session:
-clt add "Fix memory leak in parser [BUG, HIGH] codex:${CODEX_THREAD_ID:?Current Codex session ID is required}"
+clt start "Fix memory leak in parser [BUG, HIGH]"
+# Or: clt start "Task description" --session <exact-current-session-id>
+
+# Existing unlinked task, or a task already linked to this session:
+clt list todo
+clt claim todo <index>
 ```
+
+Manual tasks display `[MANUAL]`. Claims survive session exits, restarts, edits,
+and ordinary status moves. Finish with `clt done`, or, when the user wants
+automation to take over, record the plan and remaining work, list the current
+status, and run `clt handoff doing <index>`. Handoff moves the task to Todo and
+keeps the same conversation. Stop editing after handoff because an enabled
+daemon may resume immediately. Do not hand off automatically just because a
+turn ends. Existing automated sessions keep their established CLT controls;
+never replace another session's link or bypass an active owner.
+
+Preserve both `clt:manual` and the final `codex:<session-id>` token when adding
+notes. `clt start` and `clt claim` write these markers for you. Use an updated
+CLT binary and scheduler; an older daemon cannot honor manual claims. If these
+commands are unavailable, use a stopped tracking task and report that CLT needs
+upgrading instead of using an eligible `add` followed by `status`.
 
 Inspect the stored task after creation; `clt list` hides session markers. For a
 Markdown-backed status the marker ends the task's line; for a folder-backed

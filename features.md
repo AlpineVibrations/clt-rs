@@ -11,6 +11,7 @@ in [Feature Ideas](docs/FEATURE_IDEAS.md); they are not a list of shipped featur
 - [Kanban view](#kanban-view)
   - [Agent Projects](#agent-projects)
   - [Task sessions and controls](#task-sessions-and-controls)
+  - [Direct Codex sessions](#direct-codex-sessions)
   - [Service heartbeat and logs](#service-heartbeat-and-logs)
   - [Models and providers](#models-and-providers)
 - [Codex agent](#codex-agent)
@@ -158,6 +159,52 @@ The background service refreshes its registry heartbeat every 15 seconds indepen
 
 Press `l` from the Kanban board to open output for the selected task. A task linked to the currently active Codex session shows that session's live agent output even if the task has already moved to Done or become blocked; otherwise completed or blocked tasks with a linked session show that task's recorded output. If a worker exited before saving run history, CLT also checks the exact session's retained log paths. The open console follows the highlighted task as you move through the board. The same key opens the selected project's live or latest output from the Agent Projects pane. On an Agent Projects row, `s` directly controls the one active, interactive, or fenced session; if several sessions are present, open the intended output first. While project output is open, `s` stops or resumes its exact session, `i` takes over a live or stopped session interactively and hands it back to automated exec afterward, and `c` opens the displayed session interactively, taking over its automated run when active. These controls use the session represented by the displayed run rather than searching the task board, so they remain available when a task was moved, nested, deleted, or lost its session marker. CLT refuses to act when the displayed output does not identify one exact session or already has an interactive handoff in progress. The console expands and follows new output until `l` or `Esc` closes the log.
 
+### Direct Codex sessions
+
+When you open Codex directly and start work in a CLT project, create the task and
+reserve it for that conversation in one command:
+
+```bash
+clt start "Implement the planned feature"
+# Uses CODEX_THREAD_ID; alternatively pass --session <exact-current-session-id>.
+
+# To take an existing task from the same conversation or an unlinked task:
+clt list todo
+clt claim todo 1
+```
+
+The task appears directly in Doing as `[MANUAL]`, with its conversation attached.
+There is no temporary eligible Todo for the daemon to pick up. The claim reserves
+the whole project, including against interrupted Doing recovery, and persists
+across Codex exits and daemon restarts. CLT does not infer that an external
+session has finished from a missing child process. Opening another CLT session
+for that project is also prevented while the manual claim remains.
+
+Finish with `clt done doing <index>`, or explicitly return unfinished work to
+automation after recording the plan and remaining steps:
+
+```bash
+clt list doing
+clt handoff doing 1
+```
+
+Handoff moves the task to Todo and releases its claim while preserving the exact
+Codex session ID. When eligible, automation resumes that conversation using the
+project's normal settings. A disabled project stays disabled. Stop working in
+the direct session after handoff; an enabled daemon may pick it up immediately.
+Task edits and ordinary status moves preserve the claim, so moving to Todo alone
+does not hand it off. Deleting or completing the task releases the reservation.
+`s` and `c` on a manual task explain its ownership instead of launching or stopping
+a duplicate conversation.
+
+Claims require the exact current session UUID and an idle project. Existing
+automated conversations, active leases, and unfinished Git finalizations retain
+their established CLT controls. A session may belong to only one task. If the
+session ID is unavailable, keep any tracking task stopped until it can be linked
+and claimed. These commands and scheduler protections require the updated CLT
+binary; restart the scheduler after upgrading and refresh the bundled skills
+with `clt skills install`.
+
 ### Models and providers
 
 Press uppercase `M` from either the task board or Agent Projects to open the Models page; uppercase `M`, `Tab`, or `Esc` returns to the pane you came from. The Models page keeps a catalog of providers and model targets with aligned, labeled columns. `USE` shows live availability, `FAV` marks favorites, and the separate `CLT` and `CODEX` columns identify the effective CLT-wide default and the user's Codex config default; `YES` is shown when a row has that role. `THINK` shows each model's default reasoning level: press `t` to cycle through system, low, medium, high, extra-high, max, and ultra. A model setting is used for agent runs unless the selected project has its own reasoning override. Changing `THINK` on the `CODEX=YES` model also updates Codex's top-level reasoning default immediately; choosing system removes that override. Pressing `c` to choose a new Codex default writes both its model and reasoning setting. When no explicit CLT override exists, CLT follows the Codex default and both columns mark the same model. The provider pane always shows the available presets: press `1` through `4` to add or enable OpenAI, OpenRouter, Ollama, or LM Studio. Ollama and LM Studio query their standard local URLs for models immediately. To remove a provider, select it in the left pane and press `x` or `Delete`; its models and affected CLT/project selections are removed, along with its custom Codex provider configuration. Built-in OpenAI cannot be removed, but `Space` can disable it.
@@ -277,7 +324,7 @@ Agent-facing workflow skills are included in the repository's `skills/` director
 
 Automated `clt` agent runs use embedded copies when these skills are not installed. Run `clt skills install` as described in [Installation](#installation) when you also want to invoke them directly in other Codex sessions.
 
-The task-management skill also tells standalone Codex sessions to link a newly created task to their current conversation with a terminal `codex:<session-id>` token, even when project automation is disabled. The marker goes after all task text and tags and is hidden in task listings. Existing links are preserved, and additional tasks or independent follow-ups do not reuse a session already linked to another task. If Codex cannot determine its current session ID, it leaves the task unlinked and reports that limitation. Refresh an installed skill with `clt skills install` to receive this guidance.
+The task-management skill tells standalone Codex sessions to use `clt start` or `clt claim` to reserve their work and attach the current conversation, even when project automation is disabled. See [Direct Codex sessions](#direct-codex-sessions). Existing links are preserved, and independent follow-ups do not reuse the parent's session. If Codex cannot determine its current session ID, it keeps the tracking task stopped and reports the limitation. Refresh an installed skill with `clt skills install` to receive this guidance.
 
 ### Scheduling and task recovery
 

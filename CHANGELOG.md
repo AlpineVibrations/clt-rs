@@ -6,6 +6,10 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+### Added
+
+- Reserve directly opened Codex sessions with `clt start` or `clt claim`. Manually owned tasks display `[MANUAL]` and keep the project out of automated scheduling and interrupted-task recovery until completion or an explicit `clt handoff`, which preserves the conversation for implementation.
+
 ## [0.7.5] - 2026-09-30
 
 ### Fixed

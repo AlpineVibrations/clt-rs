@@ -219,7 +219,9 @@ pub(super) fn prefix_task_agent_flag(
     entry: &TaskEntry,
     session_states: &TaskAgentSessionStates,
 ) -> String {
-    if task_has_stopped_agent_flag(status, entry, session_states) {
+    if status != TaskStatus::Done && crate::task::task_content_is_manual(&entry.content) {
+        format!("[MANUAL] {text}")
+    } else if task_has_stopped_agent_flag(status, entry, session_states) {
         format!("[STOPPED] {text}")
     } else {
         text
@@ -3661,6 +3663,11 @@ pub(super) fn tui_codex_session_availability_for_path_at(
     session_id: &str,
     state_dir: &Path,
 ) -> Result<TuiCodexSessionAvailability> {
+    if get_tasks_dir(project_path).is_dir()
+        && crate::task::board_has_manual_task(&get_tasks_dir(project_path))?
+    {
+        return Ok(TuiCodexSessionAvailability::ProjectBusy);
+    }
     if !panel.select_project_for_path(project_path) {
         return Ok(TuiCodexSessionAvailability::Idle);
     }
@@ -8008,9 +8015,14 @@ pub(super) fn execute_tui_key_effect(
                         };
 
                         if !task_supports_interactive_codex_resume(selected_status, &task) {
-                            app.feedback_buffer =
+                            app.feedback_buffer = if crate::task::task_content_is_manual(
+                                &task.content,
+                            ) {
+                                "This conversation is reserved by a directly opened Codex session. Use clt handoff to release it.".to_string()
+                            } else {
                                 "Codex sessions are available from Todo, Doing, or Done tasks."
-                                    .to_string();
+                                    .to_string()
+                            };
                             return Ok(false);
                         }
 

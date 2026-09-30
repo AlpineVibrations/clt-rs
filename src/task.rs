@@ -219,6 +219,61 @@ pub(super) fn task_entry_is_blocked(entry: &TaskEntry) -> bool {
 }
 
 pub(super) const TASK_STOPPED_MARKER: &str = "clt:stopped";
+pub(super) const TASK_MANUAL_MARKER: &str = "clt:manual";
+
+pub(super) fn task_content_is_manual(content: &str) -> bool {
+    content
+        .split_whitespace()
+        .any(|word| word == TASK_MANUAL_MARKER)
+}
+
+pub(super) fn task_content_without_manual_marker(content: &str) -> String {
+    let mut result = content.to_string();
+    // Keep prose, newlines, and the terminal conversation marker intact.
+    for (start, word) in content.rmatch_indices(TASK_MANUAL_MARKER) {
+        let end = start + word.len();
+        if (start == 0 || content[..start].ends_with(char::is_whitespace))
+            && (end == content.len() || content[end..].starts_with(char::is_whitespace))
+        {
+            let start = if content[..start].ends_with(' ') {
+                start - 1
+            } else {
+                start
+            };
+            result.replace_range(start..end, "");
+        }
+    }
+    result.trim_end().to_string()
+}
+
+pub(super) fn task_content_with_manual_session(content: &str, session_id: &str) -> String {
+    let content =
+        task_content_without_recoverable_codex_session(task_content_without_stop_marker(content));
+    let content = task_content_without_manual_marker(&content);
+    task_content_with_codex_session(
+        &format!("{} {TASK_MANUAL_MARKER}", content.trim_end()),
+        session_id,
+    )
+}
+
+/// Manual claims fence the whole checkout, including claims on nested boards.
+/// Done tasks retain their conversation history but no longer reserve work.
+pub(super) fn board_has_manual_task(board_dir: &Path) -> Result<bool> {
+    for status in [TaskStatus::Backlog, TaskStatus::Todo, TaskStatus::Doing] {
+        for task in read_task_entries(board_dir, status)? {
+            if task_content_is_manual(&task.content) {
+                return Ok(true);
+            }
+            if task.has_subtasks
+                && let TaskSource::Path { path, is_dir: true } = &task.source
+                && board_has_manual_task(path)?
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
 
 pub(super) fn task_content_is_stopped(content: &str) -> bool {
     content.split_whitespace().next_back() == Some(TASK_STOPPED_MARKER)
@@ -241,7 +296,9 @@ pub(super) fn task_entry_is_stopped(entry: &TaskEntry) -> bool {
 }
 
 pub(super) fn task_entry_is_ready(entry: &TaskEntry) -> bool {
-    !task_entry_is_stopped(entry) && !task_entry_is_blocked(entry)
+    !task_entry_is_stopped(entry)
+        && !task_entry_is_blocked(entry)
+        && !task_content_is_manual(&entry.content)
 }
 
 pub(super) fn task_content_is_blocked(content: &str) -> bool {
@@ -745,7 +802,7 @@ fn task_name_without_reordering(path: &Path, name: &str, prepend: bool) -> Resul
 }
 
 pub(super) fn first_sentence(content: &str) -> Option<String> {
-    let normalized = normalize_task_text(content);
+    let normalized = normalize_task_text(&task_content_without_manual_marker(content));
     if normalized.is_empty() {
         return None;
     }
@@ -876,7 +933,9 @@ pub(super) fn task_content_without_recoverable_codex_session(content: &str) -> S
 }
 
 pub(super) fn task_content_for_edit(content: &str) -> String {
-    task_content_without_recoverable_codex_session(task_content_without_stop_marker(content))
+    task_content_without_manual_marker(&task_content_without_recoverable_codex_session(
+        task_content_without_stop_marker(content),
+    ))
 }
 
 pub(super) fn task_content_with_codex_session(content: &str, session_id: &str) -> String {
@@ -980,7 +1039,8 @@ pub(super) fn split_description_metadata(value: &str) -> (&str, Option<&str>) {
 }
 
 pub(super) fn task_display_text(entry: &TaskEntry) -> String {
-    let summary = task_content_without_stop_marker(&entry.summary);
+    let summary =
+        task_content_without_manual_marker(task_content_without_stop_marker(&entry.summary));
     match &entry.metadata {
         Some(metadata) => format!("{summary} ({metadata})"),
         None => summary.to_string(),
@@ -988,7 +1048,9 @@ pub(super) fn task_display_text(entry: &TaskEntry) -> String {
 }
 
 pub(super) fn task_full_display_text(entry: &TaskEntry) -> String {
-    let content = normalize_task_text(task_content_without_stop_marker(&entry.content));
+    let content = normalize_task_text(&task_content_without_manual_marker(
+        task_content_without_stop_marker(&entry.content),
+    ));
     if content.is_empty() {
         task_display_text(entry)
     } else {
@@ -1044,6 +1106,11 @@ pub(super) fn write_lines(path: &Path, lines: &[String]) -> Result<()> {
 #[cfg(unix)]
 pub(super) fn replace_file_atomically(path: &Path, content: &[u8]) -> Result<()> {
     replace_file_atomically_with_before_publish(path, content, |_| Ok(()))
+}
+
+#[cfg(not(unix))]
+pub(super) fn replace_file_atomically(path: &Path, content: &[u8]) -> Result<()> {
+    fs::write(path, content).with_context(|| format!("Failed to write task file {:?}", path))
 }
 
 #[cfg(unix)]
@@ -1653,7 +1720,7 @@ pub(super) fn write_task_entry_content_with_before_replace(
             }
 
             before_replace();
-            lines[*line_index] = format!("- {content}");
+            lines[*line_index] = format!("- {}", single_line_content(content));
             write_lines(&path, &lines)?;
         }
         TaskSource::Path { path, is_dir } => {
@@ -1673,7 +1740,7 @@ pub(super) fn write_task_entry_content_with_before_replace(
                     );
                 }
                 before_replace();
-                fs::write(&target_path, replacement)
+                replace_file_atomically(&target_path, replacement.as_bytes())
                     .with_context(|| format!("Failed to write task file {:?}", target_path))?;
             } else if *is_dir && path.is_dir() && entry.content.trim_end() == title_from_path(path)
             {

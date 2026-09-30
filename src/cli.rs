@@ -17,6 +17,7 @@ use crate::{
         set_agent_project_enabled, set_agent_project_git_mode, show_agent_logs, show_agent_status,
         unregister_agent_project,
     },
+    manual_sessions::{claim_manual_task, handoff_manual_task, start_manual_task},
     platform::{AgentServiceAction, manage_agent_service},
     runner::run_automated_exec_gate,
     scheduler::{print_agent_scheduler_pass, run_agent_daemon, run_agent_once},
@@ -72,6 +73,23 @@ enum Commands {
         #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
         task: Vec<String>,
     },
+    /// Creates a Doing task reserved for a directly opened Codex session
+    Start {
+        /// Exact current Codex session ID (defaults to CODEX_THREAD_ID)
+        #[arg(long)]
+        session: Option<String>,
+        description: String,
+    },
+    /// Claims an existing task for a directly opened Codex session and moves it to Doing
+    Claim {
+        status: String,
+        task_index: String,
+        /// Exact current Codex session ID (defaults to CODEX_THREAD_ID)
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// Releases a manual task to Todo, keeping its conversation for automation
+    Handoff { status: String, task_index: String },
     /// Queues independent follow-up work in Todo without starting another session
     FollowUp {
         /// Parent status (doing)
@@ -422,6 +440,34 @@ pub(super) fn run() -> Result<()> {
             let (description, metadata) = parse_add_task_args(task)?;
             let msg = add_task(&root, &description, metadata)?;
             println!("{}", msg);
+        }
+        Some(Commands::Start {
+            session,
+            description,
+        }) => {
+            start_manual_task(&root, &description, session.as_deref())?;
+            println!(
+                "[MANUAL] Task reserved in Doing. Use clt handoff doing <index> to queue automation."
+            );
+        }
+        Some(Commands::Claim {
+            status,
+            task_index,
+            session,
+        }) => {
+            claim_manual_task(
+                &root,
+                TaskStatus::parse(&status)?,
+                &task_index,
+                session.as_deref(),
+            )?;
+            println!(
+                "[MANUAL] Task reserved in Doing. Use clt handoff doing <index> to queue automation."
+            );
+        }
+        Some(Commands::Handoff { status, task_index }) => {
+            handoff_manual_task(&root, TaskStatus::parse(&status)?, &task_index)?;
+            println!("Task handed off to Todo with its Codex conversation attached.");
         }
         Some(Commands::FollowUp {
             status,

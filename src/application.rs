@@ -44,7 +44,8 @@ use crate::{
         insert_content_into_markdown, move_path_into_directory,
         move_task_without_reordering_after_lock, normalize_status_arg, parse_one_based_task_index,
         read_markdown_entries, recoverable_codex_session_id_from_task_content, remove_task_entry,
-        reorder_directory_task, reorder_markdown_task, task_content_with_codex_session,
+        reorder_directory_task, reorder_markdown_task, task_content_is_manual,
+        task_content_with_codex_session, task_content_with_manual_session,
         task_content_without_stop_marker, task_entry_at, task_entry_is_stopped,
         task_for_codex_session_in_board,
     },
@@ -1813,6 +1814,9 @@ pub(super) fn update_task_in_board_after_lock(
     let entry = board.entry(status, task_index)?;
     let session_id = recoverable_codex_session_id_from_task_content(&entry.content);
     let updated_content = match session_id {
+        Some(session_id) if task_content_is_manual(&entry.content) => {
+            task_content_with_manual_session(new_description, session_id)
+        }
         Some(session_id) => task_content_with_codex_session(new_description, session_id),
         None => new_description.trim_end().to_string(),
     };

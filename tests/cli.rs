@@ -66,6 +66,208 @@ fn assert_success(output: &Output) -> (String, String) {
     (stdout, stderr)
 }
 
+const MANUAL_SESSION: &str = "01900000-0000-7000-8000-000000000001";
+
+#[test]
+fn manual_claim_refuses_existing_clt_ownership_before_mutating_the_board() {
+    for ownership in ["lease", "prior-run", "launch"] {
+        let workspace = TestWorkspace::new("manual-busy");
+        assert_success(&workspace.run(&["init"]));
+        assert_success(&workspace.run(&["agent", "register"]));
+        assert_success(&workspace.run(&["add", "Existing task"]));
+        let todo_before = fs::read(workspace.path().join("tasks/todo.md")).unwrap();
+        let doing_before = fs::read(workspace.path().join("tasks/doing.md")).unwrap();
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let database_path = workspace.path().join("agent-state/agent.db");
+            let database = turso::Builder::new_local(database_path.to_str().unwrap())
+                .experimental_multiprocess_wal(true).build().await.unwrap();
+            let connection = database.connect().unwrap();
+            if ownership == "prior-run" {
+                connection.execute("INSERT INTO session_git_modes (project_id, codex_session_id, git_mode) SELECT id, ?1, 'off' FROM projects", [MANUAL_SESSION]).await.unwrap();
+            } else if ownership == "launch" {
+                connection.execute("INSERT INTO agent_git_launch_states (project_id, run_token, git_mode, starting_head, worktree_baseline, created_at) SELECT id, 'old-run', 'commit', 'old-head', '{}', '100' FROM projects", ()).await.unwrap();
+            } else {
+                connection.execute("INSERT INTO leases (project_id, holder, acquired_at, expires_at) SELECT id, 'existing-worker', '100', '9999999999' FROM projects", ()).await.unwrap();
+            }
+        });
+        for arguments in [
+            vec!["start", "Conflicting work", "--session", MANUAL_SESSION],
+            vec!["claim", "todo", "1", "--session", MANUAL_SESSION],
+        ] {
+            let output = workspace.run(&arguments);
+            assert!(!output.status.success());
+            let error = output_text(&output).1;
+            assert!(
+                error.contains(if ownership == "prior-run" {
+                    "already has an automated run"
+                } else {
+                    "still has a CLT owner"
+                }),
+                "{error}"
+            );
+        }
+        assert_eq!(
+            todo_before,
+            fs::read(workspace.path().join("tasks/todo.md")).unwrap()
+        );
+        assert_eq!(
+            doing_before,
+            fs::read(workspace.path().join("tasks/doing.md")).unwrap()
+        );
+    }
+}
+
+#[test]
+fn concurrent_direct_starts_publish_only_one_manual_owner() {
+    let workspace = TestWorkspace::new("manual-concurrent");
+    assert_success(&workspace.run(&["init"]));
+    let children = [MANUAL_SESSION, "01900000-0000-7000-8000-000000000002"].map(|session| {
+        Command::new(env!("CARGO_BIN_EXE_clt"))
+            .current_dir(workspace.path())
+            .args(["--local", "start", "Direct work", "--session", session])
+            .env("CLT_AGENT_STATE_DIR", workspace.path().join("agent-state"))
+            .env_remove("CLT_AGENT_PROJECT_ID")
+            .env_remove("CLT_AGENT_RUN_TOKEN")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+    });
+    let outputs = children.map(|child| child.wait_with_output().unwrap());
+    assert_eq!(
+        outputs
+            .iter()
+            .filter(|output| output.status.success())
+            .count(),
+        1
+    );
+    let rejected = outputs
+        .iter()
+        .find(|output| !output.status.success())
+        .unwrap();
+    assert!(
+        output_text(rejected)
+            .1
+            .contains("already has a manual task")
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("tasks/doing.md"))
+            .unwrap()
+            .matches("- Direct work")
+            .count(),
+        1
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("tasks/todo.md")).unwrap(),
+        "# To Do Tasks\n"
+    );
+}
+
+#[test]
+fn manual_tasks_start_in_doing_and_handoff_keeps_the_conversation() {
+    for folders in [false, true] {
+        let workspace = TestWorkspace::new("manual-lifecycle");
+        assert_success(&workspace.run(if folders {
+            &["init", "--folders"]
+        } else {
+            &["init"]
+        }));
+        assert_success(&workspace.run(&["agent", "register"]));
+        assert_success(&workspace.run(&["add", "Unrelated queued work"]));
+        assert_success(&workspace.run(&[
+            "start",
+            "Plan the feature.",
+            "--session",
+            MANUAL_SESSION,
+        ]));
+        let (doing, _) = assert_success(&workspace.run(&["list", "doing"]));
+        assert!(doing.contains("[MANUAL] Plan the feature."));
+        assert!(!doing.contains("STOPPED") && !doing.contains("clt:manual"));
+        let (todo, _) = assert_success(&workspace.run(&["list", "todo"]));
+        assert!(todo.contains("Unrelated queued work") && !todo.contains("Plan the feature"));
+        // Retries must never create a second task or replace somebody else's link.
+        assert!(
+            !workspace
+                .run(&["start", "Duplicate", "--session", MANUAL_SESSION])
+                .status
+                .success()
+        );
+        assert!(
+            !workspace
+                .run(&[
+                    "claim",
+                    "doing",
+                    "1",
+                    "--session",
+                    "01900000-0000-7000-8000-000000000002"
+                ])
+                .status
+                .success()
+        );
+        assert_success(&workspace.run(&["claim", "doing", "1", "--session", MANUAL_SESSION]));
+        // Ordinary moves preserve the claim. Only handoff releases it.
+        assert_success(&workspace.run(&["status", "doing", "1", "todo"]));
+        let (todo, _) = assert_success(&workspace.run(&["list", "todo"]));
+        assert!(todo.contains("[MANUAL] Plan the feature."));
+        let index = todo
+            .lines()
+            .find(|line| line.contains("Plan the feature"))
+            .unwrap()
+            .split('.')
+            .next()
+            .unwrap();
+        assert_success(&workspace.run(&["handoff", "todo", index]));
+        let (todo, _) = assert_success(&workspace.run(&["list", "todo"]));
+        assert!(!todo.contains("MANUAL"));
+        let stored = if folders {
+            fs::read_dir(workspace.path().join("tasks/todo"))
+                .unwrap()
+                .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+                .find(|text| text.contains("Plan the feature"))
+                .unwrap()
+        } else {
+            fs::read_to_string(workspace.path().join("tasks/todo.md")).unwrap()
+        };
+        assert!(stored.contains(&format!("codex:{MANUAL_SESSION}")));
+        assert!(!stored.contains("clt:manual") && !stored.contains("clt:stopped"));
+        assert_success(&workspace.run(&["claim", "todo", index, "--session", MANUAL_SESSION]));
+        assert_success(&workspace.run(&["done", "doing", "1"]));
+        let (done, _) = assert_success(&workspace.run(&["list", "done"]));
+        assert!(!done.contains("MANUAL") && !done.contains("STOPPED"));
+        assert_success(&workspace.run(&[
+            "start",
+            "Next direct task",
+            "--session",
+            "01900000-0000-7000-8000-000000000002",
+        ]));
+    }
+}
+
+#[test]
+fn manual_claim_requires_exact_identity_and_accepts_the_runtime_session_id() {
+    let workspace = TestWorkspace::new("manual-identity");
+    assert_success(&workspace.run(&["init"]));
+    let invoke = |session: Option<&str>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_clt"));
+        command
+            .current_dir(workspace.path())
+            .args(["--local", "start", "Direct work"])
+            .env("CLT_AGENT_STATE_DIR", workspace.path().join("agent-state"))
+            .env_remove("CLT_AGENT_PROJECT_ID")
+            .env_remove("CLT_AGENT_RUN_TOKEN")
+            .env_remove("CODEX_THREAD_ID");
+        if let Some(session) = session {
+            command.env("CODEX_THREAD_ID", session);
+        }
+        command.output().unwrap()
+    };
+    assert!(!invoke(None).status.success());
+    assert!(!invoke(Some("guess")).status.success());
+    assert_success(&invoke(Some(MANUAL_SESSION)));
+    let stored = fs::read_to_string(workspace.path().join("tasks/doing.md")).unwrap();
+    assert!(stored.contains(&format!("clt:manual codex:{MANUAL_SESSION}")));
+}
+
 #[test]
 fn help_is_reported_on_stdout_with_a_success_exit() {
     let workspace = TestWorkspace::new("help");
