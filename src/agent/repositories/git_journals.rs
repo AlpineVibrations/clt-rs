@@ -4,10 +4,11 @@ use clt_database::turso::{Connection, Database, params, transaction::Transaction
 use super::RepositoryDatabase;
 use crate::{
     agent::{
-        AGENT_EXTERNAL_COMPLETION_REASON, AGENT_GIT_FINALIZATION_RESUME_TOKEN_PREFIX, AgentGitMode,
-        AgentRunOutcome, GitFinalizationRecord, GitFinalizationState, NewGitFinalization,
-        TursoAgentStore, git_finalization_record_from_row, query_count, row_integer,
-        row_optional_integer, row_optional_text, row_text, update_project_after_run,
+        AGENT_EXTERNAL_COMPLETION_REASON, AGENT_GIT_FINALIZATION_RESUME_TOKEN_PREFIX,
+        AGENT_MISSING_GIT_RECOVERY_TOKEN_PREFIX, AgentGitMode, AgentRunOutcome,
+        GitFinalizationRecord, GitFinalizationState, NewGitFinalization, TursoAgentStore,
+        git_finalization_record_from_row, query_count, row_integer, row_optional_integer,
+        row_optional_text, row_text, update_project_after_run,
     },
     managed_git::AgentGitStartState,
     runner::agent_timestamp,
@@ -56,6 +57,83 @@ async fn session_can_enable_git(
 }
 
 impl TursoAgentStore {
+    /// Reserve an idle project for explicit recovery of a lost journal. The
+    /// original run/mode records and logs remain evidence, never a new boundary.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn begin_missing_git_recovery_blocking(
+        &self,
+        project_id: i64,
+        project_path: &std::path::Path,
+        session_id: &str,
+        expected_run_id: i64,
+        holder: &str,
+        acquired_at: &str,
+        expires_at: &str,
+    ) -> Result<()> {
+        self.blocking.block_on_persist(async {
+            let mut conn = self.repositories.git_journals.connect().await?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).await?;
+            anyhow::ensure!(query_count(&tx,
+                "SELECT COUNT(*) FROM runs WHERE id = ?1 AND project_id = ?2
+                 AND status IN ('failure', 'timeout')
+                 AND EXISTS (SELECT 1 FROM projects WHERE id = ?2 AND path = ?3)
+                 AND id = (SELECT MAX(id) FROM runs WHERE project_id = ?2)",
+                params![expected_run_id, project_id, project_path.to_string_lossy().as_ref()],
+            ).await? == 1, "The latest run changed; review recovery again");
+            anyhow::ensure!(query_count(&tx,
+                "SELECT EXISTS (SELECT 1 FROM git_finalizations WHERE project_id = ?1
+                    AND (codex_session_id = ?2 OR state NOT IN ('completed', 'cancelled')))
+                 OR EXISTS (SELECT 1 FROM agent_git_launch_states WHERE project_id = ?1)
+                 OR EXISTS (SELECT 1 FROM agent_workers WHERE project_id = ?1
+                    AND state IN ('dispatching', 'running', 'finalizing'))
+                 OR EXISTS (SELECT 1 FROM leases WHERE project_id = ?1)
+                 OR EXISTS (SELECT 1 FROM session_controls WHERE project_id = ?1
+                    AND (child_pid IS NOT NULL OR interactive_holder IS NOT NULL
+                         OR interactive_launch_token IS NOT NULL
+                         OR (state <> 'stopped' AND NOT (state = 'resume_requested' AND codex_session_id = ?2))))",
+                params![project_id, session_id],
+            ).await? == 0,
+                "Recovery requires an idle project with no surviving Git journal or launch record. Stop active work and retry; existing recovery records are preserved");
+            tx.execute(
+                "INSERT INTO leases (project_id, holder, acquired_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
+                params![project_id, holder, acquired_at, expires_at],
+            ).await?;
+            tx.execute(
+                "INSERT INTO session_controls (project_id, codex_session_id, state, run_token, updated_at)
+                 VALUES (?1, ?2, 'stopped', ?4, ?3)
+                 ON CONFLICT(project_id, codex_session_id) DO UPDATE
+                    SET state = 'stopped', run_token = ?4, updated_at = ?3",
+                params![project_id, session_id, acquired_at, format!("{AGENT_MISSING_GIT_RECOVERY_TOKEN_PREFIX}{expected_run_id}")],
+            ).await?;
+            tx.commit().await?;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn finish_missing_git_recovery_blocking(
+        &self,
+        project_id: i64,
+        holder: &str,
+    ) -> Result<()> {
+        self.blocking.block_on_persist(async {
+            let conn = self.repositories.git_journals.connect().await?;
+            let changed = conn
+                .execute(
+                    "UPDATE projects SET failure_count = 0, last_failure_at = NULL,
+                    last_blocked_recovery_at = NULL, updated_at = ?3
+                 WHERE id = ?1 AND EXISTS (SELECT 1 FROM leases WHERE project_id = ?1
+                    AND holder = ?2 AND CAST(expires_at AS INTEGER) > CAST(?3 AS INTEGER))",
+                    params![project_id, holder, agent_timestamp()],
+                )
+                .await?;
+            anyhow::ensure!(
+                changed == 1,
+                "Recovery lost its project reservation; check the queued task before retrying"
+            );
+            Ok(())
+        })
+    }
+
     pub(crate) fn can_enable_session_git_blocking(
         &self,
         project_id: i64,

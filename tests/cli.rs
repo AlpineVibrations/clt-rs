@@ -496,6 +496,50 @@ fn folder_initialization_creates_all_status_directories() {
 }
 
 #[test]
+fn recover_task_preserves_work_and_queues_a_fresh_conversation() {
+    let workspace = TestWorkspace::new("recover-task");
+    assert_success(&workspace.run(&["init"]));
+    assert_success(&workspace.run(&["agent", "register"]));
+    fs::write(
+        workspace.path().join("tasks/doing.md"),
+        "# Doing\n- Finish feature. codex:lost-session\n",
+    )
+    .unwrap();
+    fs::write(workspace.path().join("feature.txt"), "existing work\n").unwrap();
+    let database_path = workspace.path().join("agent-state/agent.db");
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let db = turso::Builder::new_local(database_path.to_str().unwrap())
+            .experimental_multiprocess_wal(true).build().await.unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("INSERT INTO session_controls (project_id,codex_session_id,state,run_token,updated_at)
+            SELECT id,'lost-session','resume_requested','old-run','100' FROM projects", ()).await.unwrap();
+        conn.execute("INSERT INTO session_git_modes (project_id,codex_session_id,git_mode)
+            SELECT id,'lost-session','commit' FROM projects", ()).await.unwrap();
+        conn.execute("INSERT INTO runs (project_id,status,started_at,finished_at,summary,codex_session_id)
+            SELECT id,'failure','99','100','Known Codex session has no frozen Git start journal','lost-session' FROM projects", ()).await.unwrap();
+        conn.execute("UPDATE projects SET failure_count = 1", ()).await.unwrap();
+    });
+    let wrong = workspace.run(&["agent", "recover-task", "--session", "another-session"]);
+    assert!(!wrong.status.success());
+    let (message, _) = assert_success(&workspace.run(&["agent", "recover-task"]));
+    assert!(message.contains("A fresh Codex run"));
+    let (todo, _) = assert_success(&workspace.run(&["list", "todo"]));
+    assert!(todo.contains("Finish feature."));
+    let content = fs::read_to_string(workspace.path().join("tasks/todo.md")).unwrap();
+    assert!(content.contains("Previous Codex session: lost-session"));
+    assert!(!content.contains("codex:lost-session"));
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("feature.txt")).unwrap(),
+        "existing work\n"
+    );
+    assert!(!workspace.run(&["agent", "recover-task"]).status.success());
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("tasks/todo.md")).unwrap(),
+        content
+    );
+}
+
+#[test]
 fn invalid_inputs_fail_on_stderr_without_mutating_the_board() {
     let workspace = TestWorkspace::new("failures");
     assert_success(&workspace.run(&["init"]));

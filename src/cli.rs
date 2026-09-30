@@ -10,6 +10,7 @@ use std::{
 use crate::runner::{AutomatedSupervisorSpec, run_automated_session_supervisor};
 use crate::{
     agent::{AgentGitMode, ensure_agent_state_dir, open_agent_store, open_agent_store_at},
+    application::git_recovery::{plan_git_recovery, recover_git_task},
     application::{
         AgentTaskSelection, ManagedTaskWorkflow, TaskDoneOutcome, clean_agent_state, expand_tasks,
         get_task_root, list_agent_projects, list_tasks, reconcile_agent_project,
@@ -19,7 +20,7 @@ use crate::{
     },
     manual_sessions::{claim_manual_task, handoff_manual_task, start_manual_task},
     platform::{AgentServiceAction, manage_agent_service},
-    runner::run_automated_exec_gate,
+    runner::{resolve_agent_project_root, run_automated_exec_gate},
     scheduler::{print_agent_scheduler_pass, run_agent_daemon, run_agent_once},
     session_control::{
         InteractiveCodexResumeMode, run_agent_interactive_session_worker,
@@ -189,6 +190,14 @@ enum AgentCommands {
     Reconcile {
         /// Project path to reconcile. Defaults to the current directory.
         path: Option<PathBuf>,
+    },
+    /// Recover a lost Git record: queue a fresh attempt, or accept an already-Done task
+    RecoverTask {
+        /// Project path. Defaults to the current directory.
+        path: Option<PathBuf>,
+        /// Select the previous conversation if the failed run is ambiguous.
+        #[arg(long)]
+        session: Option<String>,
     },
     /// Configures the git-commit skill for a registered project
     GitCommit {
@@ -642,6 +651,17 @@ fn handle_agent_command(command: AgentCommands, local: bool, default_root: &Path
         AgentCommands::Reconcile { path } => {
             let state_dir = ensure_agent_state_dir()?;
             reconcile_agent_project(&state_dir, path.as_deref(), local, default_root)?;
+        }
+        AgentCommands::RecoverTask { path, session } => {
+            let root = resolve_agent_project_root(path.as_deref(), local, default_root)?;
+            let store = open_agent_store()?;
+            let project = store
+                .list_projects_blocking()?
+                .into_iter()
+                .find(|project| project.path == root)
+                .with_context(|| format!("Project is not registered: {}", root.display()))?;
+            let plan = plan_git_recovery(&store, &project, session.as_deref())?;
+            println!("{}", recover_git_task(&store, &plan)?);
         }
         AgentCommands::GitCommit { command } => {
             let store = open_agent_store()?;

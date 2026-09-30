@@ -40,6 +40,9 @@ use crate::{
         set_codex_model_reasoning_if_default_at, upsert_codex_provider_config_at,
         valid_environment_variable_name,
     },
+    application::git_recovery::{
+        GitRecoveryPlan, failure_has_missing_git_start, plan_git_recovery, recover_git_task,
+    },
     application::{
         AgentLeaseHolderLiveness, AgentProjectScan, AgentProjectScanStatus, delete_task_in_board,
         ensure_status_conversion_allowed, move_task_in_board, move_task_to_archive_in_board,
@@ -2771,18 +2774,22 @@ pub(super) fn load_tui_agent_panel_snapshot_inner(
         .map(|project| {
             let scan = scan_agent_project(&project.path);
             let daemon_scan_problem = tui_agent_daemon_scan_problem(&project, &scan);
-            let latest_run = if project.enabled
-                && project.failure_count > 0
-                && (scan.todo_count > 0
-                    || scan.doing_count > 0
-                    || pending_git_finalizations.contains_key(&project.id))
-            {
+            let latest_run = if project.failure_count > 0 {
                 store.latest_run_for_project_blocking(project.id)?
             } else {
                 None
             };
+            let relevant_failure = latest_run.as_ref().filter(|run| {
+                scan.todo_count > 0
+                    || scan.doing_count > 0
+                    || pending_git_finalizations.contains_key(&project.id)
+                    || run
+                        .summary
+                        .as_deref()
+                        .is_some_and(failure_has_missing_git_start)
+            });
             let failure_problem =
-                tui_agent_failure_problem(&project, latest_run.as_ref(), now, failure_backoff);
+                tui_agent_failure_problem(&project, relevant_failure, now, failure_backoff);
             let runtime_state = resolve_tui_agent_runtime_state(
                 tui_agent_runtime_state(project.id, &active_leases),
                 interactive_session_projects.contains(&project.id),
@@ -2938,7 +2945,7 @@ pub(super) fn tui_agent_failure_problem(
     now: u64,
     failure_backoff: Duration,
 ) -> Option<String> {
-    if !project.enabled || project.failure_count <= 0 {
+    if project.failure_count <= 0 {
         return None;
     }
     let run = latest_run.filter(|run| matches!(run.status.as_str(), "failure" | "timeout"))?;
@@ -2952,6 +2959,17 @@ pub(super) fn tui_agent_failure_problem(
                 .as_deref()
                 .unwrap_or("No failure summary was recorded")
         });
+    if failure_has_missing_git_start(summary) {
+        return Some(
+            "Git recovery available - press r\n\
+             CLT is missing this task's saved Git starting point. Press r to recover from current files and commits; you can review and confirm before anything changes.\n\
+             A fresh Codex run will check existing work and finish what remains. Tasks already in Done will stay completed. Press l for the saved error."
+                .to_string(),
+        );
+    }
+    if !project.enabled {
+        return None;
+    }
     let retry = remaining_agent_delay(project.last_failure_at.as_deref(), now, failure_backoff)
         .map(|remaining| format!("Automatic retry in {remaining}s while the daemon is active."))
         .unwrap_or_else(|| "Automatic retry is ready when the daemon is active.".to_string());
@@ -3786,6 +3804,28 @@ pub(super) fn selected_tui_agent_log_view_at(
             None => {
                 let store = open_agent_store_at(state_dir)?;
                 let mut run = store.latest_run_for_project_blocking(selected.project.id)?;
+                if let Some(failed_run) = run.as_ref().filter(|run| {
+                    matches!(run.status.as_str(), "failure" | "timeout")
+                        && run
+                            .summary
+                            .as_deref()
+                            .is_some_and(failure_has_missing_git_start)
+                }) {
+                    // Git preflight can fail before any output file exists.
+                    // Show that saved failure instead of an older session's log.
+                    let mut view = TuiAgentLogView::message(
+                        selected.project.name.clone(),
+                        format!(
+                            "Saved agent error (run {})\n{}",
+                            failed_run.id,
+                            failed_run.summary.as_deref().unwrap_or_default(),
+                        ),
+                    );
+                    view.session_target = failed_run.codex_session_id.clone().map(|session_id| {
+                        TuiCodexSessionTarget::new(&selected.project, session_id)
+                    });
+                    return Ok(Some(view));
+                }
                 if run
                     .as_ref()
                     .is_some_and(|run| run.stdout_path.is_none() && run.stderr_path.is_none())
@@ -4242,6 +4282,7 @@ pub(super) fn format_agent_project_table_row(
     let last_run = format_agent_table_last_run(&item.project);
     let path_or_error = item
         .displayed_problem()
+        .and_then(|problem| problem.lines().next())
         .unwrap_or_else(|| item.project.path.to_str().unwrap_or("<non-UTF-8 path>"));
 
     if width < 120 {
@@ -5979,6 +6020,7 @@ pub(super) struct TuiApp {
     pub(super) model_input: Option<TuiModelInput>,
     pub(super) awaiting_model_provider_choice: bool,
     pub(super) pending_agent_project_removal: Option<TuiAgentProjectRemoval>,
+    pub(super) pending_git_recovery: Option<GitRecoveryPlan>,
     pub(super) agent_log_view: Option<TuiAgentLogView>,
     pub(super) selected_board: usize,
     pub(super) editing_task_idx: Option<usize>,
@@ -6021,6 +6063,7 @@ impl TuiApp {
             model_input: None,
             awaiting_model_provider_choice: false,
             pending_agent_project_removal: None,
+            pending_git_recovery: None,
             agent_log_view: None,
             selected_board: TODO_BOARD_INDEX,
             editing_task_idx: None,
@@ -6183,6 +6226,9 @@ pub(super) enum TuiEffect {
 }
 
 pub(super) fn update_tui_pane(app: &mut TuiApp, key: KeyEvent) -> Option<Vec<TuiEffect>> {
+    if app.pending_git_recovery.is_some() {
+        return Some(vec![TuiEffect::PaneKey(key)]);
+    }
     if app.current_mode == Mode::Help {
         if matches!(
             key.code,
@@ -6940,6 +6986,25 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
     // The feedback area is always the last element of main_layout
     f.render_widget(feedback_paragraph, feedback_area);
 
+    if let Some(plan) = app.pending_git_recovery.as_ref() {
+        let area = Rect::new(
+            size.x + 1,
+            size.y + 1,
+            size.width.saturating_sub(2),
+            size.height.saturating_sub(2),
+        );
+        let prompt = wrap_input_text(&plan.prompt(), area.width.saturating_sub(2) as usize);
+        f.render_widget(ratatui::widgets::Clear, area);
+        f.render_widget(
+            Paragraph::new(prompt).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Recover task "),
+            ),
+            area,
+        );
+    }
+
     if matches!(app.current_mode, Mode::Help) {
         let help_text = "TUI Commands:\n\n\
                                  [Space]        - Create new task / toggle selected agent project\n\
@@ -7015,6 +7080,28 @@ pub(super) fn execute_tui_key_effect(
     let board_dir = app.board_dir();
     let statuses = TASK_STATUSES;
     let input_available_width = terminal.size()?.width.saturating_sub(2) as usize;
+    if let Some(plan) = app.pending_git_recovery.take() {
+        match key.code {
+            KeyCode::Char('y' | 'Y') => {
+                let result = open_agent_store().and_then(|store| recover_git_task(&store, &plan));
+                app.agent_panel.refresh(&app.active_root);
+                *last_agent_panel_refresh = Instant::now();
+                match result {
+                    Ok(message) => app.feedback_buffer = message,
+                    Err(error) => {
+                        // Keep action errors visible above the stale failed-run guidance.
+                        app.agent_panel.last_error =
+                            Some(format!("Unable to recover task: {error}"));
+                    }
+                }
+            }
+            KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+                app.feedback_buffer = "Task recovery cancelled".to_string();
+            }
+            _ => app.pending_git_recovery = Some(plan),
+        }
+        return Ok(false);
+    }
     if let Some(removal) = app.pending_agent_project_removal.take() {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
@@ -7541,6 +7628,26 @@ pub(super) fn execute_tui_key_effect(
                         }
                     }
                     KeyCode::Char('r') | KeyCode::Char('R') => {
+                        if let Some(project) = app.agent_panel.selected_project()
+                            && project.failure_problem.as_deref().is_some_and(|problem| {
+                                problem.starts_with("Git recovery available")
+                            })
+                        {
+                            let result = open_agent_store().and_then(|store| {
+                                plan_git_recovery(&store, &project.project, None)
+                            });
+                            match result {
+                                Ok(plan) => {
+                                    app.agent_log_view = None;
+                                    app.pending_git_recovery = Some(plan);
+                                }
+                                Err(error) => {
+                                    app.agent_panel.last_error =
+                                        Some(format!("Unable to prepare recovery: {error}"))
+                                }
+                            }
+                            return Ok(false);
+                        }
                         app.feedback_buffer = match retry_selected_tui_agent_project(
                             &mut app.agent_panel,
                             &app.active_root,

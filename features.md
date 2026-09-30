@@ -18,6 +18,7 @@ in [Feature Ideas](docs/FEATURE_IDEAS.md); they are not a list of shipped featur
   - [Linux sandbox setup](#linux-codex-sandbox-setup)
   - [Project registration and settings](#project-registration-and-settings)
   - [Managed Git](#managed-git)
+  - [Missing Git recovery records](#missing-git-recovery-records)
   - [Agent skills](#agent-skills)
   - [Scheduling and task recovery](#scheduling-and-task-recovery)
   - [Goals and blocked tasks](#goals-and-blocked-tasks)
@@ -135,7 +136,7 @@ When the current project is registered, the Kanban console title appends its age
 
 Press `Tab` to toggle between the task board and the full-screen Agent Projects pane. In Agent Projects, Up/Down selects a registered project, `Enter` opens that project's task board, `Space` toggles the project `ON` or `OFF`, `Delete` removes it from the agent list after a `y`/`n` confirmation, and `g` cycles the `GIT` column through `OFF`, `COM`, and `PUSH`. These modes disable Git automation, ask Codex to create a task commit, or ask Codex to create that commit and let CLT publish it. Removing a project unregisters it from the agent list and clears its stored agent history, including unfinished Git finalizations and launch boundaries. It leaves the project, task files, and Git checkout unchanged. Removal is refused while an independent worker or agent lease is active. The currently open project is marked with `*`, the pane's top border shows the current local time before the daemon status, and the terminal title updates to the active project.
 
-The daemon persists its own project-scan result separately from the TUI's local task count. If the background service cannot read a project, or a pending project is waiting after a failed run, the `AGENT` column shows `ERROR`, the row turns red, and selecting it shows the full cause and recovery guidance in the console. Failed runs include their automatic-retry timing; after correcting the cause, press `r` to clear the cooldown and retry immediately. External projects under `/Volumes` specifically direct macOS users to enable Full Disk Access for CLT and restart the agent; missing external projects instead prompt users to check that the drive is mounted. The `AGENT` column shows `INTERACTIVE` in full for a live guarded Codex handoff. This session reserves the project, so queued tasks wait until it releases the reservation. `FENCED` means CLT is preserving a handoff or lease reservation without claiming that an automated agent is running. `STALE` identifies a reservation whose generated owner process has exited; the daemon reclaims it once no matching session or worker still needs the fence. Selecting any of these rows explains the waiting state in the console. Press `s` directly on `INTERACTIVE` or session-backed `FENCED` rows to request a safe stop, or open its output with `l` for exact-session `s`/`i` controls.
+The daemon persists its own project-scan result separately from the TUI's local task count. If the background service cannot read a project, or a pending project is waiting after a failed run, the `AGENT` column shows `ERROR`, the row turns red, and selecting it shows the full cause and recovery guidance in the console. Retryable failures include their automatic-retry timing; after correcting the cause, press `r` to clear the cooldown and retry immediately. Missing Git starting records instead show `Git recovery available - press r`; `r` opens a [task recovery confirmation](#missing-git-recovery-records). External projects under `/Volumes` specifically direct macOS users to enable Full Disk Access for CLT and restart the agent; missing external projects instead prompt users to check that the drive is mounted. The `AGENT` column shows `INTERACTIVE` in full for a live guarded Codex handoff. This session reserves the project, so queued tasks wait until it releases the reservation. `FENCED` means CLT is preserving a handoff or lease reservation without claiming that an automated agent is running. `STALE` identifies a reservation whose generated owner process has exited; the daemon reclaims it once no matching session or worker still needs the fence. Selecting any of these rows explains the waiting state in the console. Press `s` directly on `INTERACTIVE` or session-backed `FENCED` rows to request a safe stop, or open its output with `l` for exact-session `s`/`i` controls.
 
 ### Task sessions and controls
 
@@ -316,6 +317,47 @@ Unstaged and untracked work can coexist with an automated task, including new fi
 Managed Git task moves preserve folder-backed tasks as paths: Directory-to-Directory Todo/Doing/Done transitions rename only the moving file or folder, preserving every unrelated task's path. New completions appear at the top of Done. Managed completions use a descending filename order prefix to prepend without renumbering existing tasks; ordinary manual reordering can normalize those prefixes. Prelaunch rejects a board layout in which a folder-backed Todo would enter Markdown-backed Doing, or folder-backed Doing would enter Markdown-backed Done; expand and commit the destination layout first. If a crash leaves identical session-linked copies on both sides of a managed move, CLT repairs the duplicate without reordering unrelated tasks. Ambiguous or nonidentical copies fail closed.
 
 Commits from either enabled mode use `CLT Agent <clt-agent@localhost>` as both author and committer so automated work is recognizable without changing repository or global Git configuration. Existing enabled registrations migrate to commit-only mode. In the TUI, the modes appear as `COM`, `PUSH`, and `OFF` in the `GIT` column.
+
+### Missing Git recovery records
+
+When a previous task's Git starting record is missing, Agent Projects shows
+`Git recovery available - press r`. Select that project and press `r`, then `y`
+to confirm recovery (`n` or `Esc` cancels). The confirmation identifies the task
+and explains the action before changing anything.
+
+For unfinished work, CLT preserves the current files, staged changes, commits,
+and old conversation, records the previous session ID in the task history, and
+queues the same task in Todo for a fresh Codex conversation. That run reviews
+existing work and Git history, verifies what is complete, and finishes only what
+remains. With Git automation enabled, it receives a new Git starting record
+through normal launch preparation.
+CLT does not roll back work or invent a record for the old attempt.
+
+For a task already in Done, confirmation accepts its current completion and
+clears the obsolete retry request. CLT leaves the task and its conversation link
+in place and does not run it again. Project enablement and Git settings stay as
+configured; queued work starts when the project's scheduler is active.
+
+The equivalent explicit command is:
+
+```bash
+clt agent recover-task /path/to/project
+# If the failed run does not identify one task:
+clt agent recover-task /path/to/project --session <previous-session-id>
+```
+
+Recovery requires an idle project, no manual owner, and no surviving Git journal
+for that session or unfinished Git work elsewhere in the project. It rechecks
+the saved run and exact task after confirmation, refuses ambiguous links, and
+keeps interrupted task moves stopped so recovery can be retried. Stop active
+work before retrying a refused recovery. Automated agents cannot invoke this
+command to bypass their commit checks.
+
+Press `l` on the project to read the saved diagnostic, even if no log was created.
+Before recovery, task-level `l` still shows its earlier output. Old conversations
+remain available with `codex resume <previous-session-id>`. Ordinary retries and
+restarting CLT cannot recreate the missing record; this action explicitly starts
+a new attempt from the current checkout instead.
 
 ### Agent skills
 

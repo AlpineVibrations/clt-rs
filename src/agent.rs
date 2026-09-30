@@ -301,6 +301,8 @@ pub(super) enum GitFinalizationState {
     Cancelled,
 }
 
+pub(super) const AGENT_MISSING_GIT_RECOVERY_TOKEN_PREFIX: &str = "clt-git-recovery:";
+
 impl GitFinalizationState {
     pub(super) fn database_value(self) -> &'static str {
         match self {

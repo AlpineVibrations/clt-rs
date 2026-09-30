@@ -2435,6 +2435,156 @@ fn agent_project_table_surfaces_failed_run_reason_and_retry_guidance() {
 }
 
 #[test]
+fn missing_git_start_shows_readable_recovery_steps_on_normal_terminals() {
+    let root = temp_root("tui-missing-git-start");
+    fs::create_dir_all(&root).unwrap();
+    for summary in [
+        "Codex runner failed before completion: Known Codex session has no frozen Git start journal; CLT will not reconstruct the task boundary from a later checkout",
+        "Codex session completed-session has completed task evidence but no frozen Git start journal; CLT cannot safely reconstruct the exact-one-commit boundary",
+        "Git-enabled task recovery has no frozen start journal; only a fresh NextTodo run may establish a new task boundary",
+    ] {
+        let mut app = TuiApp::new(&root, false);
+        let mut item = tui_agent_project_for_test(13, "project");
+        item.project.failure_count = 1;
+        item.project.last_failure_at = Some("100".to_string());
+        item.runtime_state = TuiAgentRuntimeState::Error;
+        let run = agent::AgentRunRecord {
+            id: 1,
+            project_id: item.project.id,
+            project_name: item.project.name.clone(),
+            project_path: item.project.path.clone(),
+            status: "failure".to_string(),
+            started_at: "99".to_string(),
+            finished_at: Some("100".to_string()),
+            exit_code: None,
+            stdout_path: None,
+            stderr_path: None,
+            summary: Some(summary.to_string()),
+            codex_session_id: None,
+        };
+        item.failure_problem =
+            tui_agent_failure_problem(&item.project, Some(&run), 250, Duration::from_secs(300));
+        let problem = item.displayed_problem().unwrap();
+        assert!(problem.starts_with("Git recovery available - press r\n"));
+        assert!(!problem.contains("Automatic retry"));
+        assert!(problem.contains("Press r"));
+        assert!(!problem.contains("frozen"));
+        let row = format_agent_project_table_row(0, &item, 180, 7, 20, false);
+        assert!(row.contains("Git recovery available - press r"));
+        assert_eq!(row.lines().count(), 1);
+        assert!(!row.contains("Press Space"));
+        app.agent_panel.projects = vec![item];
+        app.agent_panel.state.select(Some(0));
+        for width in [80, 120] {
+            let mut terminal =
+                Terminal::new(ratatui::backend::TestBackend::new(width, 24)).unwrap();
+            terminal.draw(|frame| render_tui(frame, &app)).unwrap();
+            let rendered = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            for text in [
+                "Git recovery available - press r",
+                "Press r",
+                "fresh Codex run",
+                "Press l",
+            ] {
+                assert!(rendered.contains(text), "missing {text:?} at width {width}");
+            }
+        }
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn missing_git_start_output_keeps_the_saved_failure_and_exact_session() {
+    let root = temp_root("tui-missing-git-start-output");
+    let state_dir = root.join("state");
+    let project_root = root.join("project");
+    fs::create_dir_all(&project_root).unwrap();
+    let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
+    store
+        .register_project_blocking(&project_root, "project")
+        .unwrap();
+    let project = store.list_projects_blocking().unwrap().remove(0);
+    let old_log = root.join("old.out");
+    fs::write(&old_log, "Earlier successful output").unwrap();
+    store
+        .record_run_outcome_blocking(agent::AgentRunOutcome {
+            project_id: project.id,
+            status: "success",
+            started_at: "99",
+            finished_at: Some("100"),
+            exit_code: Some(0),
+            log_dir: None,
+            stdout_path: Some(old_log.to_str().unwrap()),
+            stderr_path: None,
+            summary: Some("Earlier run"),
+            codex_session_id: Some("affected-session"),
+        })
+        .unwrap();
+    let mut item = tui_agent_project_for_test(project.id, "project");
+    item.project = project;
+    item.runtime_state = TuiAgentRuntimeState::Error;
+    let mut panel = TuiAgentPanel {
+        projects: vec![item],
+        current_project_registration: None,
+        daemon_status: "running".to_string(),
+        state: ListState::default(),
+        scroll_offset: 0,
+        last_error: None,
+    };
+    panel.state.select(Some(0));
+    let summary = "Known Codex session has no frozen Git start journal; CLT will not reconstruct the task boundary from a later checkout";
+    for session_id in [Some("affected-session"), None] {
+        store
+            .record_run_outcome_blocking(agent::AgentRunOutcome {
+                project_id: panel.projects[0].project.id,
+                status: "failure",
+                started_at: "101",
+                finished_at: Some("102"),
+                exit_code: None,
+                log_dir: None,
+                stdout_path: None,
+                stderr_path: None,
+                summary: Some(summary),
+                codex_session_id: session_id,
+            })
+            .unwrap();
+        let mut view = selected_tui_agent_log_view_at(&panel, &state_dir)
+            .unwrap()
+            .unwrap();
+        view.refresh().unwrap();
+        assert!(view.content.contains(summary));
+        assert!(!view.content.contains("Earlier successful output"));
+        assert!(!view.is_live);
+        assert!(view.path.is_none());
+        assert_eq!(
+            view.session_target
+                .as_ref()
+                .map(|target| target.session_id.as_str()),
+            session_id
+        );
+        // Task output still provides the original conversation log.
+        let task = task_entry_from_text(
+            TaskSource::MarkdownLine { line_index: 1 },
+            "Affected task",
+            "Affected task codex:affected-session",
+            false,
+        );
+        let task_view = selected_tui_task_log_view_at(&panel, TaskStatus::Doing, &task, &state_dir)
+            .unwrap()
+            .unwrap();
+        assert!(task_view.content.contains("Earlier successful output"));
+    }
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn current_project_registration_is_present_only_when_active_project_is_unregistered() {
     let active_root = PathBuf::from("/tmp/current");
     let other_project = tui_agent_project_for_test(1, "other");

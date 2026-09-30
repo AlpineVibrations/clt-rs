@@ -13,6 +13,8 @@ use std::{
 
 use anyhow::{Context, Result};
 
+pub(super) mod git_recovery;
+
 use crate::{
     agent::{
         self, AGENT_DB_FILE, AgentGitMode, AgentSessionControlState, GitFinalizationState,
