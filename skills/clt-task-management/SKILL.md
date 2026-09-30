@@ -122,8 +122,10 @@ clt list todo
 clt claim todo <index>
 ```
 
-Manual tasks display `[MANUAL]`. Claims survive session exits, restarts, edits,
-and ordinary status moves. Finish with `clt done`, or, when the user wants
+Manual tasks display `[MANUAL]` while claimed. Claims survive session exits,
+restarts, edits, and moves to Backlog. Moving a task to Todo in the TUI or with
+`clt status` releases its manual claim, removes the label, and preserves its
+conversation for normal automation. Finish with `clt done`, or, when the user wants
 automation to take over, record the plan and remaining work, list the current
 status, and run `clt handoff doing <index>`. Handoff moves the task to Todo and
 keeps the same conversation. Stop editing after handoff because an enabled

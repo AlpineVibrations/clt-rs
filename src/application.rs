@@ -46,8 +46,8 @@ use crate::{
         read_markdown_entries, recoverable_codex_session_id_from_task_content, remove_task_entry,
         reorder_directory_task, reorder_markdown_task, task_content_is_manual,
         task_content_with_codex_session, task_content_with_manual_session,
-        task_content_without_stop_marker, task_entry_at, task_entry_is_stopped,
-        task_for_codex_session_in_board,
+        task_content_without_manual_marker, task_content_without_stop_marker, task_entry_at,
+        task_entry_is_stopped, task_for_codex_session_in_board,
     },
     tui::{
         format_agent_daemon_runtime_status, load_task_agent_session_states,
@@ -1706,10 +1706,44 @@ pub(super) fn move_task_in_board_after_lock(
     to: TaskStatus,
     task_index: usize,
 ) -> Result<()> {
+    let board = TaskBoard::new(board_dir);
+    let entry = board.entry(from, task_index)?;
+    let manual_session = if to == TaskStatus::Todo && task_content_is_manual(&entry.content) {
+        let session = recoverable_codex_session_id_from_task_content(&entry.content)
+            .context("Manual task needs its attached Codex conversation before moving to Todo")?;
+        let mut linked = Vec::new();
+        crate::session_control::collect_codex_session_tasks_in_board(
+            board_dir,
+            session,
+            &mut linked,
+        )?;
+        anyhow::ensure!(
+            linked.len() == 1,
+            "Resolve duplicate conversation links before moving this manual task to Todo"
+        );
+        Some(session.to_string())
+    } else {
+        None
+    };
     if from != to {
         ensure_status_conversion_allowed(board_dir, to)?;
     }
-    TaskBoard::new(board_dir).move_task_after_lock(from, to, task_index)
+    // Publish the destination while still claimed. The shared board lock keeps
+    // scheduling out until the move succeeds and ownership is released.
+    board.move_task_after_lock(from, to, task_index)?;
+    if let Some(session) = manual_session {
+        let todo = board
+            .entries(TaskStatus::Todo)?
+            .into_iter()
+            .find(|task| {
+                recoverable_codex_session_id_from_task_content(&task.content)
+                    == Some(session.as_str())
+            })
+            .context("Moved manual task disappeared before releasing its claim")?;
+        let content = task_content_without_manual_marker(&todo.content);
+        board.write_entry_content(TaskStatus::Todo, &todo, &content)?;
+    }
+    Ok(())
 }
 
 pub(super) fn move_task_to_archive_in_board(

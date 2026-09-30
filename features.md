@@ -192,8 +192,10 @@ Handoff moves the task to Todo and releases its claim while preserving the exact
 Codex session ID. When eligible, automation resumes that conversation using the
 project's normal settings. A disabled project stays disabled. Stop working in
 the direct session after handoff; an enabled daemon may pick it up immediately.
-Task edits and ordinary status moves preserve the claim, so moving to Todo alone
-does not hand it off. Deleting or completing the task releases the reservation.
+Moving the task to Todo in the TUI or with `clt status doing <index> todo` also
+hands it off: the manual label disappears and it becomes a regular queued task
+with its conversation preserved. Task edits and moves to Backlog preserve the
+claim. Deleting or completing the task releases the reservation.
 `s` and `c` on a manual task explain its ownership instead of launching or stopping
 a duplicate conversation.
 

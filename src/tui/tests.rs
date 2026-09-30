@@ -332,6 +332,57 @@ fn tui_reorganize_action_moves_the_selected_task_between_boards() {
 }
 
 #[test]
+fn tui_moving_manual_work_to_todo_releases_the_claim_and_keeps_the_session() {
+    for folders in [false, true] {
+        let root = temp_root("tui-manual-todo-handoff");
+        init_tasks(&root, folders).unwrap();
+        insert_task(
+            &root,
+            TaskStatus::Doing,
+            None,
+            "Planned feature clt:manual codex:planning-session",
+            None,
+        )
+        .unwrap();
+        let board = get_tasks_dir(&root);
+        let mut states = [
+            ListState::default(),
+            ListState::default(),
+            ListState::default(),
+            ListState::default(),
+        ];
+        let mut selected = 1;
+        states[selected].select(Some(0));
+        let result = reorganize_selected_tui_task(
+            &board,
+            &TASK_STATUSES,
+            &mut states,
+            &mut selected,
+            false,
+            TuiTaskReorganizeDirection::Left,
+        );
+        assert_eq!(result, "Moved task to todo");
+        assert_eq!(selected, TODO_BOARD_INDEX);
+        assert!(!board_has_manual_task(&board).unwrap());
+        let task = task_entry_at(&board, TaskStatus::Todo, 1).unwrap();
+        assert!(task_entry_is_ready(&task));
+        assert_eq!(
+            recoverable_codex_session_id_from_task_content(&task.content),
+            Some("planning-session")
+        );
+        assert_eq!(
+            task_display_text_with_agent_flag(
+                &task,
+                TaskStatus::Todo,
+                &TaskAgentSessionStates::new()
+            ),
+            "Planned feature"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
 fn tui_done_move_selects_and_shows_the_newest_completion() {
     for folders in [false, true] {
         let root = temp_root("tui-done-visible");

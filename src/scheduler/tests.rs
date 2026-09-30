@@ -59,14 +59,15 @@ fn manual_claim_blocks_scheduler_recovery_and_stale_acquisition() {
     let pass = run_agent_once_with_runner(&state_dir, &runner).unwrap();
     assert_eq!(pass.runs_started, 0);
     assert_eq!(runner.ran_project_count(), 0);
-    // Completing direct work releases the board reservation for unrelated Todo.
+    // A normal move back to Todo releases the reservation for queued work.
     move_task_in_board(
         &get_tasks_dir(&project.path),
         TaskStatus::Doing,
-        TaskStatus::Done,
+        TaskStatus::Todo,
         "1",
     )
     .unwrap();
+    assert!(!board_has_manual_task(&get_tasks_dir(&project.path)).unwrap());
     let pass = run_agent_once_with_runner(&state_dir, &runner).unwrap();
     assert_eq!(pass.runs_started, 1);
     fs::remove_dir_all(root).unwrap();

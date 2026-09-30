@@ -205,10 +205,10 @@ fn manual_tasks_start_in_doing_and_handoff_keeps_the_conversation() {
                 .success()
         );
         assert_success(&workspace.run(&["claim", "doing", "1", "--session", MANUAL_SESSION]));
-        // Ordinary moves preserve the claim. Only handoff releases it.
+        // Returning to Todo is the normal handoff, including from the TUI.
         assert_success(&workspace.run(&["status", "doing", "1", "todo"]));
         let (todo, _) = assert_success(&workspace.run(&["list", "todo"]));
-        assert!(todo.contains("[MANUAL] Plan the feature."));
+        assert!(!todo.contains("[MANUAL]"));
         let index = todo
             .lines()
             .find(|line| line.contains("Plan the feature"))
@@ -216,7 +216,8 @@ fn manual_tasks_start_in_doing_and_handoff_keeps_the_conversation() {
             .split('.')
             .next()
             .unwrap();
-        assert_success(&workspace.run(&["handoff", "todo", index]));
+        assert_success(&workspace.run(&["claim", "todo", index, "--session", MANUAL_SESSION]));
+        assert_success(&workspace.run(&["handoff", "doing", "1"]));
         let (todo, _) = assert_success(&workspace.run(&["list", "todo"]));
         assert!(!todo.contains("MANUAL"));
         let stored = if folders {

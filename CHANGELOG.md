@@ -6,6 +6,10 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+### Fixed
+
+- Moving a manually claimed task to Todo now releases its claim and removes the manual label, preserving the attached Codex conversation so ordinary automation can pick it up. This applies to TUI moves and CLI status changes.
+
 ### Added
 
 - Reserve directly opened Codex sessions with `clt start` or `clt claim`. Manually owned tasks display `[MANUAL]` and keep the project out of automated scheduling and interrupted-task recovery until completion or an explicit `clt handoff`, which preserves the conversation for implementation.
