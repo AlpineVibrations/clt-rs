@@ -1,0 +1,3 @@
+Allow task activation and launch recovery to preserve concurrent unstaged task edits
+
+COMPLETED 2026-09-30: Allow concurrent unstaged task edits and other worktree changes during launch verification, activation, and terminal-worker recovery while retaining Git history, index, destination, and task-identity checks. Added Markdown/folder activation and connected/disconnected recovery regressions; updated agent guidance and documentation. Verified rustfmt, Clippy, and cargo test --locked --all-targets --all-features -- --test-threads=1 (715 passed, 1 ignored). Serial execution avoids an existing parallel database-health fixture directory collision. clt:manual codex:01a0f2c7-2388-7a12-a2b9-b8e2652ebe00

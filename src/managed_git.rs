@@ -2561,7 +2561,6 @@ pub(super) fn verify_agent_git_start_state_unchanged(
     let current_upstream = resolve_agent_git_upstream(project_root, current_branch.as_deref())?;
     let expected_baseline = AgentGitWorktreeBaseline::from_json(&start.worktree_baseline)?;
     let current_index_tree = agent_git_index_tree(project_root)?;
-    let current_baseline = capture_agent_git_worktree_baseline(project_root)?;
     // Older journals were created under the clean-index requirement.
     let expected_index_tree = match expected_baseline.initial_index_tree.as_deref() {
         Some(tree) => tree.to_string(),
@@ -2575,9 +2574,9 @@ pub(super) fn verify_agent_git_start_state_unchanged(
             "resolve the legacy prelaunch index",
         )?,
     };
-    let worktree_is_unchanged = current_baseline.tracked_patch_ids
-        == expected_baseline.tracked_patch_ids
-        && current_baseline.untracked_blob_ids == expected_baseline.untracked_blob_ids;
+    // The shared worktree may change while the child starts or awaits activation.
+    // Preserve the recorded baseline, but fence only the Git proof boundary here;
+    // activation checks the selected task identity and finalization seals the index.
     let upstream_is_unchanged = if git_mode == AgentGitMode::CommitAndPush {
         capture_agent_git_upstream_destination(project_root, current_branch.as_deref())?
             == Some(AgentGitUpstreamDestination {
@@ -2598,11 +2597,10 @@ pub(super) fn verify_agent_git_start_state_unchanged(
         || current_branch != start.branch_ref
         || current_upstream != start.upstream_ref
         || current_index_tree != expected_index_tree
-        || !worktree_is_unchanged
         || !upstream_is_unchanged
     {
         anyhow::bail!(
-            "Git HEAD, branch, upstream, index, or worktree changed after CLT froze the automated run; start the task before making implementation changes or commits"
+            "Git HEAD, branch, upstream, or index changed after CLT froze the automated run; start the task before making staged changes or commits"
         );
     }
     require_agent_git_index_tree(project_root, &current_index_tree)?;

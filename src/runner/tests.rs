@@ -616,14 +616,10 @@ fn automated_supervisor_monitor_panic_still_reaps_its_codex_group() {
 }
 
 #[cfg(unix)]
-fn assert_disconnected_no_session_launch_recovery(mutate_checkout: bool) {
+fn assert_disconnected_no_session_launch_recovery(mutation: &str) {
     use std::os::unix::fs::PermissionsExt;
 
-    let root = temp_root(if mutate_checkout {
-        "automated-supervisor-pre-session-mutated"
-    } else {
-        "automated-supervisor-pre-session-unchanged"
-    });
+    let root = temp_root(&format!("automated-supervisor-pre-session-{mutation}"));
     let state_dir = root.join("state/clt");
     let project_root = root.join("project");
     add_task(&project_root, "committed task", None).unwrap();
@@ -737,8 +733,11 @@ fn assert_disconnected_no_session_launch_recovery(mutate_checkout: bool) {
             .unwrap()
             .contains("supervised Codex process group was proven reaped")
     );
-    if mutate_checkout {
+    if mutation != "unchanged" {
         fs::write(project_root.join("unexpected.txt"), "changed after crash\n").unwrap();
+    }
+    if mutation == "staged" {
+        run_test_git(&project_root, &["add", "unexpected.txt"]);
         let error = prepare_agent_git_start_state_for_run(
             &store,
             &project,
@@ -776,6 +775,12 @@ fn assert_disconnected_no_session_launch_recovery(mutate_checkout: bool) {
         );
     }
 
+    if mutation != "unchanged" {
+        assert_eq!(
+            fs::read_to_string(project_root.join("unexpected.txt")).unwrap(),
+            "changed after crash\n"
+        );
+    }
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -819,13 +824,14 @@ fn rejected_prelaunch_preserves_runner_fence_and_records_original_error() {
     ));
     let lease_holder = agent_worker_lease_holder(run_token);
     let start = capture_agent_git_start_state(&project_root, project.git_mode).unwrap();
-    // Reproduce a real checkout edit between freezing the baseline and opening
-    // the launch gate. Codex must never execute with the stale baseline.
+    // Reproduce an index edit between freezing the boundary and opening
+    // the launch gate. Unstaged work is allowed, but index changes remain fenced.
     fs::write(
         project_root.join("concurrent-edit.txt"),
         "preserve this edit\n",
     )
     .unwrap();
+    run_test_git(&project_root, &["add", "concurrent-edit.txt"]);
     let marker = root.join("codex-launched");
     let fake_codex = root.join("fake-codex");
     fs::write(
@@ -852,7 +858,7 @@ fn rejected_prelaunch_preserves_runner_fence_and_records_original_error() {
     .unwrap()
     {
         AgentRunnerLaunchResult::Failed(result) => result,
-        AgentRunnerLaunchResult::Launched(_) => panic!("stale baseline must prevent launch"),
+        AgentRunnerLaunchResult::Launched(_) => panic!("changed index must prevent launch"),
     };
     assert_eq!(result.status, "failure");
     assert!(
@@ -863,7 +869,7 @@ fn rejected_prelaunch_preserves_runner_fence_and_records_original_error() {
     assert!(
         result
             .summary
-            .contains("worktree changed after CLT froze the automated run")
+            .contains("index changed after CLT froze the automated run")
     );
     assert!(
         fs::read_to_string(&result.stderr_path)
@@ -945,13 +951,19 @@ fn rejected_prelaunch_preserves_runner_fence_and_records_original_error() {
 #[cfg(unix)]
 #[test]
 fn disconnected_no_session_reclaims_unchanged_launch_after_worker_abandonment() {
-    assert_disconnected_no_session_launch_recovery(false);
+    assert_disconnected_no_session_launch_recovery("unchanged");
 }
 
 #[cfg(unix)]
 #[test]
-fn disconnected_no_session_preserves_launch_after_checkout_mutation() {
-    assert_disconnected_no_session_launch_recovery(true);
+fn disconnected_no_session_preserves_launch_after_index_mutation() {
+    assert_disconnected_no_session_launch_recovery("staged");
+}
+
+#[cfg(unix)]
+#[test]
+fn disconnected_no_session_recovers_after_unstaged_worktree_edits() {
+    assert_disconnected_no_session_launch_recovery("unstaged");
 }
 
 pub(crate) struct FakeAgentRunner {
@@ -2065,14 +2077,10 @@ fn codex_runner_writes_logs_and_treats_no_tasks_left_as_idle() {
 }
 
 #[cfg(unix)]
-fn assert_connected_no_session_launch_recovery(mutate_checkout: bool) {
+fn assert_connected_no_session_launch_recovery(mutation: &str) {
     use std::os::unix::fs::PermissionsExt;
 
-    let root = temp_root(if mutate_checkout {
-        "git-runner-no-session-mutated"
-    } else {
-        "git-runner-no-session-unchanged"
-    });
+    let root = temp_root(&format!("git-runner-no-session-{mutation}"));
     let state_dir = root.join("state/clt");
     let project_root = root.join("project");
     add_task(&project_root, "committed task", None).unwrap();
@@ -2156,8 +2164,11 @@ fn assert_connected_no_session_launch_recovery(mutate_checkout: bool) {
             .unwrap()
             .is_some()
     );
-    if mutate_checkout {
+    if mutation != "unchanged" {
         fs::write(project_root.join("unexpected.txt"), "changed after reap\n").unwrap();
+    }
+    if mutation == "staged" {
+        run_test_git(&project_root, &["add", "unexpected.txt"]);
         let error = prepare_agent_git_start_state_for_run(
             &store,
             &project,
@@ -2195,19 +2206,31 @@ fn assert_connected_no_session_launch_recovery(mutate_checkout: bool) {
         );
     }
 
+    if mutation != "unchanged" {
+        assert_eq!(
+            fs::read_to_string(project_root.join("unexpected.txt")).unwrap(),
+            "changed after reap\n"
+        );
+    }
     fs::remove_dir_all(root).unwrap();
 }
 
 #[cfg(unix)]
 #[test]
 fn connected_no_session_reclaims_unchanged_launch_after_worker_finalization() {
-    assert_connected_no_session_launch_recovery(false);
+    assert_connected_no_session_launch_recovery("unchanged");
 }
 
 #[cfg(unix)]
 #[test]
-fn connected_no_session_preserves_launch_after_checkout_mutation() {
-    assert_connected_no_session_launch_recovery(true);
+fn connected_no_session_preserves_launch_after_index_mutation() {
+    assert_connected_no_session_launch_recovery("staged");
+}
+
+#[cfg(unix)]
+#[test]
+fn connected_no_session_recovers_after_unstaged_worktree_edits() {
+    assert_connected_no_session_launch_recovery("unstaged");
 }
 
 #[cfg(unix)]

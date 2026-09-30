@@ -29,7 +29,9 @@ Do not run that startup procedure from inside a released automated CLT task. For
 
 After release, inspect the frozen state but do not pull, fetch/synchronize, merge, rebase, switch branches, reset history, reconfigure the upstream, or push. Move the selected Todo task to Doing before implementation so CLT can recheck and bind the frozen launch record to the session's `WORKING` journal.
 
-An unconsumed pre-registration launch boundary is immutable. Do not retry by recapturing it from the current checkout or by cleaning/unregistering the project. Even if a reaped child exits before announcing a session, CLT preserves the record until the exact worker is terminal, no session-control row owns the run token, and the checkout and Git mode still match; otherwise it fails closed.
+Unstaged task-board edits and other unstaged or untracked changes made after launch do not invalidate activation or terminal-worker launch recovery. Preserve those edits and continue with the selected task; CLT still checks HEAD, branch, upstream, the index, and the selected task identity without replacing the recorded baseline.
+
+An unconsumed pre-registration launch boundary is immutable. Do not retry by recapturing it from the current checkout or by cleaning/unregistering the project. Even if a reaped child exits before announcing a session, CLT preserves the record until the exact worker is terminal, no session-control row owns the run token, and HEAD, branch, upstream, index, and Git mode still match; otherwise it fails closed.
 
 ## Shared Dirty Worktrees
 
@@ -168,7 +170,7 @@ For managed Git automation, directory-backed status moves preserve the existing 
 
 When an automated CLT prompt enables `commit` or `commit-and-push` mode, `clt done` starts a durable task finalization. The task may already appear in the Done store, but that move is provisional while CLT reports `FINALIZING`.
 
-CLT already completed its scheduler-owned startup preparation and branch/upstream validation, persisted the server-owned launch state, and only then released this automated run. That preparation may deliberately preserve the current commit when an older `WORKING` journal depends on it. Do not repeat the preparation. Move the selected committed Todo task to Doing before implementation; CLT rechecks the starting commit, branch, baseline, and upstream configuration and binds the session journal at that seam. Do not pull, fetch/synchronize, merge, rebase, switch branches, reset history, reconfigure the destination, or rewrite history afterward.
+CLT already completed its scheduler-owned startup preparation and branch/upstream validation, persisted the server-owned launch state, and only then released this automated run. That preparation may deliberately preserve the current commit when an older `WORKING` journal depends on it. Do not repeat the preparation. Move the selected committed Todo task to Doing before implementation; CLT rechecks the starting commit, branch, index, and upstream configuration and binds the session journal at that seam. Do not pull, fetch/synchronize, merge, rebase, switch branches, reset history, reconfigure the destination, or rewrite history afterward.
 
 Before `clt done`, run every available formatter, linter, signing check, and hook check that can mutate files. Then stage the verified implementation plus the active Doing task with its dated completion note and terminal session marker. Inspect the staged diff, and keep all unrelated baseline work outside the task commit, preserving its existing staging in the shared index when using a separate task index. `clt done` uses a private index to project that task into Done and seals the exact resulting full repository tree, not merely the changed paths or patch. It then moves the worktree entry provisionally. Stage only the resulting board transition and inspect the complete staged diff again before committing.
 

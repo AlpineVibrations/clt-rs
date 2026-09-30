@@ -6,6 +6,7 @@ use crate::worker::tests::reserve_test_worker;
 mod advanced_branch;
 mod enable_on_resume;
 mod follow_up;
+mod launch_edits;
 mod orphan;
 mod projection;
 mod staged_start;
@@ -535,7 +536,7 @@ fn git_enabled_task_must_exist_in_the_frozen_commit() {
 }
 
 #[test]
-fn prelaunch_git_snapshot_rejects_work_before_task_activation() {
+fn prelaunch_git_snapshot_preserves_concurrent_worktree_edits() {
     let root = temp_root("automated-git-prelaunch-snapshot");
     let project_root = root.join("project");
     init_tasks(&project_root, false).unwrap();
@@ -546,8 +547,26 @@ fn prelaunch_git_snapshot_rejects_work_before_task_activation() {
     .unwrap();
     initialize_test_git_repository(&project_root);
     let start = capture_agent_git_start_state(&project_root, AgentGitMode::Commit).unwrap();
-    fs::write(project_root.join("too-early.txt"), "implementation\n").unwrap();
+    fs::write(project_root.join("user-notes.txt"), "concurrent notes\n").unwrap();
+    fs::write(
+        project_root.join("tasks/todo.md"),
+        "# Todo Tasks\n- New task\n- Start first\n",
+    )
+    .unwrap();
+    fs::remove_file(project_root.join("tasks/backlog.md")).unwrap();
+    let before = run_test_git(&project_root, &["status", "--porcelain"]);
+    verify_agent_git_start_state_unchanged(&project_root, AgentGitMode::Commit, &start).unwrap();
+    assert_eq!(
+        run_test_git(&project_root, &["status", "--porcelain"]),
+        before
+    );
+    assert_eq!(
+        run_test_git(&project_root, &["rev-parse", "HEAD"]),
+        start.starting_head
+    );
 
+    // Staging the same concurrent work changes the proof boundary and remains fenced.
+    run_test_git(&project_root, &["add", "tasks/todo.md"]);
     let error = verify_agent_git_start_state_unchanged(&project_root, AgentGitMode::Commit, &start)
         .unwrap_err();
     assert!(format!("{error:#}").contains("changed after CLT froze"));
@@ -746,86 +765,133 @@ fn unconsumed_git_launch_boundary_cannot_be_overwritten_after_release() {
 
 #[test]
 fn unchanged_launch_boundary_is_reclaimed_only_after_its_worker_is_dead() {
-    let root = temp_root("automated-git-unchanged-launch-reclaim");
-    let state_dir = root.join("state/clt");
-    let project_root = root.join("project");
-    init_tasks(&project_root, false).unwrap();
-    fs::write(
-        project_root.join("tasks/todo.md"),
-        "# Todo Tasks\n- Retry after a pre-registration crash\n",
-    )
-    .unwrap();
-    initialize_test_git_repository(&project_root);
-    let project_root = fs::canonicalize(project_root).unwrap();
-    let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
-    store
-        .register_project_blocking(&project_root, "project")
-        .unwrap();
-    store
-        .set_project_git_mode_for_path_blocking(&project_root, AgentGitMode::Commit)
-        .unwrap();
-    let project = store.list_projects_blocking().unwrap().remove(0);
-    assert!(
-        store
-            .try_acquire_lease_blocking(project.id, "scheduler", "100", "999")
-            .unwrap()
-    );
-    assert!(reserve_test_worker(
-        &store,
-        project.id,
-        "dead-launch-worker",
-        "scheduler",
-        "101",
-        12,
-    ));
-    assert!(
-        store
-            .claim_worker_blocking("dead-launch-worker", 123, "102")
-            .unwrap()
-    );
-    let launch = capture_agent_git_start_state(&project_root, AgentGitMode::Commit).unwrap();
-    store
-        .record_git_launch_state_blocking(
-            project.id,
-            "dead-launch-worker",
-            AgentGitMode::Commit,
-            &launch,
-            "103",
+    for concurrent_edits in [false, true] {
+        let root = temp_root("automated-git-unchanged-launch-reclaim");
+        let state_dir = root.join("state/clt");
+        let project_root = root.join("project");
+        init_tasks(&project_root, false).unwrap();
+        fs::write(
+            project_root.join("tasks/todo.md"),
+            "# Todo Tasks\n- Retry after a pre-registration crash\n",
         )
         .unwrap();
-    assert!(
+        initialize_test_git_repository(&project_root);
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
         store
-            .abandon_worker_blocking(agent::AgentWorkerAbandonment {
-                worker_token: "dead-launch-worker",
-                expected_state: "running",
-                expected_worker_pid: Some(123),
-                expected_heartbeat_at: Some("102"),
-                finished_at: "104",
-                error: "simulated crash before session registration",
-                permitted_successor_holder: None,
-            })
-            .unwrap()
-    );
-
-    let recovered = prepare_agent_git_start_state_for_run(
-        &store,
-        &project,
-        AgentTaskSelection::NextTodo,
-        false,
-        false,
-        "replacement-worker",
-    )
-    .unwrap()
-    .unwrap();
-    assert_eq!(recovered, launch);
-    assert!(
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
         store
-            .git_launch_state_blocking(project.id, "dead-launch-worker")
-            .unwrap()
-            .is_none()
-    );
+            .set_project_git_mode_for_path_blocking(&project_root, AgentGitMode::Commit)
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        assert!(
+            store
+                .try_acquire_lease_blocking(project.id, "scheduler", "100", "999")
+                .unwrap()
+        );
+        assert!(reserve_test_worker(
+            &store,
+            project.id,
+            "dead-launch-worker",
+            "scheduler",
+            "101",
+            12,
+        ));
+        assert!(
+            store
+                .claim_worker_blocking("dead-launch-worker", 123, "102")
+                .unwrap()
+        );
+        let launch = capture_agent_git_start_state(&project_root, AgentGitMode::Commit).unwrap();
+        store
+            .record_git_launch_state_blocking(
+                project.id,
+                "dead-launch-worker",
+                AgentGitMode::Commit,
+                &launch,
+                "103",
+            )
+            .unwrap();
+        if concurrent_edits {
+            fs::write(
+                project_root.join("tasks/todo.md"),
+                "# Todo Tasks\n- Retry after a pre-registration crash\n- Concurrent task\n",
+            )
+            .unwrap();
+            fs::write(project_root.join("notes.txt"), "User notes\n").unwrap();
+        }
+        // Worktree edits do not bypass the worker ownership fence.
+        assert!(
+            prepare_agent_git_start_state_for_run(
+                &store,
+                &project,
+                AgentTaskSelection::NextTodo,
+                false,
+                false,
+                "too-soon",
+            )
+            .is_err()
+        );
+        assert_eq!(
+            store
+                .git_launch_state_blocking(project.id, "dead-launch-worker")
+                .unwrap(),
+            Some((AgentGitMode::Commit, launch.clone())),
+        );
+        assert!(
+            store
+                .abandon_worker_blocking(agent::AgentWorkerAbandonment {
+                    worker_token: "dead-launch-worker",
+                    expected_state: "running",
+                    expected_worker_pid: Some(123),
+                    expected_heartbeat_at: Some("102"),
+                    finished_at: "104",
+                    error: "simulated crash before session registration",
+                    permitted_successor_holder: None,
+                })
+                .unwrap()
+        );
 
-    fs::remove_dir_all(root).unwrap();
+        let recovered = prepare_agent_git_start_state_for_run(
+            &store,
+            &project,
+            AgentTaskSelection::NextTodo,
+            false,
+            false,
+            "replacement-worker",
+        )
+        .unwrap()
+        .unwrap();
+        if concurrent_edits {
+            assert_eq!(
+                read_tasks(&project_root, "todo").unwrap(),
+                vec![
+                    "- Retry after a pre-registration crash",
+                    "- Concurrent task"
+                ]
+            );
+            assert_eq!(
+                fs::read_to_string(project_root.join("notes.txt")).unwrap(),
+                "User notes\n"
+            );
+            assert_eq!(
+                run_test_git(&project_root, &["show", "HEAD:tasks/todo.md"]),
+                "# Todo Tasks\n- Retry after a pre-registration crash\n- Concurrent task"
+            );
+            assert_ne!(recovered.starting_head, launch.starting_head);
+        } else {
+            assert_eq!(recovered, launch);
+        }
+        assert!(
+            store
+                .git_launch_state_blocking(project.id, "dead-launch-worker")
+                .unwrap()
+                .is_none()
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[test]

@@ -8,6 +8,7 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ### Fixed
 
+- Preserve concurrent unstaged task edits and other worktree changes during automated launch verification, task activation, and terminal-worker launch recovery. Keep the original launch baseline and Git history, index, destination, and task-identity checks.
 - Moving a manually claimed task to Todo now releases its claim and removes the manual label, preserving the attached Codex conversation so ordinary automation can pick it up. This applies to TUI moves and CLI status changes.
 
 ### Added
