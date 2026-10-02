@@ -1269,7 +1269,7 @@ fn running_agent_log_view_streams_the_current_output_file() {
     let stdout_path = log_dir.join("200-000-p1-1.out");
     let stderr_path = log_dir.join("200-000-p1-1.err");
     fs::write(&stdout_path, "").unwrap();
-    let header = "Reading additional input from stdin...\nOpenAI Codex v0.153.3\n--------\nmodel: gpt-6-astra\nreasoning effort: xhigh\nsession id: session-live\n";
+    let header = "CLT launch fast mode: off\nReading additional input from stdin...\nOpenAI Codex v0.153.3\n--------\nmodel: gpt-6-astra\nreasoning effort: xhigh\nsession id: session-live\n";
     fs::write(&stderr_path, header).unwrap();
 
     let mut panel = TuiAgentPanel {
@@ -1291,7 +1291,7 @@ fn running_agent_log_view_streams_the_current_output_file() {
     assert_eq!(log_view.content, header);
     assert_eq!(
         log_view.settings_label(),
-        " Model: unknown | Thinking: unknown "
+        " Model: unknown | Thinking: unknown | Fast: off "
     );
     assert_eq!(
         viewed_tui_codex_session_target(Some(&log_view)).unwrap(),
@@ -1307,7 +1307,7 @@ fn running_agent_log_view_streams_the_current_output_file() {
     assert!(log_view.content.contains("still working"));
     assert_eq!(
         log_view.settings_label(),
-        " Model: gpt-6-astra | Thinking: xhigh "
+        " Model: gpt-6-astra | Thinking: xhigh | Fast: off "
     );
 
     fs::remove_dir_all(root).unwrap();
@@ -1966,12 +1966,12 @@ fn open_kanban_agent_log_follows_the_selected_task() {
     fs::write(&second_stdout, "second task output").unwrap();
     fs::write(
         &first_stderr,
-        "OpenAI Codex v0.153.3\n--------\nmodel: gpt-6-astra\nreasoning effort: high\n--------\n",
+        "CLT launch fast mode: on\nOpenAI Codex v0.153.3\n--------\nmodel: gpt-6-astra\nreasoning effort: high\n--------\n",
     )
     .unwrap();
     fs::write(
         &second_stderr,
-        "OpenAI Codex v0.153.3\n--------\nmodel: gpt-5.6-sol\nreasoning effort: medium\n--------\n",
+        "CLT launch fast mode: off\nOpenAI Codex v0.153.3\n--------\nmodel: gpt-5.6-sol\nreasoning effort: medium\n--------\n",
     )
     .unwrap();
     for (started_at, session_id, stdout_path, stderr_path) in [
@@ -2034,7 +2034,7 @@ fn open_kanban_agent_log_follows_the_selected_task() {
     assert_eq!(log_view.as_ref().unwrap().content, "first task output");
     assert_eq!(
         log_view.as_ref().unwrap().settings_label(),
-        " Model: gpt-6-astra | Thinking: high "
+        " Model: gpt-6-astra | Thinking: high | Fast: on "
     );
 
     sync_open_tui_task_log_view_at(
@@ -2049,7 +2049,7 @@ fn open_kanban_agent_log_follows_the_selected_task() {
     assert_eq!(log_view.as_ref().unwrap().content, "second task output");
     assert_eq!(
         log_view.as_ref().unwrap().settings_label(),
-        " Model: gpt-5.6-sol | Thinking: medium "
+        " Model: gpt-5.6-sol | Thinking: medium | Fast: off "
     );
 
     sync_open_tui_task_log_view_at(
@@ -2065,7 +2065,7 @@ fn open_kanban_agent_log_follows_the_selected_task() {
     assert_eq!(project_log_view.content, "second task output");
     assert_eq!(
         project_log_view.settings_label(),
-        " Model: gpt-5.6-sol | Thinking: medium "
+        " Model: gpt-5.6-sol | Thinking: medium | Fast: off "
     );
     assert!(!project_log_view.is_live);
     assert_eq!(
@@ -2092,7 +2092,7 @@ fn agent_log_settings_remain_visible_while_output_scrolls() {
     .unwrap();
     fs::write(
         &settings_path,
-        "OpenAI Codex v0.153.3\n--------\nmodel: gpt-6-astra\nreasoning effort: xhigh\n--------\n",
+        "CLT launch fast mode: on\nOpenAI Codex v0.153.3\n--------\nmodel: gpt-6-astra\nreasoning effort: xhigh\n--------\n",
     )
     .unwrap();
     let mut app = TuiApp::new(&root, true);
@@ -2118,7 +2118,7 @@ fn agent_log_settings_remain_visible_while_output_scrolls() {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("Model: gpt-6-astra | Thinking: xhigh"));
+        assert!(rendered.contains("Model: gpt-6-astra | Thinking: xhigh | Fast: on"));
         assert!(rendered.contains("last output line"));
     }
 
@@ -2127,7 +2127,7 @@ fn agent_log_settings_remain_visible_while_output_scrolls() {
     view.refresh().unwrap();
     assert_eq!(
         view.settings_label(),
-        " Model: unknown | Thinking: unknown "
+        " Model: unknown | Thinking: unknown | Fast: unknown "
     );
     assert!(view.content.contains("last output line"));
     fs::remove_dir_all(root).unwrap();

@@ -1556,12 +1556,17 @@ impl TuiAgentLogView {
 
     pub(super) fn settings_label(&self) -> String {
         format!(
-            " Model: {} | Thinking: {} ",
+            " Model: {} | Thinking: {} | Fast: {} ",
             self.settings.model.as_deref().unwrap_or("unknown"),
             self.settings
                 .reasoning_effort
                 .as_deref()
                 .unwrap_or("unknown"),
+            match self.settings.fast_enabled {
+                Some(true) => "on",
+                Some(false) => "off",
+                None => "unknown",
+            },
         )
     }
 }

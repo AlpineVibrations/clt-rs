@@ -67,6 +67,12 @@ Unit tests live under the module that owns the behavior, for example `src/task/t
 `src/test_support.rs` and are compiled only for tests. `tests/cli.rs` remains a black-box
 integration suite for the installed command contract.
 
+The runner records the requested Fast setting as the first line of each automated
+run's stderr log. The log footer reads that launch record and Codex's complete
+startup header from the displayed run, preserving historical settings independently
+of current project settings. Missing records stay unknown; task/output text cannot
+replace the recorded settings.
+
 `clt skills install` is dispatched before task-root discovery. Its installer reads
 the same embedded skill text that the agent prompt fallback uses and resolves the
 user home from `HOME` on Unix or `USERPROFILE` (with a drive/path fallback) on

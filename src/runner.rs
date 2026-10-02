@@ -377,6 +377,13 @@ pub(super) fn launch_agent_runner_stage(
     } else {
         command.arg("--disable").arg("fast_mode");
     }
+    append_agent_log_line(
+        &stderr_path,
+        &format!(
+            "{AGENT_LOG_FAST_MODE_PREFIX}{}",
+            if project.codex_fast_enabled { "on" } else { "off" }
+        ),
+    )?;
     let configured_session_id = configure_automated_codex_subcommand(
         &mut command,
         project,
@@ -2569,10 +2576,13 @@ pub(super) fn agent_codex_session_id_from_log(path: &Path) -> Result<Option<Stri
     Ok(None)
 }
 
+const AGENT_LOG_FAST_MODE_PREFIX: &str = "CLT launch fast mode: ";
+
 #[derive(Debug, Default, Eq, PartialEq)]
 pub(super) struct AgentRunSettings {
     pub(super) model: Option<String>,
     pub(super) reasoning_effort: Option<String>,
+    pub(super) fast_enabled: Option<bool>,
 }
 
 pub(super) fn agent_run_settings_from_log(path: &Path) -> Result<AgentRunSettings> {
@@ -2582,11 +2592,26 @@ pub(super) fn agent_run_settings_from_log(path: &Path) -> Result<AgentRunSetting
     let mut saw_banner = false;
     let mut in_header = false;
 
-    // Only trust Codex's startup header, never similarly named fields in task/output text.
+    // Trust CLT's first-line launch record and Codex's complete startup header,
+    // never similarly named fields in task/output text.
     // Bound reads even when a live or older log has no complete header.
-    for line in BufReader::new(file.take(16 * 1024)).lines().take(100) {
+    for (index, line) in BufReader::new(file.take(16 * 1024))
+        .lines()
+        .take(100)
+        .enumerate()
+    {
         let line = line?;
         let line = line.trim();
+        if index == 0
+            && let Some(value) = line.strip_prefix(AGENT_LOG_FAST_MODE_PREFIX)
+        {
+            settings.fast_enabled = match value {
+                "on" => Some(true),
+                "off" => Some(false),
+                _ => None,
+            };
+            continue;
+        }
         if !saw_banner {
             saw_banner = line.starts_with("OpenAI Codex v");
             continue;
@@ -2612,7 +2637,10 @@ pub(super) fn agent_run_settings_from_log(path: &Path) -> Result<AgentRunSetting
         }
     }
 
-    Ok(AgentRunSettings::default())
+    Ok(AgentRunSettings {
+        fast_enabled: settings.fast_enabled,
+        ..AgentRunSettings::default()
+    })
 }
 
 pub(super) fn latest_agent_log_path(log_dir: &Path, extension: &str) -> Result<Option<PathBuf>> {

@@ -258,6 +258,39 @@ fn agent_run_settings_only_read_the_complete_startup_header() {
     fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn agent_run_settings_fast_mode_only_reads_the_launch_record() {
+    let root = temp_root("agent-run-fast-settings");
+    fs::create_dir_all(&root).unwrap();
+    let path = root.join("run.err");
+    for (content, expected) in [
+        ("CLT launch fast mode: on\n", Some(true)),
+        ("CLT launch fast mode: off\n", Some(false)),
+        (
+            "CLT launch fast mode: on\nOpenAI Codex v0.153.3\n--------\nmodel: partial",
+            Some(true),
+        ),
+        (
+            "CLT launch fast mode: off\nOpenAI Codex v0.153.3\n--------\nmodel: run-model\n--------\nCLT launch fast mode: on\n",
+            Some(false),
+        ),
+        (
+            "OpenAI Codex v0.153.3\n--------\nmodel: older-model\n--------\nCLT launch fast mode: on\n",
+            None,
+        ),
+        ("task output\nCLT launch fast mode: on\n", None),
+        ("CLT launch fast mode: invalid\n", None),
+    ] {
+        fs::write(&path, content).unwrap();
+        assert_eq!(
+            agent_run_settings_from_log(&path).unwrap().fast_enabled,
+            expected,
+            "{content}"
+        );
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[cfg(unix)]
 #[test]
 fn interactive_terminal_event_source_process_entry() {
@@ -2071,6 +2104,12 @@ fn codex_runner_writes_logs_and_treats_no_tasks_left_as_idle() {
             "arg=--sandbox\narg=danger-full-access\narg=--ask-for-approval\narg=never\narg=--enable\narg=goals\narg=--config\narg=model_provider=\"openai\"\narg=--model\narg=gpt-5.6-terra\narg=--config\narg=model_reasoning_effort=\"high\"\narg=--enable\narg=fast_mode\narg=--config\narg=service_tier=\"fast\"\narg=exec\narg=--skip-git-repo-check\narg=-C\n"
         ));
     assert!(!stderr.contains("arg=model_reasoning_effort=\"low\"\n"));
+    assert_eq!(
+        agent_run_settings_from_log(&result.stderr_path)
+            .unwrap()
+            .fast_enabled,
+        Some(true)
+    );
     assert!(stderr.contains(&format!("arg={}\n", project_root.display())));
 
     fs::remove_dir_all(root).unwrap();
@@ -2689,6 +2728,12 @@ fn codex_runner_marks_shutdown_as_interrupted() {
     assert_eq!(result.status, "interrupted");
     let stderr = fs::read_to_string(&result.stderr_path).unwrap();
     assert!(stderr.contains("arg=--enable\narg=goals\narg=--disable\narg=fast_mode\narg=exec\n"));
+    assert_eq!(
+        agent_run_settings_from_log(&result.stderr_path)
+            .unwrap()
+            .fast_enabled,
+        Some(false)
+    );
     assert!(stderr.contains("agent is shutting down"));
 
     fs::remove_dir_all(root).unwrap();

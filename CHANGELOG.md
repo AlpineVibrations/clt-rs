@@ -6,6 +6,12 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+## [0.7.7] - 2026-10-02
+
+### Added
+
+- Show `Fast: on`, `off`, or `unknown` beside Model and Thinking in the agent log footer. Record each automated run's launch setting so live and completed logs retain it after project settings change; older logs show `unknown`.
+
 ## [0.7.6] - 2026-10-02
 
 ### Fixed
