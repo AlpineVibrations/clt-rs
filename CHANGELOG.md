@@ -6,6 +6,8 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+## [0.7.6] - 2026-10-02
+
 ### Fixed
 
 - Recover tasks with missing Git starting records from Agent Projects with `r` and confirmation, or `clt agent recover-task`. Preserve existing files, staging, commits and conversation history; queue unfinished work for a fresh attempt, or accept already-Done work without rerunning it. Keep the saved diagnostic available with `l`, including failures before any log was created.
