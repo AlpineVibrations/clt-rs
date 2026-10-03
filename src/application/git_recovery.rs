@@ -5,9 +5,10 @@ use chrono::Local;
 
 use crate::{
     agent::{
-        AGENT_MISSING_GIT_RECOVERY_TOKEN_PREFIX, AgentProject, AgentSessionControlState,
-        TursoAgentStore,
+        AGENT_BRANCH_GIT_RECOVERY_REASON, AGENT_MISSING_GIT_RECOVERY_TOKEN_PREFIX, AgentProject,
+        AgentSessionControlState, GitFinalizationRecord, GitFinalizationState, TursoAgentStore,
     },
+    managed_git::current_agent_git_branch,
     runner::{agent_timestamp, agent_timestamp_after, automated_agent_child_context},
     session_control::InteractiveAgentLease,
     task::{
@@ -28,6 +29,10 @@ pub(crate) fn failure_has_missing_git_start(summary: &str) -> bool {
     summary.contains("no frozen Git start journal") || summary.contains("no frozen start journal")
 }
 
+pub(crate) fn failure_has_git_recovery(summary: &str) -> bool {
+    failure_has_missing_git_start(summary) || summary.contains("Git task branch changed:")
+}
+
 #[derive(Clone)]
 pub(crate) struct GitRecoveryPlan {
     pub(crate) project: AgentProject,
@@ -36,11 +41,22 @@ pub(crate) struct GitRecoveryPlan {
     pub(crate) status: TaskStatus,
     board_dir: PathBuf,
     run_id: i64,
+    journal: Option<GitFinalizationRecord>,
+    current_branch: Option<String>,
 }
 
 impl GitRecoveryPlan {
     pub(crate) fn prompt(&self) -> String {
         let title: String = task_display_text(&self.task).chars().take(160).collect();
+        if let Some(journal) = &self.journal {
+            return format!(
+                "Recover {}: {}\nRetire the old attempt on {} and queue a fresh Codex conversation on {} to review existing work? Files, staging, commits and the old journal are preserved. A provisional Done task returns to Todo for verification. [y/n]",
+                self.project.name,
+                title,
+                journal.branch_ref.as_deref().unwrap_or("detached HEAD"),
+                self.current_branch.as_deref().unwrap_or("detached HEAD"),
+            );
+        }
         if self.status == TaskStatus::Done {
             format!(
                 "Recover {}: {}\nThis task is already in Done. Accept its current completion and stop retrying the old run? Files, commits and conversation are preserved. [y/n]",
@@ -80,14 +96,8 @@ pub(crate) fn plan_git_recovery(
 ) -> Result<GitRecoveryPlan> {
     let run = store
         .latest_run_for_project_blocking(project.id)?
-        .filter(|run| {
-            matches!(run.status.as_str(), "failure" | "timeout")
-                && run
-                    .summary
-                    .as_deref()
-                    .is_some_and(failure_has_missing_git_start)
-        })
-        .context("This project has no missing Git recovery record to recover")?;
+        .filter(|run| matches!(run.status.as_str(), "failure" | "timeout"))
+        .context("This project has no failed Git attempt to recover")?;
     anyhow::ensure!(
         session_id
             .zip(run.codex_session_id.as_deref())
@@ -102,6 +112,7 @@ pub(crate) fn plan_git_recovery(
     let controls = store.session_controls_for_project_blocking(project.id)?;
     let recovery_token = format!("{AGENT_MISSING_GIT_RECOVERY_TOKEN_PREFIX}{}", run.id);
     let mut candidates = Vec::new();
+    let mut current_branch = None;
     for (board, status, task) in &tasks {
         let session = recoverable_codex_session_id_from_task_content(&task.content).unwrap();
         let selected = match requested_session {
@@ -117,19 +128,42 @@ pub(crate) fn plan_git_recovery(
                     })
             }
         };
-        if selected
-            && store
-                .git_finalization_blocking(project.id, session)?
-                .is_none()
-        {
-            candidates.push((board, status, task, session));
+        if selected {
+            let journal = store.git_finalization_blocking(project.id, session)?;
+            let recoverable = if let Some(journal) = &journal {
+                current_branch = current_agent_git_branch(&project.path)?;
+                let interrupted_recovery = journal.state == GitFinalizationState::Cancelled
+                    && journal.last_error.as_deref() == Some(AGENT_BRANCH_GIT_RECOVERY_REASON)
+                    && controls.iter().any(|control| {
+                        control.codex_session_id == session
+                            && control.state == AgentSessionControlState::Stopped
+                            && control.run_token.as_deref() == Some(recovery_token.as_str())
+                    });
+                journal.commit_oid.is_none()
+                    && current_branch.is_some()
+                    && (interrupted_recovery
+                        || current_branch != journal.branch_ref
+                            && matches!(
+                                journal.state,
+                                GitFinalizationState::Working
+                                    | GitFinalizationState::Tracking
+                                    | GitFinalizationState::CommitPending
+                            ))
+            } else {
+                run.summary
+                    .as_deref()
+                    .is_some_and(failure_has_missing_git_start)
+            };
+            if recoverable {
+                candidates.push((board, status, task, session, journal));
+            }
         }
     }
     anyhow::ensure!(
         candidates.len() == 1,
         "Cannot identify one affected task. Use clt agent recover-task --session <session-id> for the intended task; its saved error is available with l"
     );
-    let (board, status, task, session) = candidates.remove(0);
+    let (board, status, task, session, journal) = candidates.remove(0);
     anyhow::ensure!(
         tasks
             .iter()
@@ -155,15 +189,18 @@ pub(crate) fn plan_git_recovery(
         status: *status,
         board_dir: board.clone(),
         run_id: run.id,
+        journal,
+        current_branch,
     })
 }
 
-/// Explicit user acceptance starts a *new* attempt, preserving the old run's
-/// evidence. A completed task needs only its obsolete resume request stopped.
+/// Explicit user acceptance starts a new attempt, preserving the old evidence.
+/// Only missing-journal recovery accepts Done; a retired sealed attempt needs
+/// fresh verification even if its provisional board move already reached Done.
 pub(crate) fn recover_git_task(store: &TursoAgentStore, plan: &GitRecoveryPlan) -> Result<String> {
     anyhow::ensure!(
         automated_agent_child_context()?.is_none(),
-        "Missing-journal recovery requires an explicit user action outside an automated CLT run"
+        "Git task recovery requires an explicit user action outside an automated CLT run"
     );
     let project_board = get_tasks_dir(&plan.project.path);
     let _lock = acquire_board_mutation_lock(&project_board)?;
@@ -193,17 +230,24 @@ pub(crate) fn recover_git_task(store: &TursoAgentStore, plan: &GitRecoveryPlan) 
         "The task's conversation links changed; review recovery again"
     );
     let holder = InteractiveAgentLease::holder_for_current_process();
+    if plan.journal.is_some() {
+        anyhow::ensure!(
+            current_agent_git_branch(&plan.project.path)? == plan.current_branch,
+            "The checkout branch changed while recovery was being confirmed; review recovery again"
+        );
+    }
     store.begin_missing_git_recovery_blocking(
         plan.project.id,
         &plan.project.path,
         &plan.session_id,
         plan.run_id,
+        plan.journal.as_ref(),
         &holder,
         &agent_timestamp(),
         &agent_timestamp_after(60),
     )?;
     let result = (|| -> Result<String> {
-        if plan.status != TaskStatus::Done {
+        if plan.status != TaskStatus::Done || plan.journal.is_some() {
             // Keep the stopped old session attached through the move. A crash
             // before the final write leaves an explicitly stopped, retryable task.
             let stopped = format!(
@@ -232,8 +276,17 @@ pub(crate) fn recover_git_task(store: &TursoAgentStore, plan: &GitRecoveryPlan) 
             );
             // Do not use a codex: marker for the previous conversation: it is
             // history, and the next attempt must get its own session and journal.
+            let reason = if let Some(journal) = &plan.journal {
+                format!(
+                    "the checkout branch changed from {} to {}; the previous Git attempt was explicitly retired",
+                    journal.branch_ref.as_deref().unwrap_or("detached HEAD"),
+                    plan.current_branch.as_deref().unwrap_or("detached HEAD"),
+                )
+            } else {
+                "the previous run lost its Git starting record".to_string()
+            };
             let content = format!(
-                "{original}\n\nUNBLOCKED {}: User requested recovery after the previous run lost its Git starting record. Previous Codex session: {}. Review current files and Git history first; preserve existing work and commits, verify what is already complete, and implement only what remains. This is a fresh attempt; follow the project's current Git settings. Do not recreate or duplicate earlier commits.",
+                "{original}\n\nUNBLOCKED {}: User requested recovery after {reason}. Previous Codex session: {}. Review current files and Git history first; preserve existing work and commits, verify what is already complete, and implement only what remains. This is a fresh attempt; follow the project's current Git settings. Do not recreate or duplicate earlier commits.",
                 Local::now().format("%Y-%m-%d"),
                 plan.session_id,
             );
@@ -241,17 +294,19 @@ pub(crate) fn recover_git_task(store: &TursoAgentStore, plan: &GitRecoveryPlan) 
         }
         store.finish_missing_git_recovery_blocking(plan.project.id, &holder)
             .context("Task recovery was published, but clearing its old failure state failed; check the task board before retrying")?;
-        Ok(if plan.status == TaskStatus::Done {
-            format!(
-                "Accepted completed task in {} and stopped its obsolete retry. Files and commits were preserved.",
-                plan.project.name
-            )
-        } else {
-            format!(
-                "Recovered task in {}. A fresh Codex run will review existing work and finish what remains when project scheduling is active. Files, commits and the old conversation were preserved.",
-                plan.project.name
-            )
-        })
+        Ok(
+            if plan.status == TaskStatus::Done && plan.journal.is_none() {
+                format!(
+                    "Accepted completed task in {} and stopped its obsolete retry. Files and commits were preserved.",
+                    plan.project.name
+                )
+            } else {
+                format!(
+                    "Recovered task in {}. A fresh Codex run will review existing work and finish what remains when project scheduling is active. Files, commits and the old conversation were preserved.",
+                    plan.project.name
+                )
+            },
+        )
     })();
     let release = store.release_lease_blocking(plan.project.id, &holder);
     match result {

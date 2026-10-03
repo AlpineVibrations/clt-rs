@@ -1095,6 +1095,13 @@ pub(super) fn run_agent_job_inner(
     });
     renew_agent_job_worker_fence(&job)?;
     let finished_at = agent_timestamp();
+    // Reconciliation still preserves the journal, but its generic pending
+    // summary must not hide the actionable prelaunch branch diagnostic.
+    let branch_recovery_error = run_result
+        .as_ref()
+        .err()
+        .map(|error| format!("Codex runner failed before completion: {error:#}"))
+        .filter(|error| error.contains("Git task branch changed:"));
 
     let (
         mut status,
@@ -1304,6 +1311,14 @@ pub(super) fn run_agent_job_inner(
                 }
             }
         }
+    }
+
+    if status != "success"
+        && let Some(error) = branch_recovery_error
+    {
+        status = "failure";
+        summary = error;
+        git_finalization_pending = true;
     }
 
     let control_resolution_result: Result<()> = (|| {

@@ -936,6 +936,33 @@ pub(super) fn ensure_agent_git_index_preflight(
     Ok(())
 }
 
+pub(crate) fn current_agent_git_branch(project_root: &Path) -> Result<Option<String>> {
+    git_optional_stdout(
+        project_root,
+        &["symbolic-ref", "-q", "HEAD"],
+        &[1],
+        "inspect the task recovery checkout branch",
+    )
+}
+
+pub(crate) fn verify_agent_git_resume_branch(
+    project_root: &Path,
+    finalization: &agent::GitFinalizationRecord,
+) -> Result<()> {
+    let current = current_agent_git_branch(project_root)?;
+    anyhow::ensure!(
+        current == finalization.branch_ref,
+        "Git task branch changed: checkout is {}, but session {} belongs to {}. CLT will not launch Codex against another branch's Git boundary. Return to the original branch outside the automated run, or use `clt agent recover-task` to explicitly retire the old attempt and review remaining work on the current branch. Files, staging and commits are preserved.",
+        current.as_deref().unwrap_or("detached HEAD"),
+        finalization.codex_session_id,
+        finalization
+            .branch_ref
+            .as_deref()
+            .unwrap_or("detached HEAD"),
+    );
+    Ok(())
+}
+
 pub(super) fn prepare_agent_git_start_state_for_run(
     store: &agent::TursoAgentStore,
     project: &agent::AgentProject,

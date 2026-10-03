@@ -41,7 +41,8 @@ use crate::{
         valid_environment_variable_name,
     },
     application::git_recovery::{
-        GitRecoveryPlan, failure_has_missing_git_start, plan_git_recovery, recover_git_task,
+        GitRecoveryPlan, failure_has_git_recovery, failure_has_missing_git_start,
+        plan_git_recovery, recover_git_task,
     },
     application::{
         AgentLeaseHolderLiveness, AgentProjectScan, AgentProjectScanStatus, delete_task_in_board,
@@ -2788,10 +2789,7 @@ pub(super) fn load_tui_agent_panel_snapshot_inner(
                 scan.todo_count > 0
                     || scan.doing_count > 0
                     || pending_git_finalizations.contains_key(&project.id)
-                    || run
-                        .summary
-                        .as_deref()
-                        .is_some_and(failure_has_missing_git_start)
+                    || run.summary.as_deref().is_some_and(failure_has_git_recovery)
             });
             let failure_problem =
                 tui_agent_failure_problem(&project, relevant_failure, now, failure_backoff);
@@ -2964,6 +2962,11 @@ pub(super) fn tui_agent_failure_problem(
                 .as_deref()
                 .unwrap_or("No failure summary was recorded")
         });
+    if summary.contains("Git task branch changed:") {
+        return Some(format!(
+            "Git recovery available - press r\n{summary}\nPress r to review a fresh attempt on the current branch; the old journal is preserved. Press l for the saved error."
+        ));
+    }
     if failure_has_missing_git_start(summary) {
         return Some(
             "Git recovery available - press r\n\
@@ -3811,10 +3814,7 @@ pub(super) fn selected_tui_agent_log_view_at(
                 let mut run = store.latest_run_for_project_blocking(selected.project.id)?;
                 if let Some(failed_run) = run.as_ref().filter(|run| {
                     matches!(run.status.as_str(), "failure" | "timeout")
-                        && run
-                            .summary
-                            .as_deref()
-                            .is_some_and(failure_has_missing_git_start)
+                        && run.summary.as_deref().is_some_and(failure_has_git_recovery)
                 }) {
                     // Git preflight can fail before any output file exists.
                     // Show that saved failure instead of an older session's log.

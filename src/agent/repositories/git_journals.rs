@@ -4,11 +4,11 @@ use clt_database::turso::{Connection, Database, params, transaction::Transaction
 use super::RepositoryDatabase;
 use crate::{
     agent::{
-        AGENT_EXTERNAL_COMPLETION_REASON, AGENT_GIT_FINALIZATION_RESUME_TOKEN_PREFIX,
-        AGENT_MISSING_GIT_RECOVERY_TOKEN_PREFIX, AgentGitMode, AgentRunOutcome,
-        GitFinalizationRecord, GitFinalizationState, NewGitFinalization, TursoAgentStore,
-        git_finalization_record_from_row, query_count, row_integer, row_optional_integer,
-        row_optional_text, row_text, update_project_after_run,
+        AGENT_BRANCH_GIT_RECOVERY_REASON, AGENT_EXTERNAL_COMPLETION_REASON,
+        AGENT_GIT_FINALIZATION_RESUME_TOKEN_PREFIX, AGENT_MISSING_GIT_RECOVERY_TOKEN_PREFIX,
+        AgentGitMode, AgentRunOutcome, GitFinalizationRecord, GitFinalizationState,
+        NewGitFinalization, TursoAgentStore, git_finalization_record_from_row, query_count,
+        row_integer, row_optional_integer, row_optional_text, row_text, update_project_after_run,
     },
     managed_git::AgentGitStartState,
     runner::agent_timestamp,
@@ -57,8 +57,8 @@ async fn session_can_enable_git(
 }
 
 impl TursoAgentStore {
-    /// Reserve an idle project for explicit recovery of a lost journal. The
-    /// original run/mode records and logs remain evidence, never a new boundary.
+    /// Reserve an idle project for explicit recovery. A reviewed branch-mismatch
+    /// journal is retired atomically with stopping its session, retaining its proof.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn begin_missing_git_recovery_blocking(
         &self,
@@ -66,6 +66,7 @@ impl TursoAgentStore {
         project_path: &std::path::Path,
         session_id: &str,
         expected_run_id: i64,
+        expected_journal: Option<&GitFinalizationRecord>,
         holder: &str,
         acquired_at: &str,
         expires_at: &str,
@@ -80,9 +81,27 @@ impl TursoAgentStore {
                  AND id = (SELECT MAX(id) FROM runs WHERE project_id = ?2)",
                 params![expected_run_id, project_id, project_path.to_string_lossy().as_ref()],
             ).await? == 1, "The latest run changed; review recovery again");
+            if let Some(expected) = expected_journal {
+                let mut rows = tx.query(
+                    "SELECT project_id, codex_session_id, state, git_mode, starting_head,
+                            branch_ref, upstream_ref, worktree_baseline, task_identity,
+                            owner_run_token, commit_oid, generation, last_error, created_at,
+                            updated_at, completed_at, acknowledged_at, acknowledged_run_id
+                     FROM git_finalizations WHERE project_id = ?1 AND codex_session_id = ?2",
+                    params![project_id, session_id],
+                ).await?;
+                let current = rows.next().await?.map(|row| git_finalization_record_from_row(&row)).transpose()?;
+                anyhow::ensure!(current.as_ref() == Some(expected)
+                    && expected.commit_oid.is_none()
+                    && (matches!(expected.state, GitFinalizationState::Working | GitFinalizationState::Tracking | GitFinalizationState::CommitPending)
+                        || expected.state == GitFinalizationState::Cancelled
+                            && expected.last_error.as_deref() == Some(AGENT_BRANCH_GIT_RECOVERY_REASON)),
+                    "The Git recovery record changed or has a verified commit; review recovery again");
+            }
             anyhow::ensure!(query_count(&tx,
                 "SELECT EXISTS (SELECT 1 FROM git_finalizations WHERE project_id = ?1
-                    AND (codex_session_id = ?2 OR state NOT IN ('completed', 'cancelled')))
+                    AND (codex_session_id = ?2 OR state NOT IN ('completed', 'cancelled'))
+                    AND NOT (?3 = 1 AND codex_session_id = ?2))
                  OR EXISTS (SELECT 1 FROM agent_git_launch_states WHERE project_id = ?1)
                  OR EXISTS (SELECT 1 FROM agent_workers WHERE project_id = ?1
                     AND state IN ('dispatching', 'running', 'finalizing'))
@@ -91,9 +110,17 @@ impl TursoAgentStore {
                     AND (child_pid IS NOT NULL OR interactive_holder IS NOT NULL
                          OR interactive_launch_token IS NOT NULL
                          OR (state <> 'stopped' AND NOT (state = 'resume_requested' AND codex_session_id = ?2))))",
-                params![project_id, session_id],
+                params![project_id, session_id, i64::from(expected_journal.is_some())],
             ).await? == 0,
                 "Recovery requires an idle project with no surviving Git journal or launch record. Stop active work and retry; existing recovery records are preserved");
+            if expected_journal.is_some() {
+                tx.execute(
+                    "UPDATE git_finalizations SET state = 'cancelled', generation = generation + 1,
+                        owner_run_token = NULL, last_error = ?3, updated_at = ?4,
+                        completed_at = ?4 WHERE project_id = ?1 AND codex_session_id = ?2",
+                    params![project_id, session_id, AGENT_BRANCH_GIT_RECOVERY_REASON, acquired_at],
+                ).await?;
+            }
             tx.execute(
                 "INSERT INTO leases (project_id, holder, acquired_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
                 params![project_id, holder, acquired_at, expires_at],

@@ -302,6 +302,8 @@ pub(super) enum GitFinalizationState {
 }
 
 pub(super) const AGENT_MISSING_GIT_RECOVERY_TOKEN_PREFIX: &str = "clt-git-recovery:";
+pub(crate) const AGENT_BRANCH_GIT_RECOVERY_REASON: &str =
+    "User explicitly retired the previous Git attempt after changing checkout branches";
 
 impl GitFinalizationState {
     pub(super) fn database_value(self) -> &'static str {

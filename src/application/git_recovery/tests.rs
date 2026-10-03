@@ -419,6 +419,7 @@ fn recovery_resumes_an_interrupted_move_even_when_the_failed_run_has_no_session_
             &project.path,
             SESSION,
             plan.run_id,
+            None,
             "recovery",
             &agent_timestamp(),
             &agent_timestamp_after(60),
@@ -506,6 +507,445 @@ fn recovery_confirmation_is_visible_and_captures_navigation_keys() {
             .unwrap()
             .is_empty()
     );
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+fn branch_fixture(folders: bool, status: TaskStatus) -> (PathBuf, TursoAgentStore, AgentProject) {
+    let (root, store, project) = fixture(folders, status);
+    let start = capture_agent_git_start_state(&project.path, AgentGitMode::Commit).unwrap();
+    let task = TaskBoard::new(get_tasks_dir(&project.path))
+        .entries(status)
+        .unwrap()
+        .remove(0);
+    assert!(
+        store
+            .create_git_finalization_blocking(NewGitFinalization {
+                project_id: project.id,
+                codex_session_id: SESSION,
+                git_mode: AgentGitMode::CommitAndPush,
+                starting_head: Some(&start.starting_head),
+                branch_ref: start.branch_ref.as_deref(),
+                upstream_ref: start.upstream_ref.as_deref(),
+                worktree_baseline: &start.worktree_baseline,
+                task_identity: durable_task_identity(&task.content).as_deref(),
+                owner_run_token: None,
+                created_at: &agent_timestamp(),
+            })
+            .unwrap()
+    );
+    for (generation, state) in [
+        (0, GitFinalizationState::Tracking),
+        (1, GitFinalizationState::CommitPending),
+    ] {
+        assert!(
+            store
+                .compare_and_set_git_finalization_blocking(
+                    project.id,
+                    SESSION,
+                    generation,
+                    state,
+                    None,
+                    None,
+                    None,
+                    &agent_timestamp()
+                )
+                .unwrap()
+        );
+    }
+    run_test_git(&project.path, &["switch", "-c", "auth"]);
+    store
+        .record_run_outcome_blocking(AgentRunOutcome {
+            project_id: project.id,
+            status: "failure",
+            started_at: "101",
+            finished_at: Some("102"),
+            exit_code: None,
+            log_dir: None,
+            stdout_path: None,
+            stderr_path: None,
+            summary: Some("Task Git finalization remains FINALIZING"),
+            codex_session_id: Some(SESSION),
+        })
+        .unwrap();
+    (root, store, project)
+}
+
+#[test]
+fn branch_recovery_retires_pending_proof_and_requeues_even_provisional_done() {
+    for folders in [false, true] {
+        for status in [TaskStatus::Doing, TaskStatus::Done] {
+            let (root, store, project) = branch_fixture(folders, status);
+            let before = store
+                .git_finalization_blocking(project.id, SESSION)
+                .unwrap()
+                .unwrap();
+            let branch = run_test_git(&project.path, &["symbolic-ref", "HEAD"]);
+            let head = run_test_git(&project.path, &["rev-parse", "HEAD"]);
+            let index = run_test_git(&project.path, &["write-tree"]);
+            let plan = plan_git_recovery(&store, &project, None).unwrap();
+            assert!(plan.prompt().contains("refs/heads/auth"));
+            assert!(plan.prompt().contains("provisional Done"));
+            recover_git_task(&store, &plan).unwrap();
+            let after = store
+                .git_finalization_blocking(project.id, SESSION)
+                .unwrap()
+                .unwrap();
+            assert_eq!(after.state, GitFinalizationState::Cancelled);
+            assert_eq!(after.branch_ref, before.branch_ref);
+            assert_eq!(after.starting_head, before.starting_head);
+            assert_eq!(after.worktree_baseline, before.worktree_baseline);
+            assert_eq!(after.task_identity, before.task_identity);
+            assert!(after.commit_oid.is_none());
+            assert_eq!(
+                run_test_git(&project.path, &["symbolic-ref", "HEAD"]),
+                branch
+            );
+            assert_eq!(run_test_git(&project.path, &["rev-parse", "HEAD"]), head);
+            assert_eq!(run_test_git(&project.path, &["write-tree"]), index);
+            assert_eq!(
+                fs::read_to_string(project.path.join("feature.txt")).unwrap(),
+                "additional user changes\n"
+            );
+            assert_eq!(
+                fs::read_to_string(project.path.join("untracked.txt")).unwrap(),
+                "preserve this\n"
+            );
+            let board = TaskBoard::new(get_tasks_dir(&project.path));
+            assert!(board.entries(status).unwrap().is_empty());
+            let todo = board.entries(TaskStatus::Todo).unwrap().remove(0);
+            assert!(task_entry_is_ready(&todo));
+            assert!(recoverable_codex_session_id_from_task_content(&todo.content).is_none());
+            assert!(
+                todo.content
+                    .contains("previous Git attempt was explicitly retired")
+            );
+            assert!(recover_git_task(&store, &plan).is_err());
+            let fresh = prepare_agent_git_start_state_for_run(
+                &store,
+                &project,
+                AgentTaskSelection::NextTodo,
+                false,
+                false,
+                "fresh-branch-run",
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(fresh.branch_ref.as_deref(), Some("refs/heads/auth"));
+            drop(store);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+}
+
+#[test]
+fn branch_recovery_rechecks_checkout_journal_and_live_ownership() {
+    for change in [
+        "branch",
+        "journal",
+        "commit",
+        "lease",
+        "launch",
+        "session",
+        "other-journal",
+    ] {
+        let (root, store, project) = branch_fixture(false, TaskStatus::Done);
+        let plan = plan_git_recovery(&store, &project, None).unwrap();
+        match change {
+            "branch" => {
+                run_test_git(&project.path, &["switch", "-c", "another"]);
+            }
+            "journal" | "commit" => {
+                assert!(
+                    store
+                        .compare_and_set_git_finalization_blocking(
+                            project.id,
+                            SESSION,
+                            2,
+                            if change == "commit" {
+                                GitFinalizationState::PushPending
+                            } else {
+                                GitFinalizationState::CommitPending
+                            },
+                            None,
+                            if change == "commit" {
+                                Some("verified-commit")
+                            } else {
+                                None
+                            },
+                            Some("changed"),
+                            &agent_timestamp()
+                        )
+                        .unwrap()
+                );
+            }
+            "lease" => {
+                assert!(
+                    store
+                        .try_acquire_lease_blocking(
+                            project.id,
+                            "someone",
+                            &agent_timestamp(),
+                            &agent_timestamp_after(60)
+                        )
+                        .unwrap()
+                );
+            }
+            "launch" => {
+                let start =
+                    capture_agent_git_start_state(&project.path, AgentGitMode::Commit).unwrap();
+                store
+                    .record_git_launch_state_blocking(
+                        project.id,
+                        "other-launch",
+                        AgentGitMode::Commit,
+                        &start,
+                        &agent_timestamp(),
+                    )
+                    .unwrap();
+            }
+            "session" => {
+                store
+                    .mark_session_running_with_git_mode_blocking(
+                        project.id,
+                        "other-session",
+                        12345,
+                        "live",
+                        &root.join("out"),
+                        &root.join("err"),
+                        AgentGitMode::Off,
+                    )
+                    .unwrap();
+            }
+            "other-journal" => {
+                let start =
+                    capture_agent_git_start_state(&project.path, AgentGitMode::Commit).unwrap();
+                store
+                    .create_git_finalization_blocking(NewGitFinalization {
+                        project_id: project.id,
+                        codex_session_id: "other-session",
+                        git_mode: AgentGitMode::Commit,
+                        starting_head: Some(&start.starting_head),
+                        branch_ref: start.branch_ref.as_deref(),
+                        upstream_ref: None,
+                        worktree_baseline: &start.worktree_baseline,
+                        task_identity: None,
+                        owner_run_token: None,
+                        created_at: &agent_timestamp(),
+                    })
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let journal = store
+            .git_finalization_blocking(project.id, SESSION)
+            .unwrap();
+        let board = fs::read(project.path.join("tasks/done.md")).unwrap();
+        assert!(recover_git_task(&store, &plan).is_err(), "{change}");
+        assert_eq!(
+            store
+                .git_finalization_blocking(project.id, SESSION)
+                .unwrap(),
+            journal
+        );
+        assert_eq!(fs::read(project.path.join("tasks/done.md")).unwrap(), board);
+        if change == "commit" {
+            assert!(plan_git_recovery(&store, &project, None).is_err());
+        }
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn branch_recovery_can_retry_after_retiring_journal_but_failing_board_write() {
+    let (root, store, project) = branch_fixture(true, TaskStatus::Done);
+    let plan = plan_git_recovery(&store, &project, None).unwrap();
+    let TaskSource::Path { path, .. } = &plan.task.source else {
+        unreachable!()
+    };
+    let permissions = fs::metadata(path).unwrap().permissions();
+    let mut readonly = permissions.clone();
+    readonly.set_readonly(true);
+    fs::set_permissions(path, readonly).unwrap();
+    assert!(recover_git_task(&store, &plan).is_err());
+    assert_eq!(
+        store
+            .git_finalization_blocking(project.id, SESSION)
+            .unwrap()
+            .unwrap()
+            .state,
+        GitFinalizationState::Cancelled
+    );
+    fs::set_permissions(path, permissions).unwrap();
+    let retry = plan_git_recovery(&store, &project, None).unwrap();
+    recover_git_task(&store, &retry).unwrap();
+    assert!(task_entry_is_ready(
+        &TaskBoard::new(get_tasks_dir(&project.path))
+            .entries(TaskStatus::Todo)
+            .unwrap()[0]
+    ));
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn resume_branch_check_rejects_switched_and_detached_checkouts_without_changes() {
+    let (root, store, project) = branch_fixture(false, TaskStatus::Done);
+    let journal = store
+        .git_finalization_blocking(project.id, SESSION)
+        .unwrap()
+        .unwrap();
+    for detached in [false, true] {
+        if detached {
+            run_test_git(&project.path, &["checkout", "--detach"]);
+        }
+        let index = run_test_git(&project.path, &["write-tree"]);
+        let error = crate::managed_git::verify_agent_git_resume_branch(&project.path, &journal)
+            .unwrap_err();
+        assert!(error.to_string().contains("Git task branch changed:"));
+        assert_eq!(run_test_git(&project.path, &["write-tree"]), index);
+    }
+    run_test_git(
+        &project.path,
+        &[
+            "switch",
+            journal
+                .branch_ref
+                .as_deref()
+                .unwrap()
+                .strip_prefix("refs/heads/")
+                .unwrap(),
+        ],
+    );
+    crate::managed_git::verify_agent_git_resume_branch(&project.path, &journal).unwrap();
+    assert!(plan_git_recovery(&store, &project, None).is_err());
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn runner_refuses_branch_mismatch_before_spawning_codex() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (root, store, project) = branch_fixture(false, TaskStatus::Done);
+    let journal = store
+        .git_finalization_blocking(project.id, SESSION)
+        .unwrap();
+    store
+        .try_acquire_lease_blocking(
+            project.id,
+            "resume-holder",
+            &agent_timestamp(),
+            &agent_timestamp_after(60),
+        )
+        .unwrap();
+    let fake_codex = root.join("fake-codex");
+    fs::write(&fake_codex, "#!/bin/sh\ntouch child-was-launched\n").unwrap();
+    fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o755)).unwrap();
+    let runner =
+        CodexAgentRunner::with_command(root.join("state"), Duration::from_secs(5), fake_codex);
+    let error = runner
+        .run_project(
+            &project,
+            AgentTaskSelection::ResumeSession,
+            Some(SESSION),
+            "resume-holder",
+            None,
+            &new_agent_shutdown_signal(),
+        )
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("Git task branch changed:"),
+        "{error:#}"
+    );
+    assert!(!project.path.join("child-was-launched").exists());
+    assert_eq!(
+        store
+            .git_finalization_blocking(project.id, SESSION)
+            .unwrap(),
+        journal
+    );
+    let completion = run_agent_job(
+        AgentRunJob {
+            state_dir: root.join("state"),
+            project: project.clone(),
+            holder: "resume-holder".to_string(),
+            worker_token: None,
+            max_global_jobs: 1,
+            task_selection: AgentTaskSelection::ResumeSession,
+            resume_session_id: Some(SESSION.to_string()),
+            blocked_task_count_before: 0,
+            done_task_contents_before: Vec::new(),
+            blocked_task_snapshots_before: Vec::new(),
+        },
+        &runner,
+        &new_agent_shutdown_signal(),
+    )
+    .unwrap();
+    assert_eq!(completion.status, "failure");
+    assert!(completion.summary.contains("Git task branch changed:"));
+    let saved = store
+        .latest_run_for_project_blocking(project.id)
+        .unwrap()
+        .unwrap();
+    assert!(saved.summary.unwrap().contains("Git task branch changed:"));
+    assert!(!project.path.join("child-was-launched").exists());
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn branch_mismatch_diagnostic_offers_recovery_with_a_readable_confirmation() {
+    let (root, store, project) = branch_fixture(false, TaskStatus::Done);
+    let journal = store
+        .git_finalization_blocking(project.id, SESSION)
+        .unwrap()
+        .unwrap();
+    let summary = crate::managed_git::verify_agent_git_resume_branch(&project.path, &journal)
+        .unwrap_err()
+        .to_string();
+    store
+        .record_run_outcome_blocking(AgentRunOutcome {
+            project_id: project.id,
+            status: "failure",
+            started_at: "103",
+            finished_at: Some("104"),
+            exit_code: None,
+            log_dir: None,
+            stdout_path: None,
+            stderr_path: None,
+            summary: Some(&summary),
+            codex_session_id: Some(SESSION),
+        })
+        .unwrap();
+    let run = store
+        .latest_run_for_project_blocking(project.id)
+        .unwrap()
+        .unwrap();
+    let problem =
+        tui_agent_failure_problem(&project, Some(&run), 105, Duration::from_secs(300)).unwrap();
+    assert!(problem.starts_with("Git recovery available - press r"));
+    assert!(problem.contains("refs/heads/auth"));
+    assert!(problem.contains(journal.branch_ref.as_deref().unwrap()));
+    assert!(!problem.contains("Automatic retry"));
+    let plan = plan_git_recovery(&store, &project, None).unwrap();
+    let mut app = TuiApp::new(&project.path, false);
+    app.pending_git_recovery = Some(plan);
+    for width in [80, 120] {
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(width, 24)).unwrap();
+        terminal.draw(|frame| render_tui(frame, &app)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("[y/n]"));
+        assert!(rendered.contains("refs/heads/auth"));
+    }
     drop(store);
     fs::remove_dir_all(root).unwrap();
 }

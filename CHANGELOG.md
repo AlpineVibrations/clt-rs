@@ -6,6 +6,12 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+## [0.7.8] - 2026-10-02
+
+### Fixed
+
+- Detect a changed checkout branch before launching an old managed task's recovery session. Allow explicit recovery with Agent Projects `r` or `clt agent recover-task`: retain the old journal, files, staging and commits, and queue a fresh attempt on the current branch. Reverify provisional Done tasks; preserve active-owner and verified-commit protections.
+
 ## [0.7.7] - 2026-10-02
 
 ### Added
@@ -366,7 +372,11 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 - Fixed task moves so destination write failures do not remove the source task.
 - Fixed TUI navigation on empty boards.
 
-[Unreleased]: https://github.com/AlpineVibrations/clt-rs/compare/v0.7.4...HEAD
+[Unreleased]: https://github.com/AlpineVibrations/clt-rs/compare/v0.7.8...HEAD
+[0.7.8]: https://github.com/AlpineVibrations/clt-rs/compare/v0.7.7...v0.7.8
+[0.7.7]: https://github.com/AlpineVibrations/clt-rs/compare/v0.7.6...v0.7.7
+[0.7.6]: https://github.com/AlpineVibrations/clt-rs/compare/v0.7.5...v0.7.6
+[0.7.5]: https://github.com/AlpineVibrations/clt-rs/compare/v0.7.4...v0.7.5
 [0.7.4]: https://github.com/AlpineVibrations/clt-rs/compare/v0.7.3...v0.7.4
 [0.7.3]: https://github.com/AlpineVibrations/clt-rs/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/AlpineVibrations/clt-rs/compare/v0.7.1...v0.7.2

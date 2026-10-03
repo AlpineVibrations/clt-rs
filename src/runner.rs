@@ -29,7 +29,7 @@ use crate::{
         AgentGitStartState, bind_agent_git_working_task_identity, configure_agent_git_identity,
         enable_agent_git_for_resumed_session, ensure_agent_git_index_preflight,
         ensure_agent_git_working_record, prepare_agent_git_start_state_for_run,
-        verify_agent_git_start_state_unchanged,
+        verify_agent_git_resume_branch, verify_agent_git_start_state_unchanged,
     },
     platform::{
         agent_codex_path_env, agent_process_group_exists, configure_agent_child_command,
@@ -381,7 +381,11 @@ pub(super) fn launch_agent_runner_stage(
         &stderr_path,
         &format!(
             "{AGENT_LOG_FAST_MODE_PREFIX}{}",
-            if project.codex_fast_enabled { "on" } else { "off" }
+            if project.codex_fast_enabled {
+                "on"
+            } else {
+                "off"
+            }
         ),
     )?;
     let configured_session_id = configure_automated_codex_subcommand(
@@ -1886,6 +1890,9 @@ impl CodexAgentRunner {
             .map(|session_id| store.git_finalization_blocking(project.id, session_id))
             .transpose()?
             .flatten();
+        if let Some(finalization) = &existing_git_finalization {
+            verify_agent_git_resume_branch(&project.path, finalization)?;
+        }
         let git_start_state = prepare_agent_git_start_state_for_run(
             &store,
             project,

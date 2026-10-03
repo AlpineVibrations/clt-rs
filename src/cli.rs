@@ -191,7 +191,7 @@ enum AgentCommands {
         /// Project path to reconcile. Defaults to the current directory.
         path: Option<PathBuf>,
     },
-    /// Recover a lost Git record: queue a fresh attempt, or accept an already-Done task
+    /// Recover a lost Git record or explicitly restart a task after changing branches
     RecoverTask {
         /// Project path. Defaults to the current directory.
         path: Option<PathBuf>,
