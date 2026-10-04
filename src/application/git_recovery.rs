@@ -17,7 +17,7 @@ use crate::{
         move_task_without_reordering_after_lock, read_task_entries,
         recoverable_codex_session_id_from_task_content,
         task_content_without_recoverable_codex_session, task_content_without_stop_marker,
-        task_display_text,
+        task_display_text, task_entry_is_stopped,
     },
 };
 
@@ -37,17 +37,35 @@ pub(crate) fn failure_has_git_recovery(summary: &str) -> bool {
 pub(crate) struct GitRecoveryPlan {
     pub(crate) project: AgentProject,
     pub(crate) session_id: String,
-    pub(crate) task: TaskEntry,
-    pub(crate) status: TaskStatus,
-    board_dir: PathBuf,
+    linked: Option<GitRecoveryTask>,
     run_id: i64,
     journal: Option<GitFinalizationRecord>,
     current_branch: Option<String>,
 }
 
+#[derive(Clone)]
+struct GitRecoveryTask {
+    task: TaskEntry,
+    status: TaskStatus,
+    board_dir: PathBuf,
+}
+
 impl GitRecoveryPlan {
     pub(crate) fn prompt(&self) -> String {
-        let title: String = task_display_text(&self.task).chars().take(160).collect();
+        let Some(linked) = &self.linked else {
+            let journal = self
+                .journal
+                .as_ref()
+                .expect("Orphan recovery requires a journal");
+            return format!(
+                "Recover {}: orphaned Git attempt\nSession {} belongs to {} and has no task on {}. Retire this old attempt and stop its retries? The current board, files, staging, commits and old journal are preserved. [y/n]",
+                self.project.name,
+                self.session_id,
+                journal.branch_ref.as_deref().unwrap_or("detached HEAD"),
+                self.current_branch.as_deref().unwrap_or("detached HEAD"),
+            );
+        };
+        let title: String = task_display_text(&linked.task).chars().take(160).collect();
         if let Some(journal) = &self.journal {
             return format!(
                 "Recover {}: {}\nRetire the old attempt on {} and queue a fresh Codex conversation on {} to review existing work? Files, staging, commits and the old journal are preserved. A provisional Done task returns to Todo for verification. [y/n]",
@@ -57,7 +75,7 @@ impl GitRecoveryPlan {
                 self.current_branch.as_deref().unwrap_or("detached HEAD"),
             );
         }
-        if self.status == TaskStatus::Done {
+        if linked.status == TaskStatus::Done {
             format!(
                 "Recover {}: {}\nThis task is already in Done. Accept its current completion and stop retrying the old run? Files, commits and conversation are preserved. [y/n]",
                 self.project.name, title,
@@ -159,6 +177,44 @@ pub(crate) fn plan_git_recovery(
             }
         }
     }
+    // A branch switch may remove the old task entirely or replace its session.
+    // Recover the failed journal itself; never infer a replacement task by title.
+    if candidates.is_empty()
+        && let Some(session) = requested_session
+        && !tasks.iter().any(|(_, _, task)| {
+            recoverable_codex_session_id_from_task_content(&task.content) == Some(session)
+        })
+        && let Some(journal) = store.git_finalization_blocking(project.id, session)?
+    {
+        current_branch = current_agent_git_branch(&project.path)?;
+        let interrupted = journal.state == GitFinalizationState::Cancelled
+            && journal.last_error.as_deref() == Some(AGENT_BRANCH_GIT_RECOVERY_REASON)
+            && controls.iter().any(|control| {
+                control.codex_session_id == session
+                    && control.state == AgentSessionControlState::Stopped
+                    && control.run_token.as_deref() == Some(recovery_token.as_str())
+            });
+        if journal.commit_oid.is_none()
+            && current_branch.is_some()
+            && current_branch != journal.branch_ref
+            && (interrupted
+                || matches!(
+                    journal.state,
+                    GitFinalizationState::Working
+                        | GitFinalizationState::Tracking
+                        | GitFinalizationState::CommitPending
+                ))
+        {
+            return Ok(GitRecoveryPlan {
+                project: project.clone(),
+                session_id: session.to_string(),
+                linked: None,
+                run_id: run.id,
+                journal: Some(journal),
+                current_branch,
+            });
+        }
+    }
     anyhow::ensure!(
         candidates.len() == 1,
         "Cannot identify one affected task. Use clt agent recover-task --session <session-id> for the intended task; its saved error is available with l"
@@ -185,22 +241,55 @@ pub(crate) fn plan_git_recovery(
     Ok(GitRecoveryPlan {
         project: project.clone(),
         session_id: session.to_string(),
-        task: task.clone(),
-        status: *status,
-        board_dir: board.clone(),
+        linked: Some(GitRecoveryTask {
+            task: task.clone(),
+            status: *status,
+            board_dir: board.clone(),
+        }),
         run_id: run.id,
         journal,
         current_branch,
     })
 }
 
-/// Explicit user acceptance starts a new attempt, preserving the old evidence.
+/// Explicit recovery or scheduler-owned branch recovery retires the old attempt.
 /// Only missing-journal recovery accepts Done; a retired sealed attempt needs
 /// fresh verification even if its provisional board move already reached Done.
 pub(crate) fn recover_git_task(store: &TursoAgentStore, plan: &GitRecoveryPlan) -> Result<String> {
+    execute_git_recovery(store, plan, false)
+}
+
+pub(crate) fn recover_changed_branch_automatically(
+    store: &TursoAgentStore,
+    project: &AgentProject,
+    session: &str,
+) -> Result<Option<String>> {
+    if !store
+        .session_control_blocking(project.id, session)?
+        .is_some_and(|control| control.state == AgentSessionControlState::ResumeRequested)
+    {
+        return Ok(None);
+    }
+    let plan = plan_git_recovery(store, project, Some(session))?;
+    if plan.journal.is_none()
+        || plan
+            .linked
+            .as_ref()
+            .is_some_and(|linked| task_entry_is_stopped(&linked.task))
+    {
+        return Ok(None);
+    }
+    execute_git_recovery(store, &plan, true).map(Some)
+}
+
+fn execute_git_recovery(
+    store: &TursoAgentStore,
+    plan: &GitRecoveryPlan,
+    require_resume_requested: bool,
+) -> Result<String> {
     anyhow::ensure!(
         automated_agent_child_context()?.is_none(),
-        "Git task recovery requires an explicit user action outside an automated CLT run"
+        "Git task recovery must run outside an automated CLT task"
     );
     let project_board = get_tasks_dir(&plan.project.path);
     let _lock = acquire_board_mutation_lock(&project_board)?;
@@ -208,27 +297,26 @@ pub(crate) fn recover_git_task(store: &TursoAgentStore, plan: &GitRecoveryPlan) 
         !board_has_manual_task(&project_board)?,
         "A manually owned task reserves this project; finish or hand it off before recovery"
     );
-    let board = TaskBoard::new(&plan.board_dir);
-    let entries = board.entries(plan.status)?;
-    let index = entries
+    let mut linked_tasks_now = Vec::new();
+    linked_tasks(&project_board, &mut linked_tasks_now)?;
+    let link_count = linked_tasks_now
         .iter()
-        .position(|task| task.source == plan.task.source && task.content == plan.task.content)
-        .context(
-            "The task changed while recovery was being confirmed; press r to review it again",
-        )?;
-    let mut linked = Vec::new();
-    linked_tasks(&project_board, &mut linked)?;
+        .filter(|(_, _, task)| {
+            recoverable_codex_session_id_from_task_content(&task.content)
+                == Some(plan.session_id.as_str())
+        })
+        .count();
     anyhow::ensure!(
-        linked
-            .iter()
-            .filter(
-                |(_, _, task)| recoverable_codex_session_id_from_task_content(&task.content)
-                    == Some(plan.session_id.as_str())
-            )
-            .count()
-            == 1,
+        link_count == usize::from(plan.linked.is_some()),
         "The task's conversation links changed; review recovery again"
     );
+    let selected = plan.linked.as_ref().map(|linked| -> Result<_> {
+        let board = TaskBoard::new(&linked.board_dir);
+        let index = board.entries(linked.status)?.iter().position(|task| {
+            task.source == linked.task.source && task.content == linked.task.content
+        }).context("The task changed while recovery was being confirmed; press r to review it again")?;
+        Ok((linked, board, index))
+    }).transpose()?;
     let holder = InteractiveAgentLease::holder_for_current_process();
     if plan.journal.is_some() {
         anyhow::ensure!(
@@ -242,23 +330,26 @@ pub(crate) fn recover_git_task(store: &TursoAgentStore, plan: &GitRecoveryPlan) 
         &plan.session_id,
         plan.run_id,
         plan.journal.as_ref(),
+        require_resume_requested,
         &holder,
         &agent_timestamp(),
         &agent_timestamp_after(60),
     )?;
     let result = (|| -> Result<String> {
-        if plan.status != TaskStatus::Done || plan.journal.is_some() {
+        if let Some((linked, board, index)) = &selected
+            && (linked.status != TaskStatus::Done || plan.journal.is_some())
+        {
             // Keep the stopped old session attached through the move. A crash
             // before the final write leaves an explicitly stopped, retryable task.
             let stopped = format!(
                 "{} {TASK_STOPPED_MARKER}",
-                task_content_without_stop_marker(&plan.task.content)
+                task_content_without_stop_marker(&linked.task.content)
             );
-            board.write_entry_content(plan.status, &plan.task, &stopped)?;
-            if plan.status != TaskStatus::Todo {
+            board.write_entry_content(linked.status, &linked.task, &stopped)?;
+            if linked.status != TaskStatus::Todo {
                 move_task_without_reordering_after_lock(
-                    &plan.board_dir,
-                    plan.status,
+                    &linked.board_dir,
+                    linked.status,
                     TaskStatus::Todo,
                     index + 1,
                 )?;
@@ -278,7 +369,7 @@ pub(crate) fn recover_git_task(store: &TursoAgentStore, plan: &GitRecoveryPlan) 
             // history, and the next attempt must get its own session and journal.
             let reason = if let Some(journal) = &plan.journal {
                 format!(
-                    "the checkout branch changed from {} to {}; the previous Git attempt was explicitly retired",
+                    "the checkout branch changed from {} to {}; the previous Git attempt was retired",
                     journal.branch_ref.as_deref().unwrap_or("detached HEAD"),
                     plan.current_branch.as_deref().unwrap_or("detached HEAD"),
                 )
@@ -286,7 +377,7 @@ pub(crate) fn recover_git_task(store: &TursoAgentStore, plan: &GitRecoveryPlan) 
                 "the previous run lost its Git starting record".to_string()
             };
             let content = format!(
-                "{original}\n\nUNBLOCKED {}: User requested recovery after {reason}. Previous Codex session: {}. Review current files and Git history first; preserve existing work and commits, verify what is already complete, and implement only what remains. This is a fresh attempt; follow the project's current Git settings. Do not recreate or duplicate earlier commits.",
+                "{original}\n\nUNBLOCKED {}: CLT recovered after {reason}. Previous Codex session: {}. Review current files and Git history first; preserve existing work and commits, verify what is already complete, and implement only what remains. This is a fresh attempt; follow the project's current Git settings. Do not recreate or duplicate earlier commits.",
                 Local::now().format("%Y-%m-%d"),
                 plan.session_id,
             );
@@ -294,19 +385,27 @@ pub(crate) fn recover_git_task(store: &TursoAgentStore, plan: &GitRecoveryPlan) 
         }
         store.finish_missing_git_recovery_blocking(plan.project.id, &holder)
             .context("Task recovery was published, but clearing its old failure state failed; check the task board before retrying")?;
-        Ok(
-            if plan.status == TaskStatus::Done && plan.journal.is_none() {
-                format!(
-                    "Accepted completed task in {} and stopped its obsolete retry. Files and commits were preserved.",
-                    plan.project.name
-                )
-            } else {
-                format!(
-                    "Recovered task in {}. A fresh Codex run will review existing work and finish what remains when project scheduling is active. Files, commits and the old conversation were preserved.",
-                    plan.project.name
-                )
-            },
-        )
+        Ok(if plan.linked.is_none() {
+            format!(
+                "Retired orphaned Git attempt in {} and stopped its obsolete retry. The current task board, files, staging, commits and old journal were preserved.",
+                plan.project.name
+            )
+        } else if plan
+            .linked
+            .as_ref()
+            .is_some_and(|linked| linked.status == TaskStatus::Done)
+            && plan.journal.is_none()
+        {
+            format!(
+                "Accepted completed task in {} and stopped its obsolete retry. Files and commits were preserved.",
+                plan.project.name
+            )
+        } else {
+            format!(
+                "Recovered task in {}. A fresh Codex run will review existing work and finish what remains when project scheduling is active. Files, commits and the old conversation were preserved.",
+                plan.project.name
+            )
+        })
     })();
     let release = store.release_lease_blocking(plan.project.id, &holder);
     match result {

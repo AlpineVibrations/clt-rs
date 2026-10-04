@@ -354,7 +354,7 @@ fn recovery_refuses_live_owners_and_surviving_launch_or_session_journals() {
 fn recovery_keeps_an_interrupted_publication_stopped_and_retryable() {
     let (root, store, project) = fixture(true, TaskStatus::Doing);
     let plan = plan_git_recovery(&store, &project, None).unwrap();
-    let TaskSource::Path { path, .. } = &plan.task.source else {
+    let TaskSource::Path { path, .. } = &plan.linked.as_ref().unwrap().task.source else {
         unreachable!()
     };
     let original_permissions = fs::metadata(path).unwrap().permissions();
@@ -420,6 +420,7 @@ fn recovery_resumes_an_interrupted_move_even_when_the_failed_run_has_no_session_
             SESSION,
             plan.run_id,
             None,
+            false,
             "recovery",
             &agent_timestamp(),
             &agent_timestamp_after(60),
@@ -431,8 +432,11 @@ fn recovery_resumes_an_interrupted_move_even_when_the_failed_run_has_no_session_
         board
             .write_entry_content(
                 TaskStatus::Doing,
-                &plan.task,
-                &format!("{} clt:stopped", plan.task.content.trim_end()),
+                &plan.linked.as_ref().unwrap().task,
+                &format!(
+                    "{} clt:stopped",
+                    plan.linked.as_ref().unwrap().task.content.trim_end()
+                ),
             )
             .unwrap();
         move_task_without_reordering_after_lock(
@@ -616,10 +620,7 @@ fn branch_recovery_retires_pending_proof_and_requeues_even_provisional_done() {
             let todo = board.entries(TaskStatus::Todo).unwrap().remove(0);
             assert!(task_entry_is_ready(&todo));
             assert!(recoverable_codex_session_id_from_task_content(&todo.content).is_none());
-            assert!(
-                todo.content
-                    .contains("previous Git attempt was explicitly retired")
-            );
+            assert!(todo.content.contains("previous Git attempt was retired"));
             assert!(recover_git_task(&store, &plan).is_err());
             let fresh = prepare_agent_git_start_state_for_run(
                 &store,
@@ -761,7 +762,7 @@ fn branch_recovery_rechecks_checkout_journal_and_live_ownership() {
 fn branch_recovery_can_retry_after_retiring_journal_but_failing_board_write() {
     let (root, store, project) = branch_fixture(true, TaskStatus::Done);
     let plan = plan_git_recovery(&store, &project, None).unwrap();
-    let TaskSource::Path { path, .. } = &plan.task.source else {
+    let TaskSource::Path { path, .. } = &plan.linked.as_ref().unwrap().task.source else {
         unreachable!()
     };
     let permissions = fs::metadata(path).unwrap().permissions();
@@ -948,4 +949,299 @@ fn branch_mismatch_diagnostic_offers_recovery_with_a_readable_confirmation() {
     }
     drop(store);
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn branch_recovery_retires_orphan_without_touching_replacement_task_or_git() {
+    for folders in [false, true] {
+        let (root, store, project) = branch_fixture(folders, TaskStatus::Done);
+        let board = TaskBoard::new(get_tasks_dir(&project.path));
+        let task = board.entries(TaskStatus::Done).unwrap().remove(0);
+        let replacement = task.content.replace(SESSION, "replacement-session");
+        board
+            .write_entry_content(TaskStatus::Done, &task, &replacement)
+            .unwrap();
+        let head = run_test_git(&project.path, &["rev-parse", "HEAD"]);
+        let index = run_test_git(&project.path, &["write-tree"]);
+        let before = store
+            .git_finalization_blocking(project.id, SESSION)
+            .unwrap()
+            .unwrap();
+        let plan = plan_git_recovery(&store, &project, None).unwrap();
+        assert!(plan.prompt().contains("orphaned Git attempt"));
+        assert!(
+            recover_git_task(&store, &plan)
+                .unwrap()
+                .contains("Retired orphaned")
+        );
+        assert_eq!(
+            board.entries(TaskStatus::Done).unwrap()[0].content,
+            replacement
+        );
+        assert!(board.entries(TaskStatus::Todo).unwrap().is_empty());
+        assert_eq!(run_test_git(&project.path, &["rev-parse", "HEAD"]), head);
+        assert_eq!(run_test_git(&project.path, &["write-tree"]), index);
+        assert_eq!(
+            fs::read_to_string(project.path.join("feature.txt")).unwrap(),
+            "additional user changes\n"
+        );
+        let after = store
+            .git_finalization_blocking(project.id, SESSION)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.state, GitFinalizationState::Cancelled);
+        assert_eq!(after.worktree_baseline, before.worktree_baseline);
+        assert_eq!(after.starting_head, before.starting_head);
+        assert_eq!(after.branch_ref, before.branch_ref);
+        assert!(after.commit_oid.is_none());
+        assert!(
+            store
+                .resume_requested_session_blocking(project.id)
+                .unwrap()
+                .is_none()
+        );
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn orphan_branch_recovery_rechecks_links_and_rejects_same_branch() {
+    let (root, store, project) = branch_fixture(false, TaskStatus::Done);
+    let board = TaskBoard::new(get_tasks_dir(&project.path));
+    let original = fs::read(project.path.join("tasks/done.md")).unwrap();
+    fs::write(project.path.join("tasks/done.md"), "# Done\n").unwrap();
+    let plan = plan_git_recovery(&store, &project, None).unwrap();
+    fs::write(project.path.join("tasks/done.md"), &original).unwrap();
+    assert!(
+        recover_git_task(&store, &plan)
+            .unwrap_err()
+            .to_string()
+            .contains("links changed")
+    );
+    assert_eq!(board.entries(TaskStatus::Done).unwrap().len(), 1);
+    fs::write(project.path.join("tasks/done.md"), "# Done\n").unwrap();
+    let journal = store
+        .git_finalization_blocking(project.id, SESSION)
+        .unwrap()
+        .unwrap();
+    run_test_git(
+        &project.path,
+        &[
+            "switch",
+            journal
+                .branch_ref
+                .as_deref()
+                .unwrap()
+                .strip_prefix("refs/heads/")
+                .unwrap(),
+        ],
+    );
+    assert!(plan_git_recovery(&store, &project, None).is_err());
+    assert_eq!(
+        store
+            .git_finalization_blocking(project.id, SESSION)
+            .unwrap()
+            .unwrap(),
+        journal
+    );
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn scheduler_automatically_recovers_changed_branch_and_starts_fresh_work() {
+    for orphan in [false, true] {
+        let (root, store, project) = branch_fixture(false, TaskStatus::Done);
+        if orphan {
+            fs::write(project.path.join("tasks/done.md"), "# Done\n- Finished elsewhere. COMPLETED 2026-10-04: verified codex:replacement-session\n").unwrap();
+            add_task(&project.path, "Next feature", None).unwrap();
+        }
+        let done_before = fs::read(project.path.join("tasks/done.md")).unwrap();
+        let head = run_test_git(&project.path, &["rev-parse", "HEAD"]);
+        let index = run_test_git(&project.path, &["write-tree"]);
+        let state_dir = root.join("state");
+        let pass =
+            run_agent_scheduler_pass_with_max_global_jobs(&state_dir, false, &[], 1, None).unwrap();
+        assert!(pass.jobs.is_empty(), "Old session must not be launched");
+        let journal = store
+            .git_finalization_blocking(project.id, SESSION)
+            .unwrap()
+            .unwrap();
+        assert_eq!(journal.state, GitFinalizationState::Cancelled);
+        assert_eq!(store.list_projects_blocking().unwrap()[0].failure_count, 0);
+        assert_eq!(run_test_git(&project.path, &["rev-parse", "HEAD"]), head);
+        assert_eq!(run_test_git(&project.path, &["write-tree"]), index);
+        if orphan {
+            assert_eq!(
+                fs::read(project.path.join("tasks/done.md")).unwrap(),
+                done_before
+            );
+        }
+        let count = store.run_count_blocking().unwrap();
+        let next =
+            run_agent_scheduler_pass_with_max_global_jobs(&state_dir, false, &[], 1, None).unwrap();
+        assert_eq!(next.jobs.len(), 1);
+        assert_eq!(next.jobs[0].task_selection, AgentTaskSelection::NextTodo);
+        assert!(next.jobs[0].resume_session_id.is_none());
+        assert_eq!(store.run_count_blocking().unwrap(), count);
+        store
+            .release_lease_blocking(project.id, &next.jobs[0].holder)
+            .unwrap();
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn scheduler_branch_recovery_preserves_stopped_and_verified_attempts() {
+    for verified in [false, true] {
+        let (root, store, project) = branch_fixture(false, TaskStatus::Done);
+        if verified {
+            store
+                .compare_and_set_git_finalization_blocking(
+                    project.id,
+                    SESSION,
+                    2,
+                    GitFinalizationState::PushPending,
+                    None,
+                    Some("verified-commit"),
+                    None,
+                    &agent_timestamp(),
+                )
+                .unwrap();
+        } else {
+            store
+                .set_session_control_state_blocking(
+                    project.id,
+                    SESSION,
+                    AgentSessionControlState::Stopped,
+                )
+                .unwrap();
+        }
+        let before = fs::read(project.path.join("tasks/done.md")).unwrap();
+        let pass =
+            run_agent_scheduler_pass_with_max_global_jobs(&root.join("state"), false, &[], 1, None)
+                .unwrap();
+        assert!(pass.jobs.is_empty());
+        let journal = store
+            .git_finalization_blocking(project.id, SESSION)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            journal.state,
+            if verified {
+                GitFinalizationState::PushPending
+            } else {
+                GitFinalizationState::CommitPending
+            }
+        );
+        assert_eq!(
+            fs::read(project.path.join("tasks/done.md")).unwrap(),
+            before
+        );
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn scheduler_does_not_repeat_failed_branch_recovery_or_launch_on_detached_head() {
+    let (root, store, project) = branch_fixture(false, TaskStatus::Done);
+    run_test_git(&project.path, &["switch", "--detach"]);
+    let board_before = fs::read(project.path.join("tasks/done.md")).unwrap();
+    let journal_before = store
+        .git_finalization_blocking(project.id, SESSION)
+        .unwrap();
+    let mut reported_run = None;
+    for _ in 0..2 {
+        let pass =
+            run_agent_scheduler_pass_with_max_global_jobs(&root.join("state"), false, &[], 1, None)
+                .unwrap();
+        assert!(pass.jobs.is_empty());
+        let run = store
+            .latest_run_for_project_blocking(project.id)
+            .unwrap()
+            .unwrap();
+        assert!(run.summary.as_deref().unwrap().contains("detached HEAD"));
+        if let Some(previous) = reported_run {
+            assert_eq!(run.id, previous);
+        }
+        reported_run = Some(run.id);
+    }
+    assert_eq!(
+        store
+            .git_finalization_blocking(project.id, SESSION)
+            .unwrap(),
+        journal_before
+    );
+    assert_eq!(
+        fs::read(project.path.join("tasks/done.md")).unwrap(),
+        board_before
+    );
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn automatic_branch_recovery_preserves_task_stop_and_rechecks_session_stop() {
+    for stopped_task in [false, true] {
+        let (root, store, project) = branch_fixture(false, TaskStatus::Done);
+        let plan = plan_git_recovery(&store, &project, None).unwrap();
+        let journal = store
+            .git_finalization_blocking(project.id, SESSION)
+            .unwrap();
+        if stopped_task {
+            let board = TaskBoard::new(get_tasks_dir(&project.path));
+            let task = board.entries(TaskStatus::Done).unwrap().remove(0);
+            board
+                .write_entry_content(
+                    TaskStatus::Done,
+                    &task,
+                    &format!("{} clt:stopped", task.content),
+                )
+                .unwrap();
+            assert!(
+                super::recover_changed_branch_automatically(&store, &project, SESSION)
+                    .unwrap()
+                    .is_none()
+            );
+        } else {
+            // A stop after the preview must be checked in the same transaction
+            // that would cancel the journal, not just at scheduler selection.
+            store
+                .set_session_control_state_blocking(
+                    project.id,
+                    SESSION,
+                    AgentSessionControlState::Stopped,
+                )
+                .unwrap();
+            assert!(
+                super::execute_git_recovery(&store, &plan, true)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("session was stopped")
+            );
+            assert!(
+                store
+                    .lease_for_project_blocking(project.id)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert_eq!(
+            store
+                .git_finalization_blocking(project.id, SESSION)
+                .unwrap(),
+            journal
+        );
+        assert!(
+            TaskBoard::new(get_tasks_dir(&project.path))
+                .entries(TaskStatus::Todo)
+                .unwrap()
+                .is_empty()
+        );
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
 }

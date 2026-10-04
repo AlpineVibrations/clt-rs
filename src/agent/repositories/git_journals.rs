@@ -67,6 +67,7 @@ impl TursoAgentStore {
         session_id: &str,
         expected_run_id: i64,
         expected_journal: Option<&GitFinalizationRecord>,
+        require_resume_requested: bool,
         holder: &str,
         acquired_at: &str,
         expires_at: &str,
@@ -113,6 +114,12 @@ impl TursoAgentStore {
                 params![project_id, session_id, i64::from(expected_journal.is_some())],
             ).await? == 0,
                 "Recovery requires an idle project with no surviving Git journal or launch record. Stop active work and retry; existing recovery records are preserved");
+            if require_resume_requested {
+                anyhow::ensure!(query_count(&tx,
+                    "SELECT COUNT(*) FROM session_controls WHERE project_id = ?1 AND codex_session_id = ?2 AND state = 'resume_requested'",
+                    params![project_id, session_id],
+                ).await? == 1, "The session was stopped before automatic branch recovery; preserving its attempt");
+            }
             if expected_journal.is_some() {
                 tx.execute(
                     "UPDATE git_finalizations SET state = 'cancelled', generation = generation + 1,

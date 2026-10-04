@@ -6,6 +6,12 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+## [0.7.9] - 2026-10-04
+
+### Fixed
+
+- Automatically retire unverified managed Git attempts after a checkout branch switch, preserving files, staging, commits and journals. Requeue tasks still linked on the current board for fresh verification; leave replacement tasks alone and continue queued work when the old task is absent. Stop repeatedly launching the obsolete session, and retain protections for active owners, stopped sessions and verified commits.
+
 ## [0.7.8] - 2026-10-02
 
 ### Fixed

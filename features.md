@@ -363,30 +363,28 @@ a new attempt from the current checkout instead.
 ### Changing branches with unfinished Git tasks
 
 A managed task belongs to the branch recorded when it started. If you switch
-branches before it finishes, CLT checks the saved branch before launching its
-recovery session. It reports both branches and offers recovery instead of asking
-Codex to finish an old commit contract on the new branch.
+branches while an unverified attempt remains, the scheduler automatically retires
+that attempt once the project is idle. It preserves the old journal, sealed
+manifest, conversation history, files, staging, and commits.
 
-To continue the original attempt, return to its original branch outside the
-automated run and retry. To finish the remaining work on your current branch,
-stop active work, select the project in Agent Projects, press `r`, and confirm
-with `y`, or explicitly run `clt agent recover-task /path/to/project`.
-The selected task must still be present with its old conversation link, and
-the current checkout must be on an attached branch.
+If the old conversation still has a task on the current board, CLT queues that
+task in Todo for a fresh conversation to review existing work and finish what
+remains. A provisional Done entry returns to Todo for verification. If the old
+conversation has no task on the current branch, CLT leaves the board alone and
+continues with its queued work. A task linked to a different conversation is
+never adopted or rewritten. The next run captures the current branch and Git
+settings normally; CLT does not switch branches or certify the old commit.
 
-Recovery retires the old attempt, preserving its journal, sealed manifest,
-conversation history, files, staging, and commits. It queues the same task in
-Todo with a fresh conversation, which reviews existing work before completing
-what remains. A provisional Done entry also returns to Todo for verification;
-recovery does not certify its old commit. The next run captures a new boundary
-using the project's current Git settings. CLT never switches branches for you.
-
-This action requires an idle project and rejects other unfinished Git journals,
-unconsumed launch records, active workers, or manual owners. It rechecks the
-task, latest failed run, branch, and exact journal after confirmation. Journals
-with a verified commit, including `PUSH-PENDING`, cannot take this path; restore
-their original checkout and let CLT finish publication. Interrupted recovery
-keeps the old session stopped and can be retried.
+This happens without a recovery prompt or repeated Codex launches. Paused
+projects and deliberately stopped sessions stay paused or stopped. Automatic
+recovery requires an attached branch and an idle project, and preserves the
+checks for manual owners, other pending journals, active workers, unconsumed
+launch records, changed task links, and verified commits. `PUSH-PENDING` commits
+retain their publication contract. When one of these checks prevents recovery,
+CLT keeps the saved diagnostic available; resolve the reported obstacle first.
+The explicit `clt agent recover-task /path/to/project` command and Agent Projects
+`r` action remain available, including for orphaned attempts. Interrupted task
+moves remain stopped and can be retried through explicit recovery.
 
 ### Agent skills
 

@@ -28,13 +28,14 @@ use crate::{
         AGENT_SUCCESS_COOLDOWN_SECONDS_ENV, AgentDaemonCheckinSource, AgentDaemonExecutor,
         AgentDaemonRun, AgentLeaseHolderLiveness, AgentProjectScan, AgentProjectScanStatus,
         AgentRunJob, AgentSchedulerPass, AgentSchedulerStart, AgentShutdownSignal,
-        AgentTaskSelection, new_agent_shutdown_signal,
+        AgentTaskSelection, git_recovery::recover_changed_branch_automatically,
+        new_agent_shutdown_signal,
     },
     managed_git::{
         agent_git_push_retry_backoff_remaining, reconcile_pending_agent_git_finalizations,
         record_agent_git_push_retry_error, record_agent_git_push_retry_error_message,
         repair_working_git_task_link, retire_abandoned_unbound_git_journals,
-        try_acquire_agent_git_finalization_lease,
+        try_acquire_agent_git_finalization_lease, verify_agent_git_resume_branch,
     },
     platform::{
         AgentPlatform, automated_agent_process_group_is_running, local_process_is_running,
@@ -1044,6 +1045,7 @@ pub(super) fn run_agent_scheduler_pass_with_max_global_jobs(
                 })?;
             }
         }
+        let mut branch_recovery_session = None;
         let finalizations = if finalizations_before_reconcile.is_empty() {
             Vec::new()
         } else {
@@ -1066,6 +1068,46 @@ pub(super) fn run_agent_scheduler_pass_with_max_global_jobs(
                 let current = with_agent_store_at(state_dir, |store| {
                     store.list_pending_git_finalizations_blocking(Some(project.id))
                 })?;
+                // Retrying Codex cannot repair a changed Git boundary. Record
+                // the failed attempt once, then recover it outside this lease
+                // using the same board and idle-owner fences as explicit recovery.
+                for journal in current
+                    .iter()
+                    .filter(|journal| journal.state != GitFinalizationState::PushPending)
+                {
+                    if let Err(error) = verify_agent_git_resume_branch(&project.path, journal) {
+                        let summary = format!("{error:#}");
+                        finalization_lease.ensure_owned()?;
+                        with_agent_store_at(state_dir, |store| {
+                            let already_reported = store
+                                .latest_run_for_project_blocking(project.id)?
+                                .is_some_and(|run| {
+                                    run.status == "failure"
+                                        && run.codex_session_id.as_deref()
+                                            == Some(journal.codex_session_id.as_str())
+                                        && run.summary.as_deref() == Some(summary.as_str())
+                                });
+                            if !already_reported {
+                                let timestamp = agent_timestamp();
+                                store.record_run_outcome_blocking(agent::AgentRunOutcome {
+                                    project_id: project.id,
+                                    status: "failure",
+                                    started_at: &timestamp,
+                                    finished_at: Some(&timestamp),
+                                    exit_code: None,
+                                    log_dir: None,
+                                    stdout_path: None,
+                                    stderr_path: None,
+                                    summary: Some(&summary),
+                                    codex_session_id: Some(&journal.codex_session_id),
+                                })?;
+                            }
+                            Ok(())
+                        })?;
+                        branch_recovery_session = Some(journal.codex_session_id.clone());
+                        return Ok(current);
+                    }
+                }
                 if agent_git_push_retry_backoff_remaining(&current, now, failure_backoff).is_some()
                 {
                     return Ok(current);
@@ -1131,6 +1173,29 @@ pub(super) fn run_agent_scheduler_pass_with_max_global_jobs(
             existing_lease = agent_lease_for_project(state_dir, project.id)?;
             reconciled
         };
+        if let Some(session) = branch_recovery_session {
+            let recovery = with_agent_store_at(state_dir, |store| {
+                recover_changed_branch_automatically(store, &project, &session)
+            });
+            match recovery {
+                Ok(Some(message)) => println!(
+                    "Project {}: action=git_branch_recovered {message}",
+                    project.name
+                ),
+                Ok(None) => println!(
+                    "Project {}: action=skip reason=git_branch_recovery_suspended",
+                    project.name
+                ),
+                Err(error) => eprintln!(
+                    "Project {}: action=git_branch_recovery_wait error={error:#} path={}",
+                    project.name,
+                    project.path.display()
+                ),
+            }
+            // Re-scan the board and capture the current branch normally on the
+            // next pass; never reuse the retired attempt's launch state.
+            continue;
+        }
         let completed_finalizations = finalizations
             .iter()
             .filter(|finalization| finalization.state == GitFinalizationState::Completed)
