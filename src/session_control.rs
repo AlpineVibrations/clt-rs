@@ -20,8 +20,8 @@ use crate::{
         ensure_agent_state_dir_at, open_agent_store_at, with_agent_store_at,
     },
     application::{
-        AgentRunJob, AgentTaskSelection, INTERACTIVE_LEASE_GENERATION, new_agent_shutdown_signal,
-        toggle_task_stop_marker_in_board,
+        AGENT_PROJECT_ID_ENV, AGENT_RUN_TOKEN_ENV, AgentRunJob, AgentTaskSelection,
+        INTERACTIVE_LEASE_GENERATION, new_agent_shutdown_signal, toggle_task_stop_marker_in_board,
     },
     platform::{
         InteractiveTerminalForeground, agent_process_group_exists,
@@ -55,6 +55,7 @@ use crate::{
     },
 };
 
+mod completed;
 pub(super) mod planning;
 
 #[cfg(all(unix, test))]
@@ -227,6 +228,48 @@ pub(super) fn configure_interactive_codex_resume_command(
         .arg(project_root)
         .arg(session_id)
         .current_dir(project_root);
+}
+
+fn configure_completed_task_interactive_command(command: &mut Command, session_id: &str) {
+    command
+        .env_remove(AGENT_PROJECT_ID_ENV)
+        .env_remove(AGENT_RUN_TOKEN_ENV)
+        .env("CLT_INTERACTIVE_TASK_SESSION", session_id)
+        .arg(format!(
+            "CLT interactive continuation: The user reopened the completed task linked to codex:{session_id}. CLT has moved that same task from Done to Doing and reserved this exact session for interactive work. Continue under the user's new requests in this conversation, preserving its task and session identity. Earlier automated launch, one-task, and Git-finalization instructions belong to the finished run; they do not apply to this interactive continuation. Do not create a replacement or stopped tracking task, call clt start or clt claim, or attach this session to another task. Use clt list doing to locate the existing task, preserve its clt:interactive-done marker and terminal codex:{session_id} link when adding notes, and use clt done doing <current-index> after finishing requested work. CLT also returns this task to Done when the user exits this interactive session. The old automated Git journal remains terminal; do not reconstruct it, create a second CLT-Task commit for it, or assume permission to commit or push new work. Wait for the user's next request."
+        ));
+}
+
+pub(super) fn recover_stale_interactive_guardian_with_task(
+    store: &agent::TursoAgentStore,
+    project_id: i64,
+    session_id: &str,
+    guardian_holder: &str,
+    expected_child_pid: Option<u32>,
+    disposition: InteractiveGuardianDisposition,
+) -> Result<bool> {
+    let (board, _lock) = lock_project_board(store, project_id)?;
+    // The session CAS rejects a child registered after the stale snapshot.
+    // Keep the board locked through restoration so scheduling cannot observe
+    // the released reservation with its task still temporarily in Doing.
+    let recovered = store.recover_stale_interactive_guardian_blocking(
+        project_id,
+        session_id,
+        guardian_holder,
+        expected_child_pid,
+        disposition,
+    )?;
+    if recovered && disposition != InteractiveGuardianDisposition::ResumeExec {
+        completed::restore_completed_task_after_lock(&board, session_id)?;
+    }
+    Ok(recovered)
+}
+
+pub(super) fn restore_idle_completed_interactive_tasks(
+    store: &agent::TursoAgentStore,
+    project_id: i64,
+) -> Result<()> {
+    completed::restore_idle_completed_tasks(store, project_id)
 }
 
 #[cfg(unix)]
@@ -1007,6 +1050,14 @@ pub(super) fn finish_interactive_guardian_after_reap(
         // The child has been reaped and terminal ownership restored. Exit so
         // this store releases its access lock and exclusive recovery can run.
         store.check_recovery_required()?;
+        if !matches!(disposition, InteractiveGuardianDisposition::ResumeExec) {
+            completed::restore_completed_task_for_guardian(
+                store,
+                project_id,
+                session_id,
+                guardian_holder,
+            )?;
+        }
         match store.finish_interactive_guardian_blocking(
             project_id,
             session_id,
@@ -1132,10 +1183,15 @@ pub(super) fn run_guarded_interactive_codex(
 
     let disposition = InteractiveGuardianDisposition::from_guardian_holder(guardian_holder)
         .context("Interactive Codex guardian has an unrecognized holder")?;
+    let reopened_done = !matches!(disposition, InteractiveGuardianDisposition::ResumeExec)
+        && completed::reopen_completed_task(store, project.id, session_id, guardian_holder)?;
     let mut terminal_foreground = InteractiveTerminalForeground::capture(&terminal_input)?;
     let codex_command = agent_codex_command();
     let mut target = Command::new(&codex_command);
     configure_interactive_codex_resume_command(&mut target, &project.path, session_id);
+    if reopened_done {
+        configure_completed_task_interactive_command(&mut target, session_id);
+    }
     if let Some(provider) = store.resolve_credential_provider_blocking(project)? {
         configure_agent_provider_credential(&mut target, store, &provider)?;
     }

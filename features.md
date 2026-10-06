@@ -160,6 +160,15 @@ On the task board, select a Todo, Doing, or Done task, then press `c` to open it
 
 When an automated Codex run moves its selected task from Todo to Doing, CLT saves a terminal `codex:<session-id>` marker as part of that board update, including when Git automation is off. The marker uses the exact session registered for that run; activation fails if the task or session already belongs to different work. This internal marker survives task moves and wording changes, is hidden in task lists, the TUI, and the task editor, and is the task-to-session resume link. While a run is active, the database also records that session's exact run generation and log paths so `l`, stop, and interrupt target the correct live process. Completed run history retains the session ID without associating it to mutable task text. A run is reported as failed if CLT cannot persist the marker on its completed or blocked task.
 
+Opening a completed task with `c` moves that same task from Done to Doing before
+Codex starts. Continue the follow-up in its existing conversation; CLT supplies
+the current task context, so the agent does not need to create or claim another
+tracking task. The entry returns to Done when the requested work is marked
+complete or when you exit the interactive session. Failed launches and recovered
+guardian crashes also restore Done. The original completion notes, conversation,
+and completed Git proof are preserved. Todo planning and interactive takeover of
+unfinished automated work keep their existing behavior.
+
 ### Service heartbeat and logs
 
 The background service refreshes its registry heartbeat every 15 seconds independently of project scans, worker launches and the configured polling interval. `service stale` means that heartbeat has expired after 45 seconds. If registry heartbeats stop completing, the scheduler exits so launchd or systemd restarts it automatically, even with no TUI open; independent workers continue. Temporary heartbeat errors are retried within that window. The agent projects pane also restarts a running service whose check-in is stale and shows `service restarting` while it recovers. Open CLT windows share a restart lock and a 60-second cooldown, allowing the replacement scheduler to check in before another restart. A service explicitly stopped with `clt agent stop` remains stopped.

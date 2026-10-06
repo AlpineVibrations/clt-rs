@@ -46,10 +46,12 @@ use crate::{
         insert_content_into_markdown, move_path_into_directory,
         move_task_without_reordering_after_lock, normalize_status_arg, parse_one_based_task_index,
         read_markdown_entries, recoverable_codex_session_id_from_task_content, remove_task_entry,
-        reorder_directory_task, reorder_markdown_task, task_content_is_manual,
-        task_content_with_codex_session, task_content_with_manual_session,
-        task_content_without_manual_marker, task_content_without_stop_marker, task_entry_at,
-        task_entry_is_stopped, task_for_codex_session_in_board,
+        reorder_directory_task, reorder_markdown_task, task_content_is_interactive_done,
+        task_content_is_manual, task_content_with_codex_session,
+        task_content_with_interactive_done_marker, task_content_with_manual_session,
+        task_content_without_interactive_done_marker, task_content_without_manual_marker,
+        task_content_without_stop_marker, task_entry_at, task_entry_is_stopped,
+        task_for_codex_session_in_board,
     },
     tui::{
         format_agent_daemon_runtime_status, load_task_agent_session_states,
@@ -1739,6 +1741,22 @@ pub(super) fn move_task_in_board_after_lock(
     // Publish the destination while still claimed. The shared board lock keeps
     // scheduling out until the move succeeds and ownership is released.
     board.move_task_after_lock(from, to, task_index)?;
+    if to == TaskStatus::Done && task_content_is_interactive_done(&entry.content) {
+        let session = recoverable_codex_session_id_from_task_content(&entry.content)
+            .context("Reopened task needs its attached Codex conversation before completion")?;
+        let done = board
+            .entries(TaskStatus::Done)?
+            .into_iter()
+            .find(|task| {
+                recoverable_codex_session_id_from_task_content(&task.content) == Some(session)
+            })
+            .context("Reopened task disappeared before completing it")?;
+        board.write_entry_content(
+            TaskStatus::Done,
+            &done,
+            &task_content_without_interactive_done_marker(&done.content),
+        )?;
+    }
     if let Some(session) = manual_session {
         let todo = board
             .entries(TaskStatus::Todo)?
@@ -1861,6 +1879,11 @@ pub(super) fn update_task_in_board_after_lock(
         }
         Some(session_id) => task_content_with_codex_session(new_description, session_id),
         None => new_description.trim_end().to_string(),
+    };
+    let updated_content = if task_content_is_interactive_done(&entry.content) {
+        task_content_with_interactive_done_marker(&updated_content)
+    } else {
+        updated_content
     };
     let updated_content = if task_entry_is_stopped(&entry) {
         format!(

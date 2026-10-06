@@ -81,6 +81,29 @@ fn interactive_codex_resume_command_is_always_writable() {
 }
 
 #[test]
+fn completed_interactive_resume_supplies_current_task_context_without_automated_ownership() {
+    let mut command = Command::new("codex");
+    configure_interactive_codex_resume_command(
+        &mut command,
+        Path::new("/tmp/project"),
+        "session-completed",
+    );
+    super::configure_completed_task_interactive_command(&mut command, "session-completed");
+    let prompt = command.get_args().last().unwrap().to_str().unwrap();
+    assert!(prompt.contains("codex:session-completed"));
+    assert!(prompt.contains("same task from Done to Doing"));
+    assert!(prompt.contains("Do not create a replacement or stopped tracking task"));
+    assert!(prompt.contains("do not apply to this interactive continuation"));
+    let envs = command.get_envs().collect::<Vec<_>>();
+    assert!(envs.contains(&(
+        OsStr::new("CLT_INTERACTIVE_TASK_SESSION"),
+        Some(OsStr::new("session-completed"))
+    )));
+    assert!(envs.contains(&(OsStr::new(AGENT_PROJECT_ID_ENV), None)));
+    assert!(envs.contains(&(OsStr::new(AGENT_RUN_TOKEN_ENV), None)));
+}
+
+#[test]
 fn legacy_read_only_guardian_holders_recover_as_shared_sessions() {
     assert_eq!(
         InteractiveGuardianDisposition::from_guardian_holder(
@@ -3609,6 +3632,24 @@ fn shared_interactive_resume_preserves_manual_owner_through_exit_and_reopen() {
                     .unwrap()
             );
             assert!(
+                super::completed::reopen_completed_task(
+                    &store,
+                    project_id,
+                    "session-completed",
+                    &guardian,
+                )
+                .unwrap()
+            );
+            assert_eq!(
+                read_task_entries(&board, TaskStatus::Doing).unwrap().len(),
+                2
+            );
+            assert!(
+                read_task_entries(&board, TaskStatus::Done)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
                 store
                     .register_interactive_guardian_child_blocking(
                         project_id,
@@ -3620,14 +3661,19 @@ fn shared_interactive_resume_preserves_manual_owner_through_exit_and_reopen() {
                     .unwrap()
             );
             assert!(
-                store
-                    .finish_interactive_guardian_blocking(
-                        project_id,
-                        "session-completed",
-                        &guardian,
-                        disposition,
-                    )
-                    .unwrap()
+                !finish_interactive_guardian_after_reap(
+                    &store,
+                    project_id,
+                    "session-completed",
+                    &guardian,
+                    Duration::from_secs(60),
+                    disposition,
+                )
+                .unwrap()
+            );
+            assert_eq!(
+                read_task_entries(&board, TaskStatus::Done).unwrap().len(),
+                1
             );
             assert_eq!(
                 store

@@ -103,6 +103,18 @@ Before creating a task or adding a dependency, check the relevant dependency cha
 
 #### Reserve tasks in standalone Codex sessions
 
+When the user reopens a completed task interactively through CLT, continue that
+same task and conversation. CLT moves the entry from Done to Doing before
+launching Codex and supplies `CLT_INTERACTIVE_TASK_SESSION` plus an interactive
+continuation prompt. Locate the existing entry with `clt list doing`; preserve
+its `clt:interactive-done` marker and terminal `codex:<session-id>` link while
+adding notes. Do not run `clt start` or `clt claim`, create a replacement tracking
+task, or mark a workaround stopped. Finish requested work with `clt done`; CLT
+also returns the entry to Done when the interactive session exits. This is an
+interactive continuation, so the old automated run and terminal Git journal are
+not restarted. A provisional Done entry with unfinished Git proof remains under
+its original finalization controls.
+
 When Codex is working directly in a CLT-enabled project, outside a `clt agent`
 run, create and claim the task directly in Doing with `clt start`. This attaches
 the current conversation and reserves the project against automated pickup and
@@ -226,7 +238,7 @@ clt delete <status> <index>
 - **Keep Listings Scoped**: During normal task execution, list only the status needed for the current decision. Do not load the backlog unless the user asks for it or the work specifically requires backlog triage, inspection, promotion, or a whole-board diagnosis. Large unrelated backlogs consume context and can distract from actionable `todo` and `doing` work.
 - **Preserve Existing Tasks**: Never delete, reorder, or rewrite `clt` tasks unless explicitly asked. Other people may add todos while you are working, and those are real tasks, not noise.
 - **Backlog Is Not Actionable**: Do not start or automatically select backlog tasks. Work on one only after the user or project workflow promotes it to `todo`.
-- **Stopped Tasks**: Skip tasks displayed as `[STOPPED]` or ending with `clt:stopped`, including during blocked-task recovery. The user can press `s` on a task without a controllable CLT run (including a saved Codex link or idle Todo planning conversation) to stop it or allow it to start again. Preserve the marker until the user restarts the task.
+- **Stopped Tasks**: Skip tasks displayed as `[STOPPED]` or ending with `clt:stopped`, including during blocked-task recovery. The user can press `s` on a task without a controllable CLT run (including a saved Codex link or idle Todo planning conversation) to stop it or allow it to start again. Preserve the marker until the user restarts the task. Opening a completed task interactively through CLT reactivates that same task for the user's follow-up; it does not require a new stopped tracking task or a separate restart approval.
 - **Default Storage Mode**: Use regular Markdown-file mode for agent-created task lists unless the user explicitly asks for expanded folder-backed tasks. Do not run `clt init --folders` or `clt expand` just because a task has some detail.
 - **Folder-Backed Tasks**: When a status is already a folder, edit the task file for detailed notes. Keep the first sentence suitable for list and TUI display. Managed Git automation preserves a directory-backed task's existing path and order during status moves. It rejects a folder-backed Todo-to-Markdown Doing or folder-backed Doing-to-Markdown Done route before launch; expand and commit the destination layout first. Exact source/destination duplicates left by a crash are repaired without reordering unrelated tasks, while ambiguous copies fail closed.
 - **Outcome Notes**: Before changing a task's status after a work attempt, record the outcome in the task. For a Markdown-backed status, append the note to the task's existing line. For a folder-backed status, preserve the first sentence and add a `Completion note:` or `Blocked note:` section to the task file.

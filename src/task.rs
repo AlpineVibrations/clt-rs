@@ -220,6 +220,35 @@ pub(super) fn task_entry_is_blocked(entry: &TaskEntry) -> bool {
 
 pub(super) const TASK_STOPPED_MARKER: &str = "clt:stopped";
 pub(super) const TASK_MANUAL_MARKER: &str = "clt:manual";
+pub(super) const TASK_INTERACTIVE_DONE_MARKER: &str = "clt:interactive-done";
+
+pub(super) fn task_content_is_interactive_done(content: &str) -> bool {
+    content
+        .split_whitespace()
+        .any(|word| word == TASK_INTERACTIVE_DONE_MARKER)
+}
+
+pub(super) fn task_content_without_interactive_done_marker(content: &str) -> String {
+    task_content_without_marker(content, TASK_INTERACTIVE_DONE_MARKER)
+}
+
+pub(super) fn task_content_with_interactive_done_marker(content: &str) -> String {
+    let stopped = task_content_is_stopped(content);
+    let content = task_content_without_stop_marker(content);
+    let session = recoverable_codex_session_id_from_task_content(content);
+    let unlinked = task_content_without_recoverable_codex_session(content);
+    let unmarked = task_content_without_interactive_done_marker(&unlinked);
+    let marked = format!("{} {TASK_INTERACTIVE_DONE_MARKER}", unmarked.trim_end());
+    let linked = match session {
+        Some(session) => task_content_with_codex_session(&marked, session),
+        None => marked,
+    };
+    if stopped {
+        format!("{linked} {TASK_STOPPED_MARKER}")
+    } else {
+        linked
+    }
+}
 
 pub(super) fn task_content_is_manual(content: &str) -> bool {
     content
@@ -228,9 +257,13 @@ pub(super) fn task_content_is_manual(content: &str) -> bool {
 }
 
 pub(super) fn task_content_without_manual_marker(content: &str) -> String {
+    task_content_without_marker(content, TASK_MANUAL_MARKER)
+}
+
+fn task_content_without_marker(content: &str, marker: &str) -> String {
     let mut result = content.to_string();
     // Keep prose, newlines, and the terminal conversation marker intact.
-    for (start, word) in content.rmatch_indices(TASK_MANUAL_MARKER) {
+    for (start, word) in content.rmatch_indices(marker) {
         let end = start + word.len();
         if (start == 0 || content[..start].ends_with(char::is_whitespace))
             && (end == content.len() || content[end..].starts_with(char::is_whitespace))
@@ -802,7 +835,9 @@ fn task_name_without_reordering(path: &Path, name: &str, prepend: bool) -> Resul
 }
 
 pub(super) fn first_sentence(content: &str) -> Option<String> {
-    let normalized = normalize_task_text(&task_content_without_manual_marker(content));
+    let normalized = normalize_task_text(&task_content_without_interactive_done_marker(
+        &task_content_without_manual_marker(content),
+    ));
     if normalized.is_empty() {
         return None;
     }
@@ -933,8 +968,8 @@ pub(super) fn task_content_without_recoverable_codex_session(content: &str) -> S
 }
 
 pub(super) fn task_content_for_edit(content: &str) -> String {
-    task_content_without_manual_marker(&task_content_without_recoverable_codex_session(
-        task_content_without_stop_marker(content),
+    task_content_without_interactive_done_marker(&task_content_without_manual_marker(
+        &task_content_without_recoverable_codex_session(task_content_without_stop_marker(content)),
     ))
 }
 
@@ -976,7 +1011,9 @@ pub(super) fn normalize_task_text(content: &str) -> String {
 }
 
 pub(super) fn durable_task_identity(content: &str) -> Option<String> {
-    let content = task_content_without_recoverable_codex_session(content);
+    let content = task_content_without_interactive_done_marker(
+        &task_content_without_recoverable_codex_session(content),
+    );
     let mut canonical_lines = Vec::new();
     let mut skipping_outcome_section = false;
     for line in content.lines() {
@@ -1039,8 +1076,9 @@ pub(super) fn split_description_metadata(value: &str) -> (&str, Option<&str>) {
 }
 
 pub(super) fn task_display_text(entry: &TaskEntry) -> String {
-    let summary =
-        task_content_without_manual_marker(task_content_without_stop_marker(&entry.summary));
+    let summary = task_content_without_interactive_done_marker(
+        &task_content_without_manual_marker(task_content_without_stop_marker(&entry.summary)),
+    );
     match &entry.metadata {
         Some(metadata) => format!("{summary} ({metadata})"),
         None => summary.to_string(),
@@ -1048,8 +1086,8 @@ pub(super) fn task_display_text(entry: &TaskEntry) -> String {
 }
 
 pub(super) fn task_full_display_text(entry: &TaskEntry) -> String {
-    let content = normalize_task_text(&task_content_without_manual_marker(
-        task_content_without_stop_marker(&entry.content),
+    let content = normalize_task_text(&task_content_without_interactive_done_marker(
+        &task_content_without_manual_marker(task_content_without_stop_marker(&entry.content)),
     ));
     if content.is_empty() {
         task_display_text(entry)

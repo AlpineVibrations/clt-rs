@@ -45,7 +45,10 @@ use crate::{
         AgentRunner, CodexAgentRunner, agent_timestamp, agent_timestamp_after,
         agent_timestamp_seconds, format_agent_timestamp,
     },
-    session_control::InteractiveGuardianDisposition,
+    session_control::{
+        InteractiveGuardianDisposition, recover_stale_interactive_guardian_with_task,
+        restore_idle_completed_interactive_tasks,
+    },
     session_recovery::{ensure_orphaned_session_supervision, recovered_supervisor_pid},
     task::{
         TaskStatus, acquire_board_mutation_lock, board_has_manual_task, ensure_existing_board,
@@ -1591,6 +1594,16 @@ pub(super) fn reconcile_stale_agent_session_controls(
         !agent_lease_is_reclaimable(lease, reclaim_current_process_leases, now)
     });
 
+    if controls
+        .iter()
+        .any(|control| control.state == AgentSessionControlState::Stopped)
+    {
+        // Retry the board half if recovery crashed after releasing the exact
+        // guardian reservation but before restoring its Done entry.
+        with_agent_store_at(state_dir, |store| {
+            restore_idle_completed_interactive_tasks(store, project_id)
+        })?;
+    }
     for control in controls {
         if control.state == AgentSessionControlState::ReadyInteractive
             && let Some(holder) = control.interactive_holder.as_deref()
@@ -1656,15 +1669,15 @@ pub(super) fn reconcile_stale_agent_session_controls(
                     interactive_guardian_child_is_proven_absent(control.child_pid);
                 if child_is_proven_absent {
                     with_agent_store_at(state_dir, |store| {
-                        store
-                            .recover_stale_interactive_guardian_blocking(
-                                project_id,
-                                &control.codex_session_id,
-                                holder,
-                                control.child_pid,
-                                disposition,
-                            )
-                            .map(|_| ())
+                        recover_stale_interactive_guardian_with_task(
+                            store,
+                            project_id,
+                            &control.codex_session_id,
+                            holder,
+                            control.child_pid,
+                            disposition,
+                        )
+                        .map(|_| ())
                     })?;
                 }
             }
