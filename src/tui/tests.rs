@@ -1887,6 +1887,81 @@ fn completed_task_keeps_reaped_session_output_without_run_history() {
 }
 
 #[test]
+fn manual_owner_allows_shared_resume_without_hiding_selected_session_or_project() {
+    let root = temp_root("manual-shared-availability");
+    let state_dir = root.join("state");
+    let project_root = root.join("project");
+    init_tasks(&project_root, false).unwrap();
+    add_task(
+        &project_root,
+        "Manual work clt:manual codex:manual-owner",
+        None,
+    )
+    .unwrap();
+    let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
+    store
+        .register_project_blocking(&project_root, "project")
+        .unwrap();
+    let project = store.list_projects_blocking().unwrap().remove(0);
+    let mut selected = tui_agent_project_for_test(project.id, "project");
+    selected.project = project.clone();
+    let mut panel = TuiAgentPanel::new(&project_root);
+    panel.projects = vec![
+        tui_agent_project_for_test(project.id + 1, "other"),
+        selected,
+    ];
+    panel.state.select(Some(0));
+    assert_eq!(
+        tui_codex_session_availability_for_path_at(
+            &mut panel,
+            &project_root,
+            "session-completed",
+            &state_dir,
+        )
+        .unwrap(),
+        TuiCodexSessionAvailability::ProjectBusy
+    );
+    assert_eq!(panel.selected_project().unwrap().project.id, project.id);
+    // Already-open shared sessions must retain their own busy/handoff routing.
+    store
+        .set_session_control_state_blocking(
+            project.id,
+            "session-completed",
+            AgentSessionControlState::Interactive,
+        )
+        .unwrap();
+    assert_eq!(
+        tui_codex_session_availability_for_path_at(
+            &mut panel,
+            &project_root,
+            "session-completed",
+            &state_dir,
+        )
+        .unwrap(),
+        TuiCodexSessionAvailability::SelectedSessionBusy
+    );
+    store
+        .set_session_control_state_blocking(
+            project.id,
+            "session-completed",
+            AgentSessionControlState::ResumeRequested,
+        )
+        .unwrap();
+    assert_eq!(
+        tui_codex_session_availability_for_path_at(
+            &mut panel,
+            &project_root,
+            "session-completed",
+            &state_dir,
+        )
+        .unwrap(),
+        TuiCodexSessionAvailability::ProjectBusy
+    );
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn kanban_agent_log_view_uses_the_active_project_for_selected_doing_task() {
     let root = temp_root("kanban-agent-log");
     let state_dir = root.join("state/clt");

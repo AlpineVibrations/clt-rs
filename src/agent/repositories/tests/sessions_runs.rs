@@ -357,6 +357,7 @@ fn queued_shared_resume_distinguishes_its_own_worker_from_another_task() {
                     &expected.codex_session_id,
                     holder,
                     Some("original-run"),
+                    false,
                 )
                 .unwrap(),
             !own_worker

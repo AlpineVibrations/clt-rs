@@ -3770,11 +3770,6 @@ pub(super) fn tui_codex_session_availability_for_path_at(
     session_id: &str,
     state_dir: &Path,
 ) -> Result<TuiCodexSessionAvailability> {
-    if get_tasks_dir(project_path).is_dir()
-        && crate::task::board_has_manual_task(&get_tasks_dir(project_path))?
-    {
-        return Ok(TuiCodexSessionAvailability::ProjectBusy);
-    }
     if !panel.select_project_for_path(project_path) {
         return Ok(TuiCodexSessionAvailability::Idle);
     }
@@ -3798,9 +3793,13 @@ pub(super) fn tui_codex_session_availability_for_path_at(
     {
         return Ok(TuiCodexSessionAvailability::SelectedSessionBusy);
     }
-    if controls.iter().any(|control| {
-        control.codex_session_id != session_id && control.state != AgentSessionControlState::Stopped
-    }) {
+    if (get_tasks_dir(project_path).is_dir()
+        && crate::task::board_has_manual_task(&get_tasks_dir(project_path))?)
+        || controls.iter().any(|control| {
+            control.codex_session_id != session_id
+                && control.state != AgentSessionControlState::Stopped
+        })
+    {
         return Ok(TuiCodexSessionAvailability::ProjectBusy);
     }
     if selected_queued {

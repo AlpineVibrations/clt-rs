@@ -167,10 +167,10 @@ pub(super) fn is_stopped_shared_interactive_holder(holder: &str) -> bool {
         || holder.starts_with("clt-stopped-readonly-interactive-")
 }
 
-fn lock_project_without_manual_claim(
+fn lock_project_board(
     store: &agent::TursoAgentStore,
     project_id: i64,
-) -> Result<crate::task::BoardMutationLock> {
+) -> Result<(PathBuf, crate::task::BoardMutationLock)> {
     let project = store
         .list_projects_blocking()?
         .into_iter()
@@ -178,6 +178,14 @@ fn lock_project_without_manual_claim(
         .context("Project is no longer registered")?;
     let board = get_tasks_dir(&project.path);
     let lock = crate::task::acquire_board_mutation_lock(&board)?;
+    Ok((board, lock))
+}
+
+fn lock_project_without_manual_claim(
+    store: &agent::TursoAgentStore,
+    project_id: i64,
+) -> Result<crate::task::BoardMutationLock> {
+    let (board, lock) = lock_project_board(store, project_id)?;
     anyhow::ensure!(
         !board.is_dir() || !crate::task::board_has_manual_task(&board)?,
         "Project is reserved by a directly opened Codex session; use clt handoff to release it"
@@ -1888,13 +1896,43 @@ pub(super) fn reserve_tui_shared_codex_session_interactive(
     expected_stopped_run_token: Option<&str>,
 ) -> Result<bool> {
     let state_dir = ensure_agent_state_dir()?;
-    with_agent_store_at(&state_dir, |store| {
-        let _lock = lock_project_without_manual_claim(store, project_id)?;
+    reserve_tui_shared_codex_session_interactive_at(
+        &state_dir,
+        project_id,
+        session_id,
+        interactive_holder,
+        expected_stopped_run_token,
+    )
+}
+
+fn reserve_tui_shared_codex_session_interactive_at(
+    state_dir: &Path,
+    project_id: i64,
+    session_id: &str,
+    interactive_holder: &str,
+    expected_stopped_run_token: Option<&str>,
+) -> Result<bool> {
+    with_agent_store_at(state_dir, |store| {
+        let (board, _lock) = lock_project_board(store, project_id)?;
+        let mut linked = Vec::new();
+        collect_codex_session_tasks_in_board(&board, session_id, &mut linked)?;
+        anyhow::ensure!(
+            !linked
+                .iter()
+                .any(|(status, task)| *status != TaskStatus::Done
+                    && crate::task::task_content_is_manual(&task.content)),
+            "This Codex session owns a manual task; continue it in its directly opened session"
+        );
+        // Manual owners have no CLT lease or session control. Hold the board
+        // lock through reservation so their claim can authorize shared access
+        // without transferring project ownership or resuming the owner itself.
+        let has_manual_owner = crate::task::board_has_manual_task(&board)?;
         store.reserve_shared_session_interactive_blocking(
             project_id,
             session_id,
             interactive_holder,
             expected_stopped_run_token,
+            has_manual_owner,
         )
     })
 }

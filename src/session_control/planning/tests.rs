@@ -274,6 +274,7 @@ fn planning_can_open_alongside_a_busy_project_without_changing_its_run() {
                     &prepared.session_id,
                     &holder,
                     None,
+                    false,
                 )
                 .unwrap()
         );

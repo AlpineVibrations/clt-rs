@@ -3171,6 +3171,7 @@ fn writable_shared_interactive_reservation_coexists_with_another_active_session(
                 "session-blocked",
                 &requester,
                 None,
+                false,
             )
             .unwrap()
     );
@@ -3403,7 +3404,8 @@ fn writable_shared_interactive_preserves_active_git_work_through_exit_and_reopen
                         project_id,
                         "session-completed",
                         &requester,
-                        None
+                        None,
+                        false,
                     )
                     .unwrap(),
                 "{git_mode:?} {boundary}"
@@ -3414,7 +3416,8 @@ fn writable_shared_interactive_preserves_active_git_work_through_exit_and_reopen
                         project_id,
                         "session-completed",
                         &requester,
-                        None
+                        None,
+                        false,
                     )
                     .unwrap()
             );
@@ -3424,7 +3427,8 @@ fn writable_shared_interactive_preserves_active_git_work_through_exit_and_reopen
                         project_id,
                         "session-active",
                         &requester,
-                        None
+                        None,
+                        false,
                     )
                     .unwrap()
             );
@@ -3476,7 +3480,8 @@ fn writable_shared_interactive_preserves_active_git_work_through_exit_and_reopen
                         project_id,
                         "session-completed",
                         &requester,
-                        None
+                        None,
+                        false,
                     )
                     .unwrap()
             );
@@ -3528,6 +3533,158 @@ fn writable_shared_interactive_preserves_active_git_work_through_exit_and_reopen
 }
 
 #[test]
+fn shared_interactive_resume_preserves_manual_owner_through_exit_and_reopen() {
+    for folders in [false, true] {
+        let root = temp_root("shared-manual-owner");
+        let state_dir = root.join("state");
+        let project_root = root.join("project");
+        init_tasks(&project_root, folders).unwrap();
+        let board = get_tasks_dir(&project_root);
+        add_task(
+            &project_root,
+            "Manual work clt:manual codex:manual-owner",
+            None,
+        )
+        .unwrap();
+        move_task_in_board(&board, TaskStatus::Todo, TaskStatus::Doing, "1").unwrap();
+        add_task(&project_root, "Finished work codex:session-completed", None).unwrap();
+        move_task_in_board(&board, TaskStatus::Todo, TaskStatus::Done, "1").unwrap();
+        let manual_before = task_entry_at(&board, TaskStatus::Doing, 1).unwrap().content;
+        let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let project_id = store.list_projects_blocking().unwrap().remove(0).id;
+        assert!(InteractiveAgentLease::try_acquire_at(&state_dir, project_id, 60).is_err());
+
+        for restore_stopped in [false, true] {
+            let requester = InteractiveAgentLease::holder_for_shared_session(restore_stopped);
+            assert!(
+                super::reserve_tui_shared_codex_session_interactive_at(
+                    &state_dir,
+                    project_id,
+                    "session-completed",
+                    &requester,
+                    None,
+                )
+                .unwrap()
+            );
+            assert!(
+                !super::reserve_tui_shared_codex_session_interactive_at(
+                    &state_dir,
+                    project_id,
+                    "session-completed",
+                    &requester,
+                    None,
+                )
+                .unwrap()
+            );
+            assert!(
+                super::reserve_tui_shared_codex_session_interactive_at(
+                    &state_dir,
+                    project_id,
+                    "manual-owner",
+                    &requester,
+                    None,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("owns a manual task")
+            );
+
+            let disposition = InteractiveGuardianDisposition::from_handoff(
+                InteractiveCodexResumeMode::WritableShared,
+                &requester,
+            );
+            let guardian = interactive_guardian_holder(disposition);
+            assert!(
+                store
+                    .adopt_interactive_guardian_blocking(
+                        project_id,
+                        Some("session-completed"),
+                        &requester,
+                        &guardian,
+                        60,
+                    )
+                    .unwrap()
+            );
+            assert!(
+                store
+                    .register_interactive_guardian_child_blocking(
+                        project_id,
+                        "session-completed",
+                        &guardian,
+                        std::process::id(),
+                        60,
+                    )
+                    .unwrap()
+            );
+            assert!(
+                store
+                    .finish_interactive_guardian_blocking(
+                        project_id,
+                        "session-completed",
+                        &guardian,
+                        disposition,
+                    )
+                    .unwrap()
+            );
+            assert_eq!(
+                store
+                    .session_control_blocking(project_id, "session-completed")
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                AgentSessionControlState::Stopped
+            );
+            assert!(
+                store
+                    .session_control_blocking(project_id, "manual-owner")
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                store
+                    .lease_for_project_blocking(project_id)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                task_entry_at(&board, TaskStatus::Doing, 1).unwrap().content,
+                manual_before
+            );
+            assert!(!scan_agent_project(&project_root).has_schedulable_work());
+        }
+        // A stale shared-mode decision must not fabricate an owner after handoff.
+        move_task_in_board(&board, TaskStatus::Doing, TaskStatus::Done, "1").unwrap();
+        let requester = InteractiveAgentLease::holder_for_shared_session(true);
+        assert!(
+            !super::reserve_tui_shared_codex_session_interactive_at(
+                &state_dir,
+                project_id,
+                "session-completed",
+                &requester,
+                None,
+            )
+            .unwrap()
+        );
+        let requester = InteractiveAgentLease::holder_for_shared_session(false);
+        assert!(
+            !super::reserve_tui_shared_codex_session_interactive_at(
+                &state_dir,
+                project_id,
+                "another-session",
+                &requester,
+                None,
+            )
+            .unwrap()
+        );
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
 fn cancelling_shared_resume_restores_a_stopped_session() {
     let root = temp_root("shared-stopped-reservation");
     let state_dir = root.join("state/clt");
@@ -3562,6 +3719,7 @@ fn cancelling_shared_resume_restores_a_stopped_session() {
                 "session-stopped",
                 &requester,
                 None,
+                false,
             )
             .unwrap()
     );

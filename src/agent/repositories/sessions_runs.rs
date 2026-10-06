@@ -1053,6 +1053,8 @@ impl TursoAgentStore {
         codex_session_id: &str,
         interactive_holder: &str,
         expected_stopped_run_token: Option<&str>,
+        // Verified by the caller while holding the project board lock.
+        has_manual_owner: bool,
     ) -> Result<bool> {
         self.blocking.block_on_persist(async {
             let mut conn = self.repositories.sessions_runs.connect().await?;
@@ -1094,7 +1096,7 @@ impl TursoAgentStore {
                                 OR (run_token IS NULL AND ?5 IS NULL)
                             )
                             AND (
-                                EXISTS (
+                                ?6 = 1 OR EXISTS (
                                     SELECT 1 FROM leases WHERE project_id = ?3
                                 )
                                 OR EXISTS (
@@ -1109,7 +1111,8 @@ impl TursoAgentStore {
                             agent_timestamp(),
                             project_id,
                             codex_session_id,
-                            expected_stopped_run_token
+                            expected_stopped_run_token,
+                            i64::from(has_manual_owner)
                         ],
                     )
                     .await
@@ -1126,7 +1129,7 @@ impl TursoAgentStore {
                              WHERE project_id = ?1 AND codex_session_id = ?2
                           )
                             AND (
-                                EXISTS (
+                                ?5 = 1 OR EXISTS (
                                     SELECT 1 FROM leases WHERE project_id = ?1
                                 )
                                 OR EXISTS (
@@ -1141,7 +1144,8 @@ impl TursoAgentStore {
                             project_id,
                             codex_session_id,
                             interactive_holder,
-                            agent_timestamp()
+                            agent_timestamp(),
+                            i64::from(has_manual_owner)
                         ],
                     )
                     .await
