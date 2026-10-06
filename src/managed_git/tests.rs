@@ -4,6 +4,7 @@ use crate::test_support::*;
 use crate::worker::tests::reserve_test_worker;
 
 mod advanced_branch;
+mod deletion;
 mod enable_on_resume;
 mod follow_up;
 mod launch_edits;
@@ -1499,7 +1500,7 @@ fn externally_completed_working_task_is_not_resumed_if_board_move_was_interrupte
     );
     assert!(
         store
-            .accept_external_git_completion_blocking(
+            .cancel_idle_working_git_finalization_blocking(
                 finalization.project_id,
                 session_id,
                 finalization.generation,
@@ -1507,6 +1508,7 @@ fn externally_completed_working_task_is_not_resumed_if_board_move_was_interrupte
                 "external-completion-test-fence",
                 "100",
                 "101",
+                GitTaskCancellation::ExternalCompletion,
             )
             .unwrap()
     );
@@ -1806,7 +1808,7 @@ fn external_completion_fences_the_journal_but_accepts_user_edited_task_content()
     ] {
         assert!(
             !store
-                .accept_external_git_completion_blocking(
+                .cancel_idle_working_git_finalization_blocking(
                     finalization.project_id,
                     session_id,
                     generation,
@@ -1814,6 +1816,7 @@ fn external_completion_fences_the_journal_but_accepts_user_edited_task_content()
                     "fence",
                     &agent_timestamp(),
                     &agent_timestamp_after(60),
+                    GitTaskCancellation::ExternalCompletion,
                 )
                 .unwrap()
         );

@@ -11,9 +11,9 @@ use anyhow::{Context, Result};
 use crate::{
     agent::{
         self, AGENT_DB_FILE, AGENT_EXTERNAL_COMPLETION_REASON,
-        AGENT_GIT_FINALIZATION_RESUME_TOKEN_PREFIX, AGENT_WORKERS_ACTIVE_PROJECT_INDEX,
-        AgentSessionControlState, GitFinalizationState, current_agent_platform,
-        ensure_agent_state_dir, open_agent_store_at, with_agent_store_at,
+        AGENT_GIT_FINALIZATION_RESUME_TOKEN_PREFIX, AGENT_TASK_DELETION_REASON,
+        AGENT_WORKERS_ACTIVE_PROJECT_INDEX, AgentSessionControlState, GitFinalizationState,
+        current_agent_platform, ensure_agent_state_dir, open_agent_store_at, with_agent_store_at,
     },
     application::{
         AGENT_DAEMON_CHECKIN_STALE_SECONDS, AGENT_DAEMON_DATABASE_LOCK_RETRY_ATTEMPTS,
@@ -1860,13 +1860,16 @@ pub(super) fn project_has_resumable_doing_task(
                 // Doing task. Only a durable task/session link permits resume.
                 continue;
             };
-            let externally_completed = store
+            let cancelled_by_user = store
                 .git_finalization_blocking(project.id, session_id)?
                 .is_some_and(|journal| {
                     journal.state == GitFinalizationState::Cancelled
-                        && journal.last_error.as_deref() == Some(AGENT_EXTERNAL_COMPLETION_REASON)
+                        && matches!(
+                            journal.last_error.as_deref(),
+                            Some(AGENT_EXTERNAL_COMPLETION_REASON | AGENT_TASK_DELETION_REASON)
+                        )
                 });
-            if !externally_completed {
+            if !cancelled_by_user {
                 return Ok(true);
             }
         }
@@ -1899,13 +1902,16 @@ fn interrupted_codex_session_in_doing(
             {
                 continue;
             }
-            let externally_completed = store
+            let cancelled_by_user = store
                 .git_finalization_blocking(project.id, session_id)?
                 .is_some_and(|journal| {
                     journal.state == GitFinalizationState::Cancelled
-                        && journal.last_error.as_deref() == Some(AGENT_EXTERNAL_COMPLETION_REASON)
+                        && matches!(
+                            journal.last_error.as_deref(),
+                            Some(AGENT_EXTERNAL_COMPLETION_REASON | AGENT_TASK_DELETION_REASON)
+                        )
                 });
-            if !externally_completed {
+            if !cancelled_by_user {
                 return Ok(Some(session_id.to_string()));
             }
         }

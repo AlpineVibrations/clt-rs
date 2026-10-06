@@ -18,7 +18,7 @@ pub(super) mod git_recovery;
 use crate::{
     agent::{
         self, AGENT_DB_FILE, AgentGitMode, AgentSessionControlState, GitFinalizationState,
-        agent_state_dir, open_agent_store, open_agent_store_at,
+        GitTaskCancellation, agent_state_dir, open_agent_store, open_agent_store_at,
     },
     managed_git::{
         AgentGitProofContext, AgentGitStartState, capture_agent_git_resealed_manifest,
@@ -109,7 +109,7 @@ pub(super) fn reconcile_agent_project(
     Ok(())
 }
 
-const AGENT_EXTERNAL_COMPLETION_LEASE_SECONDS: u64 = 60;
+const AGENT_TASK_CANCELLATION_LEASE_SECONDS: u64 = 60;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum TaskDoneOutcome {
@@ -1054,8 +1054,35 @@ pub(super) fn delete_task_in_board(
     let _mutation_lock = acquire_board_mutation_lock(board_dir)?;
     let board = TaskBoard::new(board_dir);
     let entry = board.entry(status, task_index)?;
-    ensure_managed_git_task_mutation_allowed(board_dir, &entry, false, None)?;
-    board.remove_entry(status, &entry)
+    if automated_agent_child_context()?.is_some() {
+        ensure_managed_git_task_mutation_allowed(board_dir, &entry, false, None)?;
+        return board.remove_entry(status, &entry);
+    }
+    mutate_user_managed_task_after_lock(board_dir, &entry, GitTaskCancellation::Deletion, || {
+        board.remove_entry_without_reordering(status, &entry)
+    })?;
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn delete_task_in_board_with_store(
+    board_dir: &Path,
+    status: TaskStatus,
+    task_index_str: &str,
+    store: &agent::TursoAgentStore,
+) -> Result<()> {
+    let task_index = parse_one_based_task_index(task_index_str)?;
+    let _mutation_lock = acquire_board_mutation_lock(board_dir)?;
+    let board = TaskBoard::new(board_dir);
+    let entry = board.entry(status, task_index)?;
+    mutate_user_managed_task_with_store_after_lock(
+        board_dir,
+        &entry,
+        store,
+        GitTaskCancellation::Deletion,
+        || board.remove_entry_without_reordering(status, &entry),
+    )?;
+    Ok(())
 }
 
 pub(super) fn ensure_managed_git_task_mutation_allowed(
@@ -1536,12 +1563,12 @@ pub(super) fn move_task_to_done_with_agent_store(
     Ok(true)
 }
 
-fn external_completion_lease_holder() -> String {
+fn task_cancellation_lease_holder() -> String {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    format!("clt-external-completion-{}-{nonce}", std::process::id())
+    format!("clt-task-cancellation-{}-{nonce}", std::process::id())
 }
 
 fn agent_project_for_board(
@@ -1556,6 +1583,7 @@ fn agent_project_for_board(
         .max_by_key(|project| project.path.as_os_str().len()))
 }
 
+#[cfg(test)]
 fn move_user_task_to_done_with_store_after_lock(
     board_dir: &Path,
     from: TaskStatus,
@@ -1563,42 +1591,58 @@ fn move_user_task_to_done_with_store_after_lock(
     entry: &TaskEntry,
     store: &agent::TursoAgentStore,
 ) -> Result<Option<String>> {
+    mutate_user_managed_task_with_store_after_lock(
+        board_dir,
+        entry,
+        store,
+        GitTaskCancellation::ExternalCompletion,
+        || move_task_in_board_after_lock(board_dir, from, TaskStatus::Done, task_index),
+    )
+}
+
+fn mutate_user_managed_task_with_store_after_lock(
+    board_dir: &Path,
+    entry: &TaskEntry,
+    store: &agent::TursoAgentStore,
+    cancellation: GitTaskCancellation,
+    mutate: impl FnOnce() -> Result<()>,
+) -> Result<Option<String>> {
     let Some(session_id) = recoverable_codex_session_id_from_task_content(&entry.content) else {
-        move_task_in_board_after_lock(board_dir, from, TaskStatus::Done, task_index)?;
+        mutate()?;
         return Ok(None);
     };
     let Some(project) = agent_project_for_board(store, board_dir)? else {
-        move_task_in_board_after_lock(board_dir, from, TaskStatus::Done, task_index)?;
+        mutate()?;
         return Ok(None);
     };
     let Some(finalization) = store.git_finalization_blocking(project.id, session_id)? else {
-        move_task_in_board_after_lock(board_dir, from, TaskStatus::Done, task_index)?;
+        mutate()?;
         return Ok(None);
     };
     if finalization.state.is_terminal() {
-        move_task_in_board_after_lock(board_dir, from, TaskStatus::Done, task_index)?;
+        mutate()?;
         return Ok(None);
     }
-    if finalization.state != GitFinalizationState::Working {
+    if finalization.state != GitFinalizationState::Working || finalization.commit_oid.is_some() {
         anyhow::bail!(
-            "Task {session_id} has a managed Git journal in {}; its commit proof is already sealed and cannot be replaced by an external completion",
-            finalization.state.status_label()
+            "Task {session_id} has a managed Git journal in {}; its commit proof is already sealed and prevents {}",
+            finalization.state.status_label(),
+            cancellation.action(),
         );
     }
     let bound_identity = finalization
         .task_identity
         .as_deref()
         .context("The Working Git journal has no durable task identity")?;
-    // A manual Done move accepts the selected session-linked task even after a
-    // user edits its text or commits the work themselves. Preserve the journal's
-    // original identity for the generation-fenced cancellation below; automated
-    // completion still requires its exact task identity and sealed commit.
+    // The user selects the saved session even after editing its task text.
+    // Cancel against the original identity and generation; automated completion
+    // still requires its exact task payload and sealed commit.
 
     reconcile_idle_project_ownership(store, project.id)?;
     let acquired_at = agent_timestamp();
-    let expires_at = agent_timestamp_after(AGENT_EXTERNAL_COMPLETION_LEASE_SECONDS);
-    let lease_holder = external_completion_lease_holder();
-    if !store.accept_external_git_completion_blocking(
+    let expires_at = agent_timestamp_after(AGENT_TASK_CANCELLATION_LEASE_SECONDS);
+    let lease_holder = task_cancellation_lease_holder();
+    if !store.cancel_idle_working_git_finalization_blocking(
         project.id,
         session_id,
         finalization.generation,
@@ -1606,6 +1650,7 @@ fn move_user_task_to_done_with_store_after_lock(
         &lease_holder,
         &acquired_at,
         &expires_at,
+        cancellation,
     )? {
         let current = store.git_finalization_blocking(project.id, session_id)?;
         let state = current
@@ -1613,23 +1658,23 @@ fn move_user_task_to_done_with_store_after_lock(
             .map(|journal| journal.state.status_label())
             .unwrap_or("MISSING");
         anyhow::bail!(
-            "Task {session_id} changed while CLT was accepting external completion (journal: {state}); retry the Done move"
+            "Task {session_id} changed while CLT was {} (journal: {state}); retry the action",
+            cancellation.action(),
         );
     }
 
-    let move_result = move_task_in_board_after_lock(board_dir, from, TaskStatus::Done, task_index);
+    let move_result = mutate();
     let release_result = store.release_lease_blocking(project.id, &lease_holder);
     if let Err(release_error) = release_result {
         return match move_result {
             Ok(()) => Err(release_error).with_context(|| {
                 format!(
-                    "Task {session_id} moved to Done, but CLT could not release its external-completion fence"
+                    "CLT finished {} for {session_id}, but could not release its project fence",
+                    cancellation.action(),
                 )
             }),
             Err(move_error) => Err(move_error).with_context(|| {
-                format!(
-                    "CLT also could not release the external-completion fence: {release_error:#}"
-                )
+                format!("CLT also could not release the task-cancellation fence: {release_error:#}")
             }),
         };
     }
@@ -1643,21 +1688,35 @@ fn move_user_task_to_done_after_lock(
     task_index: usize,
     entry: &TaskEntry,
 ) -> Result<Option<String>> {
+    mutate_user_managed_task_after_lock(
+        board_dir,
+        entry,
+        GitTaskCancellation::ExternalCompletion,
+        || move_task_in_board_after_lock(board_dir, from, TaskStatus::Done, task_index),
+    )
+}
+
+fn mutate_user_managed_task_after_lock(
+    board_dir: &Path,
+    entry: &TaskEntry,
+    cancellation: GitTaskCancellation,
+    mutate: impl FnOnce() -> Result<()>,
+) -> Result<Option<String>> {
     let Some(_session_id) = recoverable_codex_session_id_from_task_content(&entry.content) else {
-        move_task_in_board_after_lock(board_dir, from, TaskStatus::Done, task_index)?;
+        mutate()?;
         return Ok(None);
     };
     let state_dir = agent_state_dir()?;
     if !state_dir.join(AGENT_DB_FILE).is_file() {
-        move_task_in_board_after_lock(board_dir, from, TaskStatus::Done, task_index)?;
+        mutate()?;
         return Ok(None);
     }
     let store = open_agent_store_at(&state_dir)?;
     if store.pending_migration_version().is_some() {
-        move_task_in_board_after_lock(board_dir, from, TaskStatus::Done, task_index)?;
+        mutate()?;
         return Ok(None);
     }
-    move_user_task_to_done_with_store_after_lock(board_dir, from, task_index, entry, &store)
+    mutate_user_managed_task_with_store_after_lock(board_dir, entry, &store, cancellation, mutate)
 }
 
 pub(super) fn move_task_in_board(

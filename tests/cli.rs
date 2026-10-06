@@ -576,6 +576,116 @@ fn invalid_inputs_fail_on_stderr_without_mutating_the_board() {
 }
 
 #[test]
+fn user_delete_cancels_an_idle_working_journal_but_automated_deletion_stays_fenced() {
+    for folders in [false, true] {
+        let workspace = TestWorkspace::new("managed-deletion");
+        assert_success(&workspace.run(&["init"]));
+        assert_success(&workspace.run(&["agent", "register"]));
+        fs::write(
+            workspace.path().join("tasks/doing.md"),
+            "# Doing Tasks\n- Accidental task. BLOCKED 2026-10-06: Wrong repository. codex:cli-deletion clt:stopped\n- Keep this task\n",
+        )
+        .unwrap();
+        if folders {
+            assert_success(&workspace.run(&["expand"]));
+        }
+        let database_path = workspace.path().join("agent-state/agent.db");
+        let update = |sql: &str| {
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                let database = turso::Builder::new_local(database_path.to_str().unwrap())
+                    .experimental_multiprocess_wal(true)
+                    .build()
+                    .await
+                    .unwrap();
+                database.connect().unwrap().execute(sql, ()).await.unwrap();
+            });
+        };
+        update(
+            "INSERT INTO git_finalizations (
+                    project_id,codex_session_id,state,git_mode,starting_head,branch_ref,
+                    worktree_baseline,task_identity,generation,created_at,updated_at
+                ) SELECT id,'cli-deletion','working','commit',
+                    '1111111111111111111111111111111111111111','refs/heads/main',
+                    '{}','v2' || char(10) || 'Accidental task.',0,'100','100' FROM projects",
+        );
+        update(
+            "INSERT INTO session_controls (project_id,codex_session_id,state,updated_at)
+                SELECT id,'cli-deletion','stopped','100' FROM projects",
+        );
+        let (before, _) = assert_success(&workspace.run(&["list", "doing"]));
+        for (sql, expected) in [
+            (
+                "UPDATE session_controls SET state = 'running'",
+                "is still active",
+            ),
+            (
+                "UPDATE session_controls SET state = 'stopped'; UPDATE git_finalizations SET state = 'commit_pending'",
+                "commit proof is already sealed",
+            ),
+        ] {
+            // Execute each statement separately; the connector accepts one at a time.
+            for statement in sql.split(';') {
+                update(statement);
+            }
+            let output = workspace.run(&["delete", "doing", "1"]);
+            assert!(!output.status.success());
+            assert!(output_text(&output).1.contains(expected));
+            assert_eq!(assert_success(&workspace.run(&["list", "doing"])).0, before);
+        }
+        update("UPDATE git_finalizations SET state = 'working'");
+        let automated = Command::new(env!("CARGO_BIN_EXE_clt"))
+            .current_dir(workspace.path())
+            .args(["--local", "delete", "doing", "1"])
+            .env("CLT_AGENT_STATE_DIR", workspace.path().join("agent-state"))
+            .env("CLT_AGENT_PROJECT_ID", "1")
+            .env("CLT_AGENT_RUN_TOKEN", "automated-delete")
+            .output()
+            .unwrap();
+        assert!(!automated.status.success());
+        assert!(
+            output_text(&automated)
+                .1
+                .contains("managed Git journal in WORKING")
+        );
+        assert_eq!(assert_success(&workspace.run(&["list", "doing"])).0, before);
+
+        let (stdout, stderr) = assert_success(&workspace.run(&["delete", "doing", "1"]));
+        assert_eq!(stdout, "Task 1 from doing deleted successfully.\n");
+        assert!(stderr.is_empty());
+        let (remaining, _) = assert_success(&workspace.run(&["list", "doing"]));
+        assert!(!remaining.contains("Accidental task"));
+        assert!(remaining.contains("Keep this task"));
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let database = turso::Builder::new_local(database_path.to_str().unwrap())
+                .experimental_multiprocess_wal(true)
+                .build()
+                .await
+                .unwrap();
+            let connection = database.connect().unwrap();
+            let mut rows = connection
+                .query(
+                    "SELECT g.state, g.generation, g.last_error, s.state
+                 FROM git_finalizations g JOIN session_controls s
+                   ON g.project_id = s.project_id AND g.codex_session_id = s.codex_session_id
+                 WHERE g.codex_session_id = 'cli-deletion'",
+                    (),
+                )
+                .await
+                .unwrap();
+            let row = rows.next().await.unwrap().unwrap();
+            assert_eq!(row.get::<String>(0).unwrap(), "cancelled");
+            assert_eq!(row.get::<i64>(1).unwrap(), 1);
+            assert!(
+                row.get::<String>(2)
+                    .unwrap()
+                    .contains("explicitly deleted the idle task")
+            );
+            assert_eq!(row.get::<String>(3).unwrap(), "stopped");
+        });
+    }
+}
+
+#[test]
 fn user_done_commands_accept_an_edited_task_with_an_idle_managed_journal() {
     for folders in [false, true] {
         for arguments in [

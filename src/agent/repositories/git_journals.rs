@@ -4,11 +4,11 @@ use clt_database::turso::{Connection, Database, params, transaction::Transaction
 use super::RepositoryDatabase;
 use crate::{
     agent::{
-        AGENT_BRANCH_GIT_RECOVERY_REASON, AGENT_EXTERNAL_COMPLETION_REASON,
-        AGENT_GIT_FINALIZATION_RESUME_TOKEN_PREFIX, AGENT_MISSING_GIT_RECOVERY_TOKEN_PREFIX,
-        AgentGitMode, AgentRunOutcome, GitFinalizationRecord, GitFinalizationState,
-        NewGitFinalization, TursoAgentStore, git_finalization_record_from_row, query_count,
-        row_integer, row_optional_integer, row_optional_text, row_text, update_project_after_run,
+        AGENT_BRANCH_GIT_RECOVERY_REASON, AGENT_GIT_FINALIZATION_RESUME_TOKEN_PREFIX,
+        AGENT_MISSING_GIT_RECOVERY_TOKEN_PREFIX, AgentGitMode, AgentRunOutcome,
+        GitFinalizationRecord, GitFinalizationState, GitTaskCancellation, NewGitFinalization,
+        TursoAgentStore, git_finalization_record_from_row, query_count, row_integer,
+        row_optional_integer, row_optional_text, row_text, update_project_after_run,
     },
     managed_git::AgentGitStartState,
     runner::agent_timestamp,
@@ -555,7 +555,7 @@ impl TursoAgentStore {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn accept_external_git_completion_blocking(
+    pub(crate) fn cancel_idle_working_git_finalization_blocking(
         &self,
         project_id: i64,
         codex_session_id: &str,
@@ -564,9 +564,10 @@ impl TursoAgentStore {
         lease_holder: &str,
         acquired_at: &str,
         expires_at: &str,
+        cancellation: GitTaskCancellation,
     ) -> Result<bool> {
         self.blocking
-            .block_on_persist(self.accept_external_git_completion(
+            .block_on_persist(self.cancel_idle_working_git_finalization(
                 project_id,
                 codex_session_id,
                 expected_generation,
@@ -574,11 +575,12 @@ impl TursoAgentStore {
                 lease_holder,
                 acquired_at,
                 expires_at,
+                cancellation,
             ))
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn accept_external_git_completion(
+    async fn cancel_idle_working_git_finalization(
         &self,
         project_id: i64,
         codex_session_id: &str,
@@ -587,15 +589,15 @@ impl TursoAgentStore {
         lease_holder: &str,
         acquired_at: &str,
         expires_at: &str,
+        cancellation: GitTaskCancellation,
     ) -> Result<bool> {
+        let action = cancellation.action();
         let mut conn = self.repositories.git_journals.connect().await?;
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .await
             .with_context(|| {
-                format!(
-                    "Failed to begin accepting external completion for Codex session {codex_session_id}"
-                )
+                format!("Failed to begin {action} for Codex session {codex_session_id}")
             })?;
 
         if query_count(
@@ -609,29 +611,40 @@ impl TursoAgentStore {
             > 0
         {
             anyhow::bail!(
-                "Task {codex_session_id} still has an active agent worker; stop it before moving the task to Done as an external completion"
+                "Task {codex_session_id} still has an active agent worker; stop it before {action}"
             );
         }
 
         if query_count(
             &transaction,
             "SELECT COUNT(*) FROM session_controls
-              WHERE project_id = ?1 AND codex_session_id = ?2
+              WHERE project_id = ?1
                 AND NOT (
                     state IN ('stopped', 'resume_requested')
                     AND child_pid IS NULL
                     AND interactive_holder IS NULL
                     AND interactive_launch_token IS NULL
                 )",
-            params![project_id, codex_session_id],
+            [project_id],
         )
         .await?
             > 0
         {
             anyhow::bail!(
-                "Codex session {codex_session_id} is still active; stop it before moving the task to Done as an external completion"
+                "A Codex session in this project is still active; stop it before {action}"
             );
         }
+
+        anyhow::ensure!(
+            query_count(
+                &transaction,
+                "SELECT COUNT(*) FROM agent_git_launch_states WHERE project_id = ?1",
+                [project_id],
+            )
+            .await?
+                == 0,
+            "The project has an unconsumed Git launch boundary; recover it before {action}"
+        );
 
         transaction
             .execute(
@@ -643,7 +656,7 @@ impl TursoAgentStore {
             .await
             .with_context(|| {
                 format!(
-                    "Failed to clear an expired project lease before accepting external completion for {codex_session_id}"
+                    "Failed to clear an expired project lease before {action} for {codex_session_id}"
                 )
             })?;
         if query_count(
@@ -655,7 +668,7 @@ impl TursoAgentStore {
             > 0
         {
             anyhow::bail!(
-                "Task {codex_session_id} still has an active project lease; stop its agent session before moving the task to Done as an external completion"
+                "Task {codex_session_id} still has an active project lease; stop its agent session before {action}"
             );
         }
         let lease_inserted = transaction
@@ -667,6 +680,7 @@ impl TursoAgentStore {
                        WHERE project_id = ?1 AND codex_session_id = ?5
                          AND state = 'working' AND generation = ?6
                          AND task_identity = ?7
+                         AND commit_oid IS NULL
                   )",
                 params![
                     project_id,
@@ -680,13 +694,11 @@ impl TursoAgentStore {
             )
             .await
             .with_context(|| {
-                format!(
-                    "Failed to fence the project while accepting external completion for {codex_session_id}"
-                )
+                format!("Failed to fence the project while {action} for {codex_session_id}")
             })?;
         if lease_inserted != 1 {
             transaction.commit().await.with_context(|| {
-                format!("Failed to finish a rejected external completion for {codex_session_id}")
+                format!("Failed to finish rejecting {action} for {codex_session_id}")
             })?;
             return Ok(false);
         }
@@ -701,7 +713,7 @@ impl TursoAgentStore {
                     AND state = 'working' AND generation = ?5
                     AND task_identity = ?6",
                 params![
-                    AGENT_EXTERNAL_COMPLETION_REASON,
+                    cancellation.reason(),
                     acquired_at,
                     project_id,
                     codex_session_id,
@@ -712,14 +724,28 @@ impl TursoAgentStore {
             .await
             .with_context(|| {
                 format!(
-                    "Failed to cancel the managed Git journal for externally completed task {codex_session_id}"
+                    "Failed to cancel the managed Git journal while {action} for {codex_session_id}"
                 )
             })?;
         if changed != 1 {
             return Ok(false);
         }
 
-        transaction
+        if cancellation == GitTaskCancellation::Deletion {
+            // Persist the user's cancellation before removing board evidence.
+            // A failed or interrupted deletion must never resume the old work.
+            transaction
+                .execute(
+                    "INSERT INTO session_controls (project_id, codex_session_id, state, updated_at)
+                     VALUES (?1, ?2, 'stopped', ?3)
+                     ON CONFLICT(project_id, codex_session_id) DO UPDATE
+                        SET state = 'stopped', run_token = NULL, updated_at = ?3",
+                    params![project_id, codex_session_id, acquired_at],
+                )
+                .await
+                .context("Failed to preserve the deleted task's stopped session")?;
+        } else {
+            transaction
             .execute(
                 "DELETE FROM session_controls
                   WHERE project_id = ?1 AND codex_session_id = ?2
@@ -735,9 +761,10 @@ impl TursoAgentStore {
                     "Failed to clear the idle resume state for externally completed task {codex_session_id}"
                 )
             })?;
+        }
 
         transaction.commit().await.with_context(|| {
-            format!("Failed to commit external completion for Codex session {codex_session_id}")
+            format!("Failed to commit {action} for Codex session {codex_session_id}")
         })?;
         Ok(true)
     }

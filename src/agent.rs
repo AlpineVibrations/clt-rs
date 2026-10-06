@@ -175,6 +175,31 @@ pub(super) const AGENT_CODEX_REASONING_EFFORTS: [&str; 7] =
 pub(super) const AGENT_STATE_DIR_ENV: &str = "CLT_AGENT_STATE_DIR";
 pub(super) const AGENT_GIT_FINALIZATION_RESUME_TOKEN_PREFIX: &str = "clt-git-finalization:";
 pub(super) const AGENT_EXTERNAL_COMPLETION_REASON: &str = "Managed Git proof was cancelled because a user explicitly moved the task to Done as an external completion";
+pub(super) const AGENT_TASK_DELETION_REASON: &str =
+    "Managed Git proof was cancelled because a user explicitly deleted the idle task";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum GitTaskCancellation {
+    ExternalCompletion,
+    Deletion,
+}
+
+impl GitTaskCancellation {
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            Self::ExternalCompletion => AGENT_EXTERNAL_COMPLETION_REASON,
+            Self::Deletion => AGENT_TASK_DELETION_REASON,
+        }
+    }
+
+    pub(crate) fn action(self) -> &'static str {
+        match self {
+            Self::ExternalCompletion => "moving the task to Done as an external completion",
+            Self::Deletion => "deleting the task",
+        }
+    }
+}
+
 pub(super) const AGENT_ABANDONED_UNBOUND_JOURNAL_REASON: &str =
     "Managed Git proof was cancelled because its run ended before claiming a task";
 pub(super) const AGENT_DB_FILE: &str = "agent.db";

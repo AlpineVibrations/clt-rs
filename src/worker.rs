@@ -262,7 +262,7 @@ fn reconcile_exited_project_workers_with(
             expected_worker_pid: worker.worker_pid,
             expected_heartbeat_at: worker.heartbeat_at.as_deref(),
             finished_at: &agent_timestamp(),
-            error: "Worker process exited before the user accepted external task completion",
+            error: "Worker process exited before the user cancelled its managed task",
             permitted_successor_holder: lease
                 .as_ref()
                 .filter(|lease| lease.holder != worker.lease_holder)

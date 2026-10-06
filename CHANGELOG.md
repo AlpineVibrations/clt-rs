@@ -9,6 +9,7 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 ### Fixed
 
 - Reuse the same task when reopening a completed Codex session interactively: move it to Doing before launch, tell Codex to continue that task, and return it to Done on completion or exit without creating a stopped replacement task or restarting its completed Git journal.
+- Allow explicit deletion of idle managed Git tasks still in `WORKING`, cancelling the obsolete journal while preserving Git boundaries and conversation history. Keep live owners and sealed proof protected, and prevent interrupted deletions from resuming cancelled work.
 - Allow completed Codex sessions to reopen alongside a directly opened session with a manual task claim. Preserve the manual claim and scheduler fence, reject duplicate resumes of the claimed session, and keep shared-session controls tied to the selected project.
 - Backfill earlier Kanban tasks when a long selected task collapses, selection is cleared, or the viewport grows, so a stale scroll position cannot leave available space empty.
 - Let ready Todo work run ahead of queued dependency blockers in both supervisor and ordinary recovery scheduling, including when an older supervisor decision held the project. Keep assessment priority for blocked Doing tasks and stalled queues. Scope supervisor logs to each blocked task’s exact session so an old error from a completed predecessor cannot become the supplied current failure.
