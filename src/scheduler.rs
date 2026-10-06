@@ -1424,7 +1424,8 @@ pub(super) fn run_agent_scheduler_pass_with_max_global_jobs(
         let task_selection = decide_agent_scheduling_stage(AgentSchedulingDecisionRequest {
             has_resume_session: resume_session_id.is_some(),
             resume_interrupted_task,
-            has_blocked_task: scan.has_blocked_task(),
+            has_blocked_task: scan.has_blocked_task()
+                && !crate::supervisor::queued_blockers_can_wait(&project)?,
             blocked_recovery_backoff_active,
             has_pending_task: scan.has_pending_task(),
         })

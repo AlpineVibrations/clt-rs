@@ -385,3 +385,139 @@ fn supervisor_keeps_the_original_git_boundary_while_approving_a_retry() {
     drop(store);
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn supervisor_and_legacy_recovery_allow_ready_todo_after_queued_blockers() {
+    for folders in [false, true] {
+        for mode in ["off", "on", "saved-repair"] {
+            let root = temp_root("supervisor-ready-predecessor");
+            let state = root.join("state");
+            let path = root.join("project");
+            init_tasks(&path, folders).unwrap();
+            add_task(
+                &path,
+                "FOG-06. BLOCKED 2026-10-06: Wait for FOG-05. codex:downstream",
+                None,
+            )
+            .unwrap();
+            add_task(
+                &path,
+                "FOG-05. UNBLOCKED 2026-10-06: FOG-04 completed. codex:ready-predecessor",
+                None,
+            )
+            .unwrap();
+            let store = agent::TursoAgentStore::open_blocking(&state).unwrap();
+            store.register_project_blocking(&path, "project").unwrap();
+            let project = store.list_projects_blocking().unwrap().remove(0);
+            if mode != "off" {
+                enable(&store);
+            }
+            if mode == "saved-repair" {
+                // Reproduce a decision persisted by 0.8.0 before the gate fix.
+                begin_review(&store, &project).unwrap();
+                finish_review(
+                    &store,
+                    &project,
+                    &result(
+                        &root,
+                        json!({
+                            "decision":"repair", "task":1, "reason":"Historical writer conflict",
+                            "next_action":"Repair the completed predecessor"
+                        }),
+                    ),
+                )
+                .unwrap();
+            }
+            let before = evidence(&project).unwrap();
+            let pass = run_agent_scheduler_pass(&state, false, &[]).unwrap();
+            assert_eq!(pass.jobs.len(), 1, "folders={folders} mode={mode}");
+            assert_eq!(pass.jobs[0].task_selection, AgentTaskSelection::NextTodo);
+            assert_eq!(
+                crate::worker::automated_codex_session_to_resume(
+                    &path,
+                    pass.jobs[0].task_selection
+                )
+                .unwrap()
+                .as_deref(),
+                Some("ready-predecessor")
+            );
+            assert_eq!(before, evidence(&project).unwrap());
+            assert!(
+                store
+                    .supervisor_review_blocking(project.id)
+                    .unwrap()
+                    .is_none()
+            );
+            drop(store);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+}
+
+#[test]
+fn supervisor_still_reviews_a_queue_with_no_ready_work() {
+    let (root, state, store, project) = fixture("supervisor-stalled-queue");
+    move_task(&project.path, TaskStatus::Doing, TaskStatus::Todo, "1").unwrap();
+    let board = get_tasks_dir(&project.path);
+    let ready = task_entry_at(&board, TaskStatus::Todo, 1).unwrap();
+    write_task_entry_content(
+        &board,
+        TaskStatus::Todo,
+        &ready,
+        "Paused prerequisite clt:stopped",
+    )
+    .unwrap();
+    enable(&store);
+    let pass = run_agent_scheduler_pass(&state, false, &[]).unwrap();
+    assert_eq!(pass.jobs.len(), 1);
+    assert_eq!(
+        pass.jobs[0].task_selection,
+        AgentTaskSelection::SupervisorReview
+    );
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn supervisor_prompt_uses_only_the_blocked_tasks_exact_session_logs() {
+    let (root, _, store, project) = fixture("supervisor-scoped-logs");
+    for (session, summary, stderr) in [
+        (
+            "original-session",
+            "Current task probe failed",
+            "current-task.err",
+        ),
+        (
+            "completed-predecessor",
+            "Old thread already has an active writer",
+            "unrelated-writer.err",
+        ),
+    ] {
+        store
+            .record_run_outcome_blocking(agent::AgentRunOutcome {
+                project_id: project.id,
+                status: "failure",
+                started_at: "100",
+                finished_at: Some("101"),
+                exit_code: Some(1),
+                log_dir: None,
+                stdout_path: None,
+                stderr_path: Some(stderr),
+                summary: Some(summary),
+                codex_session_id: Some(session),
+            })
+            .unwrap();
+    }
+    enable(&store);
+    begin_review(&store, &project).unwrap();
+    let mut command = Command::new("codex");
+    configure_command(&mut command, &store, &project, &root.join("run.err")).unwrap();
+    let prompt = command.get_args().last().unwrap().to_string_lossy();
+    assert!(prompt.contains("Current task probe failed"));
+    assert!(prompt.contains("current-task.err"));
+    assert!(prompt.contains("original-session"));
+    assert!(!prompt.contains("Old thread already has an active writer"));
+    assert!(!prompt.contains("unrelated-writer.err"));
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}

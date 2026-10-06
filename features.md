@@ -433,9 +433,9 @@ Automated runs start Codex with `--sandbox danger-full-access --ask-for-approval
 
 ### Blocked-task supervisor
 
-The optional supervisor reviews blocked work before CLT starts another task or ordinary blocked-task recovery in that project. It defaults to off, the CLT default model, high thinking, and fast mode off. Configure it on the single line at the top of Agent Projects (`u` selects the line; `Space`, `m`, `t`, and `f` change its settings). Install the updated binary and restart the scheduler to use the feature.
+The optional supervisor reviews execution blockers in Doing before CLT starts another task, and reviews queued blockers when no ready Todo work remains. Blocked Todo tasks waiting on prerequisites do not prevent a ready Todo from running, regardless of its position in the list. A saved review hold from a queued dependency wait is cleared when ready work can proceed. It defaults to off, the CLT default model, high thinking, and fast mode off. Configure it on the single line at the top of Agent Projects (`u` selects the line; `Space`, `m`, `t`, and `f` change its settings). Install the updated binary and restart the scheduler to use the feature.
 
-After the implementation worker exits and saves its blocker evidence, a separate review worker takes the project's lease. It uses a read-only sandbox, the supervisor's model settings, and a three-minute deadline. It examines task notes and relevant project files and returns one structured decision:
+After the implementation worker exits and saves its blocker evidence, a separate review worker takes the project's lease. It uses a read-only sandbox, the supervisor's model settings, and a three-minute deadline. It examines task notes, relevant project files and the latest available logs for each blocked task’s exact session, then returns one structured decision. Errors from other project sessions are not supplied as current failure evidence:
 
 - **Retry:** give the original task session a concrete new approach. CLT saves the decision before unblocking the task, restores returned Todo work to Doing, and passes the supervisor's direction to the original conversation. Its Git journal and partial work remain intact.
 - **Wait:** identify the missing prerequisite and what must change.
