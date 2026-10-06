@@ -272,6 +272,8 @@ pub(super) enum AgentTaskSelection {
     ResumeDoing,
     RecoverBlocked,
     ResumeSession,
+    SupervisorReview,
+    SupervisorRetry,
 }
 
 impl AgentTaskSelection {
@@ -281,6 +283,8 @@ impl AgentTaskSelection {
             Self::ResumeDoing => "resume_doing",
             Self::RecoverBlocked => "recover_blocked",
             Self::ResumeSession => "resume_session",
+            Self::SupervisorReview => "supervisor_review",
+            Self::SupervisorRetry => "supervisor_retry",
         }
     }
 
@@ -290,6 +294,8 @@ impl AgentTaskSelection {
             "resume_doing" => Ok(Self::ResumeDoing),
             "recover_blocked" => Ok(Self::RecoverBlocked),
             "resume_session" => Ok(Self::ResumeSession),
+            "supervisor_review" => Ok(Self::SupervisorReview),
+            "supervisor_retry" => Ok(Self::SupervisorRetry),
             _ => anyhow::bail!("Unknown agent worker task selection: {value}"),
         }
     }

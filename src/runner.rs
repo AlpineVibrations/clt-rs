@@ -18,8 +18,8 @@ use chrono::{DateTime, Local, Utc};
 
 use crate::{
     agent::{
-        self, AGENT_STATE_DIR_ENV, AgentGitMode, AgentSessionControlAction, open_agent_store_at,
-        with_agent_store_at,
+        self, AGENT_STATE_DIR_ENV, AgentGitMode, AgentSessionControlAction, GitFinalizationState,
+        open_agent_store_at, with_agent_store_at,
     },
     application::{
         AGENT_PROJECT_ID_ENV, AGENT_RUN_TOKEN_ENV, AGENT_SESSION_CONTROL_POLL_MILLIS,
@@ -43,7 +43,10 @@ use crate::{
         CLT_TASK_MANAGEMENT_SKILL_NAME, EMBEDDED_CLT_TASK_MANAGEMENT_SKILL,
         EMBEDDED_GIT_COMMIT_SKILL, GIT_COMMIT_SKILL_NAME,
     },
-    task::{TaskStatus, acquire_board_mutation_lock, ensure_existing_board, get_tasks_dir},
+    task::{
+        TaskBoard, TaskStatus, acquire_board_mutation_lock, ensure_existing_board, get_tasks_dir,
+        read_task_entries, recoverable_codex_session_id_from_task_content, task_entry_is_ready,
+    },
     worker::{
         attach_codex_session_to_active_task, automated_codex_session_to_resume,
         blocked_task_snapshots, print_agent_run_heartbeat, task_contents_for_status,
@@ -316,10 +319,18 @@ pub(super) fn launch_agent_runner_stage(
     let mut command = Command::new(&runner.command);
     command
         .arg("--sandbox")
-        .arg("danger-full-access")
+        .arg(if task_selection == AgentTaskSelection::SupervisorReview {
+            "read-only"
+        } else {
+            "danger-full-access"
+        })
         .arg("--ask-for-approval")
         .arg("never")
-        .arg("--enable")
+        .arg(if task_selection == AgentTaskSelection::SupervisorReview {
+            "--disable"
+        } else {
+            "--enable"
+        })
         .arg("goals");
     let model_target = if let Some(model_id) = project.codex_model.as_ref() {
         agent::AgentModelDefaults {
@@ -388,12 +399,25 @@ pub(super) fn launch_agent_runner_stage(
             }
         ),
     )?;
-    let configured_session_id = configure_automated_codex_subcommand(
-        &mut command,
-        project,
-        task_selection,
-        resume_session_id,
-    )?;
+    let supervisor_direction = if task_selection == AgentTaskSelection::SupervisorRetry {
+        store
+            .supervisor_review_blocking(project.id)?
+            .map(|review| review.message())
+    } else {
+        None
+    };
+    let configured_session_id = if task_selection == AgentTaskSelection::SupervisorReview {
+        crate::supervisor::configure_command(&mut command, store, project, &stderr_path)?;
+        None
+    } else {
+        configure_automated_codex_subcommand_with_direction(
+            &mut command,
+            project,
+            task_selection,
+            resume_session_id,
+            supervisor_direction.as_deref(),
+        )?
+    };
     #[cfg(not(unix))]
     if let Some(session_id) = configured_session_id.as_deref() {
         anyhow::bail!(
@@ -624,8 +648,9 @@ Blocked-task monitor:
 "#;
 pub(super) const AGENT_RESUME_SESSION_PROMPT_APPENDIX: &str = r#"
 
-Interactive handoff recovery:
-- Resume the exact task and Codex session that CLT handed back from interactive mode.
+Existing task recovery:
+- Resume the exact task and Codex session selected by CLT, preserving prior work and its existing Git journal.
+- If the linked unfinished task was returned to Todo after unblocking, move that same task to Doing before continuing. This is a continuation, not a fresh task or Git boundary.
 - If CLT reports this task as FINALIZING, inspect the existing commit first and continue only the first unproven local step. A PUSH-PENDING task is scheduler-owned and must not resume Codex merely to publish. Never create a duplicate completion commit or move a successfully committed task back to Doing.
 - Inspect the linked task, current project state, and any interactive instructions, then continue from the next unfinished substantive step in the conversation context.
 - A prior assistant plan, progress message, draft, summary, or claimed completion is not proof that requested work finished.
@@ -657,15 +682,17 @@ pub(super) fn configure_agent_provider_credential(
     Ok(())
 }
 
-fn validate_planned_todo_start(
+/// Returns whether this is a first automated launch. A returned Todo with prior
+/// automation must use resume preparation and keep its original Git boundary.
+fn validate_todo_session_start(
     store: &agent::TursoAgentStore,
     project: &agent::AgentProject,
     session_id: &str,
-) -> Result<()> {
+) -> Result<bool> {
     anyhow::ensure!(
         automated_codex_session_to_resume(&project.path, AgentTaskSelection::NextTodo)?.as_deref()
             == Some(session_id),
-        "The selected planning conversation no longer belongs to the next ready Todo"
+        "The selected conversation no longer belongs to the next ready Todo"
     );
     let mut tasks = Vec::new();
     crate::session_control::collect_codex_session_tasks_in_board(
@@ -675,20 +702,50 @@ fn validate_planned_todo_start(
     )?;
     anyhow::ensure!(
         tasks.len() == 1,
-        "Planning conversation must belong to exactly one task"
+        "Todo conversation must belong to exactly one task"
     );
+    if store.planning_session_can_start_blocking(project.id, session_id)? {
+        return Ok(true);
+    }
+    // A prior run is not a planning session. Only an idle automated session
+    // can take this route; stop/handoff/running controls remain authoritative.
     anyhow::ensure!(
-        store.planning_session_can_start_blocking(project.id, session_id)?,
-        "Selected Todo conversation is busy or has prior automated work; preserve its existing run and Git boundary"
+        store
+            .session_control_blocking(project.id, session_id)?
+            .is_none(),
+        "Selected Todo conversation is busy or stopped; preserve its existing run and Git boundary"
     );
-    Ok(())
+    if let Some(journal) = store.git_finalization_blocking(project.id, session_id)? {
+        anyhow::ensure!(
+            journal.state == GitFinalizationState::Working,
+            "Selected Todo conversation has Git finalization history that requires its existing recovery path"
+        );
+    }
+    Ok(false)
 }
 
+#[cfg(test)]
 pub(super) fn configure_automated_codex_subcommand(
     command: &mut Command,
     project: &agent::AgentProject,
     task_selection: AgentTaskSelection,
     resume_session_id: Option<&str>,
+) -> Result<Option<String>> {
+    configure_automated_codex_subcommand_with_direction(
+        command,
+        project,
+        task_selection,
+        resume_session_id,
+        None,
+    )
+}
+
+fn configure_automated_codex_subcommand_with_direction(
+    command: &mut Command,
+    project: &agent::AgentProject,
+    task_selection: AgentTaskSelection,
+    resume_session_id: Option<&str>,
+    direction: Option<&str>,
 ) -> Result<Option<String>> {
     let session_id = match resume_session_id {
         Some(session_id) => Some(session_id.to_string()),
@@ -713,6 +770,9 @@ pub(super) fn configure_automated_codex_subcommand(
         prompt.push_str(&format!(
             "\n\nStart the planned task:\n- CLT is now starting implementation of the Todo task linked to codex:{session_id}.\n- Continue from the plan, requirements, and decisions in this conversation. This instruction supersedes the earlier planning-only instruction to wait before implementation.\n- Inspect the current task and repository, move that exact Todo to Doing, and complete it using the workflow above. Preserve its codex:{session_id} marker.\n- Do not select another task. If the linked task is no longer a ready Todo, stop without starting other work.\n"
         ));
+    }
+    if let Some(direction) = direction {
+        prompt.push_str(&format!("\n\nSupervisor decision for this exact task:\n{direction}\nFollow this next step while preserving the existing task, session, and Git boundary."));
     }
     command.arg(prompt);
     Ok(session_id)
@@ -1715,8 +1775,11 @@ pub(super) fn build_agent_codex_prompt(
         AgentTaskSelection::RecoverBlocked => {
             prompt.push_str(AGENT_RECOVER_BLOCKED_PROMPT_APPENDIX);
         }
-        AgentTaskSelection::ResumeSession => {
+        AgentTaskSelection::ResumeSession | AgentTaskSelection::SupervisorRetry => {
             prompt.push_str(AGENT_RESUME_SESSION_PROMPT_APPENDIX);
+        }
+        AgentTaskSelection::SupervisorReview => {
+            return "Read-only blocked-task supervisor review".into();
         }
     }
     match project.git_mode {
@@ -1840,19 +1903,24 @@ impl CodexAgentRunner {
             shutdown,
         } = request;
         let runner = self;
+        let timeout = if task_selection == AgentTaskSelection::SupervisorReview {
+            crate::supervisor::REVIEW_TIMEOUT
+        } else {
+            runner.timeout
+        };
         let store = open_agent_store_at(&runner.state_dir)?;
         let known_session_id = match resume_session_id {
             Some(session_id) => Some(session_id.to_string()),
             None => automated_codex_session_to_resume(&project.path, task_selection)?,
         };
-        let starting_planning_session =
-            task_selection == AgentTaskSelection::NextTodo && known_session_id.is_some();
-        if let Some(session_id) = known_session_id
+        let starting_planning_session = if let Some(session_id) = known_session_id
             .as_deref()
-            .filter(|_| starting_planning_session)
+            .filter(|_| task_selection == AgentTaskSelection::NextTodo)
         {
-            validate_planned_todo_start(&store, project, session_id)?;
-        }
+            validate_todo_session_start(&store, project, session_id)?
+        } else {
+            false
+        };
         let mut effective_project = project.clone();
         effective_project.git_mode =
             effective_agent_git_mode(&store, project, known_session_id.as_deref())?;
@@ -1905,21 +1973,58 @@ impl CodexAgentRunner {
             task_contents_for_status(&project.path, TaskStatus::Doing).unwrap_or_default();
         let blocked_task_snapshots_before =
             blocked_task_snapshots(&project.path).unwrap_or_default();
-        // Freeze Todo selection through gated registration. A stop, reorder, or
-        // interactive visit during Git preparation must not launch a stale plan.
-        let todo_launch_lock = if task_selection == AgentTaskSelection::NextTodo
+        // Freeze selection and any returned-Todo activation through gated
+        // registration. Recovery retains the old journal; first activation
+        // continues to check the fresh launch boundary in the task command.
+        let todo_launch_lock = if (task_selection == AgentTaskSelection::NextTodo
+            || known_session_id.is_some())
             && ensure_existing_board(&project.path)?
         {
             let lock = acquire_board_mutation_lock(&get_tasks_dir(&project.path))?;
-            anyhow::ensure!(
-                automated_codex_session_to_resume(&project.path, task_selection)?
-                    == known_session_id,
-                "The next Todo's Codex session changed during launch preparation; retry selection"
-            );
-            if let Some(session_id) = known_session_id.as_deref() {
-                validate_planned_todo_start(&store, project, session_id)?;
+            if task_selection == AgentTaskSelection::NextTodo {
+                anyhow::ensure!(
+                    automated_codex_session_to_resume(&project.path, task_selection)?
+                        == known_session_id,
+                    "The next Todo's Codex session changed during launch preparation; retry selection"
+                );
+                if let Some(session_id) = known_session_id.as_deref() {
+                    anyhow::ensure!(
+                        validate_todo_session_start(&store, project, session_id)?
+                            == starting_planning_session,
+                        "The Todo conversation's automated history changed during launch preparation; retry selection"
+                    );
+                }
             }
             Some(lock)
+        } else {
+            None
+        };
+        let resumed_todo_index = if let Some(session_id) = known_session_id
+            .as_deref()
+            .filter(|_| !starting_planning_session && todo_launch_lock.is_some())
+        {
+            let board = get_tasks_dir(&project.path);
+            let index = read_task_entries(&board, TaskStatus::Todo)?
+                .iter()
+                .position(|task| {
+                    task_entry_is_ready(task)
+                        && recoverable_codex_session_id_from_task_content(&task.content)
+                            == Some(session_id)
+                })
+                .map(|index| index + 1);
+            if index.is_some() {
+                let mut matches = Vec::new();
+                crate::session_control::collect_codex_session_tasks_in_board(
+                    &board,
+                    session_id,
+                    &mut matches,
+                )?;
+                anyhow::ensure!(
+                    matches.len() == 1,
+                    "Resumed conversation must belong to exactly one task"
+                );
+            }
+            index
         } else {
             None
         };
@@ -1927,7 +2032,14 @@ impl CodexAgentRunner {
             runner,
             store: &store,
             project,
-            task_selection,
+            task_selection: if task_selection == AgentTaskSelection::NextTodo
+                && known_session_id.is_some()
+                && !starting_planning_session
+            {
+                AgentTaskSelection::ResumeSession
+            } else {
+                task_selection
+            },
             resume_session_id: known_session_id.as_deref(),
             lease_holder,
             run_file_stem: &run_file_stem,
@@ -1965,8 +2077,15 @@ impl CodexAgentRunner {
                     stderr_path: &stderr_path,
                     lease_holder,
                     lease_timeout_seconds: runner.lease_timeout.as_secs(),
-                    claim_requested_resume: task_selection == AgentTaskSelection::ResumeSession
-                        && resume_session_id == Some(session_id),
+                    claim_requested_resume: resume_session_id == Some(session_id)
+                        && (task_selection == AgentTaskSelection::ResumeSession
+                            || task_selection == AgentTaskSelection::SupervisorRetry
+                                && store
+                                    .session_control_blocking(project.id, session_id)?
+                                    .is_some_and(|control| {
+                                        control.state
+                                            == agent::AgentSessionControlState::ResumeRequested
+                                    })),
                     claim_planning_session: starting_planning_session,
                 },
             );
@@ -2022,6 +2141,18 @@ impl CodexAgentRunner {
             )?;
             let _ =
                 bind_agent_git_working_task_identity(&store, project, session_id, &run_file_stem)?;
+            if let Some(index) = resumed_todo_index {
+                // This task already has an automated boundary. Reactivate it
+                // only after registering the exact child and binding its saved
+                // journal, before releasing the child. Do not apply the fresh
+                // Todo activation check against an older starting checkout.
+                TaskBoard::new(get_tasks_dir(&project.path))
+                    .move_task_without_reordering_after_lock(
+                        TaskStatus::Todo,
+                        TaskStatus::Doing,
+                        index,
+                    )?;
+            }
         }
         #[cfg(unix)]
         if let Err(error) = supervisor_control
@@ -2055,13 +2186,13 @@ impl CodexAgentRunner {
                 control: &mut supervisor_control,
                 proof: &mut supervisor_proof,
             },
-            runner.timeout,
+            timeout,
             runner.heartbeat_interval,
             |elapsed| {
                 print_agent_run_heartbeat(
                     project,
                     elapsed,
-                    runner.timeout,
+                    timeout,
                     &stdout_path,
                     &stderr_path,
                     &mut last_heartbeat_stderr_bytes,
@@ -2175,13 +2306,13 @@ impl CodexAgentRunner {
         #[cfg(not(unix))]
         let wait_result = wait_for_child_with_timeout_and_heartbeat(
             &mut child,
-            runner.timeout,
+            timeout,
             runner.heartbeat_interval,
             |elapsed| {
                 print_agent_run_heartbeat(
                     project,
                     elapsed,
-                    runner.timeout,
+                    timeout,
                     &stdout_path,
                     &stderr_path,
                     &mut last_heartbeat_stderr_bytes,
@@ -2220,7 +2351,7 @@ impl CodexAgentRunner {
             wait_result,
             requested_control,
             reported_no_tasks: stdout.contains(AGENT_NO_TASKS_LEFT_MARKER),
-            timeout: runner.timeout,
+            timeout,
         });
         if let Some(note) = supervision.stderr_note.as_deref() {
             append_agent_log_line(&stderr_path, note)?;

@@ -38,6 +38,7 @@ const TABLES: &[(&str, &str)] = &[
     ("agent_git_launch_states", "*"),
     ("git_finalizations", "*"),
     ("session_git_modes", "*"),
+    ("supervisor_reviews", "*"),
 ];
 
 pub(super) struct RegistryAccess {
@@ -305,7 +306,17 @@ async fn read_database_snapshot(db: &Database) -> Result<Json> {
                 == 0,
         "The session Git mode table is missing after its migration was applied"
     );
+    let has_supervisor = super::query_count(
+        &transaction,
+        "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'supervisor_reviews'",
+        (),
+    )
+    .await?
+        == 1;
     for (name, columns) in TABLES {
+        if *name == "supervisor_reviews" && !has_supervisor {
+            continue;
+        }
         if *name == "session_git_modes" && !has_session_modes {
             // Live older workers defer migration 19. Their registry updates
             // must still produce a usable snapshot while they finish.
@@ -343,7 +354,13 @@ async fn read_database_snapshot(db: &Database) -> Result<Json> {
         tables.insert((*name).to_string(), json!(records));
     }
     transaction.commit().await?;
-    let version = if has_session_modes { 2 } else { 1 };
+    let version = if !has_session_modes {
+        1
+    } else if has_supervisor {
+        3
+    } else {
+        2
+    };
     Ok(json!({"version": version, "tables": tables}))
 }
 
@@ -355,13 +372,16 @@ pub(crate) fn read_snapshot(state_dir: &Path) -> Result<Option<Json>> {
     let mut snapshot: Json = serde_json::from_slice(&fs::read(&path)?)
         .with_context(|| format!("Invalid external registry snapshot {}", path.display()))?;
     anyhow::ensure!(
-        snapshot["version"] == 1 || snapshot["version"] == 2,
+        snapshot["version"] == 1 || snapshot["version"] == 2 || snapshot["version"] == 3,
         "Unsupported registry snapshot version"
     );
     // Older snapshots have no session-mode evidence. Preserve that uncertainty;
     // in particular, absence of a Git journal does not prove Git was disabled.
     if snapshot["version"] == 1 && snapshot["tables"].get("session_git_modes").is_none() {
         snapshot["tables"]["session_git_modes"] = json!([]);
+    }
+    if snapshot["version"] != 3 && snapshot["tables"].get("supervisor_reviews").is_none() {
+        snapshot["tables"]["supervisor_reviews"] = json!([]);
     }
     for (table, _) in TABLES {
         anyhow::ensure!(

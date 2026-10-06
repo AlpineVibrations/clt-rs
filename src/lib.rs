@@ -11,6 +11,7 @@ mod scheduler;
 mod session_control;
 mod session_recovery;
 mod skills;
+mod supervisor;
 mod task;
 #[cfg(test)]
 mod test_support;

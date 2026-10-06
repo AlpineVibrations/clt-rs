@@ -175,6 +175,29 @@ pub(super) fn acquire_agent_job_stage(
     if board_has_manual_task(&get_tasks_dir(&project.path))? {
         return Ok(AgentJobAcquisitionResult::SessionSuspended);
     }
+    if matches!(
+        task_selection,
+        AgentTaskSelection::SupervisorReview | AgentTaskSelection::SupervisorRetry
+    ) {
+        let currently_blocked = !crate::worker::blocked_tasks(&project.path)?.is_empty();
+        let still_selected = with_agent_store_at(state_dir, |store| {
+            Ok(
+                match crate::supervisor::gate(store, project, currently_blocked)? {
+                    crate::supervisor::Gate::Review => {
+                        task_selection == AgentTaskSelection::SupervisorReview
+                    }
+                    crate::supervisor::Gate::Retry(session) => {
+                        task_selection == AgentTaskSelection::SupervisorRetry
+                            && resume_session_id.as_deref() == Some(&session)
+                    }
+                    _ => false,
+                },
+            )
+        })?;
+        if !still_selected {
+            return Ok(AgentJobAcquisitionResult::SessionSuspended);
+        }
+    }
     let mut acquired_at = agent_timestamp();
     let mut expires_at = agent_timestamp_after(lease_timeout.as_secs());
     let mut acquired = with_agent_store_at(state_dir, |store| {
@@ -211,7 +234,14 @@ pub(super) fn acquire_agent_job_stage(
         let controls = with_agent_store_at(state_dir, |store| {
             store.session_controls_for_project_blocking(project.id)
         })?;
-        if session_controls_suspend_project(&controls) {
+        let suspended = if task_selection == AgentTaskSelection::SupervisorReview {
+            controls
+                .iter()
+                .any(|control| !crate::supervisor::control_allows_review(control))
+        } else {
+            session_controls_suspend_project(&controls)
+        };
+        if suspended {
             with_agent_store_at(state_dir, |store| {
                 store.release_lease_blocking(project.id, holder).map(|_| ())
             })?;
@@ -1001,6 +1031,62 @@ pub(super) fn run_agent_scheduler_pass_with_max_global_jobs(
             now,
         )?;
         existing_lease = agent_lease_for_project(state_dir, project.id)?;
+        // A blocked outcome is reviewed before ordinary recovery can create
+        // another resume request or activate downstream work. Sealed Git
+        // finalization keeps its existing priority and ownership contract.
+        let pending = with_agent_store_at(state_dir, |store| {
+            store.list_pending_git_finalizations_blocking(Some(project.id))
+        })?;
+        if pending
+            .iter()
+            .all(|journal| journal.state == GitFinalizationState::Working)
+        {
+            let gate = with_agent_store_at(state_dir, |store| {
+                crate::supervisor::gate(store, &project, scan.has_blocked_task())
+            })?;
+            let supervised = match gate {
+                crate::supervisor::Gate::Normal => None,
+                crate::supervisor::Gate::Hold(message) => {
+                    println!(
+                        "Project {}: action=supervisor_wait reason={} path={}",
+                        project.name,
+                        message,
+                        project.path.display()
+                    );
+                    continue;
+                }
+                crate::supervisor::Gate::Review => {
+                    Some((AgentTaskSelection::SupervisorReview, None))
+                }
+                crate::supervisor::Gate::Retry(session) => {
+                    Some((AgentTaskSelection::SupervisorRetry, Some(session)))
+                }
+            };
+            if let Some((task_selection, resume_session_id)) = supervised {
+                pass.pending_projects += 1;
+                if pass.active_agent_jobs + jobs.len() >= max_global_jobs {
+                    pass.deferred_projects += 1;
+                    continue;
+                }
+                let acquisition = acquire_agent_job_stage(AgentJobAcquisitionRequest {
+                    state_dir,
+                    project: &project,
+                    scan: &scan,
+                    holder: &holder,
+                    lease_timeout,
+                    reclaim_current_process_leases,
+                    max_global_jobs,
+                    task_selection,
+                    resume_session_id,
+                })?;
+                if let AgentJobAcquisitionResult::Acquired { job, .. } = acquisition {
+                    unstarted_leases.track(job.project.id, &job.holder);
+                    pass.runs_started += 1;
+                    jobs.push(*job);
+                }
+                continue;
+            }
+        }
         // Retire task-less journals whose owning run already ended before the
         // guarded finalization lease is attempted. Their recorded owner token
         // can never be matched again, so leaving them pending would skip this

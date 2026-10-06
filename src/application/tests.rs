@@ -200,6 +200,8 @@ fn git_off_activation_links_the_exact_task_and_exposes_its_live_log() {
         selected.project = project;
         selected.runtime_state = TuiAgentRuntimeState::Running;
         let mut panel = TuiAgentPanel {
+            supervisor_settings: Default::default(),
+            supervisor_selected: false,
             projects: vec![selected],
             current_project_registration: None,
             daemon_status: "running".to_string(),

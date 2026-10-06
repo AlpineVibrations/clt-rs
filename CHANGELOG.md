@@ -6,6 +6,16 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-06
+
+### Added
+
+- Add an optional blocked-task supervisor with saved retry/wait/user/replan/repair decisions, read-only reviews, bounded retries, and preservation of the original task session and Git journal. Add a global supervisor settings line at the top of Agent Projects: `u` focuses it, `Space` toggles on/off, and `m`, `t`, and `f` configure model, thinking, and fast mode.
+
+### Fixed
+
+- Resume previously automated tasks returned to Todo in their existing Codex session and Git boundary instead of rejecting them as reused planning conversations. Preserve stop and ownership controls and refuse to reconstruct missing managed Git journals.
+
 ## [0.7.9] - 2026-10-04
 
 ### Fixed

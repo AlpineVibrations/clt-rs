@@ -6,6 +6,7 @@ use super::configure_agent_connection;
 mod git_journals;
 mod projects_models;
 mod sessions_runs;
+mod supervisor;
 mod workers_leases;
 
 use git_journals::GitJournalsRepository;

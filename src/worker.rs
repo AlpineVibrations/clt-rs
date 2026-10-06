@@ -1028,6 +1028,9 @@ pub(super) fn ensure_durable_inline_git_worker(
 }
 
 pub(super) fn agent_job_uses_git(job: &AgentRunJob) -> Result<bool> {
+    if job.task_selection == AgentTaskSelection::SupervisorReview {
+        return Ok(false);
+    }
     let session_id = match &job.resume_session_id {
         Some(session_id) => Some(session_id.clone()),
         None => automated_codex_session_to_resume(&job.project.path, job.task_selection)?,
@@ -1084,6 +1087,18 @@ pub(super) fn run_agent_job_inner(
         })
         .transpose()?
         .unwrap_or(false);
+    if job.task_selection == AgentTaskSelection::SupervisorRetry {
+        with_agent_store_at(&job.state_dir, |store| {
+            crate::supervisor::prepare_retry(store, &job.project)
+        })?;
+    }
+    if job.task_selection == AgentTaskSelection::SupervisorReview {
+        with_agent_store_at(&job.state_dir, |store| {
+            crate::supervisor::begin_review(store, &job.project)?;
+            job.project = crate::supervisor::configured_project(store, &job.project)?;
+            Ok(())
+        })?;
+    }
     let started_at = agent_timestamp();
     let run_result = runner.run_project(AgentRunRequest {
         project: &job.project,
@@ -1115,6 +1130,30 @@ pub(super) fn run_agent_job_inner(
         mut control_action,
     ) = match run_result {
         Ok(mut result) => {
+            if job.task_selection == AgentTaskSelection::SupervisorReview {
+                let decision = if result.status == "success" {
+                    with_agent_store_at(&job.state_dir, |store| {
+                        crate::supervisor::finish_review(store, &job.project, &result)
+                    })
+                } else {
+                    Err(anyhow::anyhow!(
+                        "Supervisor stopped without a decision: {}",
+                        result.summary
+                    ))
+                };
+                match decision {
+                    Ok(message) => result.summary = message,
+                    Err(error) => {
+                        result.summary = format!("Supervisor needs attention: {error:#}");
+                        if result.control_action.is_none() {
+                            result.status = "failure";
+                        }
+                        with_agent_store_at(&job.state_dir, |store| {
+                            crate::supervisor::hold_error(store, &job.project, &result.summary)
+                        })?;
+                    }
+                }
+            }
             if matches!(result.status, "success" | "idle")
                 && blocked_recovery_made_no_progress(&job)
             {
@@ -1486,6 +1525,16 @@ pub(super) fn run_agent_job_inner(
         summary = format!("{summary} Failed to finalize Codex session control: {error:#}");
     }
 
+    with_agent_store_at(&job.state_dir, |store| {
+        if job.task_selection == AgentTaskSelection::SupervisorReview {
+            if status != "success" {
+                crate::supervisor::hold_error(store, &job.project, &summary)?;
+            }
+        } else {
+            crate::supervisor::after_task_run(store, &job.project, job.task_selection, status)?;
+        }
+        Ok(())
+    })?;
     let recording_result = record_agent_result_stage(AgentResultRecordingRequest {
         job: &job,
         finalization_lease_holder: &finalization_lease_holder,
@@ -1628,6 +1677,9 @@ pub(super) fn link_agent_session_after_run_stage(
         session_id,
         run_status,
     } = request;
+    if job.task_selection == AgentTaskSelection::SupervisorReview {
+        return Ok(AgentSessionLinkResult::ExactResumePreserved);
+    }
     let _mutation_lock = acquire_board_mutation_lock(&get_tasks_dir(&job.project.path))?;
     if terminal_task_for_codex_session_in_board(&get_tasks_dir(&job.project.path), session_id)?
         .is_some()
@@ -1706,7 +1758,9 @@ pub(super) fn automated_codex_session_to_resume(
             .into_iter()
             .map(|(_, task)| task)
             .collect(),
-        AgentTaskSelection::ResumeSession => return Ok(None),
+        AgentTaskSelection::ResumeSession
+        | AgentTaskSelection::SupervisorReview
+        | AgentTaskSelection::SupervisorRetry => return Ok(None),
     };
 
     if tasks.len() != 1 {
@@ -1723,6 +1777,9 @@ pub(super) fn attach_codex_session_to_active_task(
     blocked_task_snapshots_before: &[BlockedTaskSnapshot],
     session_id: &str,
 ) -> Result<bool> {
+    if task_selection == AgentTaskSelection::SupervisorReview {
+        return Ok(true);
+    }
     let _mutation_lock = acquire_board_mutation_lock(&get_tasks_dir(project_root))?;
     if task_status_for_codex_session(project_root, session_id)?.is_some() {
         return Ok(true);
@@ -1747,7 +1804,9 @@ pub(super) fn attach_codex_session_to_active_task(
             let task = matching.next()?;
             matching.next().is_none().then_some(task)
         }),
-        AgentTaskSelection::ResumeSession => None,
+        AgentTaskSelection::ResumeSession
+        | AgentTaskSelection::SupervisorReview
+        | AgentTaskSelection::SupervisorRetry => None,
     };
     let Some(task) = task else {
         return Ok(false);

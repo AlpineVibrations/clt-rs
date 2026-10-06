@@ -1133,7 +1133,7 @@ fn agent_codex_prompt_follows_git_mode() {
 
     let exact_recovery_prompt =
         build_agent_codex_prompt(&project, AgentTaskSelection::ResumeSession, true, true);
-    assert!(exact_recovery_prompt.contains("Interactive handoff recovery:"));
+    assert!(exact_recovery_prompt.contains("Existing task recovery:"));
     assert!(exact_recovery_prompt.contains("next unfinished substantive step"));
     assert!(exact_recovery_prompt.contains("claimed completion is not proof"));
     assert!(exact_recovery_prompt.contains("durable changes actually exist"));

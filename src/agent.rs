@@ -1139,6 +1139,18 @@ const AGENT_MIGRATIONS: &[AgentMigration<'static>] = &[
              SELECT project_id, codex_session_id, git_mode FROM git_finalizations",
         ],
     },
+    AgentMigration {
+        version: 20,
+        statements: &[
+            "ALTER TABLE agent_settings ADD COLUMN supervisor_settings TEXT",
+            "CREATE TABLE supervisor_reviews (
+                project_id INTEGER PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                evidence TEXT NOT NULL,
+                record TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )",
+        ],
+    },
 ];
 
 pub(super) struct TursoAgentStore {

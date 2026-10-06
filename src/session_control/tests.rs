@@ -609,7 +609,7 @@ fn tui_stop_key_toggles_running_session_to_stop_then_resume_requested() {
         .mark_session_running_blocking(
             project_id,
             "session-123",
-            101,
+            i32::MAX as u32,
             "run-one",
             &root.join("session.out"),
             &root.join("session.err"),
@@ -624,7 +624,10 @@ fn tui_stop_key_toggles_running_session_to_stop_then_resume_requested() {
         &task,
     )
     .unwrap();
-    assert!(message.starts_with("Stopping this Codex task session"));
+    assert!(
+        message.starts_with("Stopping this Codex task session"),
+        "{message}"
+    );
     assert_eq!(
         store
             .session_control_blocking(project_id, "session-123")
@@ -758,7 +761,7 @@ fn scheduler_runs_next_todo_while_stopped_session_waits_for_exact_resume() {
     assert!(
         args[4]
             .to_string_lossy()
-            .contains("Interactive handoff recovery:")
+            .contains("Existing task recovery:")
     );
 
     let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
@@ -3057,6 +3060,8 @@ fn interactive_c_busy_check_honors_persisted_session_fences_without_a_live_log()
         )
         .unwrap();
     let mut panel = TuiAgentPanel {
+        supervisor_settings: Default::default(),
+        supervisor_selected: false,
         projects: vec![TuiAgentProject {
             project,
             scan: AgentProjectScan::empty(),
@@ -3215,6 +3220,8 @@ fn writable_shared_interactive_reservation_coexists_with_another_active_session(
         std::process::id()
     ));
     let mut panel = TuiAgentPanel {
+        supervisor_settings: Default::default(),
+        supervisor_selected: false,
         projects: vec![TuiAgentProject {
             project,
             scan: AgentProjectScan::empty(),

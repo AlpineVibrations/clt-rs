@@ -1,6 +1,6 @@
 [package]
 name = "clt-rs"
-version = "0.7.9"
+version = "0.8.0"
 edition = "2024"
 description = "File-backed task manager with a TUI Kanban board and multi-project Codex agent registry"
 license = "MIT"
@@ -46,6 +46,7 @@ crossterm = "0.29"
 libc = "0.2"
 ratatui = "0.30"
 serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
 tempfile = "3.27"
 tokio = { version = "1.52", features = ["macros", "rt-multi-thread", "signal", "time"] }
 toml_edit = "0.23"

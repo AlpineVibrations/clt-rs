@@ -1196,3 +1196,72 @@ fn registry_recovery_uses_snapshot_when_database_is_missing_or_empty() {
         fs::remove_dir_all(root).unwrap();
     }
 }
+
+#[test]
+fn registry_recovery_preserves_supervisor_settings_and_accepts_pre_supervisor_snapshots() {
+    let (root, state_dir, store, project) = registered_store("recover-supervisor");
+    let settings = crate::supervisor::SupervisorSettings {
+        enabled: true,
+        thinking: Some("xhigh".into()),
+        fast: true,
+        ..Default::default()
+    };
+    store.set_supervisor_settings_blocking(&settings).unwrap();
+    let review = crate::supervisor::SupervisorReview {
+        evidence: "saved evidence".into(),
+        state: "held".into(),
+        attempts: 1,
+        retries: 0,
+        decision: None,
+        retry_session: None,
+        error: Some("Need a user decision".into()),
+    };
+    store
+        .save_supervisor_review_blocking(project.id, &review)
+        .unwrap();
+    let snapshot = read_snapshot(&state_dir).unwrap().unwrap();
+    store.clear_supervisor_review_blocking(project.id).unwrap();
+    store
+        .set_supervisor_settings_blocking(&Default::default())
+        .unwrap();
+    store
+        .blocking
+        .block_on_persist(restore_snapshot(&store.recovery_db, &snapshot))
+        .unwrap();
+    assert_eq!(store.supervisor_settings_blocking().unwrap(), settings);
+    assert_eq!(
+        store.supervisor_review_blocking(project.id).unwrap(),
+        Some(review)
+    );
+    let mut old = snapshot.clone();
+    old["version"] = json!(2);
+    old["tables"]
+        .as_object_mut()
+        .unwrap()
+        .remove("supervisor_reviews");
+    for settings in old["tables"]["agent_settings"].as_array_mut().unwrap() {
+        settings
+            .as_object_mut()
+            .unwrap()
+            .remove("supervisor_settings");
+    }
+    fs::write(
+        state_dir.join(SNAPSHOT_FILE),
+        serde_json::to_vec(&old).unwrap(),
+    )
+    .unwrap();
+    let old = read_snapshot(&state_dir).unwrap().unwrap();
+    store
+        .blocking
+        .block_on_persist(restore_snapshot(&store.recovery_db, &old))
+        .unwrap();
+    assert!(!store.supervisor_settings_blocking().unwrap().enabled);
+    assert!(
+        store
+            .supervisor_review_blocking(project.id)
+            .unwrap()
+            .is_none()
+    );
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}

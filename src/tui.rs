@@ -1255,6 +1255,7 @@ impl TuiAgentRuntimeState {
 }
 
 pub(super) struct TuiAgentPanelSnapshot {
+    pub(super) supervisor_settings: crate::supervisor::SupervisorSettings,
     pub(super) projects: Vec<TuiAgentProject>,
     pub(super) daemon_status: String,
 }
@@ -1333,6 +1334,8 @@ pub(super) enum TuiAgentPanelRow<'a> {
 }
 
 pub(super) struct TuiAgentPanel {
+    pub(super) supervisor_settings: crate::supervisor::SupervisorSettings,
+    pub(super) supervisor_selected: bool,
     pub(super) projects: Vec<TuiAgentProject>,
     pub(super) current_project_registration: Option<TuiCurrentProjectRegistration>,
     pub(super) daemon_status: String,
@@ -1575,6 +1578,8 @@ impl TuiAgentLogView {
 impl TuiAgentPanel {
     pub(super) fn new(_active_root: &Path) -> Self {
         let mut panel = Self {
+            supervisor_settings: Default::default(),
+            supervisor_selected: false,
             projects: Vec::new(),
             current_project_registration: None,
             daemon_status: "loading".to_string(),
@@ -1603,6 +1608,7 @@ impl TuiAgentPanel {
     ) {
         match result {
             Ok(snapshot) => {
+                self.supervisor_settings = snapshot.supervisor_settings;
                 self.projects = snapshot.projects;
                 self.daemon_status = snapshot.daemon_status;
                 self.current_project_registration =
@@ -2791,8 +2797,17 @@ pub(super) fn load_tui_agent_panel_snapshot_inner(
                     || pending_git_finalizations.contains_key(&project.id)
                     || run.summary.as_deref().is_some_and(failure_has_git_recovery)
             });
-            let failure_problem =
-                tui_agent_failure_problem(&project, relevant_failure, now, failure_backoff);
+            let failure_problem = store
+                .supervisor_review_blocking(project.id)?
+                .filter(|_| {
+                    store
+                        .supervisor_settings_blocking()
+                        .is_ok_and(|settings| settings.enabled)
+                })
+                .map(|review| review.message())
+                .or_else(|| {
+                    tui_agent_failure_problem(&project, relevant_failure, now, failure_backoff)
+                });
             let runtime_state = resolve_tui_agent_runtime_state(
                 tui_agent_runtime_state(project.id, &active_leases),
                 interactive_session_projects.contains(&project.id),
@@ -2813,6 +2828,7 @@ pub(super) fn load_tui_agent_panel_snapshot_inner(
         .collect::<Result<Vec<_>>>()?;
 
     Ok(TuiAgentPanelSnapshot {
+        supervisor_settings: store.supervisor_settings_blocking()?,
         projects,
         daemon_status,
     })
@@ -3247,6 +3263,7 @@ pub(super) fn retry_selected_tui_agent_project(
 
     let store = open_agent_store()?;
     let changed = store.clear_project_failure_backoff_for_path_blocking(&project.path)?;
+    store.clear_supervisor_review_blocking(project.id)?;
     panel.refresh(active_root);
 
     if changed {
@@ -3316,6 +3333,55 @@ pub(super) fn update_selected_tui_agent_codex_settings(
     )?;
     panel.refresh(active_root);
     Ok(changed)
+}
+
+pub(super) fn edit_supervisor_settings(
+    settings: &mut crate::supervisor::SupervisorSettings,
+    targets: &[agent::AgentModelTarget],
+    key: KeyEvent,
+) -> bool {
+    match key.code {
+        KeyCode::Char(' ') => settings.enabled = !settings.enabled,
+        KeyCode::Char('f' | 'F') => settings.fast = !settings.fast,
+        KeyCode::Char('t' | 'T') => {
+            settings.thinking = next_agent_codex_setting(
+                settings.thinking.as_deref(),
+                &AGENT_CODEX_REASONING_EFFORTS,
+            )
+        }
+        KeyCode::Char('m') => {
+            let current = targets.iter().position(|target| {
+                settings.model.as_deref() == Some(&target.model_id)
+                    && settings.provider.as_deref().unwrap_or("openai") == target.provider_id
+            });
+            let next = (current.map_or(0, |index| index + 1) + 1) % (targets.len() + 1);
+            if next == 0 {
+                settings.model = None;
+                settings.provider = None;
+            } else {
+                settings.model = Some(targets[next - 1].model_id.clone());
+                settings.provider = Some(targets[next - 1].provider_id.clone());
+            }
+        }
+        _ => return false,
+    }
+    true
+}
+
+fn update_tui_supervisor_settings(panel: &mut TuiAgentPanel, key: KeyEvent) -> Result<String> {
+    let store = open_agent_store()?;
+    let mut settings = store.supervisor_settings_blocking()?;
+    let targets = store.list_enabled_model_targets_blocking()?;
+    if edit_supervisor_settings(&mut settings, &targets, key) {
+        store.set_supervisor_settings_blocking(&settings)?;
+        panel.supervisor_settings = settings;
+        Ok("Supervisor settings saved. Space on/off; m model; t thinking; f fast; Esc/Down returns to projects.".into())
+    } else {
+        Ok(
+            "Supervisor: Space on/off; m model; t thinking; f fast; Esc/Down returns to projects."
+                .into(),
+        )
+    }
 }
 
 pub(super) fn cycle_selected_tui_agent_codex_model(
@@ -3435,7 +3501,7 @@ pub(super) fn tui_agent_log_refresh_interval() -> Duration {
 }
 
 pub(super) fn tui_agent_panel_instructions() -> &'static str {
-    "Up/Down selects, Enter opens/adds, Space toggles ON/OFF, Delete removes with confirmation, g cycles Git off/commit/push, m cycles the selected target, M opens Models, f toggles fast, t cycles thinking, r retries after fixing an error, l shows output. s directly stops the selected active, interactive, or fenced session; with output open it controls that exact session. With output open: i takes over a live session and c opens a session (taking over if active). Tab returns to Kanban."
+    "u selects supervisor settings (Space on/off, m model, t thinking, f fast). Up/Down selects, Enter opens/adds, Space toggles ON/OFF, Delete removes with confirmation, g cycles Git off/commit/push, m cycles the selected target, M opens Models, f toggles fast, t cycles thinking, r retries after fixing an error, l shows output. s directly stops the selected active, interactive, or fenced session; with output open it controls that exact session. With output open: i takes over a live session and c opens a session (taking over if active). Tab returns to Kanban."
 }
 
 pub(super) fn tui_agent_log_title(log_view: &TuiAgentLogView) -> String {
@@ -4526,13 +4592,43 @@ pub(super) fn render_tui_agent_panel(
         )
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow));
-    let inner_area = block.inner(area);
+    let mut inner_area = block.inner(area);
     f.render_widget(block, area);
 
     if inner_area.height == 0 || inner_area.width == 0 {
         return;
     }
 
+    let settings = &panel.supervisor_settings;
+    let prefix = format!(
+        " Supervisor[u] {} | m:",
+        if settings.enabled { "ON" } else { "OFF" }
+    );
+    let suffix = format!(
+        " | t:{} | f:{} | Space:on/off",
+        settings.thinking.as_deref().unwrap_or("default"),
+        if settings.fast { "ON" } else { "OFF" }
+    );
+    let model = settings.model.as_deref().unwrap_or("default");
+    let model_width = (inner_area.width as usize).saturating_sub(prefix.len() + suffix.len());
+    let line = format!("{prefix}{}{suffix}", truncate_to_width(model, model_width));
+    let style = if panel.supervisor_selected {
+        Style::default().fg(Color::Black).bg(c_highlight)
+    } else {
+        Style::default().fg(text_color)
+    };
+    f.render_widget(
+        Paragraph::new(line).style(style),
+        Rect {
+            height: 1,
+            ..inner_area
+        },
+    );
+    inner_area.y += 1;
+    inner_area.height = inner_area.height.saturating_sub(1);
+    if inner_area.height == 0 {
+        return;
+    }
     if row_count == 0 {
         let message = if panel.last_error.is_some() {
             "Agent registry unavailable. See the error below."
@@ -4594,7 +4690,11 @@ pub(super) fn render_tui_agent_panel(
         return;
     }
 
-    let selected_idx = panel.state.selected();
+    let selected_idx = if panel.supervisor_selected {
+        None
+    } else {
+        panel.state.selected()
+    };
     let highlight_style = Style::default().fg(Color::Black).bg(c_highlight);
 
     for (row, idx) in (0..row_count)
@@ -6149,7 +6249,7 @@ impl TuiApp {
 
         if self.current_pane == TuiPane::AgentProjects {
             self.agent_panel
-                .keep_selection_visible(content_height.saturating_sub(4) as usize);
+                .keep_selection_visible(content_height.saturating_sub(5) as usize);
         } else if self.current_pane == TuiPane::Models {
             self.models_panel.provider_viewport_height = content_height.saturating_sub(4) as usize;
             self.models_panel.model_viewport_height = content_height.saturating_sub(4) as usize;
@@ -6381,6 +6481,21 @@ pub(super) fn update_tui_agent_projects_pane(
     app: &mut TuiApp,
     key: KeyEvent,
 ) -> Option<Vec<TuiEffect>> {
+    if key.code == KeyCode::Char('u') {
+        app.agent_panel.supervisor_selected = !app.agent_panel.supervisor_selected;
+        app.feedback_buffer = if app.agent_panel.supervisor_selected {
+            "Supervisor: Space toggles ON/OFF; m model, t thinking, f fast. Esc/Down returns to projects."
+        } else { tui_agent_panel_instructions() }.into();
+        return Some(Vec::new());
+    }
+    if app.agent_panel.supervisor_selected {
+        if matches!(key.code, KeyCode::Esc | KeyCode::Down | KeyCode::Enter) {
+            app.agent_panel.supervisor_selected = false;
+            app.feedback_buffer = tui_agent_panel_instructions().into();
+            return Some(Vec::new());
+        }
+        return Some(vec![TuiEffect::PaneKey(key)]);
+    }
     match key.code {
         KeyCode::Esc if app.active_board => {
             app.current_pane = TuiPane::Tasks;
@@ -7382,6 +7497,17 @@ pub(super) fn execute_tui_key_effect(
                     _ => app.feedback_buffer = tui_models_instructions().to_string(),
                 }
             } else if app.current_pane == TuiPane::AgentProjects {
+                if app.agent_panel.supervisor_selected
+                    && !matches!(key.code, KeyCode::Char('q' | 'h' | 'H' | '?'))
+                    && !tui_toggles_models(&key)
+                {
+                    app.feedback_buffer =
+                        match update_tui_supervisor_settings(&mut app.agent_panel, key) {
+                            Ok(message) => message,
+                            Err(error) => format!("Supervisor settings: {error:#}"),
+                        };
+                    return Ok(false);
+                }
                 match key.code {
                     KeyCode::Esc => {
                         if app.active_board {
