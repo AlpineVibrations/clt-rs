@@ -898,8 +898,23 @@ pub(super) fn keep_selected_task_visible(
         return;
     }
 
-    let Some(selected_idx) = selected_idx.filter(|idx| *idx < tasks.len()) else {
-        *scroll_offset = (*scroll_offset).min(tasks.len() - 1);
+    let selected_idx = selected_idx.filter(|idx| *idx < tasks.len());
+
+    // Reclaim empty space below the list when a task collapses or the viewport grows.
+    // Keep the largest bottom-aligned offset that fits whole task rows.
+    let mut max_scroll_offset = tasks.len() - 1;
+    let mut remaining_height = viewport_height;
+    for (idx, task) in tasks.iter().enumerate().rev() {
+        let height = task_display_height(task, idx, selected_idx, col_width);
+        if height > remaining_height {
+            break;
+        }
+        remaining_height -= height;
+        max_scroll_offset = idx;
+    }
+    *scroll_offset = (*scroll_offset).min(max_scroll_offset);
+
+    let Some(selected_idx) = selected_idx else {
         return;
     };
 

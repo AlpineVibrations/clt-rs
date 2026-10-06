@@ -115,6 +115,8 @@ Open the interactive TUI Kanban board:
 ```bash
 clt
 ```
+Selected tasks expand to show their text; other tasks occupy one line. When a task collapses or the viewport grows, the list brings earlier tasks back into view to fill available space while keeping the selection visible. In normal navigation, `Esc` clears the task selection.
+
 Press `Enter` to open a folder task with subtasks, `n` or `+` to create a subtask under the selected task, `e` to edit the selected task, `Space` to create a task, `Backspace` to return to the parent board, and `q` to quit. Creating a subtask automatically expands a Markdown-backed parent status to folder-backed storage, preserving the original status file as a `.bak`, converts the selected task into a nested board, and opens that board after the subtask is saved. Cancelling the prompt leaves storage unchanged.
 
 Press `r` to enter sticky Reorganize mode, then use the arrow keys as many times as needed: Up/Down changes the selected task's position and Left/Right moves it between columns. The task-board borders turn yellow and the selected column shows `REORGANIZE MODE` while the mode is active. Press `r` again or `Esc` to return to normal navigation.

@@ -4423,6 +4423,95 @@ fn keep_selected_task_visible_scrolls_up_to_selection() {
 }
 
 #[test]
+fn tui_kanban_reveals_earlier_tasks_after_long_selection_collapses() {
+    let root = temp_root("tui-backfill-collapsed-selection");
+    let mut app = TuiApp::new(&root, true);
+    let descriptions = [
+        "first task".to_string(),
+        "second task".to_string(),
+        "third task".to_string(),
+        format!("fourth {}", "long task ".repeat(80)),
+        "fifth task".to_string(),
+    ];
+    app.task_snapshot.board_entries[TODO_BOARD_INDEX] = descriptions
+        .iter()
+        .enumerate()
+        .map(|(line_index, text)| TaskEntry {
+            source: TaskSource::MarkdownLine { line_index },
+            summary: text.clone(),
+            content: text.clone(),
+            metadata: None,
+            has_subtasks: false,
+        })
+        .collect();
+    app.board_states[TODO_BOARD_INDEX].select(Some(3));
+    let size = Rect::new(0, 0, 120, 16);
+    app.prepare_render(size);
+    assert_eq!(app.board_scroll_offsets[TODO_BOARD_INDEX], 3);
+
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 16)).unwrap();
+    for key in [KeyCode::Down, KeyCode::Esc] {
+        update_tui_pane(&mut app, KeyEvent::new(key, KeyModifiers::NONE)).unwrap();
+        app.prepare_render(size);
+        terminal.draw(|frame| render_tui(frame, &app)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        for expected in ["1. first", "2. second", "3. third", "4. fourth", "5. fifth"] {
+            assert!(rendered.contains(expected), "{rendered}");
+        }
+    }
+    assert_eq!(app.board_states[TODO_BOARD_INDEX].selected(), None);
+}
+
+#[test]
+fn keep_selected_task_visible_backfills_after_expanded_task_collapses() {
+    let tasks = vec![
+        "- first".to_string(),
+        "- second".to_string(),
+        "- third".to_string(),
+        format!("- {}", "long task ".repeat(20)),
+        "- fifth".to_string(),
+    ];
+    let mut scroll_offset = 0;
+
+    keep_selected_task_visible(&tasks, Some(3), &mut scroll_offset, 6, 20);
+    assert_eq!(scroll_offset, 3);
+
+    // Moving to the short fifth task collapses the fourth, leaving room for all five.
+    keep_selected_task_visible(&tasks, Some(4), &mut scroll_offset, 6, 20);
+    assert_eq!(scroll_offset, 0);
+    keep_selected_task_visible(&tasks, None, &mut scroll_offset, 6, 20);
+    assert_eq!(scroll_offset, 0);
+
+    // Escape directly from the expanded task must also reclaim the empty space.
+    keep_selected_task_visible(&tasks, Some(3), &mut scroll_offset, 6, 20);
+    assert_eq!(scroll_offset, 3);
+    keep_selected_task_visible(&tasks, None, &mut scroll_offset, 6, 20);
+    assert_eq!(scroll_offset, 0);
+}
+
+#[test]
+fn keep_selected_task_visible_backfills_only_as_far_as_the_viewport_fits() {
+    let tasks = (0..10)
+        .map(|idx| format!("- task {idx}"))
+        .collect::<Vec<_>>();
+    for selected in [None, Some(9), Some(99)] {
+        let mut scroll_offset = 9;
+        keep_selected_task_visible(&tasks, selected, &mut scroll_offset, 4, 20);
+        assert_eq!(scroll_offset, 6);
+
+        // Growing the viewport reveals earlier rows without jumping to the top.
+        keep_selected_task_visible(&tasks, selected, &mut scroll_offset, 6, 20);
+        assert_eq!(scroll_offset, 4);
+    }
+}
+
+#[test]
 fn input_cursor_offset_tracks_cursor_inside_wrapped_text() {
     let text = " Add Task: hello world";
 

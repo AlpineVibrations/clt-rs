@@ -8,6 +8,7 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ### Fixed
 
+- Backfill earlier Kanban tasks when a long selected task collapses, selection is cleared, or the viewport grows, so a stale scroll position cannot leave available space empty.
 - Let ready Todo work run ahead of queued dependency blockers in both supervisor and ordinary recovery scheduling, including when an older supervisor decision held the project. Keep assessment priority for blocked Doing tasks and stalled queues. Scope supervisor logs to each blocked task’s exact session so an old error from a completed predecessor cannot become the supplied current failure.
 
 ## [0.8.0] - 2026-10-06
