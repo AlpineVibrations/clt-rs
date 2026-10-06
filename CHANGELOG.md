@@ -8,6 +8,7 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ### Fixed
 
+- Require an explicit user request before creating stopped tasks in the bundled task-management skill, including fallbacks for missing session IDs or unavailable claim commands.
 - Reuse the same task when reopening a completed Codex session interactively: move it to Doing before launch, tell Codex to continue that task, and return it to Done on completion or exit without creating a stopped replacement task or restarting its completed Git journal.
 - Allow explicit deletion of idle managed Git tasks still in `WORKING`, cancelling the obsolete journal while preserving Git boundaries and conversation history. Keep live owners and sealed proof protected, and prevent interrupted deletions from resuming cancelled work.
 - Allow completed Codex sessions to reopen alongside a directly opened session with a manual task claim. Preserve the manual claim and scheduler fence, reject duplicate resumes of the claimed session, and keep shared-session controls tied to the selected project.

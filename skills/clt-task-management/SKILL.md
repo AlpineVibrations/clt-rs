@@ -101,6 +101,9 @@ clt add "Task description" ["Optional metadata"]
 
 Before creating a task or adding a dependency, check the relevant dependency chain. Never make a task depend on itself, directly or through other tasks; split or reorder the work to avoid circular dependencies.
 
+Create tasks in stopped mode (`clt:stopped`) only when the user explicitly asks
+for it. Use the normal Todo or manually claimed Doing workflow otherwise.
+
 #### Reserve tasks in standalone Codex sessions
 
 When the user reopens a completed task interactively through CLT, continue that
@@ -123,8 +126,9 @@ interrupted-task recovery. Use it even when project automation is disabled.
 Use the exact current session ID supplied by the Codex runtime (for example,
 `CODEX_THREAD_ID` when available). Do not guess an ID, use a process ID, or take
 one from another task or the most recent session on disk. If the current ID is
-unavailable, create a stopped tracking task ending in `clt:stopped` and report that
-it cannot be linked or claimed yet. Do not leave an eligible Todo for this work.
+unavailable, report that the task cannot be linked or claimed yet; do not create
+a stopped fallback task unless the user explicitly asks for it. Do not leave an
+eligible Todo for this work.
 
 ```bash
 # Only after confirming CODEX_THREAD_ID identifies this Codex session:
@@ -150,8 +154,9 @@ never replace another session's link or bypass an active owner.
 Preserve both `clt:manual` and the final `codex:<session-id>` token when adding
 notes. `clt start` and `clt claim` write these markers for you. Use an updated
 CLT binary and scheduler; an older daemon cannot honor manual claims. If these
-commands are unavailable, use a stopped tracking task and report that CLT needs
-upgrading instead of using an eligible `add` followed by `status`.
+commands are unavailable, report that CLT needs upgrading; do not create a
+stopped fallback task unless the user explicitly asks for it. Do not substitute
+an eligible `add` followed by `status`.
 
 Inspect the stored task after creation; `clt list` hides session markers. For a
 Markdown-backed status the marker ends the task's line; for a folder-backed
