@@ -6,6 +6,19 @@ use crate::test_support::prelude::*;
 use crate::test_support::*;
 
 #[test]
+fn agent_recovery_is_an_alias_for_recover() {
+    for name in ["recover", "recovery"] {
+        let cli = Cli::try_parse_from(["clt", "agent", name]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Agent {
+                command: AgentCommands::Recover
+            })
+        ));
+    }
+}
+
+#[test]
 fn parse_add_task_args_joins_unquoted_description_words() {
     let (description, metadata) = parse_add_task_args(vec![
         "write".to_string(),

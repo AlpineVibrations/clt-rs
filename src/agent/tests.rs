@@ -397,7 +397,7 @@ fn agent_store_allows_a_second_process_to_open_the_database() {
 
 #[cfg(unix)]
 #[test]
-fn agent_store_long_lived_peer_pins_the_wal_before_auto_checkpoint_restart() {
+fn agent_store_operation_pins_the_wal_before_auto_checkpoint_restart() {
     const WAL_HEADER_BYTES: usize = 32;
     const WAL_FRAME_HEADER_BYTES: usize = 24;
     const CHECKPOINT_PRESSURE_WRITES: usize = 1_100;
@@ -423,7 +423,7 @@ fn agent_store_long_lived_peer_pins_the_wal_before_auto_checkpoint_restart() {
     let frame_count = (wal.len() - WAL_HEADER_BYTES) / (WAL_FRAME_HEADER_BYTES + page_size);
     assert!(
         frame_count > 1_000,
-        "the WAL restarted despite the long-lived store's checkpoint pin: {frame_count} frames"
+        "the WAL restarted despite the operation's checkpoint pin: {frame_count} frames"
     );
 
     let child_output = Command::new(std::env::current_exe().unwrap())

@@ -17,6 +17,9 @@ mod wal_tail_tests;
 #[path = "concurrent_open_tests.rs"]
 mod concurrent_open_tests;
 
+#[path = "live_checkpoint_tests.rs"]
+mod live_checkpoint_tests;
+
 #[path = "idle_tests.rs"]
 mod idle_tests;
 
@@ -63,55 +66,41 @@ fn idle_registry_maintenance_checkpoints_wal_and_preserves_project_settings() {
 }
 
 #[test]
-fn wal_limit_refuses_writes_and_opens_before_touching_durable_state() {
+fn wal_limit_guard_preserves_durable_state_when_cleanup_is_blocked() {
     let (root, state_dir, store, project) = registered_store("wal-write-budget");
     let wal_path = state_dir.join("agent.db-wal");
     let wal_file = OpenOptions::new().write(true).open(&wal_path).unwrap();
     let original_len = wal_file.metadata().unwrap().len();
     let snapshot = fs::read(state_dir.join(SNAPSHOT_FILE)).unwrap();
-    // Sparse extension exercises the real production threshold without writing
-    // 128 MiB of data or ever asking Turso to interpret a fabricated WAL tail.
+    // Test only the admission check with a sparse tail, never hand fabricated
+    // frames to the engine. Live checkpoint behavior uses real WALs below.
     wal_file.set_len(WAL_WRITE_LIMIT_BYTES - 1).unwrap();
     check_wal_write_budget(&state_dir).unwrap();
     wal_file.set_len(WAL_WRITE_LIMIT_BYTES).unwrap();
-    let mut polled = false;
-    let mutation = store.blocking.block_on_persist(async {
-        polled = true;
-        Ok(())
-    });
-    let setting = store.set_project_enabled_blocking(project.id, !project.enabled);
-    let reopen = TursoAgentStore::open_blocking(&state_dir);
-    // Restore before any engine read or handle teardown, including assertions.
-    let after_len = wal_file.metadata().unwrap().len();
+    let error = begin_update(&state_dir).unwrap_err();
     wal_file.set_len(original_len).unwrap();
-    assert!(!polled);
-    for error in [
-        mutation.unwrap_err(),
-        setting.unwrap_err(),
-        reopen.err().unwrap(),
-    ] {
-        let message = format!("{error:#}");
-        assert!(message.contains("128 MiB safety limit"), "{message}");
-        assert!(message.contains("clt agent recover"), "{message}");
-    }
-    assert_eq!(after_len, WAL_WRITE_LIMIT_BYTES);
+    assert!(format!("{error:#}").contains("128 MiB safety limit"));
     assert_eq!(fs::read(state_dir.join(SNAPSHOT_FILE)).unwrap(), snapshot);
     assert!(!state_dir.join(DIRTY_FILE).exists());
     assert!(!state_dir.join(REQUIRED_FILE).exists());
-    assert_eq!(
-        store.list_projects_blocking().unwrap()[0].enabled,
-        project.enabled
-    );
-    // The guard doesn't poison the store: normal writes work once space is available.
     store
         .set_project_enabled_blocking(project.id, !project.enabled)
         .unwrap();
-    assert_eq!(
-        store.list_projects_blocking().unwrap()[0].enabled,
-        !project.enabled
-    );
     drop(store);
     fs::remove_dir_all(root).unwrap();
+}
+
+/// Hold an explicit long read for tests of partial checkpoints and legacy clients.
+fn pin_store(store: &mut TursoAgentStore) {
+    store.checkpoint_pin = Some(
+        store
+            .blocking
+            .block_on_recovery(super::super::open_checkpoint_pin(
+                &store.recovery_db,
+                &store.db_path,
+            ))
+            .unwrap(),
+    );
 }
 
 #[test]
@@ -343,7 +332,115 @@ fn registry_auto_recovery_waits_for_live_store_and_session_process() {
 }
 
 #[test]
-fn registry_auto_recovery_refuses_interrupted_repairs() {
+fn registry_open_resumes_interrupted_repair_from_the_original_quarantine() {
+    for dirty in [false, true] {
+        let (root, state_dir, store, project) = registered_store("registry-auto-resume");
+        let old_snapshot = fs::read(state_dir.join(SNAPSHOT_FILE)).unwrap();
+        store
+            .set_project_enabled_blocking(project.id, false)
+            .unwrap();
+        drop(store);
+        if dirty {
+            fs::write(state_dir.join(SNAPSHOT_FILE), old_snapshot).unwrap();
+            fs::write(state_dir.join(DIRTY_FILE), "interrupted export").unwrap();
+        }
+        let original = bundle_contents(&state_dir);
+        let archive = quarantine_bundle(&state_dir).unwrap();
+        atomic_write(
+            &state_dir.join("recovery-in-progress.json"),
+            &serde_json::to_vec(&archive).unwrap(),
+        )
+        .unwrap();
+        // Model a crash during replacement, including the marker-only window.
+        corrupt_database(&state_dir);
+        fs::write(state_dir.join("agent.db-wal"), b"partial replacement").unwrap();
+        remove_if_exists(&state_dir.join(DIRTY_FILE)).unwrap();
+
+        let reopened = crate::agent::open_agent_store_at(&state_dir).unwrap();
+
+        let projects = reopened.list_projects_blocking().unwrap();
+        assert_eq!(projects[0].id, project.id);
+        assert!(!projects[0].enabled);
+        assert_eq!(bundle_contents(&archive), original);
+        assert_eq!(
+            fs::read_dir(state_dir.join("quarantine")).unwrap().count(),
+            1
+        );
+        assert!(!state_dir.join("recovery-in-progress.json").exists());
+        assert!(!state_dir.join(REQUIRED_FILE).exists());
+        assert!(!state_dir.join(DIRTY_FILE).exists());
+        drop(reopened);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn registry_auto_resume_rejects_missing_or_outside_quarantine_without_mutation() {
+    for location in ["outside", "missing", "empty"] {
+        let (root, state_dir, store, _) = registered_store("registry-invalid-resume");
+        drop(store);
+        let archive = if location == "outside" {
+            root.clone()
+        } else {
+            state_dir.join("quarantine").join(location)
+        };
+        if location == "empty" {
+            fs::create_dir_all(&archive).unwrap();
+        }
+        atomic_write(
+            &state_dir.join("recovery-in-progress.json"),
+            &serde_json::to_vec(&archive).unwrap(),
+        )
+        .unwrap();
+        let original = bundle_contents(&state_dir);
+        let error = recover_registry_automatically(&state_dir).unwrap_err();
+        let expected = if location == "empty" {
+            "original quarantined agent database is missing"
+        } else {
+            "Invalid recovery quarantine path"
+        };
+        assert!(format!("{error:#}").contains(expected));
+        assert_eq!(bundle_contents(&state_dir), original);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn registry_auto_resume_checks_live_processes_in_the_quarantined_database() {
+    let (root, state_dir, store, project) = registered_store("registry-auto-resume-live");
+    let old_snapshot = fs::read(state_dir.join(SNAPSHOT_FILE)).unwrap();
+    store
+        .mark_session_running_blocking(
+            project.id,
+            "unexported-session",
+            std::process::id(),
+            "live-run",
+            &root.join("out"),
+            &root.join("err"),
+        )
+        .unwrap();
+    drop(store);
+    fs::write(state_dir.join(SNAPSHOT_FILE), old_snapshot).unwrap();
+    let archive = quarantine_bundle(&state_dir).unwrap();
+    atomic_write(
+        &state_dir.join("recovery-in-progress.json"),
+        &serde_json::to_vec(&archive).unwrap(),
+    )
+    .unwrap();
+    let original = bundle_contents(&archive);
+    corrupt_database(&state_dir);
+
+    let error = recover_registry_automatically(&state_dir).unwrap_err();
+
+    assert!(format!("{error:#}").contains("waiting for worker/session process"));
+    assert_eq!(bundle_contents(&archive), original);
+    assert_eq!(bundle_contents(&state_dir), original);
+    assert!(state_dir.join("recovery-in-progress.json").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn registry_auto_recovery_refuses_invalid_progress_without_changing_the_bundle() {
     let marker = "recovery-in-progress.json";
     let (root, state_dir, store, _) = registered_store("registry-auto-recovery-interrupted");
     drop(store);
@@ -532,7 +629,8 @@ fn registry_auto_recovery_preserves_corrupt_database_and_does_not_repeat_reconst
 
 #[test]
 fn registry_open_after_partial_checkpoint_preserves_pin_ownership() {
-    let (root, state_dir, store, project) = registered_store("registry-partial-checkpoint");
+    let (root, state_dir, mut store, project) = registered_store("registry-partial-checkpoint");
+    pin_store(&mut store);
     store
         .write_checkpoint_pressure_blocking(project.id, 1_100)
         .unwrap();
@@ -1070,6 +1168,13 @@ fn registry_recovery_refuses_stale_snapshot_after_interrupted_update() {
     assert!(state_dir.join(DIRTY_FILE).exists());
     assert!(state_dir.join(REQUIRED_FILE).exists());
     assert!(TursoAgentStore::open_blocking(&state_dir).is_err());
+    // Even if teardown cleared the live marker before a crash, the backup's
+    // dirty evidence must prevent explicit fallback to the stale snapshot.
+    fs::remove_file(state_dir.join(DIRTY_FILE)).unwrap();
+    let error = recover_registry(&state_dir).err().unwrap();
+    assert!(format!("{error:#}").contains("snapshot may predate an interrupted Git transition"));
+    assert!(state_dir.join(DIRTY_FILE).exists());
+    assert_eq!(bundle_contents(&state_dir), original);
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -1091,7 +1196,7 @@ fn registry_recovery_restarts_from_the_quarantine_after_an_interrupted_attempt()
     let report = recover_registry(&state_dir).unwrap();
 
     assert!(!report.rebuilt_registry);
-    assert_ne!(report.quarantine, archive);
+    assert_eq!(report.quarantine, archive);
     assert_eq!(bundle_contents(&archive), original);
     assert_eq!(bundle_contents(&report.quarantine), original);
     let reopened = TursoAgentStore::open_blocking(&state_dir).unwrap();

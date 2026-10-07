@@ -306,6 +306,7 @@ enum AgentCommands {
     /// Stops the background agent service
     Stop,
     /// Recovers the agent registry after stopping services and preserving its database bundle
+    #[command(visible_alias = "recovery")]
     Recover,
     /// Shows agent service and project status
     Status,

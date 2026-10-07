@@ -65,8 +65,8 @@ original dependency/features list, and run the WAL regressions and archive check
 math evaluation so current Clippy accepts them; their behavior is unchanged.
 
 The published 0.7.2 shared-WAL coordination source is unchanged from 0.7.0, so
-CLT retains the same reader ownership fix and checkpoint pin. The versioned
-shared-WAL header layout used by CLT's recovery workaround is also unchanged.
+CLT retains the same reader ownership fix and operation-scoped checkpoint pins.
+The versioned shared-WAL header layout used by CLT's recovery workaround is also unchanged.
 
 `storage/shared_wal_coordination.rs` fixes
 `repair_transient_state_for_exclusive_open`: repair holds the local reader mutex
@@ -113,4 +113,7 @@ reads, lease replacement, project disable, reopen, and full integrity.
 
 Return to an upstream engine dependency only after a released version contains
 the equivalent ownership and reseeding fixes and passes these regressions. Keep
-CLT's checkpoint pin and retained WAL data when making that transition.
+CLT's operation checkpoint pins and retained WAL data when making that transition.
+Idle stores no longer retain a read transaction: CLT checkpoints growing WALs
+between operations. Cross-process regressions cover idle handles observing reads
+and writes after repeated truncation, including WALs above the safety threshold.

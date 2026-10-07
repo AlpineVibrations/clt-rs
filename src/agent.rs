@@ -1193,7 +1193,7 @@ struct OpenedAgentDatabase {
     db_path: PathBuf,
     db: Database,
     pending_migration_version: Option<i64>,
-    checkpoint_pin: Connection,
+    checkpoint_pin: Option<Connection>,
 }
 
 #[derive(Clone, Debug)]
@@ -1456,9 +1456,6 @@ impl TursoAgentStore {
         let access = recovery::RegistryAccess::shared(state_dir)?;
         let _writer = recovery::write_lock(state_dir)?;
         recovery::check_clean(state_dir)?;
-        // Opening can apply migrations or repair indexes. Check before opening
-        // the engine as well as before each ordinary persistent operation.
-        recovery::check_wal_write_budget(state_dir)?;
         if state_dir.join(recovery::SNAPSHOT_FILE).exists()
             && !state_dir.join(AGENT_DB_FILE).exists()
         {
@@ -1496,20 +1493,20 @@ impl TursoAgentStore {
         recovering: bool,
     ) -> Result<Self> {
         let mut blocking = AgentStoreBlockingAdapter::new(state_dir, recovering)?;
-        let opened = blocking.block_on(Self::open_database(state_dir))?;
+        let opened = blocking.block_on(Self::open_database(state_dir, recovering))?;
         blocking.attach(&opened.db);
         Ok(Self {
             db_path: opened.db_path,
             repositories: AgentRepositories::new(&opened.db),
             pending_migration_version: opened.pending_migration_version,
-            checkpoint_pin: Some(opened.checkpoint_pin),
+            checkpoint_pin: opened.checkpoint_pin,
             blocking,
             recovery_db: opened.db,
             _registry_access: access,
         })
     }
 
-    async fn open_database(state_dir: &Path) -> Result<OpenedAgentDatabase> {
+    async fn open_database(state_dir: &Path, recovering: bool) -> Result<OpenedAgentDatabase> {
         fs::create_dir_all(state_dir)
             .with_context(|| format!("Failed to create agent state directory {:?}", state_dir))?;
         let db_path = state_dir.join(AGENT_DB_FILE);
@@ -1566,9 +1563,20 @@ impl TursoAgentStore {
             .with_context(|| format!("Failed to connect to agent database {:?}", db_path))?;
         configure_agent_connection(&conn).await?;
 
+        if !recovering {
+            recovery::checkpoint_live_registry(&db, state_dir).await?;
+            recovery::check_wal_write_budget(state_dir)?;
+        }
         let pending_migration_version = apply_migrations(&mut conn, AGENT_MIGRATIONS).await?;
 
-        let checkpoint_pin = open_checkpoint_pin(&db, &db_path).await?;
+        // Recovery retains a pin until integrity has been verified. Ordinary
+        // stores pin individual operations, allowing idle handles to coexist
+        // with engine-managed WAL truncation.
+        let checkpoint_pin = if recovering {
+            Some(open_checkpoint_pin(&db, &db_path).await?)
+        } else {
+            None
+        };
 
         Ok(OpenedAgentDatabase {
             db_path,

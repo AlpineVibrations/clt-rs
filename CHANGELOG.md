@@ -6,7 +6,13 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-10-06
+
 ### Fixed
+
+- Resume interrupted registry repairs automatically from their preserved DB/WAL quarantine, without duplicating backups or falling back to stale snapshots. Accept version 3 recovery manifests and add `clt agent recovery` as an alias for `recover`.
+
+- Keep the registry WAL reclaimable while CLT windows and workers remain open: pin database operations instead of entire store lifetimes, and checkpoint growing WALs before updates or migrations so ordinary activity no longer accumulates to the 128 MiB safety stop.
 
 - Require an explicit user request before creating stopped tasks in the bundled task-management skill, including fallbacks for missing session IDs or unavailable claim commands.
 - Reuse the same task when reopening a completed Codex session interactively: move it to Doing before launch, tell Codex to continue that task, and return it to Done on completion or exit without creating a stopped replacement task or restarting its completed Git journal.
@@ -397,7 +403,9 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 - Fixed task moves so destination write failures do not remove the source task.
 - Fixed TUI navigation on empty boards.
 
-[Unreleased]: https://github.com/AlpineVibrations/clt-rs/compare/v0.7.8...HEAD
+[Unreleased]: https://github.com/AlpineVibrations/clt-rs/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/AlpineVibrations/clt-rs/compare/v0.8.0...v0.8.1
+[0.8.0]: https://github.com/AlpineVibrations/clt-rs/compare/v0.7.8...v0.8.0
 [0.7.8]: https://github.com/AlpineVibrations/clt-rs/compare/v0.7.7...v0.7.8
 [0.7.7]: https://github.com/AlpineVibrations/clt-rs/compare/v0.7.6...v0.7.7
 [0.7.6]: https://github.com/AlpineVibrations/clt-rs/compare/v0.7.5...v0.7.6

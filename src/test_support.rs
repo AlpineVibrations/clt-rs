@@ -1,6 +1,7 @@
 use std::{
     path::{Path, PathBuf},
     process::Command,
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -117,11 +118,18 @@ pub(crate) fn initialize_test_git_repository(project_root: &Path) -> String {
 }
 
 pub(crate) fn temp_root(name: &str) -> PathBuf {
+    static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    std::env::temp_dir().join(format!("clt-{name}-{nonce}"))
+    // Wall-clock resolution is coarser than parallel fixture creation on some
+    // hosts. Separate simultaneous calls and child processes as well as runs.
+    let sequence = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "clt-{name}-{nonce}-{}-{sequence}",
+        std::process::id()
+    ))
 }
 
 #[test]

@@ -145,8 +145,8 @@ pub(super) fn begin_update(state_dir: &Path) -> Result<()> {
 }
 
 /// Checked while holding the writer lock, before polling a mutation or marking
-/// the snapshot dirty. Long-lived stores can pin the WAL indefinitely, so idle
-/// maintenance alone cannot keep it below the engine's shared-index capacity.
+/// the snapshot dirty, after attempting live checkpoint maintenance. Legacy
+/// clients may still pin the WAL indefinitely; retain the engine capacity guard.
 pub(super) fn check_wal_write_budget(state_dir: &Path) -> Result<()> {
     let path = state_dir.join("agent.db-wal");
     let metadata = match fs::metadata(&path) {
@@ -161,10 +161,40 @@ pub(super) fn check_wal_write_budget(state_dir: &Path) -> Result<()> {
     );
     anyhow::ensure!(
         metadata.len() < WAL_WRITE_LIMIT_BYTES,
-        "Registry WAL reached the 128 MiB safety limit ({} MiB); database updates are paused because automatic cleanup could not get exclusive access. Close other CLT windows and foreground sessions, then run `clt agent recover` followed by `clt agent start` (state: {}). No update was started.",
+        "Registry WAL reached the 128 MiB safety limit ({} MiB); database updates are paused because an active reader prevented automatic cleanup. Restart older CLT processes to release their journal pins. If cleanup remains blocked, close other CLT windows and foreground sessions, then run `clt agent recover` followed by `clt agent start` (state: {}). No update was started.",
         metadata.len() / (1024 * 1024),
         state_dir.display()
     );
+    Ok(())
+}
+
+/// Called under the registry writer lock, outside any operation's read pin.
+/// The engine owns checkpoint locking, syncing and truncation; never trim WAL
+/// bytes ourselves. Busy readers (including older CLT processes) defer cleanup.
+pub(super) async fn checkpoint_live_registry(db: &Database, state_dir: &Path) -> Result<()> {
+    checkpoint_live_registry_above(db, state_dir, WAL_MAINTENANCE_BYTES).await
+}
+
+async fn checkpoint_live_registry_above(
+    db: &Database,
+    state_dir: &Path,
+    threshold: u64,
+) -> Result<()> {
+    if !fs::metadata(state_dir.join("agent.db-wal"))
+        .is_ok_and(|metadata| metadata.len() >= threshold)
+    {
+        return Ok(());
+    }
+    let conn = db.connect()?;
+    configure_agent_connection(&conn).await?;
+    let mut rows = conn.query("PRAGMA wal_checkpoint(TRUNCATE)", ()).await?;
+    let row = rows
+        .next()
+        .await?
+        .context("Registry checkpoint returned no result")?;
+    // A busy result is safe: the existing admission guard still leaves headroom
+    // if a legacy client or a genuinely long-running read prevents truncation.
+    let _busy = row.get::<i64>(0)?;
     Ok(())
 }
 
@@ -364,6 +394,10 @@ async fn read_database_snapshot(db: &Database) -> Result<Json> {
     Ok(json!({"version": version, "tables": tables}))
 }
 
+pub(crate) fn supported_snapshot_version(snapshot: &Json) -> bool {
+    matches!(snapshot.get("version").and_then(Json::as_u64), Some(1..=3))
+}
+
 pub(crate) fn read_snapshot(state_dir: &Path) -> Result<Option<Json>> {
     let path = state_dir.join(SNAPSHOT_FILE);
     if !path.exists() {
@@ -372,7 +406,7 @@ pub(crate) fn read_snapshot(state_dir: &Path) -> Result<Option<Json>> {
     let mut snapshot: Json = serde_json::from_slice(&fs::read(&path)?)
         .with_context(|| format!("Invalid external registry snapshot {}", path.display()))?;
     anyhow::ensure!(
-        snapshot["version"] == 1 || snapshot["version"] == 2 || snapshot["version"] == 3,
+        supported_snapshot_version(&snapshot),
         "Unsupported registry snapshot version"
     );
     // Older snapshots have no session-mode evidence. Preserve that uncertainty;
@@ -643,13 +677,6 @@ fn recover_registry_with_policy(
             snapshot.is_some(),
             "Automatic recovery requires an external registry snapshot; run clt agent recover"
         );
-        // A dirty snapshot is not evidence that the original DB is corrupt.
-        // Repair that DB and export its committed state; automatic recovery
-        // still never reconstructs from a potentially stale external snapshot.
-        anyhow::ensure!(
-            !state_dir.join("recovery-in-progress.json").exists(),
-            "A previous registry repair did not finish; run clt agent recover"
-        );
     }
     let legacy = lock_legacy_users(state_dir)?;
     if let Some(manifest) = &snapshot {
@@ -657,20 +684,39 @@ fn recover_registry_with_policy(
         // the initial drain, and no new DB user can now race this final check.
         stop_services(manifest)?;
     }
-    let dirty = state_dir.join(DIRTY_FILE).exists();
     let progress = state_dir.join("recovery-in-progress.json");
-    if progress.exists() {
+    let resuming = progress.exists();
+    let quarantine = if resuming {
         let archive: PathBuf = serde_json::from_slice(&fs::read(&progress)?)?;
         anyhow::ensure!(
-            archive.parent() == Some(state_dir.join("quarantine").as_path()),
+            archive.parent() == Some(state_dir.join("quarantine").as_path()) && archive.is_dir(),
             "Invalid recovery quarantine path"
         );
+        anyhow::ensure!(
+            !automatic
+                || fs::metadata(archive.join(super::AGENT_DB_FILE))
+                    .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0),
+            "The original quarantined agent database is missing or empty; run clt agent recover"
+        );
+        // Reuse the durable original, never archive a partial replacement or
+        // accumulate another large backup on every failed automatic retry.
+        // A crash after snapshot publication may have cleared the dirty marker.
+        if archive.join(DIRTY_FILE).exists() {
+            atomic_write(
+                &state_dir.join(DIRTY_FILE),
+                &fs::read(archive.join(DIRTY_FILE))?,
+            )?;
+        }
         restore_bundle(state_dir, &archive)?;
-    }
+        archive
+    } else {
+        let archive = quarantine_bundle(state_dir)?;
+        atomic_write(&progress, &serde_json::to_vec(&archive)?)?;
+        archive
+    };
+    let dirty = state_dir.join(DIRTY_FILE).exists();
     let has_database =
         fs::metadata(state_dir.join(super::AGENT_DB_FILE)).is_ok_and(|metadata| metadata.len() > 0);
-    let quarantine = quarantine_bundle(state_dir)?;
-    atomic_write(&progress, &serde_json::to_vec(&quarantine)?)?;
     mark_required(state_dir, RECOVERING_REASON)?;
     for name in ["agent.db-tshm", "agent.db-shm"] {
         remove_if_exists(&state_dir.join(name))?;
@@ -685,7 +731,7 @@ fn recover_registry_with_policy(
         );
         {
             let mut store = TursoAgentStore::open_for_recovery(state_dir)?;
-            if automatic && dirty {
+            if automatic {
                 // The failed export may predate a newly registered process.
                 // Check authoritative rows too before completing the repair.
                 let committed = store
@@ -741,7 +787,7 @@ fn recover_registry_with_policy(
     remove_if_exists(&progress)?;
     remove_if_exists(&state_dir.join(REQUIRED_FILE))?;
     sync_directory(state_dir)?;
-    if maintenance {
+    if maintenance && !resuming {
         // Routine checkpoints must not turn a bounded WAL into unbounded
         // archived WALs. Keep the backup until teardown and snapshot durability
         // have succeeded. Manual/failed recovery archives are never pruned here.
@@ -757,8 +803,8 @@ fn recover_registry_with_policy(
 
 fn checkpoint_exclusive_registry(store: &mut TursoAgentStore) -> Result<()> {
     // The caller holds exclusive registry access and has quarantined DB + WAL.
-    // Ordinary stores retain their checkpoint pin; only this fenced maintenance
-    // path releases it after proving the original database is readable.
+    // Recovery retains its checkpoint pin until this fenced maintenance path
+    // has proved the original database is readable.
     store
         .blocking
         .block_on_recovery(health::repair_worker_indexes_if_needed(&store.recovery_db))?;

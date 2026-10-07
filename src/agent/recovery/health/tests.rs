@@ -20,7 +20,7 @@ fn corrupt_leaf_indexes(state_dir: &Path, pages: &[usize]) {
 }
 
 fn damaged_registry(indexes: &[&str]) -> (std::path::PathBuf, std::path::PathBuf) {
-    let (root, state_dir, mut store, project) = registered_store("registry-index-health");
+    let (root, state_dir, store, project) = registered_store("registry-index-health");
     for token in ["worker-one", "worker-two"] {
         assert!(
             store
@@ -49,18 +49,9 @@ fn damaged_registry(indexes: &[&str]) -> (std::path::PathBuf, std::path::PathBuf
                 .unwrap()
         );
     }
-    let pin = store.checkpoint_pin.take().unwrap();
-    store
-        .blocking
-        .block_on(async {
-            pin.execute("ROLLBACK", ()).await?;
-            Ok(())
-        })
-        .unwrap();
-    drop(pin);
     let pages = store
         .blocking
-        .block_on(async {
+        .block_on_recovery(async {
             let conn = store.recovery_db.connect()?;
             let mut pages = Vec::new();
             for name in indexes {

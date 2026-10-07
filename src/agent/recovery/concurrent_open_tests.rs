@@ -7,7 +7,8 @@ const CHILD_STATE: &str = "CLT_REGISTRY_CONCURRENT_OPEN_TEST_STATE";
 
 #[test]
 fn registry_connection_opens_preserve_concurrent_writer_frames() {
-    let (root, state_dir, store, project) = registered_store("registry-concurrent-open");
+    let (root, state_dir, mut store, project) = registered_store("registry-concurrent-open");
+    super::pin_store(&mut store);
     store
         .write_checkpoint_pressure_blocking(project.id, 1_100)
         .unwrap();

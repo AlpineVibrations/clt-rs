@@ -178,10 +178,7 @@ fn stop_agent_services_for_recovery_with(
     mut service_command: impl FnMut(&str, &[&str]) -> Result<(bool, String)>,
     mut process_is_running: impl FnMut(u32) -> Option<bool>,
 ) -> Result<()> {
-    if !matches!(
-        manifest.get("version").and_then(serde_json::Value::as_u64),
-        Some(1 | 2)
-    ) {
+    if !agent::recovery::supported_snapshot_version(manifest) {
         anyhow::bail!(
             "Unsupported agent recovery manifest in {}",
             state_dir.display()
@@ -317,6 +314,11 @@ pub(super) fn ensure_agent_processes_stopped_for_recovery(
     state_dir: &Path,
     manifest: &serde_json::Value,
 ) -> Result<()> {
+    anyhow::ensure!(
+        agent::recovery::supported_snapshot_version(manifest),
+        "Unsupported agent recovery manifest in {}",
+        state_dir.display()
+    );
     for (table, field) in [
         ("agent_workers", "worker_pid"),
         ("session_controls", "child_pid"),

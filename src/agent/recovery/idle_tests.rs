@@ -7,7 +7,8 @@ const IDLE_CHILD_STATE: &str = "CLT_REGISTRY_IDLE_WRITER_TEST_STATE";
 
 #[test]
 fn idle_registry_observes_peer_writes_and_preserves_new_leases() {
-    let (root, state_dir, store, project) = registered_store("registry-idle-peer");
+    let (root, state_dir, mut store, project) = registered_store("registry-idle-peer");
+    super::pin_store(&mut store);
     store
         .try_acquire_lease_blocking(project.id, "old-owner", "100", "9999999999")
         .unwrap();

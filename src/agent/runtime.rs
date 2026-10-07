@@ -36,7 +36,31 @@ impl AgentStoreBlockingAdapter {
         if !self.recovering {
             recovery::check_required(&self.state_dir)?;
         }
-        self.block_on_recovery(future)
+        self.block_on_recovery(async {
+            let pin = if !self.recovering
+                && let Some(db) = &self.database
+            {
+                Some(
+                    super::open_checkpoint_pin(db, &self.state_dir.join(super::AGENT_DB_FILE))
+                        .await?,
+                )
+            } else {
+                None
+            };
+            let outcome = future.await;
+            // Do not issue further queries through a failed storage handle.
+            if let Err(error) = &outcome
+                && recovery::storage_failure(&format!("{error:#}"))
+            {
+                return outcome;
+            }
+            if let Some(pin) = pin {
+                pin.execute("ROLLBACK", ())
+                    .await
+                    .context("Failed to release the registry operation checkpoint pin")?;
+            }
+            outcome
+        })
     }
 
     pub(super) fn block_on_recovery<T>(
@@ -74,6 +98,10 @@ impl AgentStoreBlockingAdapter {
 
     pub(super) fn block_on_persist<T>(&self, future: impl Future<Output = Result<T>>) -> Result<T> {
         let _writer = recovery::write_lock(&self.state_dir)?;
+        recovery::check_clean(&self.state_dir)?;
+        if let Some(db) = &self.database {
+            self.block_on_recovery(recovery::checkpoint_live_registry(db, &self.state_dir))?;
+        }
         recovery::begin_update(&self.state_dir)?;
         let outcome = self.block_on(future);
         // A panic invalidates the handle; never issue another query on it.

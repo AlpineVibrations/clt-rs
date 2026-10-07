@@ -277,7 +277,9 @@ fn recovery_stops_verified_launchd_services() {
 fn recovery_accepts_legacy_manifests_and_rejects_unknown_versions_before_stopping() {
     for version in [
         serde_json::json!(1),
+        serde_json::json!(2),
         serde_json::json!(3),
+        serde_json::json!(4),
         serde_json::Value::Null,
     ] {
         let mut manifest = recovery_service_test_manifest(AgentPlatform::Macos);
@@ -294,7 +296,7 @@ fn recovery_accepts_legacy_manifests_and_rejects_unknown_versions_before_stoppin
             },
             |_| Some(false),
         );
-        if version == 1 {
+        if matches!(version.as_u64(), Some(1..=3)) {
             result.unwrap();
             assert_eq!(calls, 2);
         } else {
@@ -306,6 +308,16 @@ fn recovery_accepts_legacy_manifests_and_rejects_unknown_versions_before_stoppin
             );
             assert_eq!(calls, 0);
         }
+        assert_eq!(
+            ensure_agent_processes_stopped_for_recovery(
+                Path::new("/unused-agent-state"),
+                &serde_json::json!({"version": version, "tables": {
+                    "agent_workers": [], "session_controls": []
+                }})
+            )
+            .is_ok(),
+            matches!(version.as_u64(), Some(1..=3))
+        );
     }
 }
 
