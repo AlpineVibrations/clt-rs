@@ -80,9 +80,14 @@ impl TursoAgentStore {
                 "SELECT COUNT(*) FROM runs WHERE id = ?1 AND project_id = ?2
                  AND (?4 = 1 OR status IN ('failure', 'timeout'))
                  AND EXISTS (SELECT 1 FROM projects WHERE id = ?2 AND path = ?3)
-                 AND id = (SELECT MAX(id) FROM runs WHERE project_id = ?2
-                    AND (?4 = 0 OR codex_session_id = ?5))",
-                params![expected_run_id, project_id, project_path.to_string_lossy().as_ref(), i64::from(restart), session_id],
+                 AND id = CASE WHEN ?6 = 1 THEN COALESCE(
+                     (SELECT id FROM runs WHERE project_id = ?2 AND worker_token = ?7),
+                     (SELECT MAX(id) FROM runs WHERE project_id = ?2 AND codex_session_id = ?5))
+                   WHEN ?4 = 1 THEN COALESCE(
+                     (SELECT MAX(id) FROM runs WHERE project_id = ?2 AND codex_session_id = ?5),
+                     (SELECT id FROM runs WHERE project_id = ?2 AND worker_token = ?7))
+                   ELSE (SELECT MAX(id) FROM runs WHERE project_id = ?2) END",
+                params![expected_run_id, project_id, project_path.to_string_lossy().as_ref(), i64::from(restart), session_id, i64::from(restart && require_resume_requested), expected_journal.and_then(|journal| journal.owner_run_token.as_deref())],
             ).await? == 1, "The latest run changed; review recovery again");
             if let Some(expected) = expected_journal {
                 let mut rows = tx.query(
@@ -132,7 +137,12 @@ impl TursoAgentStore {
                     "SELECT COUNT(*) FROM session_controls sc JOIN runs r ON r.project_id = sc.project_id
                      WHERE sc.project_id = ?1 AND sc.codex_session_id = ?2
                        AND sc.run_token = ?3 AND r.id = ?4 AND r.status = 'failure'
-                       AND r.finished_at IS NOT NULL AND r.codex_session_id = ?2
+                       AND r.finished_at IS NOT NULL
+                       AND (r.codex_session_id IS NULL OR r.codex_session_id = ?2)
+                       AND (r.worker_token = ?3 AND EXISTS (
+                             SELECT 1 FROM agent_workers w WHERE w.worker_token = ?3
+                               AND w.project_id = ?1 AND w.state = 'completed' AND w.run_id = r.id)
+                            OR (r.worker_token IS NULL AND r.codex_session_id = ?2))
                        AND EXISTS (SELECT 1 FROM projects p WHERE p.id = ?1 AND p.enabled = 1)",
                     params![project_id, session_id, expected.owner_run_token.as_deref(), expected_run_id],
                 ).await? == 1, "The failed activation owner changed; preserving its attempt");

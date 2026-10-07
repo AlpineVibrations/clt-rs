@@ -229,6 +229,47 @@ impl TursoAgentStore {
         ))
     }
 
+    /// A worker can fail after registering a session but before the runner
+    /// returns it. In that case its durable run has no session ID yet.
+    pub(crate) fn run_for_worker_token_blocking(
+        &self,
+        project_id: i64,
+        worker_token: &str,
+    ) -> Result<Option<AgentRunRecord>> {
+        self.blocking.block_on(async {
+            let conn = self.repositories.sessions_runs.connect().await?;
+            let mut rows = conn
+                .query(
+                    "SELECT r.id, r.project_id, p.name, p.path, r.status, r.started_at,
+                        r.finished_at, r.exit_code, r.stdout_path, r.stderr_path, r.summary,
+                        r.codex_session_id
+                   FROM runs r JOIN projects p ON p.id = r.project_id
+                  WHERE r.project_id = ?1 AND r.worker_token = ?2",
+                    params![project_id, worker_token],
+                )
+                .await?;
+            rows.next()
+                .await?
+                .map(|row| {
+                    Ok(AgentRunRecord {
+                        id: row_integer(&row, 0, "id")?,
+                        project_id: row_integer(&row, 1, "project_id")?,
+                        project_name: row_text(&row, 2, "name")?,
+                        project_path: PathBuf::from(row_text(&row, 3, "path")?),
+                        status: row_text(&row, 4, "status")?,
+                        started_at: row_text(&row, 5, "started_at")?,
+                        finished_at: row_optional_text(&row, 6, "finished_at")?,
+                        exit_code: row_optional_integer(&row, 7, "exit_code")?,
+                        stdout_path: row_optional_text(&row, 8, "stdout_path")?,
+                        stderr_path: row_optional_text(&row, 9, "stderr_path")?,
+                        summary: row_optional_text(&row, 10, "summary")?,
+                        codex_session_id: row_optional_text(&row, 11, "codex_session_id")?,
+                    })
+                })
+                .transpose()
+        })
+    }
+
     async fn latest_run_for_codex_session(
         &self,
         project_id: i64,

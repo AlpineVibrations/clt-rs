@@ -1510,6 +1510,155 @@ fn activation_fixture(folders: bool) -> (PathBuf, TursoAgentStore, AgentProject)
     (root, store, project)
 }
 
+fn record_failed_activation_worker_without_session(
+    store: &TursoAgentStore,
+    project: &AgentProject,
+) {
+    let holder = "activation-test-scheduler";
+    assert!(
+        store
+            .try_acquire_lease_blocking(
+                project.id,
+                holder,
+                &agent_timestamp(),
+                &agent_timestamp_after(60)
+            )
+            .unwrap()
+    );
+    assert!(
+        store
+            .reserve_and_claim_worker_blocking(
+                AgentWorkerReservation {
+                    project_id: project.id,
+                    worker_token: "old-run",
+                    expected_lease_holder: holder,
+                    max_active_workers: 1,
+                    protocol_version: AGENT_WORKER_PROTOCOL_VERSION,
+                    service_label: "clt-inline-worker-old-run",
+                    binary_path: Path::new("/tmp/test-clt"),
+                    command_arguments: "[]",
+                    path_env: OsStr::new("/usr/bin:/bin"),
+                    codex_path: None,
+                    task_selection: "next_todo",
+                    resume_session_id: None,
+                    created_at: "103",
+                },
+                12345,
+                "104"
+            )
+            .unwrap()
+    );
+    assert!(store.finalize_worker_blocking(AgentWorkerFinalization {
+        worker_token: "old-run",
+        expected_worker_pid: Some(12345),
+        expected_lease_holder: &agent::worker_lease_holder("old-run"),
+        status: "failure",
+        finished_at: "105",
+        exit_code: None,
+        log_dir: None,
+        stdout_path: None,
+        stderr_path: None,
+        summary: Some("Failed while observing the Codex run: Git-enabled automated work requires the selected task to be committed exactly once in Todo or Doing before the task starts (found 0)"),
+        codex_session_id: None,
+        error: None,
+    }).unwrap().is_some());
+}
+
+#[test]
+fn scheduler_recovers_activation_when_failed_worker_run_lacks_session_id() {
+    for moved_to_doing in [false, true] {
+        let (root, store, project) = activation_fixture(false);
+        record_failed_activation_worker_without_session(&store, &project);
+        let run = store
+            .run_for_worker_token_blocking(project.id, "old-run")
+            .unwrap()
+            .unwrap();
+        assert!(run.codex_session_id.is_none());
+        if moved_to_doing {
+            move_task_without_reordering_after_lock(
+                &get_tasks_dir(&project.path),
+                TaskStatus::Todo,
+                TaskStatus::Doing,
+                2,
+            )
+            .unwrap();
+            fs::write(
+                project.path.join("feature.txt"),
+                "completed interactively\n",
+            )
+            .unwrap();
+            run_test_git(&project.path, &["add", "feature.txt"]);
+        }
+        let head = run_test_git(&project.path, &["rev-parse", "HEAD"]);
+        let index = run_test_git(&project.path, &["write-tree"]);
+
+        let pass =
+            run_agent_scheduler_pass_with_max_global_jobs(&root.join("state"), false, &[], 1, None)
+                .unwrap();
+        assert!(pass.jobs.is_empty());
+        assert_eq!(
+            store
+                .git_finalization_blocking(project.id, SESSION)
+                .unwrap()
+                .unwrap()
+                .state,
+            GitFinalizationState::Cancelled
+        );
+        let todo = TaskBoard::new(get_tasks_dir(&project.path))
+            .entries(TaskStatus::Todo)
+            .unwrap();
+        assert!(todo[1].content.contains("retired automatically"));
+        assert!(recoverable_codex_session_id_from_task_content(&todo[1].content).is_none());
+        assert!(
+            TaskBoard::new(get_tasks_dir(&project.path))
+                .entries(TaskStatus::Doing)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(run_test_git(&project.path, &["rev-parse", "HEAD"]), head);
+        assert_eq!(run_test_git(&project.path, &["write-tree"]), index);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn explicit_restart_recovers_stopped_worker_failure_without_session_id() {
+    let (root, store, project) = activation_fixture(false);
+    record_failed_activation_worker_without_session(&store, &project);
+    move_task_without_reordering_after_lock(
+        &get_tasks_dir(&project.path),
+        TaskStatus::Todo,
+        TaskStatus::Doing,
+        2,
+    )
+    .unwrap();
+    store
+        .set_session_control_state_blocking(project.id, SESSION, AgentSessionControlState::Stopped)
+        .unwrap();
+    let head = run_test_git(&project.path, &["rev-parse", "HEAD"]);
+    let index = run_test_git(&project.path, &["write-tree"]);
+
+    let plan = super::plan_task_restart(&store, &project, SESSION).unwrap();
+    assert!(
+        recover_git_task(&store, &plan)
+            .unwrap()
+            .contains("fresh Codex run")
+    );
+    assert_eq!(
+        store
+            .git_finalization_blocking(project.id, SESSION)
+            .unwrap()
+            .unwrap()
+            .state,
+        GitFinalizationState::Cancelled
+    );
+    assert_eq!(run_test_git(&project.path, &["rev-parse", "HEAD"]), head);
+    assert_eq!(run_test_git(&project.path, &["write-tree"]), index);
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn scheduler_recovers_failed_activation_and_preserves_queue_and_checkout() {
     for folders in [false, true] {
@@ -1582,7 +1731,6 @@ fn failed_activation_recovery_preserves_stops_owners_and_started_work() {
         "paused",
         "task-stop",
         "blocked",
-        "doing",
         "lease",
         "interactive-next",
         "bound",
@@ -1618,15 +1766,6 @@ fn failed_activation_recovery_preserves_stops_owners_and_started_work() {
                 board
                     .write_entry_content(TaskStatus::Todo, &task, &content)
                     .unwrap();
-            }
-            "doing" => {
-                move_task_without_reordering_after_lock(
-                    &get_tasks_dir(&project.path),
-                    TaskStatus::Todo,
-                    TaskStatus::Doing,
-                    2,
-                )
-                .unwrap();
             }
             "lease" => {
                 store

@@ -300,8 +300,15 @@ pub(crate) fn plan_task_restart(
         }),
         "Cannot restart sealed or verified Git work; finish its existing finalization first"
     );
+    let owner_run = journal
+        .as_ref()
+        .and_then(|journal| journal.owner_run_token.as_deref())
+        .map(|token| store.run_for_worker_token_blocking(project.id, token))
+        .transpose()?
+        .flatten();
     let run = store
         .latest_run_for_codex_session_blocking(project.id, session)?
+        .or(owner_run)
         .context("The selected session has no recorded task run")?;
     Ok(GitRecoveryPlan {
         project: project.clone(),
@@ -334,7 +341,14 @@ pub(crate) fn recover_failed_activation_automatically(
             continue;
         }
         let session = &journal.codex_session_id;
-        let Some(run) = store.latest_run_for_codex_session_blocking(project.id, session)? else {
+        let run = journal
+            .owner_run_token
+            .as_deref()
+            .map(|token| store.run_for_worker_token_blocking(project.id, token))
+            .transpose()?
+            .flatten()
+            .or(store.latest_run_for_codex_session_blocking(project.id, session)?);
+        let Some(run) = run else {
             continue;
         };
         if run.status != "failure"
@@ -359,13 +373,14 @@ pub(crate) fn recover_failed_activation_automatically(
         }
         let mut plan = plan_task_restart(store, project, session)?;
         if plan.journal.as_ref() != Some(&journal)
-            || plan.run_id != run.id
             || !plan.linked.as_ref().is_some_and(|linked| {
-                linked.status == TaskStatus::Todo && task_entry_is_ready(&linked.task)
+                matches!(linked.status, TaskStatus::Todo | TaskStatus::Doing)
+                    && task_entry_is_ready(&linked.task)
             })
         {
             continue;
         }
+        plan.run_id = run.id;
         plan.preactivation = true;
         return execute_git_recovery(store, &plan, true).map(Some);
     }

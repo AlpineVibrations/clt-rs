@@ -379,12 +379,17 @@ a new attempt from the current checkout instead.
 
 When a worker fails before activating a selected Todo because that task was added
 after the launch checkpoint, the scheduler automatically retires the idle,
-unbound attempt and queues a fresh conversation in the same position. The normal
+unbound attempt and queues a fresh conversation in the same position. If an
+interactive visit moved that linked task into Doing, recovery waits until the
+interactive session ends, then returns it to Todo for fresh verification. The normal
 launch process checkpoints the current board and captures a new Git boundary.
+Opening the queued Todo conversation interactively keeps its recovery request
+intact after exit; an explicitly stopped session remains stopped.
 This recovery works with the supervisor off and does not require another approval
 or mark the task complete. It preserves files, staging, commits and conversation
 history, and respects stopped tasks, active owners and sealed Git work. Retry
-therefore no longer remains stuck behind this failed activation's old reservation.
+therefore no longer remains stuck behind this failed activation's old reservation,
+even when the failed run ended before it recorded its Codex session ID.
 
 ### Restarting an unfinished task
 

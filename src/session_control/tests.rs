@@ -47,6 +47,8 @@ fn idle_interactive_handback_resumes_unfinished_automation_and_preserves_stops()
         "task-stopped",
         "done",
         "planning",
+        "queued-todo-unbound",
+        "stopped-todo-unbound",
         "external",
     ] {
         for stale in [false, true] {
@@ -56,7 +58,7 @@ fn idle_interactive_handback_resumes_unfinished_automation_and_preserves_stops()
             init_tasks(&project_root, false).unwrap();
             let status = match scenario {
                 "done" => TaskStatus::Done,
-                "planning" => TaskStatus::Todo,
+                "planning" | "queued-todo-unbound" | "stopped-todo-unbound" => TaskStatus::Todo,
                 _ => TaskStatus::Doing,
             };
             let content = if scenario == "task-stopped" {
@@ -71,22 +73,43 @@ fn idle_interactive_handback_resumes_unfinished_automation_and_preserves_stops()
                 .unwrap();
             let project = store.list_projects_blocking().unwrap().remove(0);
             if !matches!(scenario, "planning" | "external") {
-                store
-                    .create_git_finalization_blocking(agent::NewGitFinalization {
-                        project_id: project.id,
-                        codex_session_id: "session-handback",
-                        git_mode: AgentGitMode::Commit,
-                        starting_head: Some("1111111111111111111111111111111111111111"),
-                        branch_ref: Some("refs/heads/main"),
-                        upstream_ref: None,
-                        worktree_baseline: "{}",
-                        task_identity: Some(&durable_task_identity(content).unwrap()),
-                        owner_run_token: None,
-                        created_at: "100",
-                    })
-                    .unwrap();
+                if scenario.ends_with("todo-unbound") {
+                    store
+                        .mark_session_running_blocking(
+                            project.id,
+                            "session-handback",
+                            12345,
+                            "original-run",
+                            &root.join("run.out"),
+                            &root.join("run.err"),
+                        )
+                        .unwrap();
+                }
+                let task_identity = (!scenario.ends_with("todo-unbound"))
+                    .then(|| durable_task_identity(content).unwrap());
+                assert!(
+                    store
+                        .create_git_finalization_blocking(agent::NewGitFinalization {
+                            project_id: project.id,
+                            codex_session_id: "session-handback",
+                            git_mode: AgentGitMode::Commit,
+                            starting_head: Some("1111111111111111111111111111111111111111"),
+                            branch_ref: Some("refs/heads/main"),
+                            upstream_ref: None,
+                            worktree_baseline: "{}",
+                            task_identity: task_identity.as_deref(),
+                            owner_run_token: scenario
+                                .ends_with("todo-unbound")
+                                .then_some("original-run"),
+                            created_at: "100",
+                        })
+                        .unwrap()
+                );
             }
-            let has_control = matches!(scenario, "queued" | "stopped");
+            let has_control = matches!(
+                scenario,
+                "queued" | "stopped" | "queued-todo-unbound" | "stopped-todo-unbound"
+            );
             if has_control {
                 store
                     .set_session_control_recovery_token_blocking(
@@ -95,7 +118,7 @@ fn idle_interactive_handback_resumes_unfinished_automation_and_preserves_stops()
                         "original-run",
                     )
                     .unwrap();
-                if scenario == "stopped" {
+                if matches!(scenario, "stopped" | "stopped-todo-unbound") {
                     store
                         .set_session_control_state_blocking(
                             project.id,
@@ -126,7 +149,10 @@ fn idle_interactive_handback_resumes_unfinished_automation_and_preserves_stops()
             )
             .unwrap()
             .unwrap();
-            let resume = matches!(scenario, "idle" | "queued" | "stop-during");
+            let resume = matches!(
+                scenario,
+                "idle" | "queued" | "stop-during" | "queued-todo-unbound"
+            );
             assert_eq!(mode.resumes_exec(), resume, "{scenario}");
             let disposition = InteractiveGuardianDisposition::from_handoff(mode, &holder);
             let guardian = interactive_guardian_holder(disposition);

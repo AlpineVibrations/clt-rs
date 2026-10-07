@@ -9,6 +9,8 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 ### Fixed
 
 - Automatically recover failed task activation when a newly selected Todo was absent from the launch checkpoint. Retire the idle unbound attempt and start fresh without changing queue order, files, staging or commits, instead of leaving Retry stuck behind a stale ownership record.
+- Match early activation failures to their durable worker token when the run ended before recording a Codex session ID. Recover the linked task after an interactive session moved it into Doing, and allow an explicit restart of a stopped older handback, preserving staged work while starting a fresh Git boundary.
+- Preserve a queued unbound task's automatic recovery request when its Todo conversation is opened interactively and then closed; an explicitly stopped session remains stopped.
 
 - Let the blocked-task supervisor defer idle dependency waits to blocked Todo so ready work can proceed; preserve the waiting session and Git journal instead of repeatedly restoring it to Doing.
 - Keep queued blocked Git resume requests from taking the slot of ready prerequisite work.

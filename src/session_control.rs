@@ -1969,7 +1969,20 @@ fn reserve_idle_codex_session_interactive(
         if !task_entry_is_stopped(task)
             && !crate::task::task_content_is_interactive_done(&task.content));
     let journal = store.git_finalization_blocking(project_id, session_id)?;
-    let resumes_exec = unfinished
+    // A failed activation can leave a queued, unbound Git attempt linked in
+    // Todo. An interactive visit must not turn that queued recovery into an
+    // explicit stop merely because the task has not reached Doing yet.
+    let queued_unbound_recovery = matches!(tasks.as_slice(), [(TaskStatus::Todo, task)]
+        if !task_entry_is_stopped(task))
+        && control
+            .as_ref()
+            .is_some_and(|control| control.state == AgentSessionControlState::ResumeRequested)
+        && journal.as_ref().is_some_and(|journal| {
+            journal.state == agent::GitFinalizationState::Working
+                && journal.task_identity.is_none()
+                && journal.owner_run_token.is_some()
+        });
+    let resumes_exec = (unfinished || queued_unbound_recovery)
         && control
             .as_ref()
             .is_none_or(|control| control.state == AgentSessionControlState::ResumeRequested)
