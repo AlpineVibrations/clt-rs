@@ -1794,7 +1794,7 @@ pub(super) fn move_task_in_board_after_lock(
     } else {
         None
     };
-    if from != to {
+    if from != to && matches!(entry.source, TaskSource::Path { .. }) {
         ensure_status_conversion_allowed(board_dir, to)?;
     }
     // Publish the destination while still claimed. The shared board lock keeps

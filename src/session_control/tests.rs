@@ -5,6 +5,266 @@ use crate::tui::tests::tui_agent_project_for_test;
 use clt_database::turso;
 
 #[test]
+fn interactive_exec_handback_waits_while_the_project_is_paused() {
+    let root = temp_root("paused-exec-handback");
+    init_tasks(&root, false).unwrap();
+    let store = open_agent_store().unwrap();
+    store.register_project_blocking(&root, "project").unwrap();
+    let project = store.list_projects_blocking().unwrap().remove(0);
+    store
+        .set_project_enabled_blocking(project.id, false)
+        .unwrap();
+    store
+        .set_session_control_recovery_token_blocking(project.id, "session-paused", "original-run")
+        .unwrap();
+    let before = store
+        .session_control_blocking(project.id, "session-paused")
+        .unwrap();
+    super::run_agent_session_resume_worker(project.id, "session-paused").unwrap();
+    assert_eq!(
+        store
+            .session_control_blocking(project.id, "session-paused")
+            .unwrap(),
+        before
+    );
+    assert!(
+        store
+            .lease_for_project_blocking(project.id)
+            .unwrap()
+            .is_none()
+    );
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn idle_interactive_handback_resumes_unfinished_automation_and_preserves_stops() {
+    for scenario in [
+        "idle",
+        "queued",
+        "stopped",
+        "stop-during",
+        "task-stopped",
+        "done",
+        "planning",
+        "external",
+    ] {
+        for stale in [false, true] {
+            let root = temp_root("idle-interactive-handback");
+            let state = root.join("state");
+            let project_root = root.join("project");
+            init_tasks(&project_root, false).unwrap();
+            let status = match scenario {
+                "done" => TaskStatus::Done,
+                "planning" => TaskStatus::Todo,
+                _ => TaskStatus::Doing,
+            };
+            let content = if scenario == "task-stopped" {
+                "Unfinished task codex:session-handback clt:stopped"
+            } else {
+                "Unfinished task codex:session-handback"
+            };
+            insert_task(&project_root, status, None, content, None).unwrap();
+            let store = agent::TursoAgentStore::open_blocking(&state).unwrap();
+            store
+                .register_project_blocking(&project_root, "project")
+                .unwrap();
+            let project = store.list_projects_blocking().unwrap().remove(0);
+            if !matches!(scenario, "planning" | "external") {
+                store
+                    .create_git_finalization_blocking(agent::NewGitFinalization {
+                        project_id: project.id,
+                        codex_session_id: "session-handback",
+                        git_mode: AgentGitMode::Commit,
+                        starting_head: Some("1111111111111111111111111111111111111111"),
+                        branch_ref: Some("refs/heads/main"),
+                        upstream_ref: None,
+                        worktree_baseline: "{}",
+                        task_identity: Some(&durable_task_identity(content).unwrap()),
+                        owner_run_token: None,
+                        created_at: "100",
+                    })
+                    .unwrap();
+            }
+            let has_control = matches!(scenario, "queued" | "stopped");
+            if has_control {
+                store
+                    .set_session_control_recovery_token_blocking(
+                        project.id,
+                        "session-handback",
+                        "original-run",
+                    )
+                    .unwrap();
+                if scenario == "stopped" {
+                    store
+                        .set_session_control_state_blocking(
+                            project.id,
+                            "session-handback",
+                            AgentSessionControlState::Stopped,
+                        )
+                        .unwrap();
+                }
+            }
+            let holder = if has_control {
+                InteractiveAgentLease::holder_for_stopped_session()
+            } else {
+                InteractiveAgentLease::holder_for_idle_session()
+            };
+            let lease =
+                InteractiveAgentLease::try_acquire_with_holder_at(&state, project.id, &holder, 60)
+                    .unwrap()
+                    .unwrap();
+            let before = store
+                .git_finalization_blocking(project.id, "session-handback")
+                .unwrap();
+            let mode = super::reserve_idle_codex_session_interactive(
+                &store,
+                project.id,
+                "session-handback",
+                &holder,
+                has_control.then_some("original-run"),
+            )
+            .unwrap()
+            .unwrap();
+            let resume = matches!(scenario, "idle" | "queued" | "stop-during");
+            assert_eq!(mode.resumes_exec(), resume, "{scenario}");
+            let disposition = InteractiveGuardianDisposition::from_handoff(mode, &holder);
+            let guardian = interactive_guardian_holder(disposition);
+            assert!(
+                store
+                    .adopt_interactive_guardian_blocking(
+                        project.id,
+                        Some("session-handback"),
+                        &holder,
+                        &guardian,
+                        60
+                    )
+                    .unwrap()
+            );
+            if scenario == "stop-during" {
+                store
+                    .set_session_control_state_blocking(
+                        project.id,
+                        "session-handback",
+                        AgentSessionControlState::StopRequested,
+                    )
+                    .unwrap();
+            }
+            let expected_resume = resume && scenario != "stop-during";
+            if stale {
+                assert!(
+                    recover_stale_interactive_guardian_with_task(
+                        &store,
+                        project.id,
+                        "session-handback",
+                        &guardian,
+                        None,
+                        disposition
+                    )
+                    .unwrap()
+                );
+            } else {
+                assert_eq!(
+                    finish_interactive_guardian_after_reap(
+                        &store,
+                        project.id,
+                        "session-handback",
+                        &guardian,
+                        Duration::from_secs(60),
+                        disposition
+                    )
+                    .unwrap(),
+                    expected_resume
+                );
+            }
+            let control = store
+                .session_control_blocking(project.id, "session-handback")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                control.state,
+                if expected_resume {
+                    AgentSessionControlState::ResumeRequested
+                } else {
+                    AgentSessionControlState::Stopped
+                },
+                "{scenario}"
+            );
+            assert!(control.child_pid.is_none());
+            assert!(control.interactive_holder.is_none());
+            assert!(
+                store
+                    .lease_for_project_blocking(project.id)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                store
+                    .git_finalization_blocking(project.id, "session-handback")
+                    .unwrap(),
+                before
+            );
+            assert_eq!(
+                read_task_entries(&get_tasks_dir(&project_root), status).unwrap()[0]
+                    .content
+                    .trim(),
+                content
+            );
+            lease.release().unwrap();
+            drop(store);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+}
+
+#[test]
+fn idle_interactive_reservation_does_not_turn_a_concurrent_stop_into_exec_resume() {
+    let root = temp_root("idle-handback-concurrent-stop");
+    let store = agent::TursoAgentStore::open_blocking(&root.join("state")).unwrap();
+    let project_root = root.join("project");
+    fs::create_dir_all(&project_root).unwrap();
+    store
+        .register_project_blocking(&project_root, "project")
+        .unwrap();
+    let project = store.list_projects_blocking().unwrap().remove(0);
+    store
+        .set_session_control_recovery_token_blocking(project.id, "session", "original-run")
+        .unwrap();
+    let holder = InteractiveAgentLease::holder_for_stopped_session();
+    store
+        .try_acquire_lease_blocking(project.id, &holder, "100", "9999999999")
+        .unwrap();
+    store
+        .set_session_control_state_blocking(
+            project.id,
+            "session",
+            AgentSessionControlState::Stopped,
+        )
+        .unwrap();
+    assert!(
+        !store
+            .reserve_idle_session_interactive_for_state_blocking(
+                project.id,
+                "session",
+                &holder,
+                Some("original-run"),
+                Some(AgentSessionControlState::ResumeRequested)
+            )
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .session_control_blocking(project.id, "session")
+            .unwrap()
+            .unwrap()
+            .state,
+        AgentSessionControlState::Stopped
+    );
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn task_stop_without_a_control_record_preserves_links_and_skips_scheduling() {
     for folders in [false, true] {
         for registered in [false, true] {

@@ -961,12 +961,33 @@ impl TursoAgentStore {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn reserve_idle_session_interactive_blocking(
         &self,
         project_id: i64,
         codex_session_id: &str,
         interactive_holder: &str,
         expected_stopped_run_token: Option<&str>,
+    ) -> Result<bool> {
+        let state = self
+            .session_control_blocking(project_id, codex_session_id)?
+            .map(|control| control.state);
+        self.reserve_idle_session_interactive_for_state_blocking(
+            project_id,
+            codex_session_id,
+            interactive_holder,
+            expected_stopped_run_token,
+            state,
+        )
+    }
+
+    pub(crate) fn reserve_idle_session_interactive_for_state_blocking(
+        &self,
+        project_id: i64,
+        codex_session_id: &str,
+        interactive_holder: &str,
+        expected_stopped_run_token: Option<&str>,
+        expected_state: Option<AgentSessionControlState>,
     ) -> Result<bool> {
         self.blocking.block_on_persist(async {
             let conn = self.repositories.sessions_runs.connect().await?;
@@ -979,6 +1000,7 @@ impl TursoAgentStore {
                                 interactive_launch_token = NULL, updated_at = ?2
                           WHERE project_id = ?3 AND codex_session_id = ?4
                             AND state IN ('stopped', 'resume_requested')
+                            AND state = ?6
                             AND child_pid IS NULL
                             AND interactive_holder IS NULL
                             AND interactive_launch_token IS NULL
@@ -1009,7 +1031,8 @@ impl TursoAgentStore {
                         agent_timestamp(),
                         project_id,
                         codex_session_id,
-                        expected_stopped_run_token
+                        expected_stopped_run_token,
+                        expected_state.map(AgentSessionControlState::database_value)
                     ],
                 )
                 .await

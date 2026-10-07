@@ -848,6 +848,11 @@ pub(super) fn run_agent_session_resume_worker(project_id: i64, session_id: &str)
         .into_iter()
         .find(|project| project.id == project_id)
         .with_context(|| format!("Registered project {project_id} no longer exists"))?;
+    // Interactive handback may queue work while the user pauses the project.
+    // Leave that exact request for the scheduler when automation is enabled.
+    if !project.enabled {
+        return Ok(());
+    }
     let scan = scan_agent_project(&project.path);
     let blocked_task_count_before = scan.blocked_task_count();
     let done_task_contents_before = completed_task_contents(&project.path).unwrap_or_default();
@@ -1932,17 +1937,66 @@ pub(super) fn reserve_tui_idle_codex_session_interactive(
     session_id: &str,
     interactive_holder: &str,
     expected_stopped_run_token: Option<&str>,
-) -> Result<bool> {
+) -> Result<Option<InteractiveCodexResumeMode>> {
     let state_dir = ensure_agent_state_dir()?;
     with_agent_store_at(&state_dir, |store| {
-        let _lock = lock_project_without_manual_claim(store, project_id)?;
-        store.reserve_idle_session_interactive_blocking(
+        reserve_idle_codex_session_interactive(
+            store,
             project_id,
             session_id,
             interactive_holder,
             expected_stopped_run_token,
         )
     })
+}
+
+fn reserve_idle_codex_session_interactive(
+    store: &agent::TursoAgentStore,
+    project_id: i64,
+    session_id: &str,
+    interactive_holder: &str,
+    expected_stopped_run_token: Option<&str>,
+) -> Result<Option<InteractiveCodexResumeMode>> {
+    let (board, _lock) = lock_project_board(store, project_id)?;
+    anyhow::ensure!(
+        !crate::task::board_has_manual_task(&board)?,
+        "Project is reserved by a directly opened Codex session; use clt handoff to release it"
+    );
+    let control = store.session_control_blocking(project_id, session_id)?;
+    let mut tasks = Vec::new();
+    collect_codex_session_tasks_in_board(&board, session_id, &mut tasks)?;
+    let unfinished = matches!(tasks.as_slice(), [(TaskStatus::Doing, task)]
+        if !task_entry_is_stopped(task)
+            && !crate::task::task_content_is_interactive_done(&task.content));
+    let journal = store.git_finalization_blocking(project_id, session_id)?;
+    let resumes_exec = unfinished
+        && control
+            .as_ref()
+            .is_none_or(|control| control.state == AgentSessionControlState::ResumeRequested)
+        && journal
+            .as_ref()
+            .is_none_or(|journal| !journal.state.is_terminal())
+        && (journal.is_some()
+            || store
+                .session_git_mode_blocking(project_id, session_id)?
+                .is_some()
+            || store
+                .latest_output_run_for_codex_session_blocking(project_id, session_id)?
+                .is_some());
+    // Recheck the observed state in the reservation CAS: an intervening stop
+    // must never become an automatic handback just because its run token matches.
+    let reserved = store.reserve_idle_session_interactive_for_state_blocking(
+        project_id,
+        session_id,
+        interactive_holder,
+        expected_stopped_run_token,
+        control.map(|control| control.state),
+    )?;
+    Ok(reserved.then_some(if resumes_exec {
+        InteractiveCodexResumeMode::ResumeExec
+    } else {
+        InteractiveCodexResumeMode::WritableIdle
+    }))
 }
 
 pub(super) fn reserve_tui_shared_codex_session_interactive(

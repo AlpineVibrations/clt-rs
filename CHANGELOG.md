@@ -6,6 +6,13 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-10-07
+
+### Fixed
+
+- Return unfinished automated Doing tasks to the same exec session after an idle interactive visit, preserving explicit stops and leaving paused projects queued.
+- Allow Markdown task moves into a column containing another managed Git task without incorrectly treating the move as a storage conversion.
+
 ## [0.8.1] - 2026-10-06
 
 ### Fixed
@@ -403,7 +410,8 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 - Fixed task moves so destination write failures do not remove the source task.
 - Fixed TUI navigation on empty boards.
 
-[Unreleased]: https://github.com/AlpineVibrations/clt-rs/compare/v0.8.1...HEAD
+[Unreleased]: https://github.com/AlpineVibrations/clt-rs/compare/v0.8.2...HEAD
+[0.8.2]: https://github.com/AlpineVibrations/clt-rs/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/AlpineVibrations/clt-rs/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/AlpineVibrations/clt-rs/compare/v0.7.8...v0.8.0
 [0.7.8]: https://github.com/AlpineVibrations/clt-rs/compare/v0.7.7...v0.7.8

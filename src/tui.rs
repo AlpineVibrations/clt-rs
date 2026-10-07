@@ -5988,6 +5988,7 @@ pub(super) fn run_tui_codex_session_continue(
             &provisional_holder,
             stopped_run_token,
         )
+        .map(|reserved| reserved.then_some(InteractiveCodexResumeMode::WritableShared))
     } else {
         reserve_tui_idle_codex_session_interactive(
             target.project_id,
@@ -5996,26 +5997,27 @@ pub(super) fn run_tui_codex_session_continue(
             stopped_run_token,
         )
     };
-    if !reservation_result.as_ref().is_ok_and(|reserved| *reserved) {
+    if !reservation_result.as_ref().is_ok_and(|mode| mode.is_some()) {
         let release_result = interactive_lease.map_or(Ok(()), InteractiveAgentLease::release);
         return match (reservation_result, release_result) {
-            (Ok(false), Ok(())) if shares_project => anyhow::bail!(
+            (Ok(None), Ok(())) if shares_project => anyhow::bail!(
                 "The active project run or selected session changed before shared Codex could open; try again"
             ),
-            (Ok(false), Ok(())) => {
+            (Ok(None), Ok(())) => {
                 anyhow::bail!(
                     "This Codex session became busy before it could be reserved; try again"
                 )
             }
             (Err(error), Ok(())) => Err(error),
-            (Ok(false), Err(error)) => Err(error)
+            (Ok(None), Err(error)) => Err(error)
                 .context("The Codex session changed, and its project lease could not be released"),
             (Err(reserve_error), Err(release_error)) => Err(reserve_error).context(format!(
                 "The project lease also could not be released: {release_error}"
             )),
-            (Ok(true), _) => unreachable!(),
+            (Ok(Some(_)), _) => unreachable!(),
         };
     }
+    let resume_mode = reservation_result?.context("Interactive reservation disappeared")?;
 
     if require_resumable_task {
         let task_is_resumable = codex_session_task_supports_interactive_resume(
@@ -6064,11 +6066,7 @@ pub(super) fn run_tui_codex_session_continue(
         target.project_id,
         &target.session_id,
         &provisional_holder,
-        if shares_project {
-            InteractiveCodexResumeMode::WritableShared
-        } else {
-            InteractiveCodexResumeMode::WritableIdle
-        },
+        resume_mode,
     );
     wait_after_failed_codex_handoff(&resume_result);
     let _ =
@@ -6095,7 +6093,13 @@ pub(super) fn run_tui_codex_session_continue(
 
     Ok(match (resume_result, cancel_result, release_result) {
         (Ok(status), Ok(()), Ok(())) if status.success() => {
-            format!("Returned from Codex session for {label}; press c to open it again")
+            if resume_mode.resumes_exec() {
+                format!(
+                    "Returned from Codex session for {label}; the same task is queued for automated exec when its project is enabled"
+                )
+            } else {
+                format!("Returned from Codex session for {label}; press c to open it again")
+            }
         }
         (Ok(status), Ok(()), Ok(())) => format!("Codex session exited with status {status}"),
         (Err(error), Ok(()), Ok(())) => format!("Error: {error}"),

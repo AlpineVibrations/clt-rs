@@ -3,6 +3,88 @@ use crate::test_support::*;
 use crate::tui::tests::tui_agent_project_for_test;
 
 #[test]
+fn markdown_move_does_not_convert_or_reject_a_managed_destination_task() {
+    for folder_source in [false, true] {
+        let root = temp_root("move-past-working-destination");
+        init_tasks(&root, false).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let board_dir = root.join("tasks");
+        if folder_source {
+            convert_status_to_directory(&board_dir, TaskStatus::Doing).unwrap();
+        }
+        let board = TaskBoard::new(&board_dir);
+        board
+            .insert_content(TaskStatus::Doing, None, "UI-06 unfinished work")
+            .unwrap();
+        let content = "UI-07 waiting for UI-06. BLOCKED 2026-10-07: Prerequisite incomplete. codex:session-ui07";
+        board
+            .insert_content(TaskStatus::Todo, None, content)
+            .unwrap();
+        let store = open_agent_store().unwrap();
+        store.register_project_blocking(&root, "project").unwrap();
+        let project = store
+            .list_projects_blocking()
+            .unwrap()
+            .into_iter()
+            .find(|project| project.path == root)
+            .unwrap();
+        store
+            .set_project_enabled_blocking(project.id, false)
+            .unwrap();
+        store
+            .create_git_finalization_blocking(NewGitFinalization {
+                project_id: project.id,
+                codex_session_id: "session-ui07",
+                git_mode: AgentGitMode::Commit,
+                starting_head: Some("1111111111111111111111111111111111111111"),
+                branch_ref: Some("refs/heads/main"),
+                upstream_ref: None,
+                worktree_baseline: "{}",
+                task_identity: Some(&durable_task_identity(content).unwrap()),
+                owner_run_token: None,
+                created_at: "100",
+            })
+            .unwrap();
+        let before = store
+            .git_finalization_blocking(project.id, "session-ui07")
+            .unwrap();
+        let result = move_task_in_board(&board_dir, TaskStatus::Doing, TaskStatus::Todo, "1");
+        if folder_source {
+            // A real conversion still changes the protected task's storage.
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("managed Git journal")
+            );
+            assert_eq!(board.entries(TaskStatus::Doing).unwrap().len(), 1);
+            assert_eq!(board.entries(TaskStatus::Todo).unwrap().len(), 1);
+        } else {
+            result.unwrap();
+            assert!(board.entries(TaskStatus::Doing).unwrap().is_empty());
+            assert_eq!(
+                board.entry(TaskStatus::Todo, 2).unwrap().content.trim(),
+                "UI-06 unfinished work"
+            );
+        }
+        assert_eq!(
+            board.entry(TaskStatus::Todo, 1).unwrap().content.trim(),
+            content
+        );
+        assert!(board_dir.join("todo.md").is_file());
+        assert!(!board_dir.join("todo").exists());
+        assert_eq!(
+            store
+                .git_finalization_blocking(project.id, "session-ui07")
+                .unwrap(),
+            before
+        );
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
 fn reorder_working_task_preserves_recovery_after_returning_to_todo() {
     for folders in [false, true] {
         let root = temp_root("reorder-working-task");
