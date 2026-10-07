@@ -19,6 +19,7 @@ in [Feature Ideas](docs/FEATURE_IDEAS.md); they are not a list of shipped featur
   - [Project registration and settings](#project-registration-and-settings)
   - [Managed Git](#managed-git)
   - [Missing Git recovery records](#missing-git-recovery-records)
+  - [Restarting an unfinished task](#restarting-an-unfinished-task)
   - [Changing branches with unfinished Git tasks](#changing-branches-with-unfinished-git-tasks)
   - [Agent skills](#agent-skills)
   - [Scheduling and task recovery](#scheduling-and-task-recovery)
@@ -376,6 +377,42 @@ remain available with `codex resume <previous-session-id>`. Ordinary retries and
 restarting CLT cannot recreate the missing record; this action explicitly starts
 a new attempt from the current checkout instead.
 
+When a worker fails before activating a selected Todo because that task was added
+after the launch checkpoint, the scheduler automatically retires the idle,
+unbound attempt and queues a fresh conversation in the same position. The normal
+launch process checkpoints the current board and captures a new Git boundary.
+This recovery works with the supervisor off and does not require another approval
+or mark the task complete. It preserves files, staging, commits and conversation
+history, and respects stopped tasks, active owners and sealed Git work. Retry
+therefore no longer remains stuck behind this failed activation's old reservation.
+
+### Restarting an unfinished task
+
+If a task was mistakenly marked Done, or its idle conversation cannot continue,
+explicitly restart that task from the current checkout:
+
+```bash
+clt agent pause /path/to/project
+clt agent recover-task /path/to/project --restart --session <old-session-id>
+clt agent resume /path/to/project
+```
+
+The exact session is required. This queues the selected task first in Todo with a
+fresh conversation and Git boundary. Its old conversation ID remains in the notes;
+files, staging, commits and old Git records are preserved. A selected unsealed
+`WORKING` attempt is retired; a previously cancelled record stays unchanged. This
+also works after a successful supervisor assessment, without manufacturing a
+failed run. Backlog tasks must be promoted first.
+
+Recovery requires an idle project and refuses manual ownership, live workers,
+launch records, and sealed or verified Git work. Other unfinished `WORKING` tasks
+may remain only when they are blocked or stopped in Todo. For a dependency cycle
+in scheduling, return the waiting downstream task to Todo, then restart the
+unfinished prerequisite with this command. The supervisor also returns idle
+Doing dependency waits to blocked Todo automatically. A stopped downstream task
+remains stopped until explicitly restarted. Do not mark unfinished work Done to
+release its journal.
+
 ### Changing branches with unfinished Git tasks
 
 A managed task belongs to the branch recorded when it started. If you switch
@@ -446,17 +483,17 @@ Automated runs start Codex with `--sandbox danger-full-access --ask-for-approval
 
 ### Blocked-task supervisor
 
-The optional supervisor reviews execution blockers in Doing before CLT starts another task, and reviews queued blockers when no ready Todo work remains. Blocked Todo tasks waiting on prerequisites do not prevent a ready Todo from running, regardless of its position in the list. A saved review hold from a queued dependency wait is cleared when ready work can proceed. It defaults to off, the CLT default model, high thinking, and fast mode off. Configure it on the single line at the top of Agent Projects (`u` selects the line; `Space`, `m`, `t`, and `f` change its settings). Install the updated binary and restart the scheduler to use the feature.
+The optional supervisor reviews execution blockers in Doing before CLT starts another task, and reviews queued blockers when no ready Todo work remains. Blocked Todo tasks waiting on prerequisites do not prevent a ready Todo from running, regardless of its position in the list or an existing WORKING Git journal. Git recovery preserves that deliberate Todo placement and lets its queued resume request wait. A saved review hold from a queued dependency wait is cleared when ready work can proceed. It defaults to off, the CLT default model, high thinking, and fast mode off. Configure it on the single line at the top of Agent Projects (`u` selects the line; `Space`, `m`, `t`, and `f` change its settings). Install the updated binary and restart the scheduler to use the feature.
 
 After the implementation worker exits and saves its blocker evidence, a separate review worker takes the project's lease. It uses a read-only sandbox, the supervisor's model settings, and a three-minute deadline. It examines task notes, relevant project files and the latest available logs for each blocked task’s exact session, then returns one structured decision. Errors from other project sessions are not supplied as current failure evidence:
 
 - **Retry:** give the original task session a concrete new approach. CLT saves the decision before unblocking the task, restores returned Todo work to Doing, and passes the supervisor's direction to the original conversation. Its Git journal and partial work remain intact.
-- **Wait:** identify the missing prerequisite and what must change.
+- **Wait:** identify a real missing prerequisite and what must change. CLT returns an idle, unsealed Doing task to blocked Todo, preserving its blocker, session and journal, so ready prerequisite work can proceed. Explicitly stopped or owned sessions are not moved.
 - **User:** state the exact decision, permission, or input required.
 - **Replan:** propose a task split or reordering that preserves existing work.
 - **Repair:** identify an automation or session-state problem and a recovery step.
 
-Retry is the automatic action; the other decisions hold the project and show the reasoning and next action in the selected project's console. Replanning is a proposal, not an automatic rewrite of the task board. Resolve a prerequisite or answer a question in the task notes to provide new evidence, or press `r` on the project to request a fresh review explicitly. Unchanged task evidence reuses the saved decision instead of repeatedly launching a model. The supervisor allows at most two implementation retries before requiring user review; explicit `r` resets that budget. A crashed assessment can be attempted twice on the same evidence. Invalid, stale, failed, or timed-out assessments cannot authorize task changes.
+Retry and dependency-wait deferral are automatic actions. A queued wait holds only when no ready Todo remains. User, Replan and Repair decisions hold the project and show the reasoning and next action in the selected project's console. Replanning is a proposal, not an automatic rewrite of the task board. Resolve a prerequisite or answer a question in the task notes to provide new evidence, or press `r` on the project to request a fresh review explicitly. Unchanged task evidence reuses the saved decision instead of repeatedly launching a model. The supervisor allows at most two implementation retries before requiring user review; explicit `r` resets that budget. A crashed assessment can be attempted twice on the same evidence. Invalid, stale, failed, or timed-out assessments cannot authorize task changes.
 
 Supervisor settings and decisions survive scheduler restarts and registry recovery. Explicit stops, manual ownership, active leases, and sealed Git finalization retain their protections. Turning the supervisor off restores ordinary scheduling without deleting its saved decisions or changing task sessions. A review already running when it is switched off cannot apply its decision. Supervisor output remains available with the project's usual `l` log control.
 

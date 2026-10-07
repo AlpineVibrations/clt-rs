@@ -68,6 +68,7 @@ impl TursoAgentStore {
         expected_run_id: i64,
         expected_journal: Option<&GitFinalizationRecord>,
         require_resume_requested: bool,
+        restart: bool,
         holder: &str,
         acquired_at: &str,
         expires_at: &str,
@@ -77,10 +78,11 @@ impl TursoAgentStore {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).await?;
             anyhow::ensure!(query_count(&tx,
                 "SELECT COUNT(*) FROM runs WHERE id = ?1 AND project_id = ?2
-                 AND status IN ('failure', 'timeout')
+                 AND (?4 = 1 OR status IN ('failure', 'timeout'))
                  AND EXISTS (SELECT 1 FROM projects WHERE id = ?2 AND path = ?3)
-                 AND id = (SELECT MAX(id) FROM runs WHERE project_id = ?2)",
-                params![expected_run_id, project_id, project_path.to_string_lossy().as_ref()],
+                 AND id = (SELECT MAX(id) FROM runs WHERE project_id = ?2
+                    AND (?4 = 0 OR codex_session_id = ?5))",
+                params![expected_run_id, project_id, project_path.to_string_lossy().as_ref(), i64::from(restart), session_id],
             ).await? == 1, "The latest run changed; review recovery again");
             if let Some(expected) = expected_journal {
                 let mut rows = tx.query(
@@ -94,15 +96,20 @@ impl TursoAgentStore {
                 let current = rows.next().await?.map(|row| git_finalization_record_from_row(&row)).transpose()?;
                 anyhow::ensure!(current.as_ref() == Some(expected)
                     && expected.commit_oid.is_none()
-                    && (matches!(expected.state, GitFinalizationState::Working | GitFinalizationState::Tracking | GitFinalizationState::CommitPending)
-                        || expected.state == GitFinalizationState::Cancelled
-                            && expected.last_error.as_deref() == Some(AGENT_BRANCH_GIT_RECOVERY_REASON)),
+                    && (if restart {
+                        matches!(expected.state, GitFinalizationState::Working | GitFinalizationState::Cancelled)
+                    } else {
+                        matches!(expected.state, GitFinalizationState::Working | GitFinalizationState::Tracking | GitFinalizationState::CommitPending)
+                            || expected.state == GitFinalizationState::Cancelled
+                                && expected.last_error.as_deref() == Some(AGENT_BRANCH_GIT_RECOVERY_REASON)
+                    }),
                     "The Git recovery record changed or has a verified commit; review recovery again");
             }
             anyhow::ensure!(query_count(&tx,
                 "SELECT EXISTS (SELECT 1 FROM git_finalizations WHERE project_id = ?1
                     AND (codex_session_id = ?2 OR state NOT IN ('completed', 'cancelled'))
-                    AND NOT (?3 = 1 AND codex_session_id = ?2))
+                    AND NOT (?3 = 1 AND codex_session_id = ?2)
+                    AND NOT (?4 = 1 AND codex_session_id <> ?2 AND state = 'working'))
                  OR EXISTS (SELECT 1 FROM agent_git_launch_states WHERE project_id = ?1)
                  OR EXISTS (SELECT 1 FROM agent_workers WHERE project_id = ?1
                     AND state IN ('dispatching', 'running', 'finalizing'))
@@ -110,22 +117,38 @@ impl TursoAgentStore {
                  OR EXISTS (SELECT 1 FROM session_controls WHERE project_id = ?1
                     AND (child_pid IS NOT NULL OR interactive_holder IS NOT NULL
                          OR interactive_launch_token IS NOT NULL
-                         OR (state <> 'stopped' AND NOT (state = 'resume_requested' AND codex_session_id = ?2))))",
-                params![project_id, session_id, i64::from(expected_journal.is_some())],
+                         OR (state <> 'stopped' AND NOT (state = 'resume_requested' AND (codex_session_id = ?2 OR (?4 = 1 AND EXISTS (
+                             SELECT 1 FROM git_finalizations g WHERE g.project_id = ?1
+                               AND g.codex_session_id = session_controls.codex_session_id AND g.state = 'working')))))))",
+                params![project_id, session_id, i64::from(expected_journal.is_some()), i64::from(restart)],
             ).await? == 0,
                 "Recovery requires an idle project with no surviving Git journal or launch record. Stop active work and retry; existing recovery records are preserved");
+            if restart && require_resume_requested {
+                let expected = expected_journal.context("Automatic activation recovery needs its old journal")?;
+                anyhow::ensure!(expected.state == GitFinalizationState::Working
+                    && expected.task_identity.is_none() && expected.owner_run_token.is_some(),
+                    "Automatic activation recovery requires an unbound attempt");
+                anyhow::ensure!(query_count(&tx,
+                    "SELECT COUNT(*) FROM session_controls sc JOIN runs r ON r.project_id = sc.project_id
+                     WHERE sc.project_id = ?1 AND sc.codex_session_id = ?2
+                       AND sc.run_token = ?3 AND r.id = ?4 AND r.status = 'failure'
+                       AND r.finished_at IS NOT NULL AND r.codex_session_id = ?2
+                       AND EXISTS (SELECT 1 FROM projects p WHERE p.id = ?1 AND p.enabled = 1)",
+                    params![project_id, session_id, expected.owner_run_token.as_deref(), expected_run_id],
+                ).await? == 1, "The failed activation owner changed; preserving its attempt");
+            }
             if require_resume_requested {
                 anyhow::ensure!(query_count(&tx,
                     "SELECT COUNT(*) FROM session_controls WHERE project_id = ?1 AND codex_session_id = ?2 AND state = 'resume_requested'",
                     params![project_id, session_id],
                 ).await? == 1, "The session was stopped before automatic branch recovery; preserving its attempt");
             }
-            if expected_journal.is_some() {
+            if expected_journal.is_some_and(|journal| !restart || journal.state != GitFinalizationState::Cancelled) {
                 tx.execute(
                     "UPDATE git_finalizations SET state = 'cancelled', generation = generation + 1,
                         owner_run_token = NULL, last_error = ?3, updated_at = ?4,
                         completed_at = ?4 WHERE project_id = ?1 AND codex_session_id = ?2",
-                    params![project_id, session_id, AGENT_BRANCH_GIT_RECOVERY_REASON, acquired_at],
+                    params![project_id, session_id, if restart && require_resume_requested { "Automatically restarted failed task activation; old Git boundary preserved" } else if restart { "Owner explicitly restarted the unfinished task; old Git boundary preserved" } else { AGENT_BRANCH_GIT_RECOVERY_REASON }, acquired_at],
                 ).await?;
             }
             tx.execute(

@@ -380,3 +380,19 @@ fn agent_top_level_subcommands_parse() {
         assert!(matches!(cli.command, Some(Commands::Agent { .. })));
     }
 }
+
+#[test]
+fn explicit_task_restart_requires_an_exact_session() {
+    assert!(Cli::try_parse_from(["clt", "agent", "recover-task", "--restart"]).is_err());
+    assert!(
+        Cli::try_parse_from([
+            "clt",
+            "agent",
+            "recover-task",
+            "--restart",
+            "--session",
+            "old-session"
+        ])
+        .is_ok()
+    );
+}

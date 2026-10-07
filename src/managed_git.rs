@@ -34,8 +34,9 @@ use crate::{
         durable_task_identity, follow_up_matches_status, follow_up_session, get_status_store,
         get_tasks_dir, move_task_without_reordering_after_lock, read_task_entries,
         remove_task_entry_without_reordering, starts_with_task_note_date, task_content_is_blocked,
-        task_entry_is_ready, task_tree_contains_session_marker,
-        terminal_task_for_codex_session_in_board, title_from_path,
+        task_entry_is_blocked, task_entry_is_ready, task_entry_is_stopped,
+        task_tree_contains_session_marker, terminal_task_for_codex_session_in_board,
+        title_from_path,
     },
 };
 
@@ -657,6 +658,13 @@ pub(super) fn repair_working_git_task_link_with_lock_callbacks(
     }
     match linked.as_slice() {
         [(TaskStatus::Doing, _, _)] => return Ok(true),
+        [(TaskStatus::Todo, _, entry)]
+            if task_entry_is_blocked(entry) || task_entry_is_stopped(entry) =>
+        {
+            // Returning a dependency wait to Todo is intentional, not a lost
+            // activation. Keep its journal without undoing the deferral.
+            return Ok(true);
+        }
         [(TaskStatus::Todo, index, _)] => {
             move_task_without_reordering_after_lock(
                 &board_dir,

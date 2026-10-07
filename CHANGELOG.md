@@ -6,6 +6,17 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+### Fixed
+
+- Automatically recover failed task activation when a newly selected Todo was absent from the launch checkpoint. Retire the idle unbound attempt and start fresh without changing queue order, files, staging or commits, instead of leaving Retry stuck behind a stale ownership record.
+
+- Let the blocked-task supervisor defer idle dependency waits to blocked Todo so ready work can proceed; preserve the waiting session and Git journal instead of repeatedly restoring it to Doing.
+- Keep queued blocked Git resume requests from taking the slot of ready prerequisite work.
+
+### Added
+
+- `clt agent recover-task --restart --session <id>` explicitly queues an idle unfinished task first with a fresh conversation, including tasks mistakenly accepted as Done. Preserve files, staging, commits and historical journals; refuse active owners and sealed or verified Git work.
+
 ## [0.8.2] - 2026-10-07
 
 ### Fixed

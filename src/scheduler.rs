@@ -28,7 +28,10 @@ use crate::{
         AGENT_SUCCESS_COOLDOWN_SECONDS_ENV, AgentDaemonCheckinSource, AgentDaemonExecutor,
         AgentDaemonRun, AgentLeaseHolderLiveness, AgentProjectScan, AgentProjectScanStatus,
         AgentRunJob, AgentSchedulerPass, AgentSchedulerStart, AgentShutdownSignal,
-        AgentTaskSelection, git_recovery::recover_changed_branch_automatically,
+        AgentTaskSelection,
+        git_recovery::{
+            recover_changed_branch_automatically, recover_failed_activation_automatically,
+        },
         new_agent_shutdown_signal,
     },
     managed_git::{
@@ -242,7 +245,7 @@ pub(super) fn acquire_agent_job_stage(
                 .iter()
                 .any(|control| !crate::supervisor::control_allows_review(control))
         } else {
-            session_controls_suspend_project(&controls)
+            controls_suspend_ready_work(project, &controls)?
         };
         if suspended {
             with_agent_store_at(state_dir, |store| {
@@ -1095,6 +1098,27 @@ pub(super) fn run_agent_scheduler_pass_with_max_global_jobs(
         // can never be matched again, so leaving them pending would skip this
         // project forever with reason=active_lease.
         retire_abandoned_unbound_git_journals(state_dir, &project)?;
+        match with_agent_store_at(state_dir, |store| {
+            recover_failed_activation_automatically(store, &project)
+        }) {
+            Ok(Some(message)) => {
+                println!(
+                    "Project {}: action=task_activation_recovered {message}",
+                    project.name
+                );
+                // Recovery changed the task's session link. Re-scan before launch.
+                continue;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!(
+                    "Project {}: action=task_activation_recovery_wait error={error:#}",
+                    project.name
+                );
+                continue;
+            }
+        }
+
         let finalizations_before_reconcile = with_agent_store_at(state_dir, |store| {
             store.list_pending_git_finalizations_blocking(Some(project.id))
         })?;
@@ -1358,6 +1382,9 @@ pub(super) fn run_agent_scheduler_pass_with_max_global_jobs(
                 continue;
             };
             let eligible = status.is_active()
+                && !(status == TaskStatus::Todo
+                    && task_entry_is_blocked(&task)
+                    && crate::supervisor::queued_blockers_can_wait(&project)?)
                 && !task_entry_is_stopped(&task)
                 && (!task_entry_is_blocked(&task) || !blocked_recovery_backoff_active);
             if eligible {
@@ -1395,7 +1422,7 @@ pub(super) fn run_agent_scheduler_pass_with_max_global_jobs(
             Vec::new()
         };
         let has_suspended_session = resume_session_id.is_none()
-            && session_controls_suspend_project(&controls_after_initial_check);
+            && controls_suspend_ready_work(&project, &controls_after_initial_check)?;
         if has_suspended_session {
             println!(
                 "Project {}: action=skip reason=session_suspended todo={} doing={} scan_status={} path={}",
@@ -1924,13 +1951,19 @@ pub(super) fn resumable_codex_session_for_project(
     project: &agent::AgentProject,
     now: u64,
 ) -> Result<Option<String>> {
-    loop {
-        let Some(session_id) = with_agent_store_at(state_dir, |store| {
-            store.resume_requested_session_blocking(project.id)
-        })?
-        else {
-            return Ok(None);
-        };
+    let mut controls = with_agent_store_at(state_dir, |store| {
+        store.session_controls_for_project_blocking(project.id)
+    })?;
+    controls.sort_by(|a, b| {
+        (&a.updated_at, &a.codex_session_id).cmp(&(&b.updated_at, &b.codex_session_id))
+    });
+    for control in controls {
+        if control.state != AgentSessionControlState::ResumeRequested
+            || queued_resume_can_wait(project, &control)?
+        {
+            continue;
+        }
+        let session_id = control.codex_session_id;
         let git_finalization = with_agent_store_at(state_dir, |store| {
             store.git_finalization_blocking(project.id, &session_id)
         })?;
@@ -1991,6 +2024,43 @@ pub(super) fn resumable_codex_session_for_project(
             project.path.display()
         );
     }
+    Ok(None)
+}
+
+fn queued_resume_can_wait(
+    project: &agent::AgentProject,
+    control: &agent::AgentSessionControlRecord,
+) -> Result<bool> {
+    if control.state != AgentSessionControlState::ResumeRequested
+        || control.child_pid.is_some()
+        || control.interactive_holder.is_some()
+        || control.interactive_launch_token.is_some()
+        || !crate::supervisor::queued_blockers_can_wait(project)?
+    {
+        return Ok(false);
+    }
+    Ok(terminal_task_for_codex_session_in_board(
+        &get_tasks_dir(&project.path),
+        &control.codex_session_id,
+    )?
+    .is_some_and(|(status, task)| status == TaskStatus::Todo && task_entry_is_blocked(&task)))
+}
+
+fn controls_suspend_ready_work(
+    project: &agent::AgentProject,
+    controls: &[agent::AgentSessionControlRecord],
+) -> Result<bool> {
+    if !session_controls_suspend_project(controls) {
+        return Ok(false);
+    }
+    for control in controls {
+        if control.state != AgentSessionControlState::Stopped
+            && !queued_resume_can_wait(project, control)?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub(super) fn session_controls_suspend_project(

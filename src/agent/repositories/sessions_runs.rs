@@ -210,14 +210,30 @@ impl TursoAgentStore {
         project_id: i64,
         codex_session_id: &str,
     ) -> Result<Option<AgentRunRecord>> {
-        self.blocking
-            .block_on(self.latest_output_run_for_codex_session(project_id, codex_session_id))
+        self.blocking.block_on(self.latest_run_for_codex_session(
+            project_id,
+            codex_session_id,
+            true,
+        ))
     }
 
-    async fn latest_output_run_for_codex_session(
+    pub(crate) fn latest_run_for_codex_session_blocking(
         &self,
         project_id: i64,
         codex_session_id: &str,
+    ) -> Result<Option<AgentRunRecord>> {
+        self.blocking.block_on(self.latest_run_for_codex_session(
+            project_id,
+            codex_session_id,
+            false,
+        ))
+    }
+
+    async fn latest_run_for_codex_session(
+        &self,
+        project_id: i64,
+        codex_session_id: &str,
+        output_only: bool,
     ) -> Result<Option<AgentRunRecord>> {
         let conn = self.repositories.sessions_runs.connect().await?;
         let mut rows = conn
@@ -228,10 +244,10 @@ impl TursoAgentStore {
                  FROM runs r
                  JOIN projects p ON p.id = r.project_id
                  WHERE r.project_id = ?1 AND r.codex_session_id = ?2
-                   AND (r.stdout_path IS NOT NULL OR r.stderr_path IS NOT NULL)
+                   AND (?3 = 0 OR r.stdout_path IS NOT NULL OR r.stderr_path IS NOT NULL)
                  ORDER BY r.id DESC
                  LIMIT 1",
-                params![project_id, codex_session_id],
+                params![project_id, codex_session_id, i64::from(output_only)],
             )
             .await
             .with_context(|| {
@@ -2423,6 +2439,7 @@ impl TursoAgentStore {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn resume_requested_session_blocking(
         &self,
         project_id: i64,

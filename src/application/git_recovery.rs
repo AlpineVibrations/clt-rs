@@ -14,10 +14,10 @@ use crate::{
     task::{
         TASK_STATUSES, TASK_STOPPED_MARKER, TaskBoard, TaskEntry, TaskSource, TaskStatus,
         acquire_board_mutation_lock, board_has_manual_task, get_tasks_dir,
-        move_task_without_reordering_after_lock, read_task_entries,
+        move_task_without_reordering_after_lock, prioritize_task_after_lock, read_task_entries,
         recoverable_codex_session_id_from_task_content,
         task_content_without_recoverable_codex_session, task_content_without_stop_marker,
-        task_display_text, task_entry_is_stopped,
+        task_display_text, task_entry_is_blocked, task_entry_is_ready, task_entry_is_stopped,
     },
 };
 
@@ -41,6 +41,8 @@ pub(crate) struct GitRecoveryPlan {
     run_id: i64,
     journal: Option<GitFinalizationRecord>,
     current_branch: Option<String>,
+    restart: bool,
+    preactivation: bool,
 }
 
 #[derive(Clone)]
@@ -66,6 +68,12 @@ impl GitRecoveryPlan {
             );
         };
         let title: String = task_display_text(&linked.task).chars().take(160).collect();
+        if self.restart {
+            return format!(
+                "Restart {}: {}\nQueue a fresh attempt to finish this task? Files, staging, commits, the old conversation and Git journal are preserved. Only an unsealed idle attempt may be retired. [y/n]",
+                self.project.name, title,
+            );
+        }
         if let Some(journal) = &self.journal {
             return format!(
                 "Recover {}: {}\nRetire the old attempt on {} and queue a fresh Codex conversation on {} to review existing work? Files, staging, commits and the old journal are preserved. A provisional Done task returns to Todo for verification. [y/n]",
@@ -212,6 +220,8 @@ pub(crate) fn plan_git_recovery(
                 run_id: run.id,
                 journal: Some(journal),
                 current_branch,
+                restart: false,
+                preactivation: false,
             });
         }
     }
@@ -249,7 +259,117 @@ pub(crate) fn plan_git_recovery(
         run_id: run.id,
         journal,
         current_branch,
+        restart: false,
+        preactivation: false,
     })
+}
+
+/// An explicit restart is selected by exact session, independently of unrelated
+/// later supervisor runs. Never reopen a terminal journal or discard sealed proof.
+pub(crate) fn plan_task_restart(
+    store: &TursoAgentStore,
+    project: &AgentProject,
+    session: &str,
+) -> Result<GitRecoveryPlan> {
+    let board = get_tasks_dir(&project.path);
+    let _lock = acquire_board_mutation_lock(&board)?;
+    let mut tasks = Vec::new();
+    linked_tasks(&board, &mut tasks)?;
+    let mut selected = tasks.into_iter().filter(|(_, _, task)| {
+        recoverable_codex_session_id_from_task_content(&task.content) == Some(session)
+    });
+    let (board_dir, status, task) = selected
+        .next()
+        .context("No task links to the selected session")?;
+    anyhow::ensure!(
+        selected.next().is_none(),
+        "The conversation is linked to several tasks"
+    );
+    anyhow::ensure!(
+        status.is_active() || status == TaskStatus::Done,
+        "Move the selected task out of Backlog before restarting it"
+    );
+    let journal = store.git_finalization_blocking(project.id, session)?;
+    anyhow::ensure!(
+        journal.as_ref().is_none_or(|journal| {
+            journal.commit_oid.is_none()
+                && matches!(
+                    journal.state,
+                    GitFinalizationState::Working | GitFinalizationState::Cancelled
+                )
+        }),
+        "Cannot restart sealed or verified Git work; finish its existing finalization first"
+    );
+    let run = store
+        .latest_run_for_codex_session_blocking(project.id, session)?
+        .context("The selected session has no recorded task run")?;
+    Ok(GitRecoveryPlan {
+        project: project.clone(),
+        session_id: session.into(),
+        linked: Some(GitRecoveryTask {
+            task,
+            status,
+            board_dir,
+        }),
+        run_id: run.id,
+        journal,
+        current_branch: current_agent_git_branch(&project.path)?,
+        restart: true,
+        preactivation: false,
+    })
+}
+
+/// A selected Todo added after the launch checkpoint cannot activate against
+/// that old boundary. Retire only a failed, unbound attempt; the normal launch
+/// path will checkpoint the current board and capture a fresh boundary.
+pub(crate) fn recover_failed_activation_automatically(
+    store: &TursoAgentStore,
+    project: &AgentProject,
+) -> Result<Option<String>> {
+    for journal in store.list_pending_git_finalizations_blocking(Some(project.id))? {
+        if journal.state != GitFinalizationState::Working
+            || journal.task_identity.is_some()
+            || journal.commit_oid.is_some()
+        {
+            continue;
+        }
+        let session = &journal.codex_session_id;
+        let Some(run) = store.latest_run_for_codex_session_blocking(project.id, session)? else {
+            continue;
+        };
+        if run.status != "failure"
+            || run.finished_at.is_none()
+            || !run.summary.as_deref().is_some_and(|summary| summary.contains(
+                "requires the selected task to be committed exactly once in Todo or Doing before the task starts (found 0)"
+            ))
+        {
+            continue;
+        }
+        let Some(control) = store.session_control_blocking(project.id, session)? else {
+            continue;
+        };
+        if control.state != AgentSessionControlState::ResumeRequested
+            || control.child_pid.is_some()
+            || control.interactive_holder.is_some()
+            || control.interactive_launch_token.is_some()
+            || journal.owner_run_token.is_none()
+            || control.run_token != journal.owner_run_token
+        {
+            continue;
+        }
+        let mut plan = plan_task_restart(store, project, session)?;
+        if plan.journal.as_ref() != Some(&journal)
+            || plan.run_id != run.id
+            || !plan.linked.as_ref().is_some_and(|linked| {
+                linked.status == TaskStatus::Todo && task_entry_is_ready(&linked.task)
+            })
+        {
+            continue;
+        }
+        plan.preactivation = true;
+        return execute_git_recovery(store, &plan, true).map(Some);
+    }
+    Ok(None)
 }
 
 /// Explicit recovery or scheduler-owned branch recovery retires the old attempt.
@@ -317,8 +437,28 @@ fn execute_git_recovery(
         }).context("The task changed while recovery was being confirmed; press r to review it again")?;
         Ok((linked, board, index))
     }).transpose()?;
+    if plan.restart {
+        for journal in store.list_pending_git_finalizations_blocking(Some(plan.project.id))? {
+            if journal.codex_session_id == plan.session_id {
+                continue;
+            }
+            let linked: Vec<_> = linked_tasks_now
+                .iter()
+                .filter(|(_, _, task)| {
+                    recoverable_codex_session_id_from_task_content(&task.content)
+                        == Some(journal.codex_session_id.as_str())
+                })
+                .collect();
+            anyhow::ensure!(
+                journal.state == GitFinalizationState::Working
+                    && matches!(linked.as_slice(), [(_, TaskStatus::Todo, task)]
+                    if task_entry_is_blocked(task) || task_entry_is_stopped(task)),
+                "Another unfinished task owns this project; return its dependency wait to Todo before restarting the prerequisite"
+            );
+        }
+    }
     let holder = InteractiveAgentLease::holder_for_current_process();
-    if plan.journal.is_some() {
+    if plan.journal.is_some() || plan.restart {
         anyhow::ensure!(
             current_agent_git_branch(&plan.project.path)? == plan.current_branch,
             "The checkout branch changed while recovery was being confirmed; review recovery again"
@@ -331,13 +471,14 @@ fn execute_git_recovery(
         plan.run_id,
         plan.journal.as_ref(),
         require_resume_requested,
+        plan.restart,
         &holder,
         &agent_timestamp(),
         &agent_timestamp_after(60),
     )?;
     let result = (|| -> Result<String> {
         if let Some((linked, board, index)) = &selected
-            && (linked.status != TaskStatus::Done || plan.journal.is_some())
+            && (linked.status != TaskStatus::Done || plan.journal.is_some() || plan.restart)
         {
             // Keep the stopped old session attached through the move. A crash
             // before the final write leaves an explicitly stopped, retryable task.
@@ -354,7 +495,7 @@ fn execute_git_recovery(
                     index + 1,
                 )?;
             }
-            let todo = board
+            let mut todo = board
                 .entries(TaskStatus::Todo)?
                 .into_iter()
                 .find(|task| {
@@ -362,12 +503,29 @@ fn execute_git_recovery(
                         == Some(plan.session_id.as_str())
                 })
                 .context("The recovered task disappeared before it could be queued")?;
+            if plan.restart && !plan.preactivation {
+                prioritize_task_after_lock(&linked.board_dir, TaskStatus::Todo, &todo)?;
+                todo = board
+                    .entries(TaskStatus::Todo)?
+                    .into_iter()
+                    .next()
+                    .context("The restarted task disappeared before activation")?;
+                anyhow::ensure!(
+                    recoverable_codex_session_id_from_task_content(&todo.content)
+                        == Some(plan.session_id.as_str()),
+                    "Restarted task order changed"
+                );
+            }
             let original = task_content_without_recoverable_codex_session(
                 task_content_without_stop_marker(&todo.content),
             );
             // Do not use a codex: marker for the previous conversation: it is
             // history, and the next attempt must get its own session and journal.
-            let reason = if let Some(journal) = &plan.journal {
+            let reason = if plan.preactivation {
+                "the selected Todo was absent from the old launch checkpoint and its worker failed before activation; the unbound attempt was retired automatically".to_string()
+            } else if plan.restart {
+                "the owner explicitly restarted this unfinished task; the old attempt remains in history".to_string()
+            } else if let Some(journal) = &plan.journal {
                 format!(
                     "the checkout branch changed from {} to {}; the previous Git attempt was retired",
                     journal.branch_ref.as_deref().unwrap_or("detached HEAD"),
@@ -395,6 +553,7 @@ fn execute_git_recovery(
             .as_ref()
             .is_some_and(|linked| linked.status == TaskStatus::Done)
             && plan.journal.is_none()
+            && !plan.restart
         {
             format!(
                 "Accepted completed task in {} and stopped its obsolete retry. Files and commits were preserved.",

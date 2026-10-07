@@ -164,7 +164,7 @@ fn supervisor_reviews_before_downstream_work_then_retries_the_original_session()
 
 #[test]
 fn supervisor_waits_without_rechecking_unchanged_evidence_and_off_restores_normal_scheduling() {
-    for kind in ["wait", "user", "replan", "repair"] {
+    for kind in ["user", "replan", "repair"] {
         let (root, state, store, project) = fixture("supervisor-hold");
         enable(&store);
         let before = evidence(&project).unwrap();
@@ -518,6 +518,187 @@ fn supervisor_prompt_uses_only_the_blocked_tasks_exact_session_logs() {
     assert!(prompt.contains("original-session"));
     assert!(!prompt.contains("Old thread already has an active writer"));
     assert!(!prompt.contains("unrelated-writer.err"));
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn supervisor_wait_defers_work_and_runs_ready_prerequisite_with_journal_preserved() {
+    for folders in [false, true] {
+        let root = temp_root("supervisor-dependency-progress");
+        let state = root.join("state");
+        let path = root.join("project");
+        init_tasks(&path, folders).unwrap();
+        let board = TaskBoard::new(get_tasks_dir(&path));
+        let waiting = "UI-07 Stripe. BLOCKED 2026-10-07: Complete UI-06 first. codex:downstream";
+        board
+            .insert_content(TaskStatus::Doing, None, waiting)
+            .unwrap();
+        board
+            .insert_content(TaskStatus::Todo, None, "UI-06 Payments")
+            .unwrap();
+        initialize_test_git_repository(&path);
+        let store = agent::TursoAgentStore::open_blocking(&state).unwrap();
+        store.register_project_blocking(&path, "project").unwrap();
+        store
+            .set_project_git_mode_blocking(1, AgentGitMode::Commit)
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        let start = capture_agent_git_start_state(&path, AgentGitMode::Commit).unwrap();
+        store
+            .create_git_finalization_blocking(agent::NewGitFinalization {
+                project_id: project.id,
+                codex_session_id: "downstream",
+                git_mode: AgentGitMode::Commit,
+                starting_head: Some(&start.starting_head),
+                branch_ref: start.branch_ref.as_deref(),
+                upstream_ref: start.upstream_ref.as_deref(),
+                worktree_baseline: &start.worktree_baseline,
+                task_identity: durable_task_identity(waiting).as_deref(),
+                owner_run_token: None,
+                created_at: "100",
+            })
+            .unwrap();
+        store
+            .ensure_pending_git_finalization_resume_requested_blocking(project.id, "downstream")
+            .unwrap();
+        let journal = store
+            .git_finalization_blocking(project.id, "downstream")
+            .unwrap();
+        enable(&store);
+        begin_review(&store, &project).unwrap();
+        finish_review(
+            &store,
+            &project,
+            &result(
+                &root,
+                json!({
+                    "decision":"wait", "task":1, "reason":"UI-06 must finish first",
+                    "next_action":"Run UI-06, then resume UI-07"
+                }),
+            ),
+        )
+        .unwrap();
+        assert!(board.entries(TaskStatus::Doing).unwrap().is_empty());
+        let todo = board.entries(TaskStatus::Todo).unwrap();
+        assert_eq!(todo[1].content.trim_end(), waiting);
+        assert!(task_entry_is_blocked(&todo[1]));
+        assert_eq!(
+            store
+                .git_finalization_blocking(project.id, "downstream")
+                .unwrap(),
+            journal
+        );
+        // Several scans must not repair the waiting task back into Doing or
+        // let its saved Git resume request steal the next ready task's slot.
+        for _ in 0..2 {
+            let pass = run_agent_scheduler_pass(&state, false, &[]).unwrap();
+            assert_eq!(pass.jobs.len(), 1);
+            assert_eq!(pass.jobs[0].task_selection, AgentTaskSelection::NextTodo);
+            assert!(pass.jobs[0].resume_session_id.is_none());
+            store
+                .release_lease_blocking(project.id, &pass.jobs[0].holder)
+                .unwrap();
+            assert!(board.entries(TaskStatus::Doing).unwrap().is_empty());
+            assert_eq!(
+                store
+                    .git_finalization_blocking(project.id, "downstream")
+                    .unwrap(),
+                journal
+            );
+        }
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn supervisor_wait_without_ready_work_does_not_spin_or_override_stop() {
+    for stopped in [false, true] {
+        let (root, state, store, project) = fixture("supervisor-wait-no-work");
+        fs::write(project.path.join("tasks/todo.md"), "# Todo\n").unwrap();
+        if stopped {
+            store
+                .set_session_control_state_blocking(
+                    project.id,
+                    "original-session",
+                    AgentSessionControlState::Stopped,
+                )
+                .unwrap();
+        }
+        enable(&store);
+        begin_review(&store, &project).unwrap();
+        finish_review(
+            &store,
+            &project,
+            &result(
+                &root,
+                json!({
+                    "decision":"wait", "task":1, "reason":"External prerequisite unavailable",
+                    "next_action":"Resume once the prerequisite is available"
+                }),
+            ),
+        )
+        .unwrap();
+        for _ in 0..2 {
+            assert!(
+                run_agent_scheduler_pass(&state, false, &[])
+                    .unwrap()
+                    .jobs
+                    .is_empty()
+            );
+        }
+        assert_eq!(
+            read_task_entries(&get_tasks_dir(&project.path), TaskStatus::Doing)
+                .unwrap()
+                .len(),
+            usize::from(stopped)
+        );
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn old_wait_hold_gets_one_fresh_assessment_without_resetting_retry_budget() {
+    let (root, _, store, project) = fixture("supervisor-upgrade-wait");
+    enable(&store);
+    let mut old = begin_review(&store, &project).unwrap();
+    old.state = "held".into();
+    old.attempts = MAX_REVIEWS;
+    old.retries = 1;
+    old.decision = Some(Decision {
+        decision: DecisionKind::Wait,
+        task: 1,
+        reason: "Prerequisite is incomplete".into(),
+        next_action: "Run prerequisite first".into(),
+    });
+    store
+        .save_supervisor_review_blocking(project.id, &old)
+        .unwrap();
+    assert!(matches!(
+        gate(&store, &project, true).unwrap(),
+        Gate::Review
+    ));
+    let upgraded = begin_review(&store, &project).unwrap();
+    assert_eq!(upgraded.attempts, 1);
+    assert_eq!(upgraded.retries, 1);
+    finish_review(
+        &store,
+        &project,
+        &result(
+            &root,
+            json!({
+                "decision":"wait", "task":1, "reason":"Prerequisite is incomplete",
+                "next_action":"Run prerequisite first"
+            }),
+        ),
+    )
+    .unwrap();
+    assert!(matches!(
+        gate(&store, &project, true).unwrap(),
+        Gate::Normal
+    ));
     drop(store);
     fs::remove_dir_all(root).unwrap();
 }

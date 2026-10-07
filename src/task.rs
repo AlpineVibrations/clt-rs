@@ -2150,6 +2150,32 @@ pub(super) fn move_task_without_reordering_after_lock(
     move_task_without_reordering_with_after_destination(board_dir, from, to, task_index, || Ok(()))
 }
 
+/// Put only the selected task first. Other folder paths may belong to retained
+/// Git journals and must not be renamed as a side effect of recovery.
+pub(super) fn prioritize_task_after_lock(
+    board_dir: &Path,
+    status: TaskStatus,
+    entry: &TaskEntry,
+) -> Result<()> {
+    match &entry.source {
+        TaskSource::Path { path, .. } => {
+            let parent = path.parent().context("Task has no parent directory")?;
+            move_path_into_directory_without_reordering(path, parent, true)?;
+        }
+        TaskSource::MarkdownLine { .. } => {
+            let index = read_task_entries(board_dir, status)?
+                .iter()
+                .position(|task| task.source == entry.source && task.content == entry.content)
+                .context("Task disappeared before prioritization")?;
+            let StatusStore::MarkdownFile(path) = get_status_store(board_dir, status)? else {
+                anyhow::bail!("Task store changed before prioritization");
+            };
+            reorder_markdown_task(&path, index, 0)?;
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn move_task_without_reordering_with_after_destination(
     board_dir: &Path,
     from: TaskStatus,

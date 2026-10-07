@@ -10,7 +10,7 @@ use std::{
 use crate::runner::{AutomatedSupervisorSpec, run_automated_session_supervisor};
 use crate::{
     agent::{AgentGitMode, ensure_agent_state_dir, open_agent_store, open_agent_store_at},
-    application::git_recovery::{plan_git_recovery, recover_git_task},
+    application::git_recovery::{plan_git_recovery, plan_task_restart, recover_git_task},
     application::{
         AgentTaskSelection, ManagedTaskWorkflow, TaskDoneOutcome, clean_agent_state, expand_tasks,
         get_task_root, list_agent_projects, list_tasks, reconcile_agent_project,
@@ -198,6 +198,9 @@ enum AgentCommands {
         /// Select the previous conversation if the failed run is ambiguous.
         #[arg(long)]
         session: Option<String>,
+        /// Restart this exact idle task with a fresh conversation, preserving history.
+        #[arg(long, requires = "session")]
+        restart: bool,
     },
     /// Configures the git-commit skill for a registered project
     GitCommit {
@@ -653,7 +656,11 @@ fn handle_agent_command(command: AgentCommands, local: bool, default_root: &Path
             let state_dir = ensure_agent_state_dir()?;
             reconcile_agent_project(&state_dir, path.as_deref(), local, default_root)?;
         }
-        AgentCommands::RecoverTask { path, session } => {
+        AgentCommands::RecoverTask {
+            path,
+            session,
+            restart,
+        } => {
             let root = resolve_agent_project_root(path.as_deref(), local, default_root)?;
             let store = open_agent_store()?;
             let project = store
@@ -661,7 +668,15 @@ fn handle_agent_command(command: AgentCommands, local: bool, default_root: &Path
                 .into_iter()
                 .find(|project| project.path == root)
                 .with_context(|| format!("Project is not registered: {}", root.display()))?;
-            let plan = plan_git_recovery(&store, &project, session.as_deref())?;
+            let plan = if restart {
+                plan_task_restart(
+                    &store,
+                    &project,
+                    session.as_deref().context("Restart requires --session")?,
+                )?
+            } else {
+                plan_git_recovery(&store, &project, session.as_deref())?
+            };
             println!("{}", recover_git_task(&store, &plan)?);
         }
         AgentCommands::GitCommit { command } => {

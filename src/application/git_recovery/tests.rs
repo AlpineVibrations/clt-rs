@@ -421,6 +421,7 @@ fn recovery_resumes_an_interrupted_move_even_when_the_failed_run_has_no_session_
             plan.run_id,
             None,
             false,
+            false,
             "recovery",
             &agent_timestamp(),
             &agent_timestamp_after(60),
@@ -1240,6 +1241,506 @@ fn automatic_branch_recovery_preserves_task_stop_and_rechecks_session_stop() {
                 .entries(TaskStatus::Todo)
                 .unwrap()
                 .is_empty()
+        );
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn explicit_restart_recovers_cancelled_task_despite_later_supervisor_success() {
+    use super::plan_task_restart;
+    for folders in [false, true] {
+        let (root, store, project) = fixture(folders, TaskStatus::Doing);
+        let start = capture_agent_git_start_state(&project.path, AgentGitMode::Commit).unwrap();
+        let board = TaskBoard::new(get_tasks_dir(&project.path));
+        let original = board.entries(TaskStatus::Doing).unwrap().remove(0);
+        for (session, content) in [
+            (SESSION, original.content.as_str()),
+            (
+                "downstream",
+                "UI-07 Stripe. BLOCKED 2026-10-07: UI-06 is unfinished. codex:downstream",
+            ),
+        ] {
+            store
+                .create_git_finalization_blocking(NewGitFinalization {
+                    project_id: project.id,
+                    codex_session_id: session,
+                    git_mode: AgentGitMode::Commit,
+                    starting_head: Some(&start.starting_head),
+                    branch_ref: start.branch_ref.as_deref(),
+                    upstream_ref: start.upstream_ref.as_deref(),
+                    worktree_baseline: &start.worktree_baseline,
+                    task_identity: durable_task_identity(content).as_deref(),
+                    owner_run_token: None,
+                    created_at: "100",
+                })
+                .unwrap();
+            if session == SESSION {
+                store
+                    .compare_and_set_git_finalization_blocking(
+                        project.id,
+                        session,
+                        0,
+                        GitFinalizationState::Cancelled,
+                        None,
+                        None,
+                        Some("Externally completed"),
+                        "101",
+                    )
+                    .unwrap();
+            } else {
+                board
+                    .insert_content(TaskStatus::Todo, None, content)
+                    .unwrap();
+                store
+                    .ensure_pending_git_finalization_resume_requested_blocking(project.id, session)
+                    .unwrap();
+            }
+        }
+        store
+            .record_run_outcome_blocking(AgentRunOutcome {
+                project_id: project.id,
+                status: "success",
+                started_at: "103",
+                finished_at: Some("104"),
+                exit_code: Some(0),
+                log_dir: None,
+                stdout_path: None,
+                stderr_path: None,
+                summary: Some("Supervisor Wait: Complete UI-06 first"),
+                codex_session_id: Some("review-session"),
+            })
+            .unwrap();
+        let old = store
+            .git_finalization_blocking(project.id, SESSION)
+            .unwrap();
+        let downstream = store
+            .git_finalization_blocking(project.id, "downstream")
+            .unwrap();
+        let head = run_test_git(&project.path, &["rev-parse", "HEAD"]);
+        let index = run_test_git(&project.path, &["write-tree"]);
+        let plan = plan_task_restart(&store, &project, SESSION).unwrap();
+        recover_git_task(&store, &plan).unwrap();
+        let tasks = board.entries(TaskStatus::Todo).unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert!(task_entry_is_ready(&tasks[0]));
+        assert!(
+            tasks
+                .iter()
+                .any(|task| task_entry_is_ready(task) && task.content.contains(SESSION))
+        );
+        assert!(
+            tasks.iter().any(
+                |task| task_entry_is_blocked(task) && task.content.contains("codex:downstream")
+            )
+        );
+        assert_eq!(
+            store
+                .git_finalization_blocking(project.id, SESSION)
+                .unwrap(),
+            old
+        );
+        assert_eq!(
+            store
+                .git_finalization_blocking(project.id, "downstream")
+                .unwrap(),
+            downstream
+        );
+        assert_eq!(run_test_git(&project.path, &["rev-parse", "HEAD"]), head);
+        assert_eq!(run_test_git(&project.path, &["write-tree"]), index);
+        assert_eq!(
+            fs::read_to_string(project.path.join("feature.txt")).unwrap(),
+            "additional user changes\n"
+        );
+        assert!(recover_git_task(&store, &plan).is_err());
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn explicit_restart_rechecks_ownership_and_preserves_sealed_proof() {
+    use super::plan_task_restart;
+    for scenario in ["lease", "child", "changed-task", "sealed", "new-run"] {
+        let (root, store, project) = fixture(false, TaskStatus::Doing);
+        let plan = plan_task_restart(&store, &project, SESSION).unwrap();
+        let before = fs::read(project.path.join("tasks/doing.md")).unwrap();
+        match scenario {
+            "lease" => {
+                store
+                    .try_acquire_lease_blocking(
+                        project.id,
+                        "owner",
+                        &agent_timestamp(),
+                        &agent_timestamp_after(60),
+                    )
+                    .unwrap();
+            }
+            "child" => {
+                store
+                    .mark_session_running_blocking(
+                        project.id,
+                        SESSION,
+                        12345,
+                        "live",
+                        &root.join("live.out"),
+                        &root.join("live.err"),
+                    )
+                    .unwrap();
+            }
+            "changed-task" => {
+                fs::write(
+                    project.path.join("tasks/doing.md"),
+                    "# Doing\n- Different task\n",
+                )
+                .unwrap();
+            }
+            "sealed" => {
+                let start =
+                    capture_agent_git_start_state(&project.path, AgentGitMode::Commit).unwrap();
+                store
+                    .create_git_finalization_blocking(NewGitFinalization {
+                        project_id: project.id,
+                        codex_session_id: SESSION,
+                        git_mode: AgentGitMode::Commit,
+                        starting_head: Some(&start.starting_head),
+                        branch_ref: start.branch_ref.as_deref(),
+                        upstream_ref: None,
+                        worktree_baseline: &start.worktree_baseline,
+                        task_identity: durable_task_identity("Finish feature.").as_deref(),
+                        owner_run_token: None,
+                        created_at: "100",
+                    })
+                    .unwrap();
+                store
+                    .compare_and_set_git_finalization_blocking(
+                        project.id,
+                        SESSION,
+                        0,
+                        GitFinalizationState::Tracking,
+                        None,
+                        None,
+                        None,
+                        "101",
+                    )
+                    .unwrap();
+                assert!(plan_task_restart(&store, &project, SESSION).is_err());
+            }
+            "new-run" => {
+                store
+                    .record_run_outcome_blocking(AgentRunOutcome {
+                        project_id: project.id,
+                        status: "blocked",
+                        started_at: "105",
+                        finished_at: Some("106"),
+                        exit_code: Some(0),
+                        log_dir: None,
+                        stdout_path: None,
+                        stderr_path: None,
+                        summary: Some("New evidence"),
+                        codex_session_id: Some(SESSION),
+                    })
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        assert!(recover_git_task(&store, &plan).is_err(), "{scenario}");
+        if scenario != "changed-task" {
+            assert_eq!(
+                fs::read(project.path.join("tasks/doing.md")).unwrap(),
+                before
+            );
+        }
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+fn activation_fixture(folders: bool) -> (PathBuf, TursoAgentStore, AgentProject) {
+    let (root, store, project) = fixture(folders, TaskStatus::Todo);
+    let board = TaskBoard::new(get_tasks_dir(&project.path));
+    let task = board.entries(TaskStatus::Todo).unwrap().remove(0);
+    board
+        .write_entry_content(
+            TaskStatus::Todo,
+            &task,
+            &format!("Finish feature. codex:{SESSION}"),
+        )
+        .unwrap();
+    board
+        .insert_content(TaskStatus::Todo, Some(0), "Earlier queued work")
+        .unwrap();
+    let start = capture_agent_git_start_state(&project.path, AgentGitMode::Commit).unwrap();
+    store
+        .mark_session_running_blocking(
+            project.id,
+            SESSION,
+            12345,
+            "old-run",
+            &root.join("old.out"),
+            &root.join("old.err"),
+        )
+        .unwrap();
+    assert!(
+        store
+            .create_git_finalization_blocking(NewGitFinalization {
+                project_id: project.id,
+                codex_session_id: SESSION,
+                git_mode: AgentGitMode::Commit,
+                starting_head: Some(&start.starting_head),
+                branch_ref: start.branch_ref.as_deref(),
+                upstream_ref: None,
+                worktree_baseline: &start.worktree_baseline,
+                task_identity: None,
+                owner_run_token: Some("old-run"),
+                created_at: "100",
+            })
+            .unwrap()
+    );
+    store
+        .set_session_control_recovery_token_blocking(project.id, SESSION, "old-run")
+        .unwrap();
+    store.record_run_outcome_blocking(AgentRunOutcome {
+        project_id: project.id, status: "failure", started_at: "101", finished_at: Some("102"),
+        exit_code: None, log_dir: None, stdout_path: None, stderr_path: None,
+        summary: Some("Failed while observing the Codex run: Git-enabled automated work requires the selected task to be committed exactly once in Todo or Doing before the task starts (found 0)"),
+        codex_session_id: Some(SESSION),
+    }).unwrap();
+    (root, store, project)
+}
+
+#[test]
+fn scheduler_recovers_failed_activation_and_preserves_queue_and_checkout() {
+    for folders in [false, true] {
+        let (root, store, project) = activation_fixture(folders);
+        let head = run_test_git(&project.path, &["rev-parse", "HEAD"]);
+        let index = run_test_git(&project.path, &["write-tree"]);
+        let original = store
+            .git_finalization_blocking(project.id, SESSION)
+            .unwrap()
+            .unwrap();
+        let before = TaskBoard::new(get_tasks_dir(&project.path))
+            .entries(TaskStatus::Todo)
+            .unwrap();
+        let pass =
+            run_agent_scheduler_pass_with_max_global_jobs(&root.join("state"), false, &[], 1, None)
+                .unwrap();
+        assert!(pass.jobs.is_empty());
+        assert_eq!(pass.pass.skipped_active_lease, 0);
+        let journal = store
+            .git_finalization_blocking(project.id, SESSION)
+            .unwrap()
+            .unwrap();
+        assert_eq!(journal.state, GitFinalizationState::Cancelled);
+        assert_eq!(journal.starting_head, original.starting_head);
+        assert!(
+            journal
+                .last_error
+                .unwrap()
+                .contains("Automatically restarted")
+        );
+        let entries = TaskBoard::new(get_tasks_dir(&project.path))
+            .entries(TaskStatus::Todo)
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].content, before[0].content);
+        assert_eq!(entries[0].source, before[0].source);
+        assert_eq!(entries[1].source, before[1].source);
+        assert!(entries[1].content.contains("retired automatically"));
+        assert!(
+            entries[1]
+                .content
+                .contains(&format!("Previous Codex session: {SESSION}"))
+        );
+        assert!(recoverable_codex_session_id_from_task_content(&entries[1].content).is_none());
+        assert_eq!(run_test_git(&project.path, &["rev-parse", "HEAD"]), head);
+        assert_eq!(run_test_git(&project.path, &["write-tree"]), index);
+        assert_eq!(
+            fs::read_to_string(project.path.join("feature.txt")).unwrap(),
+            "additional user changes\n"
+        );
+        let next =
+            run_agent_scheduler_pass_with_max_global_jobs(&root.join("state"), false, &[], 1, None)
+                .unwrap();
+        assert_eq!(next.jobs.len(), 1);
+        assert_eq!(next.jobs[0].task_selection, AgentTaskSelection::NextTodo);
+        assert!(next.jobs[0].resume_session_id.is_none());
+        store
+            .release_lease_blocking(project.id, &next.jobs[0].holder)
+            .unwrap();
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn failed_activation_recovery_preserves_stops_owners_and_started_work() {
+    use super::recover_failed_activation_automatically;
+    for scenario in [
+        "stopped",
+        "paused",
+        "task-stop",
+        "blocked",
+        "doing",
+        "lease",
+        "interactive-next",
+        "bound",
+        "child",
+        "token",
+        "sealed",
+        "different-error",
+    ] {
+        let (root, store, project) = activation_fixture(false);
+        match scenario {
+            "paused" => {
+                store
+                    .set_project_enabled_blocking(project.id, false)
+                    .unwrap();
+            }
+            "stopped" => {
+                store
+                    .set_session_control_state_blocking(
+                        project.id,
+                        SESSION,
+                        AgentSessionControlState::Stopped,
+                    )
+                    .unwrap();
+            }
+            "task-stop" | "blocked" => {
+                let board = TaskBoard::new(get_tasks_dir(&project.path));
+                let task = board.entries(TaskStatus::Todo).unwrap().remove(1);
+                let content = if scenario == "task-stop" {
+                    format!("Finish feature. clt:stopped codex:{SESSION}")
+                } else {
+                    format!("Finish feature. BLOCKED 2026-10-07: needs input codex:{SESSION}")
+                };
+                board
+                    .write_entry_content(TaskStatus::Todo, &task, &content)
+                    .unwrap();
+            }
+            "doing" => {
+                move_task_without_reordering_after_lock(
+                    &get_tasks_dir(&project.path),
+                    TaskStatus::Todo,
+                    TaskStatus::Doing,
+                    2,
+                )
+                .unwrap();
+            }
+            "lease" => {
+                store
+                    .try_acquire_lease_blocking(
+                        project.id,
+                        "owner",
+                        &agent_timestamp(),
+                        &agent_timestamp_after(60),
+                    )
+                    .unwrap();
+            }
+            "child" => {
+                store
+                    .mark_session_running_blocking(
+                        project.id,
+                        SESSION,
+                        12345,
+                        "live",
+                        &root.join("live.out"),
+                        &root.join("live.err"),
+                    )
+                    .unwrap();
+            }
+            "token" => {
+                store
+                    .set_session_control_recovery_token_blocking(
+                        project.id,
+                        SESSION,
+                        "another-owner",
+                    )
+                    .unwrap();
+            }
+            "sealed" | "bound" => {
+                store
+                    .mark_session_running_blocking(
+                        project.id,
+                        SESSION,
+                        12345,
+                        "old-run",
+                        &root.join("old.out"),
+                        &root.join("old.err"),
+                    )
+                    .unwrap();
+                assert!(
+                    store
+                        .compare_and_set_git_finalization_with_identity_blocking(
+                            project.id,
+                            SESSION,
+                            0,
+                            if scenario == "sealed" {
+                                GitFinalizationState::Tracking
+                            } else {
+                                GitFinalizationState::Working
+                            },
+                            "Finish feature.",
+                            Some("old-run"),
+                            "103"
+                        )
+                        .unwrap()
+                );
+                store
+                    .set_session_control_recovery_token_blocking(project.id, SESSION, "old-run")
+                    .unwrap();
+            }
+            "interactive-next" => {
+                let holder =
+                    crate::session_control::InteractiveAgentLease::holder_for_shared_session(false);
+                assert!(
+                    store
+                        .reserve_shared_session_interactive_blocking(
+                            project.id,
+                            "next-task",
+                            &holder,
+                            None,
+                            false
+                        )
+                        .unwrap()
+                );
+            }
+            "different-error" => {
+                store
+                    .record_run_outcome_blocking(AgentRunOutcome {
+                        project_id: project.id,
+                        status: "failure",
+                        started_at: "103",
+                        finished_at: Some("104"),
+                        exit_code: None,
+                        log_dir: None,
+                        stdout_path: None,
+                        stderr_path: None,
+                        summary: Some("An unrelated implementation error"),
+                        codex_session_id: Some(SESSION),
+                    })
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let before = fs::read(project.path.join("tasks/todo.md")).unwrap();
+        let journal = store
+            .git_finalization_blocking(project.id, SESSION)
+            .unwrap();
+        let result = recover_failed_activation_automatically(&store, &project);
+        assert!(!matches!(result, Ok(Some(_))), "{scenario}");
+        assert_eq!(
+            fs::read(project.path.join("tasks/todo.md")).unwrap(),
+            before,
+            "{scenario}"
+        );
+        assert_eq!(
+            store
+                .git_finalization_blocking(project.id, SESSION)
+                .unwrap(),
+            journal,
+            "{scenario}"
         );
         drop(store);
         fs::remove_dir_all(root).unwrap();
