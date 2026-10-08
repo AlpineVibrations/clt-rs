@@ -24,7 +24,7 @@ in [Feature Ideas](docs/FEATURE_IDEAS.md); they are not a list of shipped featur
   - [Agent skills](#agent-skills)
   - [Scheduling and task recovery](#scheduling-and-task-recovery)
   - [Goals and blocked tasks](#goals-and-blocked-tasks)
-  - [Blocked-task supervisor](#blocked-task-supervisor)
+  - [Task supervisor](#task-supervisor)
   - [Background services and workers](#background-services-and-workers)
   - [Database recovery](#database-recovery)
   - [Service environment and state](#service-environment-and-state)
@@ -145,7 +145,7 @@ Press `Tab` to toggle between the task board and the full-screen Agent Projects 
 
 The daemon persists its own project-scan result separately from the TUI's local task count. If the background service cannot read a project, or a pending project is waiting after a failed run, the `AGENT` column shows `ERROR`, the row turns red, and selecting it shows the full cause and recovery guidance in the console. Retryable failures include their automatic-retry timing; after correcting the cause, press `r` to clear the cooldown and retry immediately. Missing Git starting records instead show `Git recovery available - press r`; `r` opens a [task recovery confirmation](#missing-git-recovery-records). External projects under `/Volumes` specifically direct macOS users to enable Full Disk Access for CLT and restart the agent; missing external projects instead prompt users to check that the drive is mounted. The `AGENT` column shows `INTERACTIVE` in full for a live guarded Codex handoff. This session reserves the project, so queued tasks wait until it releases the reservation. `FENCED` means CLT is preserving a handoff or lease reservation without claiming that an automated agent is running. `STALE` identifies a reservation whose generated owner process has exited; the daemon reclaims it once no matching session or worker still needs the fence. Selecting any of these rows explains the waiting state in the console. Press `s` directly on `INTERACTIVE` or session-backed `FENCED` rows to request a safe stop, or open its output with `l` for exact-session `s`/`i` controls.
 
-The single supervisor line above the project table has its own focus. Press `u` to select it, then `Space` toggles the supervisor, `m` cycles its model, `t` cycles thinking, and `f` toggles fast mode. `Esc`, `Enter`, or Down returns to the project list without changing its selection. These are global supervisor settings, separate from each project's worker settings. See [Blocked-task supervisor](#blocked-task-supervisor).
+The single supervisor line above the project table has its own focus. Press `u` to select it, then `Space` toggles the supervisor, `m` cycles its model, `t` cycles thinking, and `f` toggles fast mode. `Esc`, `Enter`, or Down returns to the project list without changing its selection. These are global supervisor settings, separate from each project's worker settings. See [Task supervisor](#task-supervisor).
 
 ### Task sessions and controls
 
@@ -497,7 +497,7 @@ Blocked-task recovery takes priority over fresh Todo work whenever its recovery 
 
 Automated runs start Codex with `--sandbox danger-full-access --ask-for-approval never --enable goals` so tasks can update Git metadata without pausing for interactive approval and `/goal` tasks can create persistent goals. This removes the Codex command sandbox for the entire run. Register only trusted repositories, or run the agent inside an externally isolated container or VM.
 
-### Blocked-task supervisor
+### Task supervisor
 
 The optional supervisor reviews execution blockers in Doing before CLT starts another task, and reviews queued blockers when no ready Todo work remains. Blocked Todo tasks waiting on prerequisites do not prevent a ready Todo from running, regardless of its position in the list or an existing WORKING Git journal. Git recovery preserves that deliberate Todo placement and lets its queued resume request wait. A saved review hold from a queued dependency wait is cleared when ready work can proceed. It defaults to off, the CLT default model, high thinking, and fast mode off. Configure it on the single line at the top of Agent Projects (`u` selects the line; `Space`, `m`, `t`, and `f` change its settings). Install the updated binary and restart the scheduler to use the feature.
 

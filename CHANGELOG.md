@@ -6,6 +6,10 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+### Changed
+
+- Rename the supervisor to “task supervisor” in its prompt, review label and documentation.
+
 ### Fixed
 
 - Recover stale, unbound Git attempts automatically when HEAD advances before activation, including blocked runs with no remaining session control. Perform this repair before saved supervisor holds so a repair recommendation cannot strand ready work; preserve commits, staging, task order and attempt history.
@@ -17,7 +21,7 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 - Match early activation failures to their durable worker token when the run ended before recording a Codex session ID. Recover the linked task after an interactive session moved it into Doing, and allow an explicit restart of a stopped older handback, preserving staged work while starting a fresh Git boundary.
 - Preserve a queued unbound task's automatic recovery request when its Todo conversation is opened interactively and then closed; an explicitly stopped session remains stopped.
 
-- Let the blocked-task supervisor defer idle dependency waits to blocked Todo so ready work can proceed; preserve the waiting session and Git journal instead of repeatedly restoring it to Doing.
+- Let the task supervisor defer idle dependency waits to blocked Todo so ready work can proceed; preserve the waiting session and Git journal instead of repeatedly restoring it to Doing.
 - Keep queued blocked Git resume requests from taking the slot of ready prerequisite work.
 
 ### Added

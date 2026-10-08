@@ -1779,7 +1779,7 @@ pub(super) fn build_agent_codex_prompt(
             prompt.push_str(AGENT_RESUME_SESSION_PROMPT_APPENDIX);
         }
         AgentTaskSelection::SupervisorReview => {
-            return "Read-only blocked-task supervisor review".into();
+            return "Read-only task supervisor review".into();
         }
     }
     match project.git_mode {
