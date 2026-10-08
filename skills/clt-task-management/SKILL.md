@@ -55,10 +55,10 @@ After moving the task to Doing, review pre-existing staged changes for task scop
 A Todo or other task-board edit added after the automated run starts may remain unstaged. Preserve it and continue finalization: CLT's exact staged-tree proof excludes that concurrent board work from the sealed task commit. Stage only the selected task's status transition, its explicit follow-up, or related hunks; never use a whole-board add when it would absorb the concurrent edit.
 
 ## Core Workflow
-The agent must adhere to the following state transition pipeline:
-`Backlog` → `Todo` → `Doing` → `Done`
+Queued work follows this state transition pipeline:
+`Todo` → `Doing` → `Done`
 
-1. **Capture/Triage**: Put work that is not ready in `backlog`. Backlog tasks are not eligible for automated agent runs.
+1. **Capture/Triage**: New queued tasks go in Todo. Use Backlog only when the user asks. Backlog tasks are not eligible for automated agent runs.
 2. **Identify/Create**: Add actionable requirements or bugs to `todo`, or promote a ready backlog task to `todo`.
 3. **Activate**: Inspect the selected task and applicable repository instructions, then move it from `todo` to `doing` before editing implementation files. For ordinary interactive work, finish pre-task Git sync/branch selection first. In an automated Git-enabled run, CLT already completed and froze that preparation before release; do not repeat or alter it.
 4. **Complete**: Once the task is verified and finished, move it from `doing` to `done`.
