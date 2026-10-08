@@ -1001,6 +1001,16 @@ pub(super) fn run_agent_scheduler_pass_with_max_global_jobs(
             continue;
         }
 
+        let mut existing_lease = agent_lease_for_project(state_dir, project.id)?;
+        reconcile_stale_agent_session_controls(
+            state_dir,
+            project.id,
+            existing_lease.as_ref(),
+            reclaim_current_process_leases,
+            now,
+        )?;
+        existing_lease = agent_lease_for_project(state_dir, project.id)?;
+        let scan = scan_agent_project(&project.path);
         let has_manual_task = match board_has_manual_task(&get_tasks_dir(&project.path)) {
             Ok(manual) => manual,
             Err(error) => {
@@ -1028,15 +1038,6 @@ pub(super) fn run_agent_scheduler_pass_with_max_global_jobs(
             );
             continue;
         }
-        let mut existing_lease = agent_lease_for_project(state_dir, project.id)?;
-        reconcile_stale_agent_session_controls(
-            state_dir,
-            project.id,
-            existing_lease.as_ref(),
-            reclaim_current_process_leases,
-            now,
-        )?;
-        existing_lease = agent_lease_for_project(state_dir, project.id)?;
         // A blocked outcome is reviewed before ordinary recovery can create
         // another resume request or activate downstream work. Sealed Git
         // finalization keeps its existing priority and ownership contract.
@@ -1097,7 +1098,16 @@ pub(super) fn run_agent_scheduler_pass_with_max_global_jobs(
         // guarded finalization lease is attempted. Their recorded owner token
         // can never be matched again, so leaving them pending would skip this
         // project forever with reason=active_lease.
-        retire_abandoned_unbound_git_journals(state_dir, &project)?;
+        if retire_abandoned_unbound_git_journals(state_dir, &project)? > 0 {
+            // Cancellation may have cleared this attempt's failure cooldown.
+            project = with_agent_store_at(state_dir, |store| {
+                store
+                    .list_projects_blocking()?
+                    .into_iter()
+                    .find(|candidate| candidate.id == project.id)
+                    .context("Project disappeared after retiring its obsolete attempt")
+            })?;
+        }
         match with_agent_store_at(state_dir, |store| {
             recover_failed_activation_automatically(store, &project)
         }) {
@@ -1621,16 +1631,11 @@ pub(super) fn reconcile_stale_agent_session_controls(
         !agent_lease_is_reclaimable(lease, reclaim_current_process_leases, now)
     });
 
-    if controls
-        .iter()
-        .any(|control| control.state == AgentSessionControlState::Stopped)
-    {
-        // Retry the board half if recovery crashed after releasing the exact
-        // guardian reservation but before restoring its Done entry.
-        with_agent_store_at(state_dir, |store| {
-            restore_idle_completed_interactive_tasks(store, project_id)
-        })?;
-    }
+    // Retry legacy board cleanup even when its idle control was already removed
+    // or mistakenly queued for automated recovery.
+    with_agent_store_at(state_dir, |store| {
+        restore_idle_completed_interactive_tasks(store, project_id)
+    })?;
     for control in controls {
         if control.state == AgentSessionControlState::ReadyInteractive
             && let Some(holder) = control.interactive_holder.as_deref()

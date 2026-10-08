@@ -654,7 +654,7 @@ fn abandoned_unbound_journal_with_a_live_owner_is_preserved() {
 }
 
 #[test]
-fn abandoned_unbound_journal_with_a_board_marker_is_preserved() {
+fn abandoned_unbound_journal_with_an_unfinished_board_marker_is_preserved() {
     let session_id: &'static str = "01a0b017-bbbb-7940-8327-edc1ee07b90c";
     let journal_owner = "1789660716-959806000-p20-marker";
     let fixture = abandoned_unbound_journal_fixture(
@@ -663,8 +663,8 @@ fn abandoned_unbound_journal_with_a_board_marker_is_preserved() {
         journal_owner,
     );
     fs::write(
-        get_tasks_dir(&fixture.project_root).join("done.md"),
-        format!("# Done Tasks\n- Completed work codex:{session_id}\n"),
+        get_tasks_dir(&fixture.project_root).join("doing.md"),
+        format!("# Doing Tasks\n- Unfinished work codex:{session_id}\n"),
     )
     .unwrap();
 
@@ -682,4 +682,148 @@ fn abandoned_unbound_journal_with_a_board_marker_is_preserved() {
     );
 
     fixture.cleanup();
+}
+
+#[test]
+fn completed_context_unbound_journal_does_not_block_next_todo() {
+    for legacy_marker in [false, true] {
+        let fixture = OrphanFixture::new("completed-context-next-todo", |_| {});
+        let now = agent_timestamp();
+        fixture.store.record_run_outcome_blocking(agent::AgentRunOutcome {
+            project_id: fixture.project.id, status: "failure", started_at: &now, finished_at: Some(&now),
+            exit_code: None, log_dir: None, stdout_path: None, stderr_path: None,
+            summary: Some("Git-enabled automated work requires the selected task to be committed exactly once in Todo or Doing before the task starts (found 0)"),
+            codex_session_id: Some(ORPHAN_SESSION_ID),
+        }).unwrap();
+        let board = get_tasks_dir(&fixture.project_root);
+        let content = format!("Completed work. codex:{ORPHAN_SESSION_ID}");
+        if legacy_marker {
+            fs::write(
+                board.join("doing.md"),
+                format!(
+                    "# Doing Tasks\n- {}\n",
+                    task_content_with_interactive_done_marker(&task_content_with_manual_session(
+                        &content,
+                        ORPHAN_SESSION_ID
+                    ))
+                ),
+            )
+            .unwrap();
+        } else {
+            fs::write(
+                board.join("done.md"),
+                format!("# Done Tasks\n- {content}\n"),
+            )
+            .unwrap();
+        }
+        add_task(&fixture.project_root, "Next real task", None).unwrap();
+        let head = run_test_git(&fixture.project_root, &["rev-parse", "HEAD"]);
+        let index = run_test_git(&fixture.project_root, &["write-tree"]);
+        let pass =
+            run_agent_scheduler_pass_with_max_global_jobs(&fixture.state_dir, false, &[], 1, None)
+                .unwrap();
+        assert_eq!(pass.jobs.len(), 1);
+        assert_eq!(
+            fixture.store.list_projects_blocking().unwrap()[0].failure_count,
+            0
+        );
+        assert_eq!(pass.jobs[0].task_selection, AgentTaskSelection::NextTodo);
+        assert!(pass.jobs[0].resume_session_id.is_none());
+        assert_eq!(
+            fixture.current_journal().state,
+            GitFinalizationState::Cancelled
+        );
+        assert!(
+            fixture
+                .store
+                .session_control_blocking(fixture.project.id, ORPHAN_SESSION_ID)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            read_task_entries(&board, TaskStatus::Doing)
+                .unwrap()
+                .is_empty()
+        );
+        let done = read_task_entries(&board, TaskStatus::Done).unwrap();
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].content.trim(), content);
+        assert_eq!(
+            run_test_git(&fixture.project_root, &["rev-parse", "HEAD"]),
+            head
+        );
+        assert_eq!(run_test_git(&fixture.project_root, &["write-tree"]), index);
+        fixture
+            .store
+            .release_lease_blocking(fixture.project.id, &pass.jobs[0].holder)
+            .unwrap();
+        drop(fixture.store);
+        fs::remove_dir_all(fixture.root).unwrap();
+    }
+}
+
+#[test]
+fn user_can_complete_unbound_attempt_without_repairing_git_metadata() {
+    for live in [false, true] {
+        let fixture = OrphanFixture::with_registered_path(
+            "external-done-unbound",
+            |path| fs::canonicalize(path).unwrap(),
+            |_| {},
+        );
+        let board = get_tasks_dir(&fixture.project_root);
+        fs::write(
+            board.join("doing.md"),
+            format!("# Doing Tasks\n- Finished manually. clt:manual codex:{ORPHAN_SESSION_ID}\n"),
+        )
+        .unwrap();
+        if live {
+            fixture
+                .store
+                .set_session_control_state_blocking(
+                    fixture.project.id,
+                    ORPHAN_SESSION_ID,
+                    AgentSessionControlState::Running,
+                )
+                .unwrap();
+        }
+        let result =
+            move_task_to_done_in_board_with_store(&board, TaskStatus::Doing, "1", &fixture.store);
+        if live {
+            assert!(result.is_err());
+            assert_eq!(fixture.current_journal(), fixture.journal);
+            assert_eq!(
+                read_task_entries(&board, TaskStatus::Doing).unwrap().len(),
+                1
+            );
+        } else {
+            assert_eq!(result.unwrap().as_deref(), Some(ORPHAN_SESSION_ID));
+            assert_eq!(
+                fixture.current_journal().state,
+                GitFinalizationState::Cancelled
+            );
+            assert!(fixture.current_journal().task_identity.is_none());
+            assert!(
+                read_task_entries(&board, TaskStatus::Doing)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(!board_has_manual_task(&board).unwrap());
+            assert!(
+                fixture
+                    .store
+                    .session_control_blocking(fixture.project.id, ORPHAN_SESSION_ID)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                fixture
+                    .store
+                    .lease_for_project_blocking(fixture.project.id)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        drop(fixture.store);
+        fs::remove_dir_all(fixture.root).unwrap();
+    }
 }

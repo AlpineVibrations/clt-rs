@@ -487,6 +487,7 @@ impl TursoAgentStore {
         project_id: i64,
         codex_session_id: &str,
         expected_generation: i64,
+        completed_task: bool,
         reason: &str,
         updated_at: &str,
     ) -> Result<bool> {
@@ -503,7 +504,7 @@ impl TursoAgentStore {
                     AND g.state = 'working' AND g.generation = ?3
                     AND g.task_identity IS NULL AND g.commit_oid IS NULL
                     AND g.completed_at IS NULL AND g.acknowledged_at IS NULL
-                    AND g.owner_run_token IS NOT NULL
+                    AND (g.owner_run_token IS NOT NULL OR ?5 = 1)
                     AND NOT EXISTS (
                         SELECT 1 FROM agent_workers w
                          WHERE w.project_id = ?1
@@ -516,13 +517,16 @@ impl TursoAgentStore {
                            AND owner.state IN ('dispatching', 'running', 'finalizing')
                     )
                     AND NOT EXISTS (
+                        SELECT 1 FROM agent_git_launch_states launch WHERE launch.project_id = ?1
+                    )
+                    AND NOT EXISTS (
                         SELECT 1 FROM leases l
                          WHERE l.project_id = ?1
                            AND CAST(l.expires_at AS INTEGER) > CAST(?4 AS INTEGER)
                     )
                     AND NOT EXISTS (
                         SELECT 1 FROM session_controls sc
-                         WHERE sc.project_id = ?1 AND sc.codex_session_id = ?2
+                         WHERE sc.project_id = ?1
                            AND (sc.child_pid IS NOT NULL
                                 OR sc.interactive_holder IS NOT NULL
                                 OR sc.interactive_launch_token IS NOT NULL
@@ -538,6 +542,7 @@ impl TursoAgentStore {
                     codex_session_id,
                     expected_generation,
                     updated_at,
+                    i64::from(completed_task),
                 ],
             )
             .await?
@@ -549,6 +554,8 @@ impl TursoAgentStore {
                     .context("Failed to finish rejecting a non-idle abandoned Git journal")?;
                 return Ok(false);
             }
+            clear_cancelled_attempt_failure(&transaction, project_id, codex_session_id, updated_at)
+                .await?;
             transaction
                 .execute(
                     "UPDATE git_finalizations
@@ -593,7 +600,7 @@ impl TursoAgentStore {
         project_id: i64,
         codex_session_id: &str,
         expected_generation: i64,
-        task_identity: &str,
+        task_identity: Option<&str>,
         lease_holder: &str,
         acquired_at: &str,
         expires_at: &str,
@@ -618,7 +625,7 @@ impl TursoAgentStore {
         project_id: i64,
         codex_session_id: &str,
         expected_generation: i64,
-        task_identity: &str,
+        task_identity: Option<&str>,
         lease_holder: &str,
         acquired_at: &str,
         expires_at: &str,
@@ -712,7 +719,7 @@ impl TursoAgentStore {
                       SELECT 1 FROM git_finalizations
                        WHERE project_id = ?1 AND codex_session_id = ?5
                          AND state = 'working' AND generation = ?6
-                         AND task_identity = ?7
+                         AND task_identity IS ?7
                          AND commit_oid IS NULL
                   )",
                 params![
@@ -736,6 +743,8 @@ impl TursoAgentStore {
             return Ok(false);
         }
 
+        clear_cancelled_attempt_failure(&transaction, project_id, codex_session_id, acquired_at)
+            .await?;
         let changed = transaction
             .execute(
                 "UPDATE git_finalizations
@@ -744,7 +753,7 @@ impl TursoAgentStore {
                         updated_at = ?2, completed_at = ?2
                   WHERE project_id = ?3 AND codex_session_id = ?4
                     AND state = 'working' AND generation = ?5
-                    AND task_identity = ?6",
+                    AND task_identity IS ?6",
                 params![
                     cancellation.reason(),
                     acquired_at,
@@ -1926,4 +1935,33 @@ impl TursoAgentStore {
                 Ok(true)
             })
     }
+}
+
+// A cancelled attempt must not leave its project displaying a retryable failure
+// or cooling down unrelated work. Retain diagnostics in run history and leave
+// a newer failure from another session untouched.
+async fn clear_cancelled_attempt_failure(
+    conn: &Connection,
+    project_id: i64,
+    session: &str,
+    updated_at: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE projects SET failure_count = 0, last_failure_at = NULL,
+             last_blocked_recovery_at = NULL, updated_at = ?3
+         WHERE id = ?1 AND EXISTS (
+             SELECT 1 FROM runs r
+             WHERE r.id = (SELECT MAX(id) FROM runs WHERE project_id = ?1)
+               AND r.status = 'failure' AND r.finished_at = projects.last_failure_at
+               AND (r.codex_session_id = ?2 OR EXISTS (
+                   SELECT 1 FROM agent_workers w JOIN git_finalizations g
+                     ON g.project_id = w.project_id AND g.owner_run_token = w.worker_token
+                   WHERE w.run_id = r.id AND g.project_id = ?1 AND g.codex_session_id = ?2
+               ))
+         )",
+        params![project_id, session, updated_at],
+    )
+    .await
+    .context("Failed to clear the cancelled attempt's retry cooldown")?;
+    Ok(())
 }

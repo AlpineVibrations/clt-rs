@@ -8,6 +8,9 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ### Fixed
 
+- Keep completed tasks in Done when opening context for discussion, without automatic claims or retries. Restore legacy interactive tasks stranded in Doing after their owner exits.
+- Allow explicit Done moves after activation failed before assigning a task identity. Retire idle unbound attempts linked to completed tasks so the next Codex Todo is no longer blocked by obsolete Git bookkeeping.
+
 - Automatically recover failed task activation when a newly selected Todo was absent from the launch checkpoint. Retire the idle unbound attempt and start fresh without changing queue order, files, staging or commits, instead of leaving Retry stuck behind a stale ownership record.
 - Match early activation failures to their durable worker token when the run ended before recording a Codex session ID. Recover the linked task after an interactive session moved it into Doing, and allow an explicit restart of a stopped older handback, preserving staged work while starting a fresh Git boundary.
 - Preserve a queued unbound task's automatic recovery request when its Todo conversation is opened interactively and then closed; an explicitly stopped session remains stopped.

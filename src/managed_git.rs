@@ -24,7 +24,7 @@ use crate::{
         agent_lease_for_project, agent_lease_holder_liveness, agent_lease_renew_interval,
         remaining_agent_delay,
     },
-    session_control::InteractiveAgentLease,
+    session_control::{InteractiveAgentLease, collect_codex_session_tasks_in_board},
     task::{
         CODEX_TASK_SESSION_PREFIX, StatusStore, TASK_DETAIL_FILES, TASK_STATUSES, TaskBoard,
         TaskEntry, TaskSource, TaskStatus, acquire_board_mutation_lock,
@@ -420,9 +420,10 @@ pub(super) fn cancel_orphaned_working_git_finalization_with_before_lock(
 }
 
 /// Retire unbound journals whose owning run already ended and whose session no
-/// longer has any board marker. A run that stops before claiming a task leaves
-/// exactly this shape behind; its recorded owner token belongs to a finished
-/// run, so the ordinary owner-fenced retirement can never match it again and
+/// longer has an unfinished task (completed conversation links are preserved).
+/// A run that stops before claiming a task leaves exactly this shape behind;
+/// its owner token belongs to a finished run, so owner-fenced retirement
+/// can never match it again and
 /// the project would otherwise stay wedged forever.
 pub(super) fn retire_abandoned_unbound_git_journals(
     state_dir: &Path,
@@ -446,7 +447,12 @@ pub(super) fn retire_abandoned_unbound_git_journals(
     let _mutation_lock = acquire_board_mutation_lock(&board_dir)?;
     let mut retired = 0;
     for journal in candidates {
-        if task_tree_contains_session_marker(&board_dir, &journal.codex_session_id)? {
+        let mut linked = Vec::new();
+        collect_codex_session_tasks_in_board(&board_dir, &journal.codex_session_id, &mut linked)?;
+        if (linked.is_empty()
+            && task_tree_contains_session_marker(&board_dir, &journal.codex_session_id)?)
+            || (!linked.is_empty() && !matches!(linked.as_slice(), [(TaskStatus::Done, _)]))
+        {
             continue;
         }
         let done = with_agent_store_at(state_dir, |store| {
@@ -454,6 +460,7 @@ pub(super) fn retire_abandoned_unbound_git_journals(
                 project.id,
                 &journal.codex_session_id,
                 journal.generation,
+                !linked.is_empty(),
                 AGENT_ABANDONED_UNBOUND_JOURNAL_REASON,
                 &agent_timestamp(),
             )

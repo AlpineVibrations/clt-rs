@@ -236,7 +236,7 @@ fn configure_completed_task_interactive_command(command: &mut Command, session_i
         .env_remove(AGENT_RUN_TOKEN_ENV)
         .env("CLT_INTERACTIVE_TASK_SESSION", session_id)
         .arg(format!(
-            "CLT interactive continuation: The user reopened the completed task linked to codex:{session_id}. CLT has moved that same task from Done to Doing and reserved this exact session for interactive work. Continue under the user's new requests in this conversation, preserving its task and session identity. Earlier automated launch, one-task, and Git-finalization instructions belong to the finished run; they do not apply to this interactive continuation. Do not create a replacement or stopped tracking task, call clt start or clt claim, or attach this session to another task. Use clt list doing to locate the existing task, preserve its clt:interactive-done marker and terminal codex:{session_id} link when adding notes, and use clt done doing <current-index> after finishing requested work. CLT also returns this task to Done when the user exits this interactive session. The old automated Git journal remains terminal; do not reconstruct it, create a second CLT-Task commit for it, or assume permission to commit or push new work. Wait for the user's next request."
+            "CLT interactive continuation: The user opened the completed task linked to codex:{session_id} for discussion. The task remains in Done. Opening context does not authorize implementation, a manual claim, a status change, or an automated run or retry. Earlier automated launch, one-task, and Git-finalization instructions do not apply to this interactive continuation; existing run records retain their original controls. Do not create a replacement or stopped tracking task, call clt start or clt claim, or attach this session to another task merely to chat. Preserve the task and its terminal codex:{session_id} link. Only change task content or begin new work when the user explicitly asks. Preserve existing Git journals and completion proof; do not reconstruct them, create another CLT-Task commit, or assume permission to commit or push new work. Wait for the user's next request."
         ));
 }
 
@@ -1188,13 +1188,18 @@ pub(super) fn run_guarded_interactive_codex(
 
     let disposition = InteractiveGuardianDisposition::from_guardian_holder(guardian_holder)
         .context("Interactive Codex guardian has an unrecognized holder")?;
-    let reopened_done = !matches!(disposition, InteractiveGuardianDisposition::ResumeExec)
-        && completed::reopen_completed_task(store, project.id, session_id, guardian_holder)?;
+    let completed_context = !matches!(disposition, InteractiveGuardianDisposition::ResumeExec)
+        && completed::prepare_completed_task_context(
+            store,
+            project.id,
+            session_id,
+            guardian_holder,
+        )?;
     let mut terminal_foreground = InteractiveTerminalForeground::capture(&terminal_input)?;
     let codex_command = agent_codex_command();
     let mut target = Command::new(&codex_command);
     configure_interactive_codex_resume_command(&mut target, &project.path, session_id);
-    if reopened_done {
+    if completed_context {
         configure_completed_task_interactive_command(&mut target, session_id);
     }
     if let Some(provider) = store.resolve_credential_provider_blocking(project)? {

@@ -377,7 +377,8 @@ fn completed_interactive_resume_supplies_current_task_context_without_automated_
     super::configure_completed_task_interactive_command(&mut command, "session-completed");
     let prompt = command.get_args().last().unwrap().to_str().unwrap();
     assert!(prompt.contains("codex:session-completed"));
-    assert!(prompt.contains("same task from Done to Doing"));
+    assert!(prompt.contains("task remains in Done"));
+    assert!(prompt.contains("does not authorize implementation"));
     assert!(prompt.contains("Do not create a replacement or stopped tracking task"));
     assert!(prompt.contains("do not apply to this interactive continuation"));
     let envs = command.get_envs().collect::<Vec<_>>();
@@ -3918,7 +3919,7 @@ fn shared_interactive_resume_preserves_manual_owner_through_exit_and_reopen() {
                     .unwrap()
             );
             assert!(
-                super::completed::reopen_completed_task(
+                super::completed::prepare_completed_task_context(
                     &store,
                     project_id,
                     "session-completed",
@@ -3928,12 +3929,11 @@ fn shared_interactive_resume_preserves_manual_owner_through_exit_and_reopen() {
             );
             assert_eq!(
                 read_task_entries(&board, TaskStatus::Doing).unwrap().len(),
-                2
+                1
             );
-            assert!(
-                read_task_entries(&board, TaskStatus::Done)
-                    .unwrap()
-                    .is_empty()
+            assert_eq!(
+                read_task_entries(&board, TaskStatus::Done).unwrap().len(),
+                1
             );
             assert!(
                 store

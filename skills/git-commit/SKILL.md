@@ -168,14 +168,13 @@ For managed Git automation, directory-backed status moves preserve the existing 
 
 ## Automated CLT Finalization
 
-These instructions apply to an unfinished automated run. When CLT reopens a
-completed task interactively, it returns that same entry to Doing and supplies
-`CLT_INTERACTIVE_TASK_SESSION`. Continue the existing task under the user's new
-instructions; do not create a replacement tracking task or revive the terminal
-Git journal. Finish with `clt done`, or let CLT return the entry to Done on
-interactive exit. Commit or push follow-up changes only when the user requests
-it, using the ordinary interactive workflow and without another `CLT-Task`
-trailer for the completed automated run.
+These instructions apply to an unfinished automated run. Opening a completed
+task interactively leaves it in Done and supplies `CLT_INTERACTIVE_TASK_SESSION`.
+Discuss the existing task without claiming it, changing status, or reviving its
+terminal Git journal. Begin follow-up implementation only when explicitly
+requested. Commit or push follow-up changes only when the user requests it,
+using the ordinary interactive workflow without another `CLT-Task` trailer for
+the completed automated run.
 
 When an automated CLT prompt enables `commit` or `commit-and-push` mode, `clt done` starts a durable task finalization. The task may already appear in the Done store, but that move is provisional while CLT reports `FINALIZING`.
 

@@ -163,14 +163,16 @@ On the task board, select a Todo, Doing, or Done task, then press `c` to open it
 
 When an automated Codex run moves its selected task from Todo to Doing, CLT saves a terminal `codex:<session-id>` marker as part of that board update, including when Git automation is off. The marker uses the exact session registered for that run; activation fails if the task or session already belongs to different work. This internal marker survives task moves and wording changes, is hidden in task lists, the TUI, and the task editor, and is the task-to-session resume link. While a run is active, the database also records that session's exact run generation and log paths so `l`, stop, and interrupt target the correct live process. Completed run history retains the session ID without associating it to mutable task text. A run is reported as failed if CLT cannot persist the marker on its completed or blocked task.
 
-Opening a completed task with `c` moves that same task from Done to Doing before
-Codex starts. Continue the follow-up in its existing conversation; CLT supplies
-the current task context, so the agent does not need to create or claim another
-tracking task. The entry returns to Done when the requested work is marked
-complete or when you exit the interactive session. Failed launches and recovered
-guardian crashes also restore Done. The original completion notes, conversation,
-and completed Git proof are preserved. Todo planning and interactive takeover of
-unfinished automated work keep their existing behavior.
+Opening a completed task with `c` leaves it in Done and opens the existing
+conversation for discussion. It does not claim the task, add `[MANUAL]`, or
+schedule automated work or retries. The agent receives this context and waits
+for your request; implementation and status changes require an explicit request.
+Completion notes, the conversation link, and completed Git proof are preserved.
+Legacy tasks left in Doing with an interactive-completion marker are returned to
+Done once their interactive owner is gone. An idle failed attempt that never
+started work cannot keep a completed task or the project's next Todo blocked.
+Todo planning and interactive takeover of unfinished automated work retain their
+existing controls.
 
 ### Service heartbeat and logs
 
@@ -464,7 +466,7 @@ clt agent run --once
 
 The scheduler scans enabled projects, picks projects with pending unblocked `todo` tasks, takes an agent lease, and starts one Codex run at a time. A foreground `run --once` owns its run directly through a unique durable inline-worker generation, so its crash and pre-session launch boundaries use the same fencing model. On macOS and Linux, the continuous daemon instead hands each run to a unique launchd job or transient systemd user service. That worker owns lease renewal, the Codex process, task/session finalization, and the run record; the scheduler is free to stop immediately after dispatch. Each normal Codex run is prompted to inspect the board, move one available task to `doing`, complete it, run relevant checks, update the task through `clt`, and stop after that single task.
 
-When a human moves an idle session-linked task to Done while its journal is still `WORKING`, CLT treats that move as explicit acceptance of externally completed work. The session marker identifies the journal even if the user edited the task text or committed the work manually. CLT checks the original journal identity, generation and ownership under a short project fence, cancels the obsolete working journal, and reports external completion. Before checking that fence, it reconciles workers proven to have exited and leases held by dead processes, so stale records do not require waiting for the scheduler. A live worker, session or lease prevents the override. Sealed `FINALIZING` and `PUSH-PENDING` proof must still complete normally; a user move cannot discard it. If the board move is interrupted after cancellation, the scheduler preserves that decision and does not resume the old session. Completed or reaped session logs show `LATEST` even when a project reservation still exists.
+When a human moves an idle session-linked task to Done while its journal is still `WORKING`, CLT treats that move as explicit acceptance of externally completed work. The session marker identifies the journal even if the user edited the task text or committed the work manually. You do not need to repair or commit task metadata before making this move. CLT checks the saved session, journal generation and ownership under a short project fence (including attempts that failed before acquiring a task identity), cancels the obsolete working journal, and reports external completion. Before checking that fence, it reconciles workers proven to have exited and leases held by dead processes, so stale records do not require waiting for the scheduler. A live worker, session or lease prevents the override. Sealed `FINALIZING` and `PUSH-PENDING` proof must still complete normally; a user move cannot discard it. If the board move is interrupted after cancellation, the scheduler preserves that decision and does not resume the old session. Completed or reaped session logs show `LATEST` even when a project reservation still exists.
 
 If the externally completed task is already in Done, pause the project with `clt agent pause .` and stop any active task run with `s` in the TUI. Once the project is idle, run `clt list done` and then `clt done done <index>` from a normal terminal. CLT accepts the completed task and cancels its stale `WORKING` journal without moving or rewriting the board entry or creating a Git commit. Repeating the command is harmless. Resume scheduling with `clt agent resume .` after acceptance. This recovery requires the task's saved session marker and does not override an active owner or sealed commit proof.
 

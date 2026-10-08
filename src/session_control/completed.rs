@@ -1,6 +1,5 @@
-//! A completed task temporarily returns to Doing while its saved conversation
-//! is open. The board marker survives guardian crashes; session controls still
-//! own the process and prevent automated recovery of this interactive work.
+//! Completed conversations leave the board unchanged. Legacy interactive-done
+//! markers are restored after their exact guardian exits or is proven absent.
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -11,8 +10,8 @@ use crate::{
     task::{
         TaskBoard, TaskEntry, TaskSource, TaskStatus, convert_status_to_directory,
         read_task_entries, recoverable_codex_session_id_from_task_content,
-        task_content_is_interactive_done, task_content_with_interactive_done_marker,
-        task_content_without_interactive_done_marker,
+        task_content_is_interactive_done, task_content_without_interactive_done_marker,
+        task_content_without_manual_marker,
     },
 };
 
@@ -77,48 +76,35 @@ fn linked_task(board: &Path, session: &str, destination: TaskStatus) -> Result<O
     Ok(tasks.pop())
 }
 
-pub(super) fn reopen_completed_task(
+pub(super) fn prepare_completed_task_context(
     store: &TursoAgentStore,
     project_id: i64,
     session: &str,
     guardian_holder: &str,
 ) -> Result<bool> {
-    let (project_board, _lock) = lock_project_board(store, project_id)?;
+    let (board, _lock) = lock_project_board(store, project_id)?;
     let control = store
         .session_control_blocking(project_id, session)?
-        .context("Interactive session control disappeared before reopening its task")?;
+        .context("Interactive session control disappeared before opening task context")?;
     anyhow::ensure!(
         control.state == AgentSessionControlState::Interactive
             && control.interactive_holder.as_deref() == Some(guardian_holder)
             && control.interactive_launch_token.as_deref() == Some(guardian_holder)
             && control.child_pid.is_none(),
-        "Interactive session ownership changed before reopening its task"
+        "Interactive session ownership changed before opening task context"
     );
-    let Some((board, status, index, task)) =
-        linked_task(&project_board, session, TaskStatus::Doing)?
-    else {
+    let mut tasks = Vec::new();
+    collect_linked_tasks(&board, Some(session), &mut tasks)?;
+    anyhow::ensure!(
+        tasks.len() <= 1,
+        "This Codex session belongs to multiple tasks; resolve duplicate links before continuing"
+    );
+    let Some((_, status, _, _)) = tasks.first() else {
         return Ok(false);
     };
-    if status != TaskStatus::Done {
-        return Ok(task_content_is_interactive_done(&task.content));
-    }
-    anyhow::ensure!(
-        store
-            .git_finalization_blocking(project_id, session)?
-            .is_none_or(|journal| journal.state.is_terminal()),
-        "This task is still finalizing its automated Git work; finish that run before reopening Done"
-    );
-    // Convert a mixed manual layout before marking the task. Folder moves then
-    // preserve every other task's filename and order.
-    prepare_destination(&board, &task, TaskStatus::Doing)?;
-    let task_board = TaskBoard::new(&board);
-    task_board.write_entry_content(
-        status,
-        &task,
-        &task_content_with_interactive_done_marker(&task.content),
-    )?;
-    task_board.move_task_without_reordering_after_lock(status, TaskStatus::Doing, index)?;
-    Ok(true)
+    // Provisional Done still belongs to its unfinished run. Merely reading its
+    // conversation neither changes that contract nor attempts Git finalization.
+    Ok(*status == TaskStatus::Done)
 }
 
 fn prepare_destination(board: &Path, task: &TaskEntry, destination: TaskStatus) -> Result<()> {
@@ -148,7 +134,9 @@ pub(super) fn restore_completed_task_after_lock(board: &Path, session: &str) -> 
     task_board.write_entry_content(
         status,
         &task,
-        &task_content_without_interactive_done_marker(&task.content),
+        &task_content_without_manual_marker(&task_content_without_interactive_done_marker(
+            &task.content,
+        )),
     )
 }
 
@@ -175,6 +163,24 @@ pub(super) fn restore_completed_task_for_guardian(
 
 pub(super) fn restore_idle_completed_tasks(store: &TursoAgentStore, project_id: i64) -> Result<()> {
     let (board, _lock) = lock_project_board(store, project_id)?;
+    // Reconciliation also runs for paused/missing projects. Do not initialize
+    // a replacement board merely to look for a legacy marker.
+    if !crate::task::TASK_STATUSES
+        .into_iter()
+        .any(|status| crate::task::status_store_exists(&board, status))
+    {
+        return Ok(());
+    }
+    if store
+        .list_active_workers_blocking()?
+        .iter()
+        .any(|worker| worker.project_id == project_id)
+        || store
+            .git_launch_state_for_project_blocking(project_id)?
+            .is_some()
+    {
+        return Ok(());
+    }
     let mut tasks = Vec::new();
     collect_linked_tasks(&board, None, &mut tasks)?;
     for (_, _, _, task) in tasks {
@@ -182,12 +188,22 @@ pub(super) fn restore_idle_completed_tasks(store: &TursoAgentStore, project_id: 
             .context("Reopened task lost its saved conversation")?;
         if store
             .session_control_blocking(project_id, session)?
-            .is_some_and(|control| {
-                control.state == AgentSessionControlState::Stopped
-                    && control.child_pid.is_none()
+            .is_none_or(|control| {
+                matches!(
+                    control.state,
+                    AgentSessionControlState::Stopped | AgentSessionControlState::ResumeRequested
+                ) && control.child_pid.is_none()
                     && control.interactive_holder.is_none()
                     && control.interactive_launch_token.is_none()
             })
+            && store
+                .git_finalization_blocking(project_id, session)?
+                .is_none_or(|journal| {
+                    journal.state.is_terminal()
+                        || (journal.state == crate::agent::GitFinalizationState::Working
+                            && journal.task_identity.is_none()
+                            && journal.commit_oid.is_none())
+                })
         {
             restore_completed_task_after_lock(&board, session)?;
         }

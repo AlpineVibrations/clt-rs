@@ -1630,10 +1630,7 @@ fn mutate_user_managed_task_with_store_after_lock(
             cancellation.action(),
         );
     }
-    let bound_identity = finalization
-        .task_identity
-        .as_deref()
-        .context("The Working Git journal has no durable task identity")?;
+    let bound_identity = finalization.task_identity.as_deref();
     // The user selects the saved session even after editing its task text.
     // Cancel against the original identity and generation; automated completion
     // still requires its exact task payload and sealed commit.

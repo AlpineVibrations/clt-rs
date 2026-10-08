@@ -276,7 +276,7 @@ fn interrupted_user_delete_stops_recovery_and_can_be_retried() {
                 journal.project_id,
                 "session-deletion",
                 journal.generation,
-                journal.task_identity.as_deref().unwrap(),
+                journal.task_identity.as_deref(),
                 "delete-test-fence",
                 "100",
                 "101",
