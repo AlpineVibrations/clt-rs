@@ -8,6 +8,7 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ### Fixed
 
+- Recover stale, unbound Git attempts automatically when HEAD advances before activation, including blocked runs with no remaining session control. Perform this repair before saved supervisor holds so a repair recommendation cannot strand ready work; preserve commits, staging, task order and attempt history.
 - Default new queued tasks to Todo in the task-management skill; use Backlog only when the user asks.
 - Keep completed tasks in Done when opening context for discussion, without automatic claims or retries. Restore legacy interactive tasks stranded in Doing after their owner exits.
 - Allow explicit Done moves after activation failed before assigning a task identity. Retire idle unbound attempts linked to completed tasks so the next Codex Todo is no longer blocked by obsolete Git bookkeeping.

@@ -393,6 +393,15 @@ history, and respects stopped tasks, active owners and sealed Git work. Retry
 therefore no longer remains stuck behind this failed activation's old reservation,
 even when the failed run ended before it recorded its Codex session ID.
 
+The scheduler also recovers an unbound attempt when HEAD advanced on the same
+branch before activation and the exact task run finished failed, blocked, or timed
+out. This works even if its old session-control row has already been cleared.
+CLT retires the stale journal, records the old conversation in task history, and
+queues a fresh attempt without changing files, staging, commits, or queue order.
+This repair runs before supervisor review and saved holds, so a previous Repair
+decision cannot prevent it. Explicit stops, manual claims, live owners, new launch
+records, bound task work and sealed proof remain protected.
+
 ### Restarting an unfinished task
 
 If a task was mistakenly marked Done, or its idle conversation cannot continue,
@@ -500,7 +509,7 @@ After the implementation worker exits and saves its blocker evidence, a separate
 - **Replan:** propose a task split or reordering that preserves existing work.
 - **Repair:** identify an automation or session-state problem and a recovery step.
 
-Retry and dependency-wait deferral are automatic actions. A queued wait holds only when no ready Todo remains. User, Replan and Repair decisions hold the project and show the reasoning and next action in the selected project's console. Replanning is a proposal, not an automatic rewrite of the task board. Resolve a prerequisite or answer a question in the task notes to provide new evidence, or press `r` on the project to request a fresh review explicitly. Unchanged task evidence reuses the saved decision instead of repeatedly launching a model. The supervisor allows at most two implementation retries before requiring user review; explicit `r` resets that budget. A crashed assessment can be attempted twice on the same evidence. Invalid, stale, failed, or timed-out assessments cannot authorize task changes.
+Retry and dependency-wait deferral are automatic actions. The scheduler handles supported pre-activation Git repairs before applying supervisor holds. A queued wait holds only when no ready Todo remains. User, Replan and remaining Repair decisions hold the project and show the reasoning and next action in the selected project's console. Replanning is a proposal, not an automatic rewrite of the task board. Resolve a prerequisite or answer a question in the task notes to provide new evidence, or press `r` on the project to request a fresh review explicitly. Unchanged task evidence reuses the saved decision instead of repeatedly launching a model. The supervisor allows at most two implementation retries before requiring user review; explicit `r` resets that budget. A crashed assessment can be attempted twice on the same evidence. Invalid, stale, failed, or timed-out assessments cannot authorize task changes.
 
 Supervisor settings and decisions survive scheduler restarts and registry recovery. Explicit stops, manual ownership, active leases, and sealed Git finalization retain their protections. Turning the supervisor off restores ordinary scheduling without deleting its saved decisions or changing task sessions. A review already running when it is switched off cannot apply its decision. Supervisor output remains available with the project's usual `l` log control.
 

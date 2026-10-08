@@ -1038,6 +1038,44 @@ pub(super) fn run_agent_scheduler_pass_with_max_global_jobs(
             );
             continue;
         }
+        // Retire task-less journals whose owning run already ended before the
+        // guarded finalization lease is attempted. Their recorded owner token
+        // can never be matched again, so leaving them pending would skip this
+        // project forever with reason=active_lease.
+        if retire_abandoned_unbound_git_journals(state_dir, &project)? > 0 {
+            // Cancellation may have cleared this attempt's failure cooldown.
+            project = with_agent_store_at(state_dir, |store| {
+                store
+                    .list_projects_blocking()?
+                    .into_iter()
+                    .find(|candidate| candidate.id == project.id)
+                    .context("Project disappeared after retiring its obsolete attempt")
+            })?;
+        }
+
+        // Repair proven pre-activation failures before a saved supervisor hold
+        // can prevent the scheduler from reaching its own recovery path.
+        match with_agent_store_at(state_dir, |store| {
+            recover_failed_activation_automatically(store, &project)
+        }) {
+            Ok(Some(message)) => {
+                println!(
+                    "Project {}: action=task_activation_recovered {message}",
+                    project.name
+                );
+                // Recovery changed the task's session link. Re-scan before launch.
+                continue;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!(
+                    "Project {}: action=task_activation_recovery_wait error={error:#}",
+                    project.name
+                );
+                continue;
+            }
+        }
+
         // A blocked outcome is reviewed before ordinary recovery can create
         // another resume request or activate downstream work. Sealed Git
         // finalization keeps its existing priority and ownership contract.
@@ -1091,40 +1129,6 @@ pub(super) fn run_agent_scheduler_pass_with_max_global_jobs(
                     pass.runs_started += 1;
                     jobs.push(*job);
                 }
-                continue;
-            }
-        }
-        // Retire task-less journals whose owning run already ended before the
-        // guarded finalization lease is attempted. Their recorded owner token
-        // can never be matched again, so leaving them pending would skip this
-        // project forever with reason=active_lease.
-        if retire_abandoned_unbound_git_journals(state_dir, &project)? > 0 {
-            // Cancellation may have cleared this attempt's failure cooldown.
-            project = with_agent_store_at(state_dir, |store| {
-                store
-                    .list_projects_blocking()?
-                    .into_iter()
-                    .find(|candidate| candidate.id == project.id)
-                    .context("Project disappeared after retiring its obsolete attempt")
-            })?;
-        }
-        match with_agent_store_at(state_dir, |store| {
-            recover_failed_activation_automatically(store, &project)
-        }) {
-            Ok(Some(message)) => {
-                println!(
-                    "Project {}: action=task_activation_recovered {message}",
-                    project.name
-                );
-                // Recovery changed the task's session link. Re-scan before launch.
-                continue;
-            }
-            Ok(None) => {}
-            Err(error) => {
-                eprintln!(
-                    "Project {}: action=task_activation_recovery_wait error={error:#}",
-                    project.name
-                );
                 continue;
             }
         }

@@ -8,7 +8,7 @@ use crate::{
         AGENT_BRANCH_GIT_RECOVERY_REASON, AGENT_MISSING_GIT_RECOVERY_TOKEN_PREFIX, AgentProject,
         AgentSessionControlState, GitFinalizationRecord, GitFinalizationState, TursoAgentStore,
     },
-    managed_git::current_agent_git_branch,
+    managed_git::{current_agent_git_branch, current_agent_git_head},
     runner::{agent_timestamp, agent_timestamp_after, automated_agent_child_context},
     session_control::InteractiveAgentLease,
     task::{
@@ -43,6 +43,7 @@ pub(crate) struct GitRecoveryPlan {
     current_branch: Option<String>,
     restart: bool,
     preactivation: bool,
+    stale_head: Option<String>,
 }
 
 #[derive(Clone)]
@@ -222,6 +223,7 @@ pub(crate) fn plan_git_recovery(
                 current_branch,
                 restart: false,
                 preactivation: false,
+                stale_head: None,
             });
         }
     }
@@ -261,6 +263,7 @@ pub(crate) fn plan_git_recovery(
         current_branch,
         restart: false,
         preactivation: false,
+        stale_head: None,
     })
 }
 
@@ -323,16 +326,20 @@ pub(crate) fn plan_task_restart(
         current_branch: current_agent_git_branch(&project.path)?,
         restart: true,
         preactivation: false,
+        stale_head: None,
     })
 }
 
-/// A selected Todo added after the launch checkpoint cannot activate against
-/// that old boundary. Retire only a failed, unbound attempt; the normal launch
-/// path will checkpoint the current board and capture a fresh boundary.
+/// Retire terminal, unbound attempts whose launch checkpoint cannot activate:
+/// HEAD advanced, or the selected task was absent from the checkpoint. The
+/// normal launch path checkpoints the board and captures a fresh boundary.
 pub(crate) fn recover_failed_activation_automatically(
     store: &TursoAgentStore,
     project: &AgentProject,
 ) -> Result<Option<String>> {
+    if !project.enabled {
+        return Ok(None);
+    }
     for journal in store.list_pending_git_finalizations_blocking(Some(project.id))? {
         if journal.state != GitFinalizationState::Working
             || journal.task_identity.is_some()
@@ -341,6 +348,44 @@ pub(crate) fn recover_failed_activation_automatically(
             continue;
         }
         let session = &journal.codex_session_id;
+        // HEAD can advance after launch but before task activation. Resuming
+        // this unbound journal can never satisfy its original launch checks.
+        // Use the exact task run, not a later successful supervisor assessment.
+        if let Some(run) = store.latest_run_for_codex_session_blocking(project.id, session)?
+            && matches!(run.status.as_str(), "failure" | "blocked" | "timeout")
+            && run.finished_at.is_some()
+            && journal.starting_head.is_some()
+            && journal.branch_ref.is_some()
+            && current_agent_git_branch(&project.path)? == journal.branch_ref
+        {
+            let head = current_agent_git_head(&project.path)?;
+            if journal.starting_head.as_deref() != Some(head.as_str()) {
+                let control = store.session_control_blocking(project.id, session)?;
+                if control.as_ref().is_some_and(|control| {
+                    control.state != AgentSessionControlState::ResumeRequested
+                        || control.child_pid.is_some()
+                        || control.interactive_holder.is_some()
+                        || control.interactive_launch_token.is_some()
+                        || control.run_token != journal.owner_run_token
+                }) {
+                    continue;
+                }
+                let plan = plan_task_restart(store, project, session)?;
+                if plan.journal.as_ref() != Some(&journal)
+                    || !plan.linked.as_ref().is_some_and(|linked| {
+                        linked.status.is_active() && !task_entry_is_stopped(&linked.task)
+                    })
+                {
+                    continue;
+                }
+                let plan = GitRecoveryPlan {
+                    run_id: run.id,
+                    stale_head: Some(head),
+                    ..plan
+                };
+                return execute_git_recovery(store, &plan, false).map(Some);
+            }
+        }
         let run = journal
             .owner_run_token
             .as_deref()
@@ -479,6 +524,12 @@ fn execute_git_recovery(
             "The checkout branch changed while recovery was being confirmed; review recovery again"
         );
     }
+    if let Some(head) = &plan.stale_head {
+        anyhow::ensure!(
+            current_agent_git_head(&plan.project.path)? == *head,
+            "The checkout commit changed during activation recovery; retry on the next scan"
+        );
+    }
     store.begin_missing_git_recovery_blocking(
         plan.project.id,
         &plan.project.path,
@@ -487,6 +538,7 @@ fn execute_git_recovery(
         plan.journal.as_ref(),
         require_resume_requested,
         plan.restart,
+        plan.stale_head.is_some(),
         &holder,
         &agent_timestamp(),
         &agent_timestamp_after(60),
@@ -518,7 +570,7 @@ fn execute_git_recovery(
                         == Some(plan.session_id.as_str())
                 })
                 .context("The recovered task disappeared before it could be queued")?;
-            if plan.restart && !plan.preactivation {
+            if plan.restart && !plan.preactivation && plan.stale_head.is_none() {
                 prioritize_task_after_lock(&linked.board_dir, TaskStatus::Todo, &todo)?;
                 todo = board
                     .entries(TaskStatus::Todo)?
@@ -536,7 +588,9 @@ fn execute_git_recovery(
             );
             // Do not use a codex: marker for the previous conversation: it is
             // history, and the next attempt must get its own session and journal.
-            let reason = if plan.preactivation {
+            let reason = if plan.stale_head.is_some() {
+                "HEAD changed before task activation and the worker ended; the stale unbound attempt was retired automatically".to_string()
+            } else if plan.preactivation {
                 "the selected Todo was absent from the old launch checkpoint and its worker failed before activation; the unbound attempt was retired automatically".to_string()
             } else if plan.restart {
                 "the owner explicitly restarted this unfinished task; the old attempt remains in history".to_string()

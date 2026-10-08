@@ -69,6 +69,7 @@ impl TursoAgentStore {
         expected_journal: Option<&GitFinalizationRecord>,
         require_resume_requested: bool,
         restart: bool,
+        stale_start: bool,
         holder: &str,
         acquired_at: &str,
         expires_at: &str,
@@ -128,6 +129,26 @@ impl TursoAgentStore {
                 params![project_id, session_id, i64::from(expected_journal.is_some()), i64::from(restart)],
             ).await? == 0,
                 "Recovery requires an idle project with no surviving Git journal or launch record. Stop active work and retry; existing recovery records are preserved");
+            if stale_start {
+                let expected = expected_journal.context("Stale activation recovery needs its old journal")?;
+                anyhow::ensure!(restart && !require_resume_requested
+                    && expected.state == GitFinalizationState::Working
+                    && expected.task_identity.is_none() && expected.starting_head.is_some(),
+                    "Stale activation recovery requires an unbound attempt");
+                anyhow::ensure!(query_count(&tx,
+                    "SELECT COUNT(*) FROM runs r WHERE r.id = ?1 AND r.project_id = ?2
+                       AND r.codex_session_id = ?3 AND r.status IN ('failure', 'blocked', 'timeout')
+                       AND r.finished_at IS NOT NULL
+                       AND (r.worker_token = ?4 OR (r.worker_token IS NULL AND ?4 IS NULL))
+                       AND NOT EXISTS (SELECT 1 FROM agent_workers w WHERE w.worker_token = r.worker_token
+                           AND (w.state <> 'completed' OR w.run_id IS NULL OR w.run_id <> r.id))
+                       AND NOT EXISTS (SELECT 1 FROM session_controls sc WHERE sc.project_id = ?2
+                           AND sc.codex_session_id = ?3 AND (sc.state <> 'resume_requested'
+                               OR sc.run_token IS NULL OR ?4 IS NULL OR sc.run_token <> ?4))
+                       AND EXISTS (SELECT 1 FROM projects p WHERE p.id = ?2 AND p.enabled = 1)",
+                    params![expected_run_id, project_id, session_id, expected.owner_run_token.as_deref()],
+                ).await? == 1, "The stale activation owner changed or stopped; preserving its attempt");
+            }
             if restart && require_resume_requested {
                 let expected = expected_journal.context("Automatic activation recovery needs its old journal")?;
                 anyhow::ensure!(expected.state == GitFinalizationState::Working
@@ -158,7 +179,7 @@ impl TursoAgentStore {
                     "UPDATE git_finalizations SET state = 'cancelled', generation = generation + 1,
                         owner_run_token = NULL, last_error = ?3, updated_at = ?4,
                         completed_at = ?4 WHERE project_id = ?1 AND codex_session_id = ?2",
-                    params![project_id, session_id, if restart && require_resume_requested { "Automatically restarted failed task activation; old Git boundary preserved" } else if restart { "Owner explicitly restarted the unfinished task; old Git boundary preserved" } else { AGENT_BRANCH_GIT_RECOVERY_REASON }, acquired_at],
+                    params![project_id, session_id, if stale_start || restart && require_resume_requested { "Automatically restarted failed task activation; old Git boundary preserved" } else if restart { "Owner explicitly restarted the unfinished task; old Git boundary preserved" } else { AGENT_BRANCH_GIT_RECOVERY_REASON }, acquired_at],
                 ).await?;
             }
             tx.execute(

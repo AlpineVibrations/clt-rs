@@ -960,6 +960,14 @@ pub(crate) fn current_agent_git_branch(project_root: &Path) -> Result<Option<Str
     )
 }
 
+pub(crate) fn current_agent_git_head(project_root: &Path) -> Result<String> {
+    resolve_git_commit(
+        project_root,
+        "HEAD",
+        "inspect the task recovery checkout commit",
+    )
+}
+
 pub(crate) fn verify_agent_git_resume_branch(
     project_root: &Path,
     finalization: &agent::GitFinalizationRecord,
