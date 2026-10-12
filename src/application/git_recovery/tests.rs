@@ -423,6 +423,7 @@ fn recovery_resumes_an_interrupted_move_even_when_the_failed_run_has_no_session_
             false,
             false,
             false,
+            None,
             "recovery",
             &agent_timestamp(),
             &agent_timestamp_after(60),
@@ -2289,6 +2290,406 @@ fn stale_activation_recovery_rechecks_head_and_owner_after_planning() {
             journal,
             "{scenario}"
         );
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+fn writer_conflict_fixture(folders: bool, git: bool) -> (PathBuf, TursoAgentStore, AgentProject) {
+    let root = temp_root("writer-conflict-recovery");
+    let project_root = root.join("project");
+    init_tasks(&project_root, folders).unwrap();
+    let board = TaskBoard::new(get_tasks_dir(&project_root));
+    board
+        .insert_content(TaskStatus::Todo, None, "Earlier queued work")
+        .unwrap();
+    board
+        .insert_content(
+            TaskStatus::Doing,
+            None,
+            &format!("Finish feature. codex:{SESSION}"),
+        )
+        .unwrap();
+    fs::write(project_root.join("feature.txt"), "before\n").unwrap();
+    initialize_test_git_repository(&project_root);
+    fs::write(project_root.join("feature.txt"), "partially implemented\n").unwrap();
+    run_test_git(&project_root, &["add", "feature.txt"]);
+    fs::write(
+        project_root.join("feature.txt"),
+        "additional user changes\n",
+    )
+    .unwrap();
+    fs::write(project_root.join("untracked.txt"), "preserve this\n").unwrap();
+    let store = TursoAgentStore::open_blocking(&root.join("state")).unwrap();
+    store
+        .register_project_blocking(&project_root, "project")
+        .unwrap();
+    let project = store.list_projects_blocking().unwrap().remove(0);
+    let mode = if git {
+        AgentGitMode::Commit
+    } else {
+        AgentGitMode::Off
+    };
+    store
+        .set_project_git_mode_blocking(project.id, mode)
+        .unwrap();
+    if git {
+        let start = capture_agent_git_start_state(&project.path, mode).unwrap();
+        store
+            .record_git_launch_state_blocking(project.id, "old-run", mode, &start, "100")
+            .unwrap();
+    }
+    store
+        .mark_session_running_with_git_mode_blocking(
+            project.id,
+            SESSION,
+            12345,
+            "old-run",
+            &root.join("old.out"),
+            &root.join("old.err"),
+            mode,
+        )
+        .unwrap();
+    if git {
+        // This failure also affects tasks already bound to a WORKING journal.
+        assert!(
+            store
+                .compare_and_set_git_finalization_with_identity_blocking(
+                    project.id,
+                    SESSION,
+                    0,
+                    GitFinalizationState::Working,
+                    "Finish feature.",
+                    Some("old-run"),
+                    "103",
+                )
+                .unwrap()
+        );
+    }
+    store
+        .set_session_control_recovery_token_blocking(project.id, SESSION, "old-run")
+        .unwrap();
+    for number in 1..=2 {
+        let stdout = root.join(format!("conflict-{number}.out"));
+        let stderr = root.join(format!("conflict-{number}.err"));
+        fs::write(&stdout, "").unwrap();
+        fs::write(&stderr, format!("CLT launch fast mode: off\nError: thread/resume: thread/resume failed: thread {SESSION} already has an active writer (code -32600)\n")).unwrap();
+        let token = format!("conflict-{number}");
+        let holder = "conflict-test-scheduler";
+        assert!(
+            store
+                .try_acquire_lease_blocking(
+                    project.id,
+                    holder,
+                    &agent_timestamp(),
+                    &agent_timestamp_after(60)
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .reserve_and_claim_worker_blocking(
+                    AgentWorkerReservation {
+                        project_id: project.id,
+                        worker_token: &token,
+                        expected_lease_holder: holder,
+                        max_active_workers: 1,
+                        protocol_version: AGENT_WORKER_PROTOCOL_VERSION,
+                        service_label: &format!("clt-inline-{token}"),
+                        binary_path: Path::new("/tmp/test-clt"),
+                        command_arguments: "[]",
+                        path_env: OsStr::new("/usr/bin:/bin"),
+                        codex_path: None,
+                        task_selection: "next_todo",
+                        resume_session_id: Some(SESSION),
+                        created_at: "105",
+                    },
+                    12345,
+                    "105"
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .finalize_worker_blocking(AgentWorkerFinalization {
+                    worker_token: &token,
+                    expected_worker_pid: Some(12345),
+                    expected_lease_holder: &agent::worker_lease_holder(&token),
+                    status: "failure",
+                    finished_at: "106",
+                    exit_code: Some(1),
+                    log_dir: None,
+                    stdout_path: stdout.to_str(),
+                    stderr_path: stderr.to_str(),
+                    summary: Some("The task's Git journal remains WORKING"),
+                    codex_session_id: Some(SESSION),
+                    error: None,
+                })
+                .unwrap()
+                .is_some()
+        );
+        store
+            .set_session_control_recovery_token_blocking(project.id, SESSION, &token)
+            .unwrap();
+    }
+    let project = store.list_projects_blocking().unwrap().remove(0);
+    (root, store, project)
+}
+
+#[test]
+fn scheduler_recovers_persistent_writer_conflict_preserving_bound_work() {
+    for folders in [false, true] {
+        for git in [false, true] {
+            let (root, store, project) = writer_conflict_fixture(folders, git);
+            let board = TaskBoard::new(get_tasks_dir(&project.path));
+            let original = store
+                .git_finalization_blocking(project.id, SESSION)
+                .unwrap();
+            let head = run_test_git(&project.path, &["rev-parse", "HEAD"]);
+            let index = run_test_git(&project.path, &["write-tree"]);
+            let before = board.entries(TaskStatus::Todo).unwrap();
+            let pass = run_agent_scheduler_pass_with_max_global_jobs(
+                &root.join("state"),
+                false,
+                &[],
+                1,
+                None,
+            )
+            .unwrap();
+            assert!(pass.jobs.is_empty());
+            assert!(board.entries(TaskStatus::Doing).unwrap().is_empty());
+            let after = board.entries(TaskStatus::Todo).unwrap();
+            assert_eq!(after.len(), 2);
+            assert_eq!(after[0].content, before[0].content);
+            assert_eq!(after[0].source, before[0].source);
+            assert!(
+                after[1]
+                    .content
+                    .contains("two consecutive resumes failed at startup")
+            );
+            assert!(
+                after[1]
+                    .content
+                    .contains(&format!("Previous Codex session: {SESSION}"))
+            );
+            assert!(recoverable_codex_session_id_from_task_content(&after[1].content).is_none());
+            assert!(task_entry_is_ready(&after[1]));
+            if let Some(original) = original {
+                let journal = store
+                    .git_finalization_blocking(project.id, SESSION)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(journal.state, GitFinalizationState::Cancelled);
+                assert_eq!(journal.starting_head, original.starting_head);
+                assert_eq!(journal.task_identity, original.task_identity);
+                assert_eq!(journal.worktree_baseline, original.worktree_baseline);
+                assert!(journal.last_error.unwrap().contains("writer conflict"));
+            }
+            assert_eq!(run_test_git(&project.path, &["rev-parse", "HEAD"]), head);
+            assert_eq!(run_test_git(&project.path, &["write-tree"]), index);
+            assert_eq!(
+                fs::read_to_string(project.path.join("feature.txt")).unwrap(),
+                "additional user changes\n"
+            );
+            assert_eq!(
+                fs::read_to_string(project.path.join("untracked.txt")).unwrap(),
+                "preserve this\n"
+            );
+            assert_eq!(
+                store
+                    .session_control_blocking(project.id, SESSION)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                AgentSessionControlState::Stopped
+            );
+            assert!(
+                super::recover_writer_conflict_automatically(&store, &project)
+                    .unwrap()
+                    .is_none()
+            );
+            let next = run_agent_scheduler_pass_with_max_global_jobs(
+                &root.join("state"),
+                false,
+                &[],
+                1,
+                None,
+            )
+            .unwrap();
+            assert_eq!(next.jobs.len(), 1);
+            assert_eq!(next.jobs[0].task_selection, AgentTaskSelection::NextTodo);
+            assert!(next.jobs[0].resume_session_id.is_none());
+            store
+                .release_lease_blocking(project.id, &next.jobs[0].holder)
+                .unwrap();
+            drop(store);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+}
+
+#[test]
+fn writer_conflict_recovery_rejects_unsafe_or_insufficient_evidence() {
+    for scenario in [
+        "one-failure",
+        "wrong-session",
+        "output",
+        "missing-log",
+        "large-log",
+        "generic-error",
+        "stopped",
+        "task-stop",
+        "blocked",
+        "manual",
+        "paused",
+        "lease",
+        "child",
+        "sealed",
+        "missing-journal",
+        "latest-run",
+        "duplicate",
+        "done",
+        "launch",
+    ] {
+        let (root, store, project) = writer_conflict_fixture(false, true);
+        let board = TaskBoard::new(get_tasks_dir(&project.path));
+        match scenario {
+            "one-failure" => fs::write(root.join("conflict-1.err"), "different failure").unwrap(),
+            "wrong-session" => fs::write(root.join("conflict-2.err"), "Error: thread/resume: thread/resume failed: thread another-session already has an active writer (code -32600)").unwrap(),
+            "output" => fs::write(root.join("conflict-2.out"), "agent started working").unwrap(),
+            "missing-log" => fs::remove_file(root.join("conflict-2.err")).unwrap(),
+            "large-log" => fs::write(root.join("conflict-2.err"), "x".repeat(65537)).unwrap(),
+            "generic-error" => fs::write(root.join("conflict-2.err"), "already has an active writer").unwrap(),
+            "stopped" => store.set_session_control_state_blocking(project.id, SESSION, AgentSessionControlState::Stopped).unwrap(),
+            "task-stop" | "manual" | "blocked" => {
+                let task = board.entries(TaskStatus::Doing).unwrap().remove(0);
+                let marker = match scenario { "manual" => "clt:manual", "blocked" => "BLOCKED 2026-10-12: waiting for input", _ => "clt:stopped" };
+                board.write_entry_content(TaskStatus::Doing, &task, &format!("Finish feature. {marker} codex:{SESSION}")).unwrap();
+            }
+            "paused" => { store.set_project_enabled_blocking(project.id, false).unwrap(); }
+            "lease" => { store.try_acquire_lease_blocking(project.id, "owner", &agent_timestamp(), &agent_timestamp_after(60)).unwrap(); }
+            "child" => store.mark_session_running_blocking(project.id, SESSION, 12345, "live", &root.join("live.out"), &root.join("live.err")).unwrap(),
+            "sealed" | "missing-journal" => {
+                assert!(store.compare_and_set_git_finalization_blocking(project.id, SESSION, 1,
+                    if scenario == "sealed" { GitFinalizationState::Tracking } else { GitFinalizationState::Cancelled },
+                    None, None, None, "107").unwrap());
+                if scenario == "missing-journal" { store.delete_terminal_git_finalization_blocking(project.id, SESSION).unwrap(); }
+            }
+            "latest-run" => { store.record_run_outcome_blocking(AgentRunOutcome {
+                project_id: project.id, status: "success", started_at: "107", finished_at: Some("108"), exit_code: Some(0),
+                log_dir: None, stdout_path: None, stderr_path: None, summary: None, codex_session_id: Some(SESSION),
+            }).unwrap(); }
+            "duplicate" => { board.insert_content(TaskStatus::Todo, None, &format!("Duplicate codex:{SESSION}")).unwrap(); }
+            "done" => { move_task_without_reordering_after_lock(board.path(), TaskStatus::Doing, TaskStatus::Done, 1).unwrap(); }
+            "launch" => {
+                let start = capture_agent_git_start_state(&project.path, AgentGitMode::Commit).unwrap();
+                store.record_git_launch_state_blocking(project.id, "new-launch", AgentGitMode::Commit, &start, "107").unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let before = fs::read(project.path.join("tasks/doing.md")).unwrap();
+        let journal = store
+            .git_finalization_blocking(project.id, SESSION)
+            .unwrap();
+        let result = super::recover_writer_conflict_automatically(&store, &project);
+        assert!(!matches!(result, Ok(Some(_))), "{scenario}");
+        assert_eq!(
+            fs::read(project.path.join("tasks/doing.md")).unwrap(),
+            before,
+            "{scenario}"
+        );
+        assert_eq!(
+            store
+                .git_finalization_blocking(project.id, SESSION)
+                .unwrap(),
+            journal,
+            "{scenario}"
+        );
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn writer_conflict_recovery_rechecks_owner_run_and_logs_after_planning() {
+    for scenario in ["owner", "run", "logs", "paused"] {
+        let (root, store, project) = writer_conflict_fixture(false, true);
+        let mut plan = super::plan_task_restart(&store, &project, SESSION).unwrap();
+        let previous = store
+            .previous_run_for_codex_session_blocking(project.id, SESSION, plan.run_id)
+            .unwrap()
+            .unwrap();
+        plan.writer_conflict = Some((previous.id, "conflict-2".into()));
+        match scenario {
+            "owner" => store
+                .set_session_control_recovery_token_blocking(project.id, SESSION, "another-owner")
+                .unwrap(),
+            "paused" => {
+                store
+                    .set_project_enabled_blocking(project.id, false)
+                    .unwrap();
+            }
+            "logs" => fs::write(root.join("conflict-2.out"), "agent activity appeared").unwrap(),
+            "run" => {
+                store
+                    .record_run_outcome_blocking(AgentRunOutcome {
+                        project_id: project.id,
+                        status: "success",
+                        started_at: "107",
+                        finished_at: Some("108"),
+                        exit_code: Some(0),
+                        log_dir: None,
+                        stdout_path: None,
+                        stderr_path: None,
+                        summary: None,
+                        codex_session_id: Some(SESSION),
+                    })
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let before = fs::read(project.path.join("tasks/doing.md")).unwrap();
+        let journal = store
+            .git_finalization_blocking(project.id, SESSION)
+            .unwrap();
+        assert!(
+            super::execute_git_recovery(&store, &plan, false).is_err(),
+            "{scenario}"
+        );
+        assert_eq!(
+            fs::read(project.path.join("tasks/doing.md")).unwrap(),
+            before,
+            "{scenario}"
+        );
+        assert_eq!(
+            store
+                .git_finalization_blocking(project.id, SESSION)
+                .unwrap(),
+            journal,
+            "{scenario}"
+        );
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn writer_conflict_recovery_accepts_only_the_current_git_recovery_token() {
+    for current in [false, true] {
+        let (root, store, project) = writer_conflict_fixture(false, true);
+        if current {
+            assert!(
+                store
+                    .ensure_pending_git_finalization_resume_requested_blocking(project.id, SESSION)
+                    .unwrap()
+            );
+        } else {
+            store
+                .set_session_control_recovery_token_blocking(project.id, SESSION, "another-owner")
+                .unwrap();
+        }
+        let result = super::recover_writer_conflict_automatically(&store, &project);
+        assert_eq!(matches!(result, Ok(Some(_))), current);
         drop(store);
         fs::remove_dir_all(root).unwrap();
     }

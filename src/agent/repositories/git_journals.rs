@@ -70,6 +70,7 @@ impl TursoAgentStore {
         require_resume_requested: bool,
         restart: bool,
         stale_start: bool,
+        writer_conflict: Option<(i64, &str)>,
         holder: &str,
         acquired_at: &str,
         expires_at: &str,
@@ -129,6 +130,29 @@ impl TursoAgentStore {
                 params![project_id, session_id, i64::from(expected_journal.is_some()), i64::from(restart)],
             ).await? == 0,
                 "Recovery requires an idle project with no surviving Git journal or launch record. Stop active work and retry; existing recovery records are preserved");
+            if let Some((previous_run_id, token)) = writer_conflict {
+                anyhow::ensure!(restart && !require_resume_requested && !stale_start
+                    && expected_journal.is_none_or(|journal| journal.state == GitFinalizationState::Working),
+                    "Writer conflict recovery requires unsealed work");
+                anyhow::ensure!(query_count(&tx,
+                    "SELECT COUNT(*) FROM runs r WHERE r.project_id = ?1 AND r.codex_session_id = ?2
+                       AND r.id IN (?3, ?4) AND r.status = 'failure' AND r.finished_at IS NOT NULL
+                       AND r.exit_code IS NOT NULL AND r.exit_code <> 0
+                       AND (r.worker_token IS NULL OR EXISTS (
+                           SELECT 1 FROM agent_workers w WHERE w.worker_token = r.worker_token
+                             AND w.project_id = ?1 AND w.state = 'completed' AND w.run_id = r.id))
+                       AND (?4 = (SELECT MAX(id) FROM runs WHERE project_id = ?1 AND codex_session_id = ?2 AND id < ?3))
+                       AND EXISTS (SELECT 1 FROM projects WHERE id = ?1 AND enabled = 1)
+                       AND EXISTS (SELECT 1 FROM session_controls sc WHERE sc.project_id = ?1
+                           AND sc.codex_session_id = ?2 AND sc.state = 'resume_requested' AND sc.run_token = ?5)
+                       AND (r.id <> ?3 OR r.worker_token IS NULL OR r.worker_token = ?5 OR ?7 = 1)
+                       AND (?6 = 1 OR EXISTS (SELECT 1 FROM session_git_modes m WHERE m.project_id = ?1
+                           AND m.codex_session_id = ?2 AND m.git_mode = 'off'))",
+                    params![project_id, session_id, expected_run_id, previous_run_id, token,
+                        i64::from(expected_journal.is_some()),
+                        i64::from(expected_journal.is_some_and(|journal| token == format!("{AGENT_GIT_FINALIZATION_RESUME_TOKEN_PREFIX}{}", journal.generation)))],
+                ).await? == 2, "The writer conflict evidence or idle owner changed; preserving its attempt");
+            }
             if stale_start {
                 let expected = expected_journal.context("Stale activation recovery needs its old journal")?;
                 anyhow::ensure!(restart && !require_resume_requested
@@ -179,7 +203,7 @@ impl TursoAgentStore {
                     "UPDATE git_finalizations SET state = 'cancelled', generation = generation + 1,
                         owner_run_token = NULL, last_error = ?3, updated_at = ?4,
                         completed_at = ?4 WHERE project_id = ?1 AND codex_session_id = ?2",
-                    params![project_id, session_id, if stale_start || restart && require_resume_requested { "Automatically restarted failed task activation; old Git boundary preserved" } else if restart { "Owner explicitly restarted the unfinished task; old Git boundary preserved" } else { AGENT_BRANCH_GIT_RECOVERY_REASON }, acquired_at],
+                    params![project_id, session_id, if writer_conflict.is_some() { "Automatically restarted persistent Codex writer conflict; old Git boundary preserved" } else if stale_start || restart && require_resume_requested { "Automatically restarted failed task activation; old Git boundary preserved" } else if restart { "Owner explicitly restarted the unfinished task; old Git boundary preserved" } else { AGENT_BRANCH_GIT_RECOVERY_REASON }, acquired_at],
                 ).await?;
             }
             tx.execute(

@@ -31,6 +31,7 @@ use crate::{
         AgentTaskSelection,
         git_recovery::{
             recover_changed_branch_automatically, recover_failed_activation_automatically,
+            recover_writer_conflict_automatically,
         },
         new_agent_shutdown_signal,
     },
@@ -1051,6 +1052,28 @@ pub(super) fn run_agent_scheduler_pass_with_max_global_jobs(
                     .find(|candidate| candidate.id == project.id)
                     .context("Project disappeared after retiring its obsolete attempt")
             })?;
+        }
+
+        // A persistent Codex startup conflict cannot be repaired by endlessly
+        // resuming the same conversation. Recover before supervisor holds.
+        match with_agent_store_at(state_dir, |store| {
+            recover_writer_conflict_automatically(store, &project)
+        }) {
+            Ok(Some(message)) => {
+                println!(
+                    "Project {}: action=writer_conflict_recovered {message}",
+                    project.name
+                );
+                continue;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!(
+                    "Project {}: action=writer_conflict_recovery_wait error={error:#}",
+                    project.name
+                );
+                continue;
+            }
         }
 
         // Repair proven pre-activation failures before a saved supervisor hold

@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    io::Read,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result};
 use chrono::Local;
@@ -6,7 +9,8 @@ use chrono::Local;
 use crate::{
     agent::{
         AGENT_BRANCH_GIT_RECOVERY_REASON, AGENT_MISSING_GIT_RECOVERY_TOKEN_PREFIX, AgentProject,
-        AgentSessionControlState, GitFinalizationRecord, GitFinalizationState, TursoAgentStore,
+        AgentRunRecord, AgentSessionControlState, GitFinalizationRecord, GitFinalizationState,
+        TursoAgentStore,
     },
     managed_git::{current_agent_git_branch, current_agent_git_head},
     runner::{agent_timestamp, agent_timestamp_after, automated_agent_child_context},
@@ -44,6 +48,7 @@ pub(crate) struct GitRecoveryPlan {
     restart: bool,
     preactivation: bool,
     stale_head: Option<String>,
+    writer_conflict: Option<(i64, String)>,
 }
 
 #[derive(Clone)]
@@ -224,6 +229,7 @@ pub(crate) fn plan_git_recovery(
                 restart: false,
                 preactivation: false,
                 stale_head: None,
+                writer_conflict: None,
             });
         }
     }
@@ -264,6 +270,7 @@ pub(crate) fn plan_git_recovery(
         restart: false,
         preactivation: false,
         stale_head: None,
+        writer_conflict: None,
     })
 }
 
@@ -327,7 +334,99 @@ pub(crate) fn plan_task_restart(
         restart: true,
         preactivation: false,
         stale_head: None,
+        writer_conflict: None,
     })
+}
+
+// Only a failed startup with no agent output qualifies. Never infer this from
+// task text or the generic WORKING summary, which can mask the actual error.
+fn writer_conflict_at_startup(run: &AgentRunRecord, session: &str) -> bool {
+    if run.status != "failure"
+        || run.finished_at.is_none()
+        || !run.exit_code.is_some_and(|code| code != 0)
+        || run.codex_session_id.as_deref() != Some(session)
+    {
+        return false;
+    }
+    let read_small_log = |path: Option<&str>| -> Option<String> {
+        let file = std::fs::File::open(path?).ok()?;
+        let mut text = String::new();
+        file.take(65537).read_to_string(&mut text).ok()?;
+        (text.len() <= 65536).then_some(text)
+    };
+    let Some(stdout) = read_small_log(run.stdout_path.as_deref()) else {
+        return false;
+    };
+    let Some(stderr) = read_small_log(run.stderr_path.as_deref()) else {
+        return false;
+    };
+    let diagnostic = format!(
+        "Error: thread/resume: thread/resume failed: thread {session} already has an active writer (code -32600)"
+    );
+    stdout.trim().is_empty() && stderr.lines().any(|line| line.trim() == diagnostic)
+}
+
+/// Two consecutive failed resumes establish a persistent startup conflict.
+/// Use the normal idle-project recovery fence; never edit Codex's own locks.
+pub(crate) fn recover_writer_conflict_automatically(
+    store: &TursoAgentStore,
+    project: &AgentProject,
+) -> Result<Option<String>> {
+    if !project.enabled {
+        return Ok(None);
+    }
+    for control in store.session_controls_for_project_blocking(project.id)? {
+        if control.state != AgentSessionControlState::ResumeRequested
+            || control.child_pid.is_some()
+            || control.interactive_holder.is_some()
+            || control.interactive_launch_token.is_some()
+        {
+            continue;
+        }
+        let Some(token) = control.run_token else {
+            continue;
+        };
+        let session = &control.codex_session_id;
+        let Some(run) = store.latest_run_for_codex_session_blocking(project.id, session)? else {
+            continue;
+        };
+        if !writer_conflict_at_startup(&run, session) {
+            continue;
+        }
+        let Some(previous) =
+            store.previous_run_for_codex_session_blocking(project.id, session, run.id)?
+        else {
+            continue;
+        };
+        if !writer_conflict_at_startup(&previous, session) {
+            continue;
+        }
+        let journal = store.git_finalization_blocking(project.id, session)?;
+        if journal.as_ref().is_some_and(|journal| {
+            journal.state != GitFinalizationState::Working || journal.commit_oid.is_some()
+        }) {
+            continue;
+        }
+        let mut plan = plan_task_restart(store, project, session)?;
+        if plan.journal != journal
+            || plan.run_id != run.id
+            || !plan.linked.as_ref().is_some_and(|linked| {
+                linked.status.is_active() && task_entry_is_ready(&linked.task)
+            })
+        {
+            continue;
+        }
+        // Missing managed journals cannot be replaced from a later checkout.
+        if plan.journal.is_none()
+            && store.session_git_mode_blocking(project.id, session)?
+                != Some(crate::agent::AgentGitMode::Off)
+        {
+            continue;
+        }
+        plan.writer_conflict = Some((previous.id, token));
+        return execute_git_recovery(store, &plan, false).map(Some);
+    }
+    Ok(None)
 }
 
 /// Retire terminal, unbound attempts whose launch checkpoint cannot activate:
@@ -530,6 +629,21 @@ fn execute_git_recovery(
             "The checkout commit changed during activation recovery; retry on the next scan"
         );
     }
+    if let Some((previous_id, _)) = &plan.writer_conflict {
+        let latest = store
+            .latest_run_for_codex_session_blocking(plan.project.id, &plan.session_id)?
+            .context("Writer conflict run disappeared")?;
+        let previous = store
+            .previous_run_for_codex_session_blocking(plan.project.id, &plan.session_id, latest.id)?
+            .context("Previous writer conflict run disappeared")?;
+        anyhow::ensure!(
+            latest.id == plan.run_id
+                && previous.id == *previous_id
+                && writer_conflict_at_startup(&latest, &plan.session_id)
+                && writer_conflict_at_startup(&previous, &plan.session_id),
+            "Writer conflict evidence changed; preserving the old attempt"
+        );
+    }
     store.begin_missing_git_recovery_blocking(
         plan.project.id,
         &plan.project.path,
@@ -539,6 +653,9 @@ fn execute_git_recovery(
         require_resume_requested,
         plan.restart,
         plan.stale_head.is_some(),
+        plan.writer_conflict
+            .as_ref()
+            .map(|(run, token)| (*run, token.as_str())),
         &holder,
         &agent_timestamp(),
         &agent_timestamp_after(60),
@@ -570,7 +687,11 @@ fn execute_git_recovery(
                         == Some(plan.session_id.as_str())
                 })
                 .context("The recovered task disappeared before it could be queued")?;
-            if plan.restart && !plan.preactivation && plan.stale_head.is_none() {
+            if plan.restart
+                && !plan.preactivation
+                && plan.stale_head.is_none()
+                && plan.writer_conflict.is_none()
+            {
                 prioritize_task_after_lock(&linked.board_dir, TaskStatus::Todo, &todo)?;
                 todo = board
                     .entries(TaskStatus::Todo)?
@@ -588,7 +709,9 @@ fn execute_git_recovery(
             );
             // Do not use a codex: marker for the previous conversation: it is
             // history, and the next attempt must get its own session and journal.
-            let reason = if plan.stale_head.is_some() {
+            let reason = if plan.writer_conflict.is_some() {
+                "two consecutive resumes failed at startup because the old conversation already has an active writer; the idle attempt was retired automatically".to_string()
+            } else if plan.stale_head.is_some() {
                 "HEAD changed before task activation and the worker ended; the stale unbound attempt was retired automatically".to_string()
             } else if plan.preactivation {
                 "the selected Todo was absent from the old launch checkpoint and its worker failed before activation; the unbound attempt was retired automatically".to_string()

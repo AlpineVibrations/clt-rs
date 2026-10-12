@@ -214,6 +214,7 @@ impl TursoAgentStore {
             project_id,
             codex_session_id,
             true,
+            None,
         ))
     }
 
@@ -226,6 +227,21 @@ impl TursoAgentStore {
             project_id,
             codex_session_id,
             false,
+            None,
+        ))
+    }
+
+    pub(crate) fn previous_run_for_codex_session_blocking(
+        &self,
+        project_id: i64,
+        session: &str,
+        before_run_id: i64,
+    ) -> Result<Option<AgentRunRecord>> {
+        self.blocking.block_on(self.latest_run_for_codex_session(
+            project_id,
+            session,
+            false,
+            Some(before_run_id),
         ))
     }
 
@@ -275,6 +291,7 @@ impl TursoAgentStore {
         project_id: i64,
         codex_session_id: &str,
         output_only: bool,
+        before_run_id: Option<i64>,
     ) -> Result<Option<AgentRunRecord>> {
         let conn = self.repositories.sessions_runs.connect().await?;
         let mut rows = conn
@@ -286,9 +303,10 @@ impl TursoAgentStore {
                  JOIN projects p ON p.id = r.project_id
                  WHERE r.project_id = ?1 AND r.codex_session_id = ?2
                    AND (?3 = 0 OR r.stdout_path IS NOT NULL OR r.stderr_path IS NOT NULL)
+                   AND (?4 IS NULL OR r.id < ?4)
                  ORDER BY r.id DESC
                  LIMIT 1",
-                params![project_id, codex_session_id, i64::from(output_only)],
+                params![project_id, codex_session_id, i64::from(output_only), before_run_id],
             )
             .await
             .with_context(|| {

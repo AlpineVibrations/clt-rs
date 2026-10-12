@@ -402,6 +402,18 @@ This repair runs before supervisor review and saved holds, so a previous Repair
 decision cannot prevent it. Explicit stops, manual claims, live owners, new launch
 records, bound task work and sealed proof remain protected.
 
+When the same conversation fails two consecutive resumes at startup with Codex's
+“already has an active writer” error, CLT automatically queues a fresh attempt
+for its unfinished task. Both failed runs must name that exact conversation,
+have a nonzero exit and no agent output, and retain their startup error logs.
+Recovery runs before saved task-supervisor holds. CLT rechecks that the project
+is enabled and idle, preserves files, staging, commits, queue order and the old
+conversation and Git journal, and asks the fresh run to verify existing work
+before finishing what remains. It never edits Codex's writer locks.
+Stopped, blocked or manually owned tasks, live workers or interactive owners,
+missing managed Git journals, and sealed or verified Git work do not qualify.
+A single conflict uses the usual exact-session retry first.
+
 ### Restarting an unfinished task
 
 If a task was mistakenly marked Done, or its idle conversation cannot continue,
