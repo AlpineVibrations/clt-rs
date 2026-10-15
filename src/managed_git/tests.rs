@@ -10,6 +10,7 @@ mod follow_up;
 mod launch_edits;
 mod orphan;
 mod projection;
+mod shared_interactive;
 mod staged_start;
 
 #[test]

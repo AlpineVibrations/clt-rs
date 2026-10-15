@@ -12,6 +12,8 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ### Fixed
 
+- Let an already-running task finish Git verification and publication while an older Done conversation remains open in shared interactive mode. Preserve the older conversation and keep unfinished Git work and exclusive owners fenced.
+
 - Automatically recover an idle unfinished task after two consecutive Codex resume startup failures report that its conversation already has an active writer. Preserve work and history, queue a fresh verification attempt, and retain live-owner, stop and Git-proof safeguards.
 
 - Recover stale, unbound Git attempts automatically when HEAD advances before activation, including blocked runs with no remaining session control. Perform this repair before saved supervisor holds so a repair recommendation cannot strand ready work; preserve commits, staging, task order and attempt history.

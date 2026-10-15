@@ -11,6 +11,46 @@ use crate::agent::{
     update_project_after_run, worker_lease_holder,
 };
 
+// All finalizer lease checks use this predicate (sc is the control row and ?4
+// is the Git recovery-token prefix). Shared interactive guardians own only
+// their conversation, so an older completed conversation cannot fence another
+// task's commit proof or publication. A shared session with unfinished Git
+// work still blocks finalization, including its own provisional Done entry.
+const GIT_FINALIZATION_NONBLOCKING_CONTROL: &str = "
+    sc.state = 'stopped'
+    OR (sc.state = 'resume_requested'
+        AND sc.child_pid IS NULL
+        AND sc.interactive_holder IS NULL
+        AND sc.interactive_launch_token IS NULL
+        AND EXISTS (
+            SELECT 1 FROM git_finalizations g
+             WHERE g.project_id = sc.project_id
+               AND g.codex_session_id = sc.codex_session_id
+               AND g.state IN ('working', 'tracking', 'commit_pending', 'push_pending')
+               AND sc.run_token = ?4 || CAST(g.generation AS TEXT)
+        ))
+    OR (sc.state IN ('ready_interactive', 'interactive', 'stop_requested')
+        AND sc.interactive_holder IS NOT NULL
+        AND (sc.interactive_holder LIKE 'clt-shared-interactive-%'
+             OR sc.interactive_holder LIKE 'clt-stopped-shared-interactive-%'
+             OR sc.interactive_holder LIKE 'clt-readonly-interactive-%'
+             OR sc.interactive_holder LIKE 'clt-stopped-readonly-interactive-%')
+        AND ((sc.state = 'ready_interactive'
+              AND sc.child_pid IS NULL AND sc.interactive_launch_token IS NULL)
+             OR (sc.state IN ('interactive', 'stop_requested')
+                 AND sc.interactive_launch_token IS NOT NULL
+                 AND sc.interactive_launch_token = sc.interactive_holder))
+        AND NOT EXISTS (
+            SELECT 1 FROM git_finalizations g
+             WHERE g.project_id = sc.project_id
+               AND g.codex_session_id = sc.codex_session_id
+               AND g.state NOT IN ('completed', 'cancelled')
+        ))";
+
+#[cfg(test)]
+#[path = "tests/workers_leases.rs"]
+mod tests;
+
 /// Persistence for independent workers and project leases.
 pub(in crate::agent) struct WorkersLeasesRepository(RepositoryDatabase);
 
@@ -222,24 +262,13 @@ impl TursoAgentStore {
                     "Failed to repair stale Git finalization recovery fences for project {project_id}"
                 )
             })?;
-        let controls_allow_finalization = "NOT EXISTS (
+        let controls_allow_finalization = format!(
+            "NOT EXISTS (
             SELECT 1 FROM session_controls sc
              WHERE sc.project_id = ?1
-               AND NOT (
-                   sc.state = 'stopped'
-                   OR (sc.state = 'resume_requested'
-                       AND sc.child_pid IS NULL
-                       AND sc.interactive_holder IS NULL
-                       AND sc.interactive_launch_token IS NULL
-                       AND EXISTS (
-                           SELECT 1 FROM git_finalizations g
-                            WHERE g.project_id = sc.project_id
-                              AND g.codex_session_id = sc.codex_session_id
-                              AND g.state IN ('working', 'tracking', 'commit_pending', 'push_pending')
-                              AND sc.run_token = ?4 || CAST(g.generation AS TEXT)
-                       ))
-               )
-        )";
+               AND NOT ({GIT_FINALIZATION_NONBLOCKING_CONTROL})
+        )"
+        );
         transaction
             .execute(
                 &format!(
@@ -315,7 +344,7 @@ impl TursoAgentStore {
                 let conn = self.repositories.workers_leases.connect().await?;
                 let changed = conn
                     .execute(
-                        "UPDATE leases
+                        &format!("UPDATE leases
                             SET expires_at = ?1
                           WHERE project_id = ?2 AND holder = ?3
                             AND NOT EXISTS (
@@ -326,21 +355,8 @@ impl TursoAgentStore {
                             AND NOT EXISTS (
                                 SELECT 1 FROM session_controls sc
                                  WHERE sc.project_id = ?2
-                                   AND NOT (
-                                       sc.state = 'stopped'
-                                       OR (sc.state = 'resume_requested'
-                                           AND sc.child_pid IS NULL
-                                           AND sc.interactive_holder IS NULL
-                                           AND sc.interactive_launch_token IS NULL
-                                           AND EXISTS (
-                                               SELECT 1 FROM git_finalizations g
-                                                WHERE g.project_id = sc.project_id
-                                                  AND g.codex_session_id = sc.codex_session_id
-                                                  AND g.state IN ('working', 'tracking', 'commit_pending', 'push_pending')
-                                                  AND sc.run_token = ?4 || CAST(g.generation AS TEXT)
-                                           ))
-                                   )
-                            )",
+                                   AND NOT ({GIT_FINALIZATION_NONBLOCKING_CONTROL})
+                            )"),
                         params![
                             expires_at,
                             project_id,
@@ -365,9 +381,10 @@ impl TursoAgentStore {
         now: &str,
     ) -> Result<bool> {
         self.blocking.block_on(async {
-                let conn = self.repositories.workers_leases.connect().await?;
-                Ok(query_count(
-                    &conn,
+            let conn = self.repositories.workers_leases.connect().await?;
+            Ok(query_count(
+                &conn,
+                &format!(
                     "SELECT COUNT(*) FROM leases l
                       WHERE l.project_id = ?1 AND l.holder = ?2
                         AND CAST(l.expires_at AS INTEGER) > CAST(?3 AS INTEGER)
@@ -379,30 +396,19 @@ impl TursoAgentStore {
                         AND NOT EXISTS (
                             SELECT 1 FROM session_controls sc
                              WHERE sc.project_id = ?1
-                               AND NOT (
-                                   sc.state = 'stopped'
-                                   OR (sc.state = 'resume_requested'
-                                       AND sc.child_pid IS NULL
-                                       AND sc.interactive_holder IS NULL
-                                       AND sc.interactive_launch_token IS NULL
-                                       AND EXISTS (
-                                           SELECT 1 FROM git_finalizations g
-                                            WHERE g.project_id = sc.project_id
-                                              AND g.codex_session_id = sc.codex_session_id
-                                              AND g.state IN ('working', 'tracking', 'commit_pending', 'push_pending')
-                                              AND sc.run_token = ?4 || CAST(g.generation AS TEXT)
-                                       ))
-                               )
-                        )",
-                    params![
-                        project_id,
-                        holder,
-                        now,
-                        AGENT_GIT_FINALIZATION_RESUME_TOKEN_PREFIX
-                    ],
-                )
-                .await? == 1)
-            })
+                               AND NOT ({GIT_FINALIZATION_NONBLOCKING_CONTROL})
+                        )"
+                ),
+                params![
+                    project_id,
+                    holder,
+                    now,
+                    AGENT_GIT_FINALIZATION_RESUME_TOKEN_PREFIX
+                ],
+            )
+            .await?
+                == 1)
+        })
     }
 
     pub(crate) fn renew_lease_blocking(
