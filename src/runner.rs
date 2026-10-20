@@ -589,7 +589,7 @@ Safety rules:
 - Inspect task details when needed; a folder-backed task's list summary may not show its blocker notes.
 - Classify failed checks before deciding the task is blocked. If the implementation satisfies the task's acceptance criteria and its relevant checks pass, an independently evidenced pre-existing or environment-only failure may be recorded as a separate follow-up. Reproduce it on the frozen starting revision in an isolated directory without switching or resetting this checkout; record the revision, commands, matching failure, and the remaining work. Ordinary code fixes are actionable tasks, not blockers. Use BLOCKED only when an unavailable dependency, permission, or input prevents starting that follow-up. If independence or acceptance remains uncertain, keep the original task blocked.
 - For that independent failure, run `clt list doing`, then `clt follow-up doing <index> "Follow-up description" --evidence "Failure evidence, baseline comparison, and remaining work"`. This queues one linked Todo task for a fresh run without starting another session or changing the parent's identity. Add `--blocked "Unavailable dependency or input and what restores it"` only for a real obstacle; that follow-up stays blocked in Doing for later recovery. Do not copy the parent's codex marker onto it. Do not work on the follow-up in this run. Record its reference and the validation evidence in the parent's COMPLETED note and finish the original task. Report the original task as completed with a queued follow-up when appropriate; creating follow-up work is not a run failure.
-- If the implementation is incomplete, a task-relevant check fails, or the task cannot be completed safely, update the original task with a concise `BLOCKED YYYY-MM-DD:` note instead of forcing it. A follow-up must not hide unfinished acceptance criteria or an unproven regression.
+- If the implementation is incomplete, a task-relevant check fails, or the task cannot be completed safely, update the original task with a concise `BLOCKED YYYY-MM-DD:` note instead of forcing it. Return that unsealed task to Todo using clt and exit; preserve its session marker, partial work, and Git journal. Never move a sealed provisional Done task backward. A follow-up must not hide unfinished acceptance criteria or an unproven regression.
 "#;
 pub(super) const AGENT_GIT_COMMIT_PROMPT_APPENDIX: &str = r#"
 
@@ -642,7 +642,7 @@ Blocked-task monitor:
 - Update the existing task; do not create a replacement task. The independent-failure follow-up procedure above is allowed only when this original task satisfies its acceptance criteria.
 - If the task is completed, add its completion note and move it to done.
 - If its blocker is resolved but the task should be retried through the normal workflow, add a newer `UNBLOCKED YYYY-MM-DD:` note and move that same task back to todo.
-- If it still cannot be completed safely, update its blocked note with what you tried and what is still needed, and leave it in doing.
+- If it still cannot be completed safely, update its blocked note with what you tried and what is still needed, return the unsealed task to todo using clt, and exit.
 - Do not select backlog work. Stop after handling that one blocked task.
 - These recovery instructions replace steps 2-4 above.
 "#;

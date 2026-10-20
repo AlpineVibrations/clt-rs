@@ -72,6 +72,18 @@ used Turso dependency. Application modules import its local API through
 
 ## Tests
 
+Blocked worker completion returns only its uniquely linked, unsealed Doing task
+to Todo under the board lock after session control settles. It preserves unrelated
+tasks, journal state, explicit stops, manual ownership and live session owners.
+WORKING link repair recognizes session markers before the stop suffix and keeps
+blocked/stopped Todo placement in linked, missing-marker and duplicate-move
+recovery. Idle resume requests also honor stopped task markers, even without
+ready Todo work, and do not reserve the project against other ready tasks.
+Direct claims may coexist with uniquely linked idle blocked/stopped
+Todo WORKING journals; leases, live controls, launch records and sealed proof
+still fence the project. Regressions cover both board layouts and CLI claim
+completion alongside a preserved journal.
+
 Unit tests live under the module that owns the behavior, for example `src/task/tests.rs`,
 `src/agent/tests.rs`, and `src/tui/tests.rs`. Shared fixture helpers are in
 `src/test_support.rs` and are compiled only for tests. `tests/cli.rs` remains a black-box

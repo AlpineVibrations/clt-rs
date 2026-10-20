@@ -118,6 +118,119 @@ fn manual_claim_refuses_existing_clt_ownership_before_mutating_the_board() {
 }
 
 #[test]
+fn manual_claim_can_coexist_only_with_idle_queued_working_journals() {
+    for scenario in [
+        "blocked",
+        "stopped",
+        "ready",
+        "doing",
+        "sealed",
+        "unlinked",
+        "live",
+        "ambiguous",
+    ] {
+        for command in ["start", "claim"] {
+            let workspace = TestWorkspace::new("manual-parked-journal");
+            assert_success(&workspace.run(&["init"]));
+            assert_success(&workspace.run(&["agent", "register"]));
+            let parked_session = "01900000-0000-7000-8000-000000000002";
+            let parked = match scenario {
+                "stopped" => format!("Older task. codex:{parked_session} clt:stopped"),
+                "ready" => format!("Older task. codex:{parked_session}"),
+                "unlinked" => "Older task. BLOCKED 2026-10-20: Missing input.".into(),
+                _ => {
+                    format!("Older task. BLOCKED 2026-10-20: Missing input. codex:{parked_session}")
+                }
+            };
+            let status = if scenario == "doing" { "doing" } else { "todo" };
+            let parked_path = workspace.path().join(format!("tasks/{status}.md"));
+            fs::write(&parked_path, format!("# Tasks\n- {parked}\n")).unwrap();
+            if scenario == "ambiguous" {
+                fs::write(
+                    workspace.path().join("tasks/backlog.md"),
+                    format!("# Backlog\n- {parked}\n"),
+                )
+                .unwrap();
+            }
+            if command == "claim" {
+                assert_success(&workspace.run(&["add", "New direct work"]));
+            }
+            let todo_before = fs::read(workspace.path().join("tasks/todo.md")).unwrap();
+            let doing_before = fs::read(workspace.path().join("tasks/doing.md")).unwrap();
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                let database_path = workspace.path().join("agent-state/agent.db");
+                let database = turso::Builder::new_local(database_path.to_str().unwrap())
+                    .experimental_multiprocess_wal(true).build().await.unwrap();
+                let connection = database.connect().unwrap();
+                connection.execute(
+                    "INSERT INTO git_finalizations (project_id, codex_session_id, state, git_mode, starting_head, worktree_baseline, created_at, updated_at)
+                     SELECT id, ?1, ?2, 'commit', 'preserved-head', '{}', '100', '100' FROM projects",
+                    [parked_session, if scenario == "sealed" { "commit_pending" } else { "working" }],
+                ).await.unwrap();
+                connection.execute(
+                    "INSERT INTO session_controls (project_id, codex_session_id, state, run_token, updated_at)
+                     SELECT id, ?1, ?2, 'preserved-token', '100' FROM projects",
+                    [parked_session, if scenario == "live" { "running" } else { "resume_requested" }],
+                ).await.unwrap();
+            });
+            let output = if command == "start" {
+                workspace.run(&["start", "New direct work", "--session", MANUAL_SESSION])
+            } else {
+                workspace.run(&[
+                    "claim",
+                    "todo",
+                    if status == "todo" { "2" } else { "1" },
+                    "--session",
+                    MANUAL_SESSION,
+                ])
+            };
+            if matches!(scenario, "blocked" | "stopped") {
+                assert_success(&output);
+                let todo = fs::read_to_string(&parked_path).unwrap();
+                assert!(todo.contains(&parked), "{scenario}: {todo}");
+                let doing = fs::read_to_string(workspace.path().join("tasks/doing.md")).unwrap();
+                assert!(doing.contains("New direct work"));
+                assert!(doing.contains(MANUAL_SESSION));
+                // The independent manual task can also finish while the older
+                // journal and its paused conversation remain intact.
+                assert_success(&workspace.run(&["done", "doing", "1"]));
+                assert!(fs::read_to_string(&parked_path).unwrap().contains(&parked));
+            } else {
+                assert!(!output.status.success(), "{scenario}");
+                assert!(
+                    output_text(&output).1.contains("still has a CLT owner"),
+                    "{scenario}: {:?}",
+                    output_text(&output)
+                );
+                assert_eq!(
+                    todo_before,
+                    fs::read(workspace.path().join("tasks/todo.md")).unwrap(),
+                    "{scenario}"
+                );
+                assert_eq!(
+                    doing_before,
+                    fs::read(workspace.path().join("tasks/doing.md")).unwrap(),
+                    "{scenario}"
+                );
+            }
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                let database_path = workspace.path().join("agent-state/agent.db");
+                let database = turso::Builder::new_local(database_path.to_str().unwrap())
+                    .experimental_multiprocess_wal(true).build().await.unwrap();
+                let connection = database.connect().unwrap();
+                let mut rows = connection.query(
+                    "SELECT state, starting_head FROM git_finalizations WHERE codex_session_id = ?1",
+                    [parked_session],
+                ).await.unwrap();
+                let row = rows.next().await.unwrap().unwrap();
+                assert_eq!(row.get::<String>(0).unwrap(), if scenario == "sealed" { "commit_pending" } else { "working" });
+                assert_eq!(row.get::<String>(1).unwrap(), "preserved-head");
+            });
+        }
+    }
+}
+
+#[test]
 fn concurrent_direct_starts_publish_only_one_manual_owner() {
     let workspace = TestWorkspace::new("manual-concurrent");
     assert_success(&workspace.run(&["init"]));

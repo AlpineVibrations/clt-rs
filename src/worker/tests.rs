@@ -797,9 +797,15 @@ fn blocked_agent_run_records_its_codex_session_for_the_blocked_task() {
     let mut runner = FakeAgentRunner::new(&state_dir, "success");
     runner.result.codex_session_id = Some("session-for-blocked-task".to_string());
     let shutdown = new_agent_shutdown_signal();
-    run_agent_job(start.jobs.pop().unwrap(), &runner, &shutdown).unwrap();
+    let completion = run_agent_job(start.jobs.pop().unwrap(), &runner, &shutdown).unwrap();
+    assert_eq!(completion.status, "blocked");
 
-    let blocked_task = read_task_entries(&get_tasks_dir(&project_root), TaskStatus::Doing)
+    assert!(
+        read_task_entries(&get_tasks_dir(&project_root), TaskStatus::Doing)
+            .unwrap()
+            .is_empty()
+    );
+    let blocked_task = read_task_entries(&get_tasks_dir(&project_root), TaskStatus::Todo)
         .unwrap()
         .remove(0);
     assert_eq!(
@@ -819,6 +825,164 @@ fn blocked_agent_run_records_its_codex_session_for_the_blocked_task() {
     );
 
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn blocked_run_deferral_preserves_journals_neighbors_and_ownership() {
+    for folders in [false, true] {
+        for scenario in [
+            "working",
+            "git-off",
+            "sealed",
+            "stopped",
+            "manual",
+            "live",
+            "duplicate",
+        ] {
+            let root = temp_root("blocked-run-deferral");
+            let state_dir = root.join("state");
+            let path = root.join("project");
+            init_tasks(&path, folders).unwrap();
+            let board = TaskBoard::new(get_tasks_dir(&path));
+            let session = "01900000-0000-7000-8000-000000000042";
+            let content = format!(
+                "Blocked work. BLOCKED 2026-10-20: Need original input. {}codex:{session}{}",
+                if scenario == "manual" {
+                    "clt:manual "
+                } else {
+                    ""
+                },
+                if scenario == "stopped" {
+                    " clt:stopped"
+                } else {
+                    ""
+                },
+            );
+            board
+                .insert_content(TaskStatus::Doing, None, &content)
+                .unwrap();
+            board
+                .insert_content(TaskStatus::Doing, None, "Unrelated work. codex:other")
+                .unwrap();
+            board
+                .insert_content(TaskStatus::Todo, None, "Ready prerequisite.")
+                .unwrap();
+            if scenario == "duplicate" {
+                board
+                    .insert_content(TaskStatus::Todo, None, &content)
+                    .unwrap();
+            }
+            let doing_before = board.entries(TaskStatus::Doing).unwrap();
+            let todo_before = board.entries(TaskStatus::Todo).unwrap();
+            let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
+            store.register_project_blocking(&path, "project").unwrap();
+            let project = store.list_projects_blocking().unwrap().remove(0);
+            if scenario != "git-off" {
+                assert!(
+                    store
+                        .create_git_finalization_blocking(agent::NewGitFinalization {
+                            project_id: project.id,
+                            codex_session_id: session,
+                            git_mode: AgentGitMode::Commit,
+                            starting_head: Some("original-head"),
+                            branch_ref: Some("refs/heads/main"),
+                            upstream_ref: None,
+                            worktree_baseline: "{}",
+                            task_identity: durable_task_identity(&content).as_deref(),
+                            owner_run_token: None,
+                            created_at: "100",
+                        })
+                        .unwrap()
+                );
+            }
+            if scenario == "sealed" {
+                let journal = store
+                    .git_finalization_blocking(project.id, session)
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    store
+                        .compare_and_set_git_finalization_blocking(
+                            project.id,
+                            session,
+                            journal.generation,
+                            GitFinalizationState::Tracking,
+                            None,
+                            None,
+                            None,
+                            "101",
+                        )
+                        .unwrap()
+                );
+            }
+            if scenario == "live" {
+                store
+                    .mark_session_running_blocking(
+                        project.id,
+                        session,
+                        123,
+                        "new-run",
+                        &root.join("out"),
+                        &root.join("err"),
+                    )
+                    .unwrap();
+            }
+            let journal_before = store
+                .git_finalization_blocking(project.id, session)
+                .unwrap();
+            let job = AgentRunJob {
+                state_dir,
+                project,
+                holder: "worker".into(),
+                worker_token: None,
+                max_global_jobs: 1,
+                task_selection: AgentTaskSelection::ResumeSession,
+                resume_session_id: Some(session.into()),
+                blocked_task_count_before: 1,
+                done_task_contents_before: Vec::new(),
+                blocked_task_snapshots_before: Vec::new(),
+            };
+            let deferred = super::defer_blocked_task_after_run(&job, session).unwrap();
+            assert_eq!(
+                deferred,
+                matches!(scenario, "working" | "git-off"),
+                "{scenario}"
+            );
+            if deferred {
+                let doing = board.entries(TaskStatus::Doing).unwrap();
+                assert_eq!(doing.len(), 1);
+                if folders {
+                    assert_eq!(doing[0].source, doing_before[1].source);
+                }
+                assert_eq!(doing[0].content, doing_before[1].content);
+                let todo = board.entries(TaskStatus::Todo).unwrap();
+                assert_eq!(todo.len(), 2);
+                assert_eq!(todo[0].source, todo_before[0].source);
+                assert_eq!(todo[1].content.trim_end(), content);
+                assert!(super::defer_blocked_task_after_run(&job, session).unwrap());
+            } else {
+                for (status, before) in [
+                    (TaskStatus::Doing, doing_before),
+                    (TaskStatus::Todo, todo_before),
+                ] {
+                    let after = board.entries(status).unwrap();
+                    assert_eq!(after.len(), before.len());
+                    for (after, before) in after.iter().zip(before.iter()) {
+                        assert_eq!(after.source, before.source);
+                        assert_eq!(after.content, before.content);
+                    }
+                }
+            }
+            assert_eq!(
+                store
+                    .git_finalization_blocking(job.project.id, session)
+                    .unwrap(),
+                journal_before
+            );
+            drop(store);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
 }
 
 #[test]

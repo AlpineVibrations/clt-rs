@@ -2314,6 +2314,136 @@ fn working_link_repair_finishes_marker_and_duplicate_activation_crashes() {
 }
 
 #[test]
+fn working_link_repair_preserves_queued_blockers_and_explicit_stops() {
+    for folders in [false, true] {
+        for scenario in [
+            "stopped",
+            "blocked",
+            "unlinked-stopped",
+            "displaced-blocked",
+            "control-stopped",
+            "stopped-duplicate",
+            "blocked-duplicate",
+        ] {
+            let root = temp_root("working-repair-queued");
+            let project_root = root.join("project");
+            init_tasks(&project_root, folders).unwrap();
+            let board = TaskBoard::new(get_tasks_dir(&project_root));
+            let session = "01900000-0000-7000-8000-000000000042";
+            let content = match scenario {
+                "blocked" | "blocked-duplicate" => {
+                    format!("Parked work. BLOCKED 2026-10-20: Inputs unavailable. codex:{session}")
+                }
+                "displaced-blocked" => {
+                    format!("Parked work. codex:{session}\nBLOCKED 2026-10-20: Inputs unavailable.")
+                }
+                "unlinked-stopped" => "Parked work. clt:stopped".into(),
+                "control-stopped" => format!("Parked work. codex:{session}"),
+                _ => format!("Parked work. codex:{session} clt:stopped"),
+            };
+            board
+                .insert_content(TaskStatus::Todo, None, &content)
+                .unwrap();
+            if scenario.ends_with("duplicate") {
+                board
+                    .insert_content(TaskStatus::Doing, None, &content)
+                    .unwrap();
+            }
+            initialize_test_git_repository(&project_root);
+            let project_root = fs::canonicalize(project_root).unwrap();
+            let store = agent::TursoAgentStore::open_blocking(&root.join("state")).unwrap();
+            store
+                .register_project_blocking(&project_root, "project")
+                .unwrap();
+            let project = store.list_projects_blocking().unwrap().remove(0);
+            store
+                .mark_session_running_blocking(
+                    project.id,
+                    session,
+                    123,
+                    "run",
+                    &root.join("out"),
+                    &root.join("err"),
+                )
+                .unwrap();
+            let start = capture_agent_git_start_state(&project_root, AgentGitMode::Commit).unwrap();
+            assert!(
+                store
+                    .create_git_finalization_blocking(agent::NewGitFinalization {
+                        project_id: project.id,
+                        codex_session_id: session,
+                        git_mode: AgentGitMode::Commit,
+                        starting_head: Some(&start.starting_head),
+                        branch_ref: start.branch_ref.as_deref(),
+                        upstream_ref: start.upstream_ref.as_deref(),
+                        worktree_baseline: &start.worktree_baseline,
+                        task_identity: durable_task_identity(&content).as_deref(),
+                        owner_run_token: Some("run"),
+                        created_at: "100",
+                    })
+                    .unwrap()
+            );
+            if scenario == "control-stopped" {
+                assert!(
+                    store
+                        .request_session_stop_blocking(project.id, session, 123, "run")
+                        .unwrap()
+                );
+                assert!(
+                    store
+                        .complete_session_stop_blocking(project.id, session, "run")
+                        .unwrap()
+                );
+            } else {
+                assert!(
+                    store
+                        .clear_running_session_control_blocking(project.id, session, Some("run"))
+                        .unwrap()
+                );
+            }
+            let journal = store
+                .git_finalization_blocking(project.id, session)
+                .unwrap()
+                .unwrap();
+            let before = board.entries(TaskStatus::Todo).unwrap().remove(0);
+            // Repeated scheduler passes must keep the same queued task, even
+            // when recovery repairs a displaced or missing session marker.
+            for _ in 0..3 {
+                assert!(
+                    repair_working_git_task_link(&store, &project_root, &journal).unwrap(),
+                    "{scenario}"
+                );
+                assert!(
+                    board.entries(TaskStatus::Doing).unwrap().is_empty(),
+                    "{scenario}"
+                );
+                let todo = board.entries(TaskStatus::Todo).unwrap();
+                assert_eq!(todo.len(), 1, "{scenario}");
+                assert_eq!(todo[0].source, before.source, "{scenario}");
+                assert_eq!(
+                    recoverable_codex_session_id_from_task_content(&todo[0].content),
+                    Some(session)
+                );
+                if !matches!(scenario, "unlinked-stopped" | "displaced-blocked") {
+                    assert_eq!(todo[0].content, before.content, "{scenario}");
+                }
+                if scenario.contains("stopped") && scenario != "control-stopped" {
+                    assert!(task_entry_is_stopped(&todo[0]), "{scenario}");
+                }
+            }
+            assert_eq!(
+                store
+                    .git_finalization_blocking(project.id, session)
+                    .unwrap(),
+                Some(journal)
+            );
+            drop(store);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+}
+
+#[test]
 fn sealed_git_finalization_rejects_a_same_path_rewrite() {
     let root = temp_root("automated-git-finalization-same-path-rewrite");
     let state_dir = root.join("state/clt");

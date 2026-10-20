@@ -44,11 +44,12 @@ use crate::{
         agent_max_global_jobs, run_agent_daemon_database_operation_with_recovery,
         scan_agent_project, task_status_for_codex_session,
     },
-    session_control::codex_session_for_task,
+    session_control::{codex_session_for_task, collect_codex_session_tasks_in_board},
     task::{
         TaskEntry, TaskStatus, acquire_board_mutation_lock,
         attach_codex_session_to_task_after_lock, durable_task_identity, get_tasks_dir,
-        read_task_entries, task_entry_is_blocked, task_entry_is_ready, task_entry_is_stopped,
+        move_task_without_reordering_after_lock, read_task_entries, task_content_is_manual,
+        task_entry_is_blocked, task_entry_is_ready, task_entry_is_stopped,
         terminal_task_for_codex_session_in_board,
     },
 };
@@ -1525,6 +1526,22 @@ pub(super) fn run_agent_job_inner(
         summary = format!("{summary} Failed to finalize Codex session control: {error:#}");
     }
 
+    if session_lifecycle_result.is_ok()
+        && control_action.is_none()
+        && !git_finalization_pending
+        && !autonomous_git_push_pending
+        && job.task_selection != AgentTaskSelection::SupervisorReview
+        && let Some(session) = codex_session_id
+            .as_deref()
+            .or(job.resume_session_id.as_deref())
+        && defer_blocked_task_after_run(&job, session)?
+    {
+        status = "blocked";
+        summary = format!(
+            "The blocked task is queued in Todo with its work and session preserved. {summary}"
+        );
+    }
+
     with_agent_store_at(&job.state_dir, |store| {
         if job.task_selection == AgentTaskSelection::SupervisorReview {
             if status != "success" {
@@ -1560,6 +1577,53 @@ pub(super) fn run_agent_job_inner(
         summary,
         stdout_path,
         stderr_path,
+    })
+}
+
+/// The worker has exited and released its session control, but still owns the
+/// project lease. Return only its blocked, unsealed task before another run can
+/// be scheduled. The board lock also protects a concurrent stop or manual edit.
+fn defer_blocked_task_after_run(job: &AgentRunJob, session: &str) -> Result<bool> {
+    let board = get_tasks_dir(&job.project.path);
+    let _lock = acquire_board_mutation_lock(&board)?;
+    renew_agent_job_worker_fence(job)?;
+    with_agent_store_at(&job.state_dir, |store| {
+        if store
+            .session_control_blocking(job.project.id, session)?
+            .is_some_and(|control| {
+                control.state != AgentSessionControlState::ResumeRequested
+                    || control.child_pid.is_some()
+                    || control.interactive_holder.is_some()
+                    || control.interactive_launch_token.is_some()
+            })
+            || store
+                .git_finalization_blocking(job.project.id, session)?
+                .is_some_and(|journal| journal.state != GitFinalizationState::Working)
+        {
+            return Ok(false);
+        }
+        let mut linked = Vec::new();
+        collect_codex_session_tasks_in_board(&board, session, &mut linked)?;
+        let [(status, task)] = linked.as_slice() else {
+            return Ok(false);
+        };
+        if !status.is_active()
+            || !task_entry_is_blocked(task)
+            || task_entry_is_stopped(task)
+            || task_content_is_manual(&task.content)
+        {
+            return Ok(false);
+        }
+        if *status == TaskStatus::Doing {
+            let Some(index) = read_task_entries(&board, *status)?
+                .iter()
+                .position(|entry| entry.source == task.source && entry.content == task.content)
+            else {
+                return Ok(false);
+            };
+            move_task_without_reordering_after_lock(&board, *status, TaskStatus::Todo, index + 1)?;
+        }
+        Ok(true)
     })
 }
 

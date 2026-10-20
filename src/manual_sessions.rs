@@ -1,12 +1,15 @@
 //! Directly opened Codex sessions reserve tasks in the board, independently of
 //! daemon process lifetimes. Claim publication and scheduler lease acquisition
 //! share the project board lock, so exactly one side can take ownership.
-use std::{fs, io::ErrorKind, path::Path};
+use std::{collections::HashSet, fs, io::ErrorKind, path::Path};
 
 use anyhow::{Context, Result};
 
 use crate::{
-    agent::{AGENT_DB_FILE, AgentSessionControlState, agent_state_dir, open_agent_store_at},
+    agent::{
+        AGENT_DB_FILE, AgentSessionControlState, GitFinalizationState, agent_state_dir,
+        open_agent_store_at,
+    },
     application::move_task_in_board_after_lock,
     runner::{automated_agent_child_context, canonicalize_existing_path},
     session_control::collect_codex_session_tasks_in_board,
@@ -16,7 +19,7 @@ use crate::{
         ensure_existing_board, get_tasks_dir, insert_task_content, parse_one_based_task_index,
         read_task_entries, recoverable_codex_session_id_from_task_content, task_content_is_manual,
         task_content_with_manual_session, task_content_without_manual_marker,
-        task_content_without_stop_marker,
+        task_content_without_stop_marker, task_entry_is_blocked, task_entry_is_stopped,
     },
 };
 
@@ -68,6 +71,24 @@ fn with_manual_board<T>(
     .then(|| acquire_board_mutation_lock(&board_dir))
     .transpose()?;
     if let (Some(store), Some(project)) = (&store, &project) {
+        let mut parked_sessions = HashSet::new();
+        for journal in store.list_pending_git_finalizations_blocking(Some(project.id))? {
+            let mut linked = Vec::new();
+            collect_codex_session_tasks_in_board(
+                &project_board,
+                &journal.codex_session_id,
+                &mut linked,
+            )?;
+            anyhow::ensure!(
+                journal.state == GitFinalizationState::Working
+                    && journal.commit_oid.is_none()
+                    && matches!(linked.as_slice(), [(TaskStatus::Todo, task)]
+                        if !task_content_is_manual(&task.content)
+                            && (task_entry_is_blocked(task) || task_entry_is_stopped(task))),
+                "The project still has a CLT owner or unfinished Git launch/finalization; return idle blocked or stopped work to Todo before claiming manual work"
+            );
+            parked_sessions.insert(journal.codex_session_id);
+        }
         anyhow::ensure!(
             store.lease_for_project_blocking(project.id)?.is_none()
                 && !store
@@ -77,16 +98,17 @@ fn with_manual_board<T>(
                 && !store
                     .session_controls_for_project_blocking(project.id)?
                     .iter()
-                    .any(|control| control.state != AgentSessionControlState::Stopped
-                        || control.child_pid.is_some()
-                        || control.interactive_holder.is_some()
-                        || control.interactive_launch_token.is_some())
+                    .any(
+                        |control| !(control.state == AgentSessionControlState::Stopped
+                            || control.state == AgentSessionControlState::ResumeRequested
+                                && parked_sessions.contains(&control.codex_session_id))
+                            || control.child_pid.is_some()
+                            || control.interactive_holder.is_some()
+                            || control.interactive_launch_token.is_some()
+                    )
                 && store
                     .git_launch_state_for_project_blocking(project.id)?
-                    .is_none()
-                && store
-                    .list_pending_git_finalizations_blocking(Some(project.id))?
-                    .is_empty(),
+                    .is_none(),
             "The project still has a CLT owner or unfinished Git launch/finalization; stop or finish that run before claiming manual work"
         );
         anyhow::ensure!(

@@ -58,7 +58,8 @@ use crate::{
         TaskStatus, acquire_board_mutation_lock, board_has_manual_task, ensure_existing_board,
         get_tasks_dir, read_task_entries, recoverable_codex_session_id_from_task_content,
         task_content_is_manual, task_entry_is_blocked, task_entry_is_stopped,
-        task_status_for_codex_session_in_board, terminal_task_for_codex_session_in_board,
+        task_for_codex_session_in_board, task_status_for_codex_session_in_board,
+        terminal_task_for_codex_session_in_board,
     },
     tui::TUI_SESSION_HANDOFF_TIMEOUT_SECONDS,
     worker::{
@@ -2067,15 +2068,22 @@ fn queued_resume_can_wait(
         || control.child_pid.is_some()
         || control.interactive_holder.is_some()
         || control.interactive_launch_token.is_some()
-        || !crate::supervisor::queued_blockers_can_wait(project)?
     {
         return Ok(false);
     }
-    Ok(terminal_task_for_codex_session_in_board(
-        &get_tasks_dir(&project.path),
-        &control.codex_session_id,
-    )?
-    .is_some_and(|(status, task)| status == TaskStatus::Todo && task_entry_is_blocked(&task)))
+    let Some((status, task)) =
+        task_for_codex_session_in_board(&get_tasks_dir(&project.path), &control.codex_session_id)?
+    else {
+        return Ok(false);
+    };
+    // A saved Git resume request is not permission to override a later stop.
+    // Read through the stop suffix, and yield even when no ready work exists.
+    if status != TaskStatus::Done && task_entry_is_stopped(&task) {
+        return Ok(true);
+    }
+    Ok(status == TaskStatus::Todo
+        && task_entry_is_blocked(&task)
+        && crate::supervisor::queued_blockers_can_wait(project)?)
 }
 
 fn controls_suspend_ready_work(

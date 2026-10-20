@@ -1818,6 +1818,93 @@ fn agent_scheduler_recovers_timed_out_session_after_worker_and_lease_are_gone() 
 }
 
 #[test]
+fn queued_resume_never_restarts_stopped_tasks_or_blocks_ready_work() {
+    for folders in [false, true] {
+        for status in [TaskStatus::Todo, TaskStatus::Doing] {
+            for git_mode in [AgentGitMode::Off, AgentGitMode::Commit] {
+                for ready_work in [false, true] {
+                    let root = temp_root("stopped-queued-resume");
+                    let state = root.join("state");
+                    let path = root.join("project");
+                    init_tasks(&path, folders).unwrap();
+                    let board = TaskBoard::new(get_tasks_dir(&path));
+                    let content = "Stopped task. BLOCKED 2026-10-20: Missing input. codex:stopped-session clt:stopped";
+                    board.insert_content(status, None, content).unwrap();
+                    if ready_work {
+                        board
+                            .insert_content(TaskStatus::Todo, None, "Ready task.")
+                            .unwrap();
+                    }
+                    initialize_test_git_repository(&path);
+                    let store = agent::TursoAgentStore::open_blocking(&state).unwrap();
+                    store.register_project_blocking(&path, "project").unwrap();
+                    let project = store.list_projects_blocking().unwrap().remove(0);
+                    store
+                        .set_project_git_mode_blocking(project.id, git_mode)
+                        .unwrap();
+                    if git_mode != AgentGitMode::Off {
+                        let start = capture_agent_git_start_state(&path, git_mode).unwrap();
+                        assert!(
+                            store
+                                .create_git_finalization_blocking(agent::NewGitFinalization {
+                                    project_id: project.id,
+                                    codex_session_id: "stopped-session",
+                                    git_mode,
+                                    starting_head: Some(&start.starting_head),
+                                    branch_ref: start.branch_ref.as_deref(),
+                                    upstream_ref: start.upstream_ref.as_deref(),
+                                    worktree_baseline: &start.worktree_baseline,
+                                    task_identity: durable_task_identity(content).as_deref(),
+                                    owner_run_token: None,
+                                    created_at: "100",
+                                })
+                                .unwrap()
+                        );
+                    }
+                    store
+                        .set_session_control_state_blocking(
+                            project.id,
+                            "stopped-session",
+                            AgentSessionControlState::ResumeRequested,
+                        )
+                        .unwrap();
+                    let journal = store
+                        .git_finalization_blocking(project.id, "stopped-session")
+                        .unwrap();
+                    for _ in 0..2 {
+                        let pass = run_agent_scheduler_pass(&state, false, &[]).unwrap();
+                        assert_eq!(pass.jobs.len(), usize::from(ready_work));
+                        if let Some(job) = pass.jobs.first() {
+                            assert_eq!(job.task_selection, AgentTaskSelection::NextTodo);
+                            assert!(job.resume_session_id.is_none());
+                            store
+                                .release_lease_blocking(project.id, &job.holder)
+                                .unwrap();
+                        }
+                        let (current_status, task) = task_for_codex_session_in_board(
+                            &get_tasks_dir(&path),
+                            "stopped-session",
+                        )
+                        .unwrap()
+                        .unwrap();
+                        assert_eq!(current_status, status);
+                        assert_eq!(task.content.trim_end(), content);
+                        assert_eq!(
+                            store
+                                .git_finalization_blocking(project.id, "stopped-session")
+                                .unwrap(),
+                            journal
+                        );
+                    }
+                    drop(store);
+                    fs::remove_dir_all(root).unwrap();
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn agent_scheduler_only_recovers_uncontrolled_session_marked_doing_tasks() {
     for (doing, stopped, expected) in [
         ("- Human work\n", false, None),

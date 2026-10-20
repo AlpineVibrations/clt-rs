@@ -6,11 +6,15 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+## [0.8.3] - 2026-10-20
+
 ### Changed
 
 - Rename the supervisor to “task supervisor” in its prompt, review label and documentation.
 
 ### Fixed
+
+- Keep stopped and blocked tasks in Todo during Git recovery, including stopped tasks whose session marker precedes `clt:stopped`. Return blocked implementation runs to Todo and allow a new manual task while older unsealed work is idle there, preserving its conversation, partial work and Git journal.
 
 - Let an already-running task finish Git verification and publication while an older Done conversation remains open in shared interactive mode. Preserve the older conversation and keep unfinished Git work and exclusive owners fenced.
 
@@ -436,7 +440,8 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 - Fixed task moves so destination write failures do not remove the source task.
 - Fixed TUI navigation on empty boards.
 
-[Unreleased]: https://github.com/AlpineVibrations/clt-rs/compare/v0.8.2...HEAD
+[Unreleased]: https://github.com/AlpineVibrations/clt-rs/compare/v0.8.3...HEAD
+[0.8.3]: https://github.com/AlpineVibrations/clt-rs/compare/v0.8.2...v0.8.3
 [0.8.2]: https://github.com/AlpineVibrations/clt-rs/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/AlpineVibrations/clt-rs/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/AlpineVibrations/clt-rs/compare/v0.7.8...v0.8.0

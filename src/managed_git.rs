@@ -14,8 +14,8 @@ use tempfile::TempDir;
 
 use crate::{
     agent::{
-        self, AGENT_ABANDONED_UNBOUND_JOURNAL_REASON, AgentGitMode, GitFinalizationState,
-        open_agent_store_at, with_agent_store_at,
+        self, AGENT_ABANDONED_UNBOUND_JOURNAL_REASON, AgentGitMode, AgentSessionControlState,
+        GitFinalizationState, open_agent_store_at, with_agent_store_at,
     },
     application::{AgentLeaseHolderLiveness, AgentRunJob, AgentTaskSelection},
     platform::{configure_agent_child_command, stop_agent_child_process},
@@ -34,7 +34,7 @@ use crate::{
         durable_task_identity, follow_up_matches_status, follow_up_session, get_status_store,
         get_tasks_dir, move_task_without_reordering_after_lock, read_task_entries,
         remove_task_entry_without_reordering, starts_with_task_note_date, task_content_is_blocked,
-        task_entry_is_blocked, task_entry_is_ready, task_entry_is_stopped,
+        task_content_is_manual, task_content_without_stop_marker, task_entry_is_ready,
         task_tree_contains_session_marker, terminal_task_for_codex_session_in_board,
         title_from_path,
     },
@@ -648,6 +648,14 @@ pub(super) fn repair_working_git_task_link_with_lock_callbacks(
         return Ok(false);
     }
     after_validation();
+    let session_stopped = store
+        .session_control_blocking(finalization.project_id, &finalization.codex_session_id)?
+        .is_some_and(|control| {
+            matches!(
+                control.state,
+                AgentSessionControlState::Stopped | AgentSessionControlState::StopRequested
+            )
+        });
     cleanup_clt_atomic_task_temporaries(&board_dir)?;
     let mut linked = Vec::new();
     for status in [TaskStatus::Todo, TaskStatus::Doing] {
@@ -655,7 +663,7 @@ pub(super) fn repair_working_git_task_link_with_lock_callbacks(
             .into_iter()
             .enumerate()
         {
-            if codex_session_id_from_task_content(&entry.content)
+            if codex_session_id_from_task_content(task_content_without_stop_marker(&entry.content))
                 == Some(finalization.codex_session_id.as_str())
                 && durable_task_identity(&entry.content).as_deref() == Some(task_identity)
             {
@@ -665,11 +673,9 @@ pub(super) fn repair_working_git_task_link_with_lock_callbacks(
     }
     match linked.as_slice() {
         [(TaskStatus::Doing, _, _)] => return Ok(true),
-        [(TaskStatus::Todo, _, entry)]
-            if task_entry_is_blocked(entry) || task_entry_is_stopped(entry) =>
-        {
-            // Returning a dependency wait to Todo is intentional, not a lost
-            // activation. Keep its journal without undoing the deferral.
+        [(TaskStatus::Todo, _, entry)] if session_stopped || !task_entry_is_ready(entry) => {
+            // Stops and queued blockers are intentional, not lost activations.
+            // The stop suffix must not hide the existing conversation link.
             return Ok(true);
         }
         [(TaskStatus::Todo, index, _)] => {
@@ -692,12 +698,17 @@ pub(super) fn repair_working_git_task_link_with_lock_callbacks(
                     )
                 }) =>
         {
-            let (_, _, todo_duplicate) = linked
+            let duplicate_status = if session_stopped || !task_entry_is_ready(first) {
+                TaskStatus::Doing
+            } else {
+                TaskStatus::Todo
+            };
+            let (_, _, duplicate) = linked
                 .iter()
-                .find(|(status, _, _)| *status == TaskStatus::Todo)
-                .expect("one linked crash duplicate is in Todo");
+                .find(|(status, _, _)| *status == duplicate_status)
+                .expect("one linked crash duplicate is in each active status");
             TaskBoard::new(&board_dir)
-                .remove_entry_without_reordering(TaskStatus::Todo, todo_duplicate)?;
+                .remove_entry_without_reordering(duplicate_status, duplicate)?;
             return Ok(true);
         }
         [] => {}
@@ -717,6 +728,9 @@ pub(super) fn repair_working_git_task_link_with_lock_callbacks(
     let [(status, index, entry)] = matches.as_slice() else {
         return Ok(false);
     };
+    if task_content_is_manual(&entry.content) {
+        return Ok(false);
+    }
     attach_codex_session_to_task_after_lock(
         project_root,
         *status,
@@ -724,7 +738,7 @@ pub(super) fn repair_working_git_task_link_with_lock_callbacks(
         &finalization.codex_session_id,
         || {},
     )?;
-    if *status == TaskStatus::Todo {
+    if *status == TaskStatus::Todo && !session_stopped && task_entry_is_ready(entry) {
         move_task_without_reordering_after_lock(
             &board_dir,
             TaskStatus::Todo,

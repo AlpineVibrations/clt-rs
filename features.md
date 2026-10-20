@@ -226,7 +226,12 @@ a duplicate conversation.
 
 Claims require the exact current session UUID and an idle project. Existing
 automated conversations, active leases, and unfinished Git finalizations retain
-their established CLT controls. A session may belong to only one task. If the
+their established CLT controls. An older unsealed `WORKING` journal does not
+prevent a new claim when it belongs uniquely to a blocked or stopped Todo and
+has no active process or interactive owner. Its journal and conversation remain
+available while the manual task reserves the project. Sealed Git work, ambiguous
+links, and unfinished work still in Doing continue to prevent a new claim.
+A session may belong to only one task. If the
 session ID is unavailable, keep any tracking task stopped until it can be linked
 and claimed. These commands and scheduler protections require the updated CLT
 binary; restart the scheduler after upgrading and refresh the bundled skills
@@ -500,6 +505,14 @@ An abandoned `WORKING` journal that never acquired a task identity can outlive i
 `FINALIZING` local-commit work takes priority over all queued work and resumes the exact linked Codex session. `PUSH-PENDING` also blocks every later project task, but it is retried entirely by CLT without launching or resuming Codex. A `WORKING` journal is earlier and more permissive: if its linked task is durably blocked and its blocked-recovery backoff is active, CLT preserves that journal and history while allowing another ready Todo to run. It deliberately skips startup synchronization for the later task so the blocked proof boundary remains reachable; after backoff, the exact blocked session is eligible for recovery again. If a crashed worker instead left an ordinary task in `doing`, the scheduler uses its durable worker record to resume that task. When exactly one interrupted or blocked task carries a session marker, recovery uses `codex exec resume` for that session instead of opening a new one. Explicit stop and interactive-handoff states suppress ordinary scheduling; an interactive `i` handback is prioritized as an exact-session resume before any Todo selection.
 
 ### Goals and blocked tasks
+
+When an implementation run cannot finish, it records a dated blocker, returns
+the unsealed task to Todo, and exits. CLT also returns the linked blocked task
+after the worker exits, preserving its notes, conversation, partial changes and
+Git journal. Recovery respects that placement and the terminal `clt:stopped`
+marker, including when repairing a missing conversation link or an interrupted
+move. An explicit stop remains in effect until the user restarts the task.
+Sealed provisional Done work keeps its existing finalization controls.
 
 Prefix a Todo task with `/goal` when it needs a persistent objective for long-running work. Automated runs enable Codex goals, remove the leading directive from the goal objective, and ask Codex to create the goal before working on the task. The directive must be the task's first non-whitespace token and must be followed by a non-empty objective; `/goal` elsewhere in a task remains ordinary text.
 
