@@ -6,6 +6,13 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+### Added
+
+- Press Enter on a running Doing task to send steering text to its active Codex
+  turn without editing the task. New automated runs own a private app-server
+  connection, validate the session and turn before sending, and confirm delivery
+  only after Codex accepts it. Failed or uncertain deliveries retain the draft.
+
 ## [0.8.3] - 2026-10-20
 
 ### Changed

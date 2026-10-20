@@ -57,6 +57,7 @@ use crate::{
 
 mod completed;
 pub(super) mod planning;
+pub(crate) mod steering;
 
 #[cfg(all(unix, test))]
 use crate::application::TEST_INTERACTIVE_EXEC_GATE_ENV;

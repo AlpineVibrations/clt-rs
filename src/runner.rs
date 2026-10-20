@@ -53,6 +53,8 @@ use crate::{
     },
 };
 
+pub(crate) mod app_server;
+
 #[cfg(test)]
 use crate::application::AGENT_DEFAULT_POLL_INTERVAL_SECONDS;
 #[cfg(unix)]
@@ -432,6 +434,15 @@ pub(super) fn launch_agent_runner_stage(
         project.id,
         run_file_stem,
     );
+    if runner.app_server && task_selection != AgentTaskSelection::SupervisorReview {
+        command = app_server::adapter_command(
+            &command,
+            &runner.state_dir,
+            project.id,
+            run_file_stem,
+            &stderr_path,
+        )?;
+    }
 
     let persist_git_launch_state = || -> Result<bool> {
         let Some(git_start_state) = git_start_state else {
@@ -541,6 +552,7 @@ pub(super) fn launch_agent_runner_stage(
 }
 
 pub(super) struct CodexAgentRunner {
+    pub(super) app_server: bool,
     pub(super) state_dir: PathBuf,
     pub(super) timeout: Duration,
     pub(super) heartbeat_interval: Duration,
@@ -1605,6 +1617,7 @@ impl CodexAgentRunner {
     ) -> Result<Self> {
         let lease_timeout = agent_lease_timeout()?;
         Ok(Self {
+            app_server: true,
             state_dir,
             timeout: agent_run_timeout()?,
             heartbeat_interval: agent_poll_interval()?,
@@ -1619,6 +1632,9 @@ impl CodexAgentRunner {
     pub(super) fn with_command(state_dir: PathBuf, timeout: Duration, command: PathBuf) -> Self {
         let lease_timeout = Duration::from_secs(60);
         Self {
+            // Existing process-supervision fixtures emulate the exec CLI. The
+            // app-server integration fixtures opt into the real adapter below.
+            app_server: false,
             state_dir,
             timeout,
             heartbeat_interval: Duration::from_secs(AGENT_DEFAULT_POLL_INTERVAL_SECONDS),
@@ -2751,7 +2767,7 @@ pub(super) fn agent_run_settings_from_log(path: &Path) -> Result<AgentRunSetting
             continue;
         }
         if !saw_banner {
-            saw_banner = line.starts_with("OpenAI Codex v");
+            saw_banner = line.starts_with("OpenAI Codex v") || line == "CLT Codex app-server";
             continue;
         }
         if line == "--------" {

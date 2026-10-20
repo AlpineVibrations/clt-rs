@@ -1,1 +1,0 @@
-if a task is in doing and an agent is running on it. and you press enter instead of editing the task it should let you submit text to auto give to the agent like if you were in interactive and enteredd stearing text it would give it when it finished the next little thing.

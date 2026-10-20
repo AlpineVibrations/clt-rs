@@ -3109,7 +3109,7 @@ fn tui_models_shortcut_preserves_lowercase_m_and_task_input() {
         assert_eq!(app.current_pane, pane);
     }
 
-    for mode in [Mode::Input, Mode::Edit] {
+    for mode in [Mode::Input, Mode::Edit, Mode::Steer] {
         let mut app = TuiApp::new(&root, true);
         app.current_mode = mode;
         let key = KeyEvent::new(KeyCode::Char('m'), KeyModifiers::SHIFT);
@@ -4832,4 +4832,73 @@ fn supervisor_row_has_independent_focus_and_uses_standard_setting_keys() {
     assert_eq!(app.current_pane, TuiPane::AgentProjects);
     assert_eq!(app.agent_panel.state.selected(), Some(0));
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn steering_composer_cancels_without_editing_and_retains_failed_drafts() {
+    let f = crate::session_control::steering::tests::Fixture::new(false, false);
+    let original = fs::read(&f.path).unwrap();
+    let mut app = TuiApp::new(&f.project.path, true);
+    app.open_steering(f.target.clone());
+    assert_eq!(app.current_mode, Mode::Steer);
+    assert!(app.editing_task_idx.is_none());
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    app.steering_key(enter, 80);
+    assert!(app.steering_delivery.is_none());
+    app.task_input
+        .insert_paste("First line\nSecond line: café".into());
+    assert_eq!(
+        app.task_input.submitted_value(),
+        "First line\nSecond line: café"
+    );
+    let (sender, receiver) = std::sync::mpsc::channel();
+    app.steering_delivery = Some(receiver);
+    // No duplicate submission and no edits while a request is in flight.
+    app.steering_key(enter, 80);
+    app.steering_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), 80);
+    app.poll_steering_delivery();
+    assert_eq!(app.current_mode, Mode::Steer);
+    sender
+        .send(Err(anyhow::anyhow!("The turn changed")))
+        .unwrap();
+    app.poll_steering_delivery();
+    assert!(app.feedback_buffer.contains("The turn changed"));
+    assert_eq!(
+        app.task_input.submitted_value(),
+        "First line\nSecond line: café"
+    );
+    assert!(app.steering_target.is_some());
+    app.steering_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), 80);
+    assert_eq!(app.current_mode, Mode::View);
+    assert!(app.task_input.submitted_value().is_empty());
+    assert!(app.steering_target.is_none());
+    assert_eq!(fs::read(&f.path).unwrap(), original);
+}
+
+#[test]
+fn steering_composer_renders_message_prompt_and_clears_only_on_receipt() {
+    let f = crate::session_control::steering::tests::Fixture::new(false, false);
+    let mut app = TuiApp::new(&f.project.path, true);
+    app.open_steering(f.target.clone());
+    app.task_input = TaskInput::new("Please keep the API".into());
+    assert!(tui_input_height(&app, 80) >= 3);
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+    app.prepare_render(Rect::new(0, 0, 100, 24));
+    terminal.draw(|frame| render_tui(frame, &app)).unwrap();
+    let rendered: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(rendered.contains("Message Agent (Enter to send, Esc to cancel)"));
+    assert!(rendered.contains("Please keep the API"));
+    let (sender, receiver) = std::sync::mpsc::channel();
+    app.steering_delivery = Some(receiver);
+    sender.send(Ok("Sent to the running agent".into())).unwrap();
+    app.poll_steering_delivery();
+    assert_eq!(app.current_mode, Mode::View);
+    assert!(app.task_input.submitted_value().is_empty());
+    assert_eq!(app.feedback_buffer, "Sent to the running agent");
 }

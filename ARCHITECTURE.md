@@ -72,6 +72,26 @@ used Turso dependency. Application modules import its local API through
 
 ## Tests
 
+`runner::app_server` adapts implementation launches to a private JSONL stdio
+server behind the existing exec gate and session supervisor. The adapter keeps
+the registered child PID and process group, inherits launch environment and Git
+identity, and translates model/provider/reasoning/Fast/goal configuration without
+changing the prompt or launch record. Reviews retain their structured exec path.
+Root-thread events produce the existing session/settings header, live stderr and
+final stdout. Goal continuations stay server-owned; failure, interruption and
+disconnect cannot become successful completion.
+
+`session_control::steering` owns a private mailbox beside each run's logs. The
+TUI and owning worker recheck the unique Doing task and the saved session,
+PID, run token and active turn before publication/delivery. Only the worker
+writes `turn/steer`, guarded by `expectedTurnId`. Atomic per-request receipts
+acknowledge the successful RPC response; queued files and transport failures
+never imply acceptance. Stale runs cannot route messages into their successors.
+Composer work runs off the UI thread and never calls task editing APIs. Protocol,
+mailbox and TUI regressions cover both board layouts, nested boards, stale turns,
+changed ownership, disconnects, drafts, goal continuations and task preservation;
+a supervised private-peer integration test covers active delivery and cancellation.
+
 Blocked worker completion returns only its uniquely linked, unsealed Doing task
 to Todo under the board lock after session control settles. It preserves unrelated
 tasks, journal state, explicit stops, manual ownership and live session owners.

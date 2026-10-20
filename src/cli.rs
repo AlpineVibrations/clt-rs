@@ -161,6 +161,12 @@ enum SkillsCommands {
 
 #[derive(Subcommand)]
 enum AgentCommands {
+    /// Internal stdio owner for a steerable automated Codex session
+    #[command(hide = true)]
+    AppServerSession {
+        #[arg(long)]
+        spec: String,
+    },
     /// Registers a project for agent runs
     Register {
         /// Project path to register. Defaults to the current directory.
@@ -374,6 +380,12 @@ pub(super) fn run() -> Result<()> {
     }) = cli.command.as_ref()
     {
         return run_automated_exec_gate(program, arguments);
+    }
+    if let Some(Commands::Agent {
+        command: AgentCommands::AppServerSession { spec },
+    }) = cli.command.as_ref()
+    {
+        return crate::runner::app_server::run_serialized(spec);
     }
     if let Some(Commands::Agent {
         command:
@@ -753,6 +765,7 @@ fn handle_agent_command(command: AgentCommands, local: bool, default_root: &Path
             )?;
         }
         AgentCommands::AutomatedExecGate { .. }
+        | AgentCommands::AppServerSession { .. }
         | AgentCommands::AutomatedSessionSupervisor { .. }
         | AgentCommands::SuperviseSession { .. }
         | AgentCommands::InteractiveExecGate { .. }

@@ -63,11 +63,13 @@ use crate::{
         InteractiveAgentLease, InteractiveCodexResumeMode, InteractiveGuardianDisposition,
         agent_session_resume_worker_log_path, cancel_tui_idle_codex_session_interactive,
         codex_session_for_task, codex_session_task_supports_interactive_resume,
-        planning::prepare_todo_planning_session, prepare_tui_codex_session_interrupt,
-        queue_tui_codex_session_exec_resume, reserve_tui_idle_codex_session_interactive,
-        reserve_tui_shared_codex_session_interactive, resume_codex_session_interactively,
-        spawn_agent_session_resume_worker, task_supports_interactive_codex_resume,
-        toggle_tui_codex_session_stop, toggle_tui_task_stop_at, tui_inactive_codex_session_control,
+        planning::prepare_todo_planning_session,
+        prepare_tui_codex_session_interrupt, queue_tui_codex_session_exec_resume,
+        reserve_tui_idle_codex_session_interactive, reserve_tui_shared_codex_session_interactive,
+        resume_codex_session_interactively, spawn_agent_session_resume_worker,
+        steering::{self, SteeringTarget},
+        task_supports_interactive_codex_resume, toggle_tui_codex_session_stop,
+        toggle_tui_task_stop_at, tui_inactive_codex_session_control,
     },
     task::{
         TASK_STATUSES, TaskBoard, TaskEntry, TaskSource, TaskStatus, acquire_board_mutation_lock,
@@ -946,6 +948,7 @@ pub(super) enum Mode {
     Reorganize,
     Input,
     Edit,
+    Steer,
     Help,
 }
 
@@ -1177,7 +1180,7 @@ impl TuiTaskSnapshot {
 }
 
 pub(super) fn tui_task_board_instructions() -> &'static str {
-    "Arrows navigate boards and tasks, Enter opens subtasks, e edits, n or + creates a subtask under the selected task, and Space creates a task. Press r to reorganize; use Shift+Arrows to move tasks. Tab opens Agent Projects, M opens Models, and h/? opens Help. Task control: s stops/starts tasks, i interrupts for interaction, c plans Todo tasks or opens linked sessions (taking over active runs), and l shows logs."
+    "Arrows navigate boards and tasks, Enter messages running Doing agents or opens subtasks/edits, e edits, n or + creates a subtask under the selected task, and Space creates a task. Press r to reorganize; use Shift+Arrows to move tasks. Tab opens Agent Projects, M opens Models, and h/? opens Help. Task control: s stops/starts tasks, i interrupts for interaction, c plans Todo tasks or opens linked sessions (taking over active runs), and l shows logs."
 }
 
 pub(super) fn tui_start_state(active_board: bool) -> TuiStartState {
@@ -6132,6 +6135,8 @@ pub(super) struct TuiApp {
     pub(super) active_board: bool,
     pub(super) current_mode: Mode,
     pub(super) task_input: TaskInput,
+    pub(super) steering_target: Option<SteeringTarget>,
+    pub(super) steering_delivery: Option<Receiver<Result<String>>>,
     pub(super) feedback_buffer: String,
     pub(super) archive_view: bool,
     pub(super) backlog_visible: bool,
@@ -6175,6 +6180,8 @@ impl TuiApp {
             active_board: start_state.active_board,
             current_mode: Mode::View,
             task_input: TaskInput::default(),
+            steering_target: None,
+            steering_delivery: None,
             feedback_buffer: start_state.feedback_buffer,
             archive_view: false,
             backlog_visible: false,
@@ -6210,6 +6217,83 @@ impl TuiApp {
     pub(super) fn open_agent_log(&mut self, log_view: TuiAgentLogView) {
         self.feedback_buffer.clear();
         self.agent_log_view = Some(log_view);
+    }
+
+    fn open_steering(&mut self, target: SteeringTarget) {
+        self.current_mode = Mode::Steer;
+        self.steering_target = Some(target);
+        self.editing_task_idx = None;
+        self.task_input.reset();
+        self.agent_log_view = None;
+        self.feedback_buffer =
+            "Send a message to the running agent. The task description stays unchanged.".into();
+    }
+
+    fn steering_key(&mut self, key: KeyEvent, width: usize) {
+        if self.steering_delivery.is_some() {
+            self.feedback_buffer = "Waiting for the agent to acknowledge delivery…".into();
+            return;
+        }
+        if tui_cancels_task_prompt(&key) {
+            self.current_mode = Mode::View;
+            self.steering_target = None;
+            self.task_input.reset();
+            self.feedback_buffer = "Message cancelled".into();
+        } else if key.code == KeyCode::Enter {
+            let text = self.task_input.submitted_value();
+            if text.trim().is_empty() || text.len() > steering::MAX_MESSAGE_BYTES {
+                self.feedback_buffer = "Enter a message of at most 64 KiB".into();
+                return;
+            }
+            let Some(target) = self.steering_target.clone() else {
+                return;
+            };
+            let state_dir = match agent_state_dir() {
+                Ok(state_dir) => state_dir,
+                Err(error) => {
+                    self.feedback_buffer = format!("{error:#}");
+                    return;
+                }
+            };
+            let (sender, receiver) = mpsc::channel();
+            thread::spawn(move || {
+                let result =
+                    steering::request_message(&state_dir, &target, &text).and_then(|request| {
+                        steering::wait_for_reply(&request, Duration::from_secs(25))
+                    });
+                let _ = sender.send(result);
+            });
+            self.steering_delivery = Some(receiver);
+            self.feedback_buffer = "Sending message; waiting for the agent to accept it…".into();
+        } else {
+            handle_input_key(&mut self.task_input.input, key, " Message Agent: ", width);
+        }
+    }
+
+    fn poll_steering_delivery(&mut self) {
+        let Some(receiver) = self.steering_delivery.as_ref() else {
+            return;
+        };
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Err(anyhow::anyhow!(
+                "Delivery is unconfirmed: the sender disconnected. Check the agent output before retrying"
+            )),
+        };
+        self.steering_delivery = None;
+        self.agent_log_view = None;
+        match result {
+            Ok(message) => {
+                self.feedback_buffer = message;
+                self.current_mode = Mode::View;
+                self.steering_target = None;
+                self.task_input.reset();
+            }
+            Err(error) => {
+                self.feedback_buffer = format!("{error:#}. Draft retained; Esc closes this prompt.")
+            }
+        }
     }
 
     pub(super) fn board_dir(&self) -> PathBuf {
@@ -6654,7 +6738,7 @@ pub(super) fn tui_input_height(app: &TuiApp, width: u16) -> u16 {
     if app.model_input.is_some() {
         return 3;
     }
-    if !matches!(app.current_mode, Mode::Input | Mode::Edit) {
+    if !matches!(app.current_mode, Mode::Input | Mode::Edit | Mode::Steer) {
         return 0;
     }
 
@@ -6664,6 +6748,8 @@ pub(super) fn tui_input_height(app: &TuiApp, width: u16) -> u16 {
         } else {
             " Add Task: "
         }
+    } else if app.current_mode == Mode::Steer {
+        " Message Agent: "
     } else {
         " Edit Task: "
     };
@@ -7051,13 +7137,15 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
             input_inner.x + (cursor as u16).min(input_inner.width.saturating_sub(1)),
             input_inner.y,
         ));
-    } else if matches!(app.current_mode, Mode::Input) || matches!(app.current_mode, Mode::Edit) {
+    } else if matches!(app.current_mode, Mode::Input | Mode::Edit | Mode::Steer) {
         let label = if matches!(app.current_mode, Mode::Input) {
             if app.subtask_parent.is_some() {
                 " Add Subtask: "
             } else {
                 " Add Task: "
             }
+        } else if app.current_mode == Mode::Steer {
+            " Message Agent: "
         } else {
             " Edit Task: "
         };
@@ -7067,11 +7155,13 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
         let available_width = size.width.saturating_sub(2) as usize;
         let input_lines = styled_task_input_lines(label, &app.task_input, available_width);
         let input_paragraph = Paragraph::new(input_lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Input Mode (Enter to save, Esc to cancel)"),
-            )
+            .block(Block::default().borders(Borders::ALL).title(
+                if app.current_mode == Mode::Steer {
+                    "Message Agent (Enter to send, Esc to cancel)"
+                } else {
+                    "Input Mode (Enter to save, Esc to cancel)"
+                },
+            ))
             .style(Style::default().fg(Color::White));
         f.render_widget(input_paragraph, main_layout[1]);
 
@@ -7147,7 +7237,7 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
         let help_text = "TUI Commands:\n\n\
                                  [Space]        - Create new task / toggle selected agent project\n\
                                  [n/+]          - Create subtask under selected task\n\
-                                 [Enter]        - Open subtasks, edit selected task, or open selected agent project\n\
+                                 [Enter]        - Message running Doing agent; otherwise open subtasks/edit task/project\n\
                                  [e]            - Edit selected task\n\
                                  [g]            - Cycle selected project's Git mode: off/commit/push\n\
                                  [s]            - Stop/start task or stop/resume displayed Agent Output session\n\
@@ -8484,6 +8574,25 @@ pub(super) fn execute_tui_key_effect(
                             statuses[app.selected_board],
                             &app.board_states[app.selected_board],
                         ) {
+                            match agent_state_dir().and_then(|state| {
+                                steering::target_for_task(
+                                    &state,
+                                    &app.active_root,
+                                    statuses[app.selected_board],
+                                    &entry,
+                                )
+                            }) {
+                                Ok(Some(target)) => {
+                                    app.open_steering(target);
+                                    return Ok(false);
+                                }
+                                Err(error) => {
+                                    app.agent_log_view = None;
+                                    app.feedback_buffer = format!("{error:#}");
+                                    return Ok(false);
+                                }
+                                Ok(None) => {}
+                            }
                             match &entry.source {
                                 TaskSource::Path { path, is_dir: true } if entry.has_subtasks => {
                                     {
@@ -8714,6 +8823,7 @@ pub(super) fn execute_tui_key_effect(
             }
             _ => {}
         },
+        Mode::Steer => app.steering_key(key, input_available_width),
         Mode::Input if tui_cancels_task_prompt(&key) => {
             app.current_mode = Mode::View;
             app.subtask_parent = None;
@@ -8868,6 +8978,7 @@ pub(super) fn tui_view_with_active_board(
                 } else if app.current_pane == TuiPane::Tasks
                     && app.active_board
                     && !app.archive_view
+                    && app.current_mode == Mode::View
                 {
                     Some(TuiEffect::SyncTaskLog)
                 } else {
@@ -8907,8 +9018,10 @@ pub(super) fn tui_view_with_active_board(
             );
         }
 
+        app.poll_steering_delivery();
         terminal_session.set_text_input(
-            matches!(app.current_mode, Mode::Input | Mode::Edit) || app.model_input.is_some(),
+            matches!(app.current_mode, Mode::Input | Mode::Edit | Mode::Steer)
+                || app.model_input.is_some(),
         )?;
         app.prepare_render(terminal.size()?.into());
         terminal.draw(|f| render_tui(f, &app))?;
@@ -8921,7 +9034,10 @@ pub(super) fn tui_view_with_active_board(
                         input.insert_paste(&content);
                     }
                 }
-                Event::Paste(content) if matches!(app.current_mode, Mode::Input | Mode::Edit) => {
+                Event::Paste(content)
+                    if matches!(app.current_mode, Mode::Input | Mode::Edit | Mode::Steer)
+                        && app.steering_delivery.is_none() =>
+                {
                     app.task_input.insert_paste(content);
                 }
                 Event::Key(key)
