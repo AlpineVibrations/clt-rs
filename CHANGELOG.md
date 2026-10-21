@@ -6,6 +6,8 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+## [0.8.5] - 2026-10-21
+
 ### Fixed
 
 - Remove the deprecated library edition override that warned during builds and
