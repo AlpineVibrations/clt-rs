@@ -1803,7 +1803,7 @@ pub(super) fn automated_codex_session_to_resume(
     project_root: &Path,
     task_selection: AgentTaskSelection,
 ) -> Result<Option<String>> {
-    let tasks = match task_selection {
+    let tasks: Vec<TaskEntry> = match task_selection {
         AgentTaskSelection::NextTodo => {
             let board = get_tasks_dir(project_root);
             if !board.join("todo").try_exists()? && !board.join("todo.md").try_exists()? {
@@ -1817,6 +1817,9 @@ pub(super) fn automated_codex_session_to_resume(
         }
         AgentTaskSelection::ResumeDoing => {
             read_task_entries(&get_tasks_dir(project_root), TaskStatus::Doing)?
+                .into_iter()
+                .filter(|task| !task_content_is_manual(&task.content))
+                .collect()
         }
         AgentTaskSelection::RecoverBlocked => blocked_tasks(project_root)?
             .into_iter()
@@ -1850,7 +1853,16 @@ pub(super) fn attach_codex_session_to_active_task(
     }
 
     let tasks = read_task_entries(&get_tasks_dir(project_root), TaskStatus::Doing)?;
-    let newly_started = newly_added_task_entry(doing_task_contents_before, &tasks);
+    let tasks = tasks
+        .into_iter()
+        .filter(|task| !task_content_is_manual(&task.content))
+        .collect::<Vec<_>>();
+    let before = doing_task_contents_before
+        .iter()
+        .filter(|content| !task_content_is_manual(content))
+        .cloned()
+        .collect::<Vec<_>>();
+    let newly_started = newly_added_task_entry(&before, &tasks);
     let task = match task_selection {
         AgentTaskSelection::NextTodo => newly_started,
         AgentTaskSelection::ResumeDoing => (tasks.len() == 1).then(|| tasks.first()).flatten(),
@@ -1913,7 +1925,11 @@ pub(super) fn blocked_tasks(project_root: &Path) -> Result<Vec<(TaskStatus, Task
         tasks.extend(
             read_task_entries(&board_dir, status)?
                 .into_iter()
-                .filter(|entry| task_entry_is_blocked(entry) && !task_entry_is_stopped(entry))
+                .filter(|entry| {
+                    task_entry_is_blocked(entry)
+                        && !task_entry_is_stopped(entry)
+                        && !task_content_is_manual(&entry.content)
+                })
                 .map(|entry| (status, entry)),
         );
     }
@@ -1966,7 +1982,16 @@ pub(super) fn newly_completed_task(
     contents_before: &[String],
 ) -> Result<Option<TaskEntry>> {
     let entries_after = read_task_entries(&get_tasks_dir(project_root), TaskStatus::Done)?;
-    Ok(newly_added_task_entry(contents_before, &entries_after).cloned())
+    let entries_after = entries_after
+        .into_iter()
+        .filter(|task| !task_content_is_manual(&task.content))
+        .collect::<Vec<_>>();
+    let before = contents_before
+        .iter()
+        .filter(|content| !task_content_is_manual(content))
+        .cloned()
+        .collect::<Vec<_>>();
+    Ok(newly_added_task_entry(&before, &entries_after).cloned())
 }
 
 pub(super) fn newly_added_task_entry<'a>(

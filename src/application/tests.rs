@@ -419,6 +419,19 @@ fn assert_folder_move_preserves_managed_destination(automated_completion: bool) 
             .unwrap()
     );
 
+    if automated_completion {
+        store
+            .mark_session_running_blocking(
+                project.id,
+                "session-unrelated",
+                std::process::id(),
+                "run-unrelated",
+                &root.join("out"),
+                &root.join("err"),
+            )
+            .unwrap();
+    }
+
     let result = if automated_completion {
         move_task_to_done_with_agent_store(
             &root,
@@ -1221,4 +1234,224 @@ fn unlinked_stop_survives_board_moves_and_skips_blocked_doing_recovery() {
     toggle_task_stop_marker_in_board(&board, TaskStatus::Doing, &stopped).unwrap();
     assert_eq!(blocked_tasks(&root).unwrap().len(), 1);
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn completion_context_recovers_only_the_exact_live_conversation() {
+    let root = temp_root("completion-runtime-context");
+    let project_root = root.join("project");
+    let other_root = root.join("other-project");
+    init_tasks(&project_root, false).unwrap();
+    init_tasks(&other_root, false).unwrap();
+    let project_root = fs::canonicalize(project_root).unwrap();
+    let store = agent::TursoAgentStore::open_blocking(&root.join("state")).unwrap();
+    store
+        .register_project_blocking(&project_root, "project")
+        .unwrap();
+    let project = store.list_projects_blocking().unwrap().remove(0);
+    store
+        .mark_session_running_blocking(
+            project.id,
+            "own-session",
+            std::process::id(),
+            "own-run",
+            &root.join("out"),
+            &root.join("err"),
+        )
+        .unwrap();
+    let context = super::recover_completion_context(&store, &project_root, "own-session")
+        .unwrap()
+        .unwrap();
+    assert_eq!(context.project_id, project.id);
+    assert_eq!(context.run_token, "own-run");
+    assert!(
+        super::recover_completion_context(&store, &project_root, "other-session")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        super::recover_completion_context(&store, &other_root, "own-session")
+            .unwrap()
+            .is_none()
+    );
+    for state in [
+        AgentSessionControlState::Stopped,
+        AgentSessionControlState::ResumeRequested,
+        AgentSessionControlState::Interactive,
+    ] {
+        store
+            .set_session_control_state_blocking(project.id, "own-session", state)
+            .unwrap();
+        assert!(
+            super::recover_completion_context(&store, &project_root, "own-session")
+                .unwrap()
+                .is_none()
+        );
+    }
+    assert!(
+        store
+            .create_git_finalization_blocking(NewGitFinalization {
+                project_id: project.id,
+                codex_session_id: "own-session",
+                git_mode: AgentGitMode::Commit,
+                starting_head: Some("preserved-start"),
+                branch_ref: Some("refs/heads/main"),
+                upstream_ref: None,
+                worktree_baseline: "{}",
+                task_identity: None,
+                owner_run_token: None,
+                created_at: "100",
+            })
+            .unwrap()
+    );
+    assert!(
+        super::recover_completion_context(&store, &project_root, "own-session")
+            .unwrap_err()
+            .to_string()
+            .contains("no running owner")
+    );
+    assert_eq!(
+        store
+            .git_finalization_blocking(project.id, "own-session")
+            .unwrap()
+            .unwrap()
+            .state,
+        GitFinalizationState::Working
+    );
+    store
+        .set_session_control_state_blocking(
+            project.id,
+            "own-session",
+            AgentSessionControlState::Running,
+        )
+        .unwrap();
+    store
+        .mark_session_running_blocking(
+            project.id,
+            "duplicate-session",
+            std::process::id(),
+            "own-run",
+            &root.join("out2"),
+            &root.join("err2"),
+        )
+        .unwrap();
+    assert!(
+        super::recover_completion_context(&store, &project_root, "own-session")
+            .unwrap_err()
+            .to_string()
+            .contains("more than one")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn resumed_done_seals_and_reseals_without_launch_environment() {
+    const CHILD: &str = "CLT_TEST_RECOVER_COMPLETION_CHILD";
+    const SESSION: &str = "01900000-0000-7000-8000-000000000005";
+    if std::env::var_os(CHILD).is_none() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "application::tests::resumed_done_seals_and_reseals_without_launch_environment",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("CODEX_THREAD_ID", SESSION)
+            .env_remove(AGENT_PROJECT_ID_ENV)
+            .env_remove(AGENT_RUN_TOKEN_ENV)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    for folders in [false, true] {
+        let root = temp_root("recovered-seal");
+        init_tasks(&root, folders).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        insert_task(
+            &root,
+            TaskStatus::Doing,
+            None,
+            &format!("Complete feature codex:{SESSION}"),
+            None,
+        )
+        .unwrap();
+        insert_task(
+            &root,
+            TaskStatus::Doing,
+            None,
+            "Independent work clt:manual codex:manual-owner",
+            None,
+        )
+        .unwrap();
+        initialize_test_git_repository(&root);
+        let store = open_agent_store().unwrap();
+        store.register_project_blocking(&root, "project").unwrap();
+        store
+            .set_project_git_mode_for_path_blocking(&root, AgentGitMode::Commit)
+            .unwrap();
+        let project = store
+            .list_projects_blocking()
+            .unwrap()
+            .into_iter()
+            .find(|p| p.path == root)
+            .unwrap();
+        store
+            .mark_session_running_blocking(
+                project.id,
+                SESSION,
+                std::process::id(),
+                "resumed-run",
+                &root.join("out"),
+                &root.join("err"),
+            )
+            .unwrap();
+        let start = capture_agent_git_start_state(&root, AgentGitMode::Commit).unwrap();
+        ensure_agent_git_working_record(&store, &project, SESSION, "resumed-run", Some(&start))
+            .unwrap();
+        bind_agent_git_working_task_identity(&store, &project, SESSION, "resumed-run").unwrap();
+        let board = TaskBoard::new(get_tasks_dir(&root));
+        let task = board.entry(TaskStatus::Doing, 1).unwrap();
+        board
+            .write_entry_content(
+                TaskStatus::Doing,
+                &task,
+                &format!("Complete feature — COMPLETED 2026-10-20: checked codex:{SESSION}"),
+            )
+            .unwrap();
+        fs::write(root.join("feature.txt"), "implemented\n").unwrap();
+        run_test_git(&root, &["add", "--all"]);
+        assert_eq!(
+            move_task_to_done(&root, TaskStatus::Doing, "1").unwrap(),
+            TaskDoneOutcome::Provisional
+        );
+        let sealed = store
+            .git_finalization_blocking(project.id, SESSION)
+            .unwrap()
+            .unwrap();
+        assert_eq!(sealed.state, GitFinalizationState::CommitPending);
+        run_test_git(&root, &["add", "--all", "--", "tasks"]);
+        fs::write(root.join("feature.txt"), "corrected after hook\n").unwrap();
+        run_test_git(&root, &["add", "feature.txt"]);
+        assert_eq!(
+            move_task_to_done(&root, TaskStatus::Done, "1").unwrap(),
+            TaskDoneOutcome::Provisional
+        );
+        let resealed = store
+            .git_finalization_blocking(project.id, SESSION)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resealed.state, GitFinalizationState::CommitPending);
+        assert!(resealed.generation > sealed.generation);
+        assert_ne!(resealed.worktree_baseline, sealed.worktree_baseline);
+        let manual = board.entries(TaskStatus::Doing).unwrap();
+        assert_eq!(manual.len(), 1);
+        assert!(task_content_is_manual(&manual[0].content));
+        fs::remove_dir_all(root).unwrap();
+    }
 }

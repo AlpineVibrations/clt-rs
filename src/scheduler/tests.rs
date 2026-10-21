@@ -3,7 +3,7 @@ use crate::test_support::prelude::*;
 use crate::test_support::*;
 
 #[test]
-fn manual_claim_blocks_scheduler_recovery_and_stale_acquisition() {
+fn manual_claim_protects_its_session_while_unrelated_automation_runs() {
     let root = temp_root("manual-scheduler");
     let state_dir = root.join("state");
     let project_root = root.join("project");
@@ -48,7 +48,11 @@ fn manual_claim_blocks_scheduler_recovery_and_stale_acquisition() {
             AgentJobAcquisitionResult::SessionSuspended
         ));
     }
-    assert!(InteractiveAgentLease::try_acquire_at(&state_dir, project.id, 60).is_err());
+    InteractiveAgentLease::try_acquire_at(&state_dir, project.id, 60)
+        .unwrap()
+        .unwrap()
+        .release()
+        .unwrap();
     assert!(
         store
             .lease_for_project_blocking(project.id)
@@ -57,8 +61,13 @@ fn manual_claim_blocks_scheduler_recovery_and_stale_acquisition() {
     );
     let runner = FakeAgentRunner::new(&state_dir, "success");
     let pass = run_agent_once_with_runner(&state_dir, &runner).unwrap();
-    assert_eq!(pass.runs_started, 0);
-    assert_eq!(runner.ran_project_count(), 0);
+    assert_eq!(pass.runs_started, 1);
+    assert_eq!(runner.ran_project_count(), 1);
+    assert!(task_content_is_manual(
+        &task_entry_at(&get_tasks_dir(&project.path), TaskStatus::Doing, 1)
+            .unwrap()
+            .content
+    ));
     // A normal move back to Todo releases the reservation for queued work.
     move_task_in_board(
         &get_tasks_dir(&project.path),
@@ -68,8 +77,7 @@ fn manual_claim_blocks_scheduler_recovery_and_stale_acquisition() {
     )
     .unwrap();
     assert!(!board_has_manual_task(&get_tasks_dir(&project.path)).unwrap());
-    let pass = run_agent_once_with_runner(&state_dir, &runner).unwrap();
-    assert_eq!(pass.runs_started, 1);
+    assert!(scan_agent_project(&project.path).has_pending_task());
     fs::remove_dir_all(root).unwrap();
 }
 

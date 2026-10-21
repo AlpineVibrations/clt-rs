@@ -13,6 +13,21 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
   connection, validate the session and turn before sending, and confirm delivery
   only after Codex accepts it. Failed or uncertain deliveries retain the draft.
 
+### Fixed
+
+- Scope manual claims to their task and conversation so independent Codex sessions
+  can work alongside running tests and automated tasks. Preserve other task paths,
+  session ownership and Git finalization; keep manual tasks out of automated pickup.
+- Recover `clt done` after loss of CLT launch variables using the exact current
+  conversation's live run record, including resealing, while rejecting another
+  task's session and preserving the existing Git checks.
+- Keep fresh runs focused on their selected Todo when the queue changes during
+  startup. Recover idle attempts whose task is absent from the frozen commit,
+  including blocked results and missing session controls, without relying on an
+  exact error message or changing existing implementation, staging or commits.
+- Recognize the app-server adapter's JSON “active writer” startup error during
+  persistent conversation-conflict recovery, preserving the exact-session checks.
+
 ## [0.8.3] - 2026-10-20
 
 ### Changed

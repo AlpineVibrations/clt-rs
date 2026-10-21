@@ -3865,7 +3865,11 @@ fn shared_interactive_resume_preserves_manual_owner_through_exit_and_reopen() {
             .register_project_blocking(&project_root, "project")
             .unwrap();
         let project_id = store.list_projects_blocking().unwrap().remove(0).id;
-        assert!(InteractiveAgentLease::try_acquire_at(&state_dir, project_id, 60).is_err());
+        InteractiveAgentLease::try_acquire_at(&state_dir, project_id, 60)
+            .unwrap()
+            .unwrap()
+            .release()
+            .unwrap();
 
         for restore_stopped in [false, true] {
             let requester = InteractiveAgentLease::holder_for_shared_session(restore_stopped);

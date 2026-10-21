@@ -41,7 +41,7 @@ in [Feature Ideas](docs/FEATURE_IDEAS.md); they are not a list of shipped featur
 - **Smart Root Detection**: Automatically finds the git repository root to keep tasks centralized, or uses the current directory.
 - **Agent Registry**: Register many projects, toggle them on or off, inspect `todo`/`doing` counts, choose per-project Git automation, and open any registered task board from the TUI.
 - **Model Catalog**: Configure provider presets or custom Responses endpoints, keep a clean enabled/favorite model list, and select CLT-wide or per-project provider/model targets.
-- **Codex Automation**: Run one Codex task at a time per enabled project, either in the foreground or through independently managed background workers that survive scheduler restarts and upgrades.
+- **Codex Automation**: Run one automated task at a time per enabled project alongside independent manual sessions. Background workers survive scheduler restarts and upgrades.
 - **Agent Skills**: Includes installable `clt-task-management` and `git-commit` skill folders for task-board and safe commit workflows.
 
 ## Installation
@@ -160,7 +160,7 @@ Crash-safe exact-session relaunch currently requires Unix process supervision. T
 
 On a Todo with no Codex link, including a `[STOPPED]` task, press `c` to create and open a planning conversation. CLT saves the full task text as context and appends the new session ID without moving the task to Doing or starting an automated turn. Discuss the work, refine its requirements, or ask Codex to update the task. Creation requires a registered project and a Codex CLI with the [app-server thread APIs](https://learn.chatgpt.com/docs/app-server); failures leave the task available for retry. When the project is idle, it remains reserved while you chat. When another task is already running, the new planning conversation opens alongside it and preserves that run and its project reservation. Returning to CLT leaves the planned task in Todo. If its agent is enabled, normal Todo automation starts the first ready task by resuming its exact attached Codex session, preserving the plan and conversation history. CLT explicitly tells Codex to begin implementation of that same task and keeps its session link. An unlinked Todo starts a new session. A stopped Todo stays stopped throughout planning and later visits; press `s` on the task when you want to allow automation. The planning conversation stays idle until the scheduler starts it. For an unstopped Todo, pause the project's agent first if you want to keep planning across visits.
 
-On the task board, select a Todo, Doing, or Done task, then press `c` to open its linked Codex session interactively. For an active automated session, `c` performs the same stop-and-handoff as `i` and automatically resumes automation when you return. For an idle session, it opens with workspace-write access. When the project is otherwise idle, CLT reserves the project until you return. When another Codex task is already using the project, the selected idle session can open alongside it without interrupting the active run, including when automatic commit or push is enabled. This also works while a directly opened Codex session holds a manual task claim: the claim stays in place, and automation remains reserved. The manually claimed session itself must be continued in its original Codex window. Both sessions can modify the same worktree. The automated task retains its process, project lease, and Git finalization records; the interactive session controls only its own saved session ID. Leaving an idle session for unfinished automated work in Doing queues the same session for automated resume, including when it was already queued before you opened it. A paused project keeps the request queued until its agent is enabled. Explicitly stopped tasks and sessions stay stopped, and planning or completed conversations retain their existing lifecycle. Shared conversations opened alongside another project owner keep their own stopped controls when you leave. Both modes return to the same board and selection afterward.
+On the task board, select a Todo, Doing, or Done task, then press `c` to open its linked Codex session interactively. For an active automated session, `c` performs the same stop-and-handoff as `i` and automatically resumes automation when you return. For an idle session, it opens with workspace-write access. When the project is otherwise idle, CLT reserves the project until you return. When another Codex task is already using the project, the selected idle session can open alongside it without interrupting the active run, including when automatic commit or push is enabled. This also works while a directly opened Codex session holds a manual task claim: the claim stays in place, and unrelated automation can continue. The manually claimed session itself must be continued in its original Codex window. Both sessions can modify the same worktree. The automated task retains its process, project lease, and Git finalization records; the interactive session controls only its own saved session ID. Leaving an idle session for unfinished automated work in Doing queues the same session for automated resume, including when it was already queued before you opened it. A paused project keeps the request queued until its agent is enabled. Explicitly stopped tasks and sessions stay stopped, and planning or completed conversations retain their existing lifecycle. Shared conversations opened alongside another project owner keep their own stopped controls when you leave. Both modes return to the same board and selection afterward.
 
 When an automated Codex run moves its selected task from Todo to Doing, CLT saves a terminal `codex:<session-id>` marker as part of that board update, including when Git automation is off. The marker uses the exact session registered for that run; activation fails if the task or session already belongs to different work. This internal marker survives task moves and wording changes, is hidden in task lists, the TUI, and the task editor, and is the task-to-session resume link. While a run is active, the database also records that session's exact run generation and log paths so `l`, stop, and interrupt target the correct live process. Completed run history retains the session ID without associating it to mutable task text. A run is reported as failed if CLT cannot persist the marker on its completed or blocked task.
 
@@ -224,11 +224,13 @@ clt claim todo 1
 ```
 
 The task appears directly in Doing as `[MANUAL]`, with its conversation attached.
-There is no temporary eligible Todo for the daemon to pick up. The claim reserves
-the whole project, including against interrupted Doing recovery, and persists
-across Codex exits and daemon restarts. CLT does not infer that an external
-session has finished from a missing child process. Opening another CLT session
-for that project is also prevented while the manual claim remains.
+There is no temporary eligible Todo for the daemon to pick up. Each claim reserves
+only its task and conversation, and persists across Codex exits and daemon
+restarts. Independent manual sessions can work alongside each other and an
+automated task, including while that task runs tests or finalizes its commit.
+The daemon skips manually claimed tasks and can run other eligible work; it still
+runs at most one automated task per project. CLT does not infer that an external
+session has finished from a missing child process.
 
 Finish with `clt done doing <index>`, or explicitly return unfinished work to
 automation after recording the plan and remaining steps:
@@ -249,18 +251,19 @@ claim. Deleting or completing the task releases the reservation.
 `s` and `c` on a manual task explain its ownership instead of launching or stopping
 a duplicate conversation.
 
-Claims require the exact current session UUID and an idle project. Existing
-automated conversations, active leases, and unfinished Git finalizations retain
-their established CLT controls. An older unsealed `WORKING` journal does not
-prevent a new claim when it belongs uniquely to a blocked or stopped Todo and
-has no active process or interactive owner. Its journal and conversation remain
-available while the manual task reserves the project. Sealed Git work, ambiguous
-links, and unfinished work still in Doing continue to prevent a new claim.
-A session may belong to only one task. If the
-session ID is unavailable, keep any tracking task stopped until it can be linked
-and claimed. These commands and scheduler protections require the updated CLT
-binary; restart the scheduler after upgrading and refresh the bundled skills
-with `clt skills install`.
+Claims require the exact current session UUID. A session may belong to only one
+task; an existing automated conversation keeps its original CLT controls and
+cannot be turned into a manual claim. Other sessions' leases, launch records and
+Git journals remain intact. Manual task creation and moves preserve neighboring
+folder paths so another task's Git proof remains valid.
+
+Sessions share the worktree: preserve each other's edits and coordinate changes
+to the same behavior. Staging and commits must be coordinated while an automated
+task seals its commit; unrelated work stays outside that commit. If the current
+session ID is unavailable, report it instead of guessing an owner or creating an
+eligible Todo. These protections require the updated CLI and scheduler; restart
+the scheduler after upgrading and refresh the bundled skills with
+`clt skills install`.
 
 ### Models and providers
 
@@ -368,6 +371,13 @@ Other work may advance the branch after the sealed task commit, including before
 
 Unstaged and untracked work can coexist with an automated task, including new files, edits, renames, and deletions made after launch. CLT treats that work as intentional and leaves it outside the sealed commit, even when it shares a path with staged implementation. The launch baseline remains recorded, but sealing and resealing verify the reviewed index rather than requiring the worktree to match that snapshot. The agent must still preserve others' work, stage its complete verified implementation, and resolve actual conflicts. Accepted concurrent user commits can include baseline work or implementation; CLT seals the remaining task changes against the current parent without requiring those edits again. Concurrent task-board edits must also remain unstaged. The Git index is a cooperative boundary: existing staged changes are recorded at launch and rechecked before task activation, but Git cannot identify which actor staged a change during the run. The agent reviews staged changes for task scope. If unrelated work is already staged, it uses a separate index for task staging, sealing, and committing, then reconciles only its task changes into the shared index while preserving unrelated staged hunks. Review the staged diff before sealing and reseal if the intended commit payload changes.
 
+If a resumed shell loses `CLT_AGENT_PROJECT_ID` and `CLT_AGENT_RUN_TOKEN`,
+`clt done` can recover them from the running record for its exact
+`CODEX_THREAD_ID`. It checks the project, running state, process and unique run
+ownership, then uses the same completion and resealing checks. It never takes
+another task's identifiers or infers an owner from the latest project run.
+Stopped, interactive and ambiguous sessions keep their existing controls.
+
 Managed Git task moves preserve folder-backed tasks as paths: Directory-to-Directory Todo/Doing/Done transitions rename only the moving file or folder, preserving every unrelated task's path. New completions appear at the top of Done. Managed completions use a descending filename order prefix to prepend without renumbering existing tasks; ordinary manual reordering can normalize those prefixes. Prelaunch rejects a board layout in which a folder-backed Todo would enter Markdown-backed Doing, or folder-backed Doing would enter Markdown-backed Done; expand and commit the destination layout first. If a crash leaves identical session-linked copies on both sides of a managed move, CLT repairs the duplicate without reordering unrelated tasks. Ambiguous or nonidentical copies fail closed.
 
 Commits from either enabled mode use `CLT Agent <clt-agent@localhost>` as both author and committer so automated work is recognizable without changing repository or global Git configuration. Existing enabled registrations migrate to commit-only mode. In the TUI, the modes appear as `COM`, `PUSH`, and `OFF` in the `GIT` column.
@@ -400,7 +410,7 @@ clt agent recover-task /path/to/project
 clt agent recover-task /path/to/project --session <previous-session-id>
 ```
 
-Recovery requires an idle project, no manual owner, and no surviving Git journal
+Recovery requires idle automated ownership, a task without a manual claim, and no surviving Git journal
 for that session or unfinished Git work elsewhere in the project. It rechecks
 the saved run and exact task after confirmation, refuses ambiguous links, and
 keeps interrupted task moves stopped so recovery can be retried. Stop active
@@ -413,9 +423,16 @@ remain available with `codex resume <previous-session-id>`. Ordinary retries and
 restarting CLT cannot recreate the missing record; this action explicitly starts
 a new attempt from the current checkout instead.
 
-When a worker fails before activating a selected Todo because that task was added
-after the launch checkpoint, the scheduler automatically retires the idle,
-unbound attempt and queues a fresh conversation in the same position. If an
+Fresh runs receive the exact Todo selected before launch. Adding or reordering
+tasks while Codex starts does not replace that selection. CLT rechecks the
+selection against the frozen commit before spawning a Git-enabled worker.
+
+When a worker ends before activating a selected Todo because that task was added
+after the launch checkpoint, the scheduler checks the saved commit and automatically
+retires the idle, unbound attempt, queueing a fresh conversation in the same position.
+This also handles blocked results, shortened error messages, and an already-cleared
+session-control record. A blocker about this activation failure is cleared; a later
+blocker about unavailable input or a dependency remains in place. If an
 interactive visit moved that linked task into Doing, recovery waits until the
 interactive session ends, then returns it to Todo for fresh verification. The normal
 launch process checkpoints the current board and captures a new Git boundary.
@@ -466,7 +483,7 @@ files, staging, commits and old Git records are preserved. A selected unsealed
 also works after a successful supervisor assessment, without manufacturing a
 failed run. Backlog tasks must be promoted first.
 
-Recovery requires an idle project and refuses manual ownership, live workers,
+Recovery requires idle automated ownership and refuses a manual claim on the selected task, live workers,
 launch records, and sealed or verified Git work. Other unfinished `WORKING` tasks
 may remain only when they are blocked or stopped in Todo. For a dependency cycle
 in scheduling, return the waiting downstream task to Todo, then restart the
@@ -493,7 +510,7 @@ settings normally; CLT does not switch branches or certify the old commit.
 This happens without a recovery prompt or repeated Codex launches. Paused
 projects and deliberately stopped sessions stay paused or stopped. Automatic
 recovery requires an attached branch and an idle project, and preserves the
-checks for manual owners, other pending journals, active workers, unconsumed
+checks for manual ownership of the selected task, other pending journals, active workers, unconsumed
 launch records, changed task links, and verified commits. `PUSH-PENDING` commits
 retain their publication contract. When one of these checks prevents recovery,
 CLT keeps the saved diagnostic available; resolve the reported obstacle first.

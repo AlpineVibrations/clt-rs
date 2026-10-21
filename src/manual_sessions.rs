@@ -1,25 +1,23 @@
 //! Directly opened Codex sessions reserve tasks in the board, independently of
 //! daemon process lifetimes. Claim publication and scheduler lease acquisition
-//! share the project board lock, so exactly one side can take ownership.
-use std::{collections::HashSet, fs, io::ErrorKind, path::Path};
+//! share the project board lock; ownership is scoped to a task and conversation.
+use std::{fs, io::ErrorKind, path::Path};
 
 use anyhow::{Context, Result};
 
 use crate::{
-    agent::{
-        AGENT_DB_FILE, AgentSessionControlState, GitFinalizationState, agent_state_dir,
-        open_agent_store_at,
-    },
+    agent::{AGENT_DB_FILE, agent_state_dir, open_agent_store_at},
     application::move_task_in_board_after_lock,
     runner::{automated_agent_child_context, canonicalize_existing_path},
     session_control::collect_codex_session_tasks_in_board,
     task::{
-        TaskBoard, TaskStatus, acquire_board_mutation_lock, board_has_manual_task,
-        board_mutation_lock_path, codex_session_id_is_uuid, codex_session_markers_in_task_content,
-        ensure_existing_board, get_tasks_dir, insert_task_content, parse_one_based_task_index,
-        read_task_entries, recoverable_codex_session_id_from_task_content, task_content_is_manual,
+        StatusStore, TaskBoard, TaskStatus, acquire_board_mutation_lock, board_mutation_lock_path,
+        codex_session_id_is_uuid, codex_session_markers_in_task_content, ensure_existing_board,
+        get_status_store, get_tasks_dir, insert_content_into_directory_without_reordering,
+        insert_content_into_markdown, parse_one_based_task_index, read_task_entries,
+        recoverable_codex_session_id_from_task_content, task_content_is_manual,
         task_content_with_manual_session, task_content_without_manual_marker,
-        task_content_without_stop_marker, task_entry_is_blocked, task_entry_is_stopped,
+        task_content_without_stop_marker,
     },
 };
 
@@ -71,46 +69,8 @@ fn with_manual_board<T>(
     .then(|| acquire_board_mutation_lock(&board_dir))
     .transpose()?;
     if let (Some(store), Some(project)) = (&store, &project) {
-        let mut parked_sessions = HashSet::new();
-        for journal in store.list_pending_git_finalizations_blocking(Some(project.id))? {
-            let mut linked = Vec::new();
-            collect_codex_session_tasks_in_board(
-                &project_board,
-                &journal.codex_session_id,
-                &mut linked,
-            )?;
-            anyhow::ensure!(
-                journal.state == GitFinalizationState::Working
-                    && journal.commit_oid.is_none()
-                    && matches!(linked.as_slice(), [(TaskStatus::Todo, task)]
-                        if !task_content_is_manual(&task.content)
-                            && (task_entry_is_blocked(task) || task_entry_is_stopped(task))),
-                "The project still has a CLT owner or unfinished Git launch/finalization; return idle blocked or stopped work to Todo before claiming manual work"
-            );
-            parked_sessions.insert(journal.codex_session_id);
-        }
-        anyhow::ensure!(
-            store.lease_for_project_blocking(project.id)?.is_none()
-                && !store
-                    .list_active_workers_blocking()?
-                    .iter()
-                    .any(|worker| worker.project_id == project.id)
-                && !store
-                    .session_controls_for_project_blocking(project.id)?
-                    .iter()
-                    .any(
-                        |control| !(control.state == AgentSessionControlState::Stopped
-                            || control.state == AgentSessionControlState::ResumeRequested
-                                && parked_sessions.contains(&control.codex_session_id))
-                            || control.child_pid.is_some()
-                            || control.interactive_holder.is_some()
-                            || control.interactive_launch_token.is_some()
-                    )
-                && store
-                    .git_launch_state_for_project_blocking(project.id)?
-                    .is_none(),
-            "The project still has a CLT owner or unfinished Git launch/finalization; stop or finish that run before claiming manual work"
-        );
+        // Other conversations may be testing, editing, or finalizing. Only the
+        // claimed conversation must be free of an existing automated contract.
         anyhow::ensure!(
             store.planning_session_can_start_blocking(project.id, session)?,
             "This conversation already has an automated run; use its existing CLT session controls"
@@ -134,10 +94,6 @@ pub(super) fn start_manual_task(
         "Pass the conversation ID with --session; do not embed a codex: marker in the description"
     );
     with_manual_board(root, &session, |board_dir, project_board| {
-        anyhow::ensure!(
-            !board_has_manual_task(project_board)?,
-            "The project already has a manual task; finish or hand it off first"
-        );
         let mut linked = Vec::new();
         collect_codex_session_tasks_in_board(project_board, &session, &mut linked)?;
         anyhow::ensure!(
@@ -145,7 +101,12 @@ pub(super) fn start_manual_task(
             "This Codex session already belongs to a task; use clt claim for that task"
         );
         let content = task_content_with_manual_session(description, &session);
-        insert_task_content(board_dir, TaskStatus::Doing, None, &content)
+        match get_status_store(board_dir, TaskStatus::Doing)? {
+            StatusStore::MarkdownFile(path) => insert_content_into_markdown(&path, None, &content),
+            StatusStore::Directory(path) => {
+                insert_content_into_directory_without_reordering(&path, &content).map(|_| ())
+            }
+        }
     })
 }
 
@@ -164,10 +125,6 @@ pub(super) fn claim_manual_task(
     with_manual_board(root, &session, |board_dir, project_board| {
         let board = TaskBoard::new(board_dir);
         let entry = board.entry(status, index)?;
-        anyhow::ensure!(
-            !board_has_manual_task(project_board)? || task_content_is_manual(&entry.content),
-            "The project already has a manual task; finish or hand it off first"
-        );
         anyhow::ensure!(
             codex_session_markers_in_task_content(&entry.content)
                 .iter()

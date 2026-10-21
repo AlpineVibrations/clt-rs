@@ -29,7 +29,8 @@ use crate::{
         AgentGitStartState, bind_agent_git_working_task_identity, configure_agent_git_identity,
         enable_agent_git_for_resumed_session, ensure_agent_git_index_preflight,
         ensure_agent_git_working_record, prepare_agent_git_start_state_for_run,
-        verify_agent_git_resume_branch, verify_agent_git_start_state_unchanged,
+        require_agent_git_start_task_identity, verify_agent_git_resume_branch,
+        verify_agent_git_start_state_unchanged,
     },
     platform::{
         agent_codex_path_env, agent_process_group_exists, configure_agent_child_command,
@@ -44,8 +45,9 @@ use crate::{
         EMBEDDED_GIT_COMMIT_SKILL, GIT_COMMIT_SKILL_NAME,
     },
     task::{
-        TaskBoard, TaskStatus, acquire_board_mutation_lock, ensure_existing_board, get_tasks_dir,
-        read_task_entries, recoverable_codex_session_id_from_task_content, task_entry_is_ready,
+        TaskBoard, TaskStatus, acquire_board_mutation_lock, durable_task_identity,
+        ensure_existing_board, get_tasks_dir, read_task_entries,
+        recoverable_codex_session_id_from_task_content, task_entry_is_ready,
     },
     worker::{
         attach_codex_session_to_active_task, automated_codex_session_to_resume,
@@ -418,6 +420,7 @@ pub(super) fn launch_agent_runner_stage(
             task_selection,
             resume_session_id,
             supervisor_direction.as_deref(),
+            git_start_state,
         )?
     };
     #[cfg(not(unix))]
@@ -749,6 +752,7 @@ pub(super) fn configure_automated_codex_subcommand(
         task_selection,
         resume_session_id,
         None,
+        None,
     )
 }
 
@@ -758,6 +762,7 @@ fn configure_automated_codex_subcommand_with_direction(
     task_selection: AgentTaskSelection,
     resume_session_id: Option<&str>,
     direction: Option<&str>,
+    git_start_state: Option<&AgentGitStartState>,
 ) -> Result<Option<String>> {
     let session_id = match resume_session_id {
         Some(session_id) => Some(session_id.to_string()),
@@ -781,6 +786,25 @@ fn configure_automated_codex_subcommand_with_direction(
     {
         prompt.push_str(&format!(
             "\n\nStart the planned task:\n- CLT is now starting implementation of the Todo task linked to codex:{session_id}.\n- Continue from the plan, requirements, and decisions in this conversation. This instruction supersedes the earlier planning-only instruction to wait before implementation.\n- Inspect the current task and repository, move that exact Todo to Doing, and complete it using the workflow above. Preserve its codex:{session_id} marker.\n- Do not select another task. If the linked task is no longer a ready Todo, stop without starting other work.\n"
+        ));
+    }
+    if task_selection == AgentTaskSelection::NextTodo
+        && session_id.is_none()
+        && let Some(selected) = read_task_entries(&get_tasks_dir(&project.path), TaskStatus::Todo)?
+            .into_iter()
+            .find(task_entry_is_ready)
+    {
+        if let Some(start) = git_start_state {
+            let identity = durable_task_identity(&selected.content)
+                .context("The selected Todo has no durable task identity")?;
+            require_agent_git_start_task_identity(&project.path, &start.starting_head, &identity)
+                .context(
+                "The selected Todo changed after launch preparation; retry before starting Codex",
+            )?;
+        }
+        prompt.push_str(&format!(
+            "\n\nSelected task for this run:\n{}\n\nCLT selected the Todo above before launch. This selection supersedes the instruction to pick the next ready task. Re-read the board and use this task's current index; do not substitute a Todo added or reordered after launch. If this task is removed, claimed by another conversation, stopped, or no longer ready, exit without starting or blocking another task.\n",
+            selected.content
         ));
     }
     if let Some(direction) = direction {
@@ -1997,6 +2021,12 @@ impl CodexAgentRunner {
             && ensure_existing_board(&project.path)?
         {
             let lock = acquire_board_mutation_lock(&get_tasks_dir(&project.path))?;
+            if let Some(session) = known_session_id.as_deref() {
+                anyhow::ensure!(
+                    !crate::task::board_has_manual_session(&get_tasks_dir(&project.path), session)?,
+                    "This Codex session owns a manual task; continue it in its directly opened session"
+                );
+            }
             if task_selection == AgentTaskSelection::NextTodo {
                 anyhow::ensure!(
                     automated_codex_session_to_resume(&project.path, task_selection)?

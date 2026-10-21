@@ -2993,3 +2993,61 @@ fn agent_clean_resets_failures_and_removes_logs() {
 
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn automation_selection_and_results_ignore_parallel_manual_work() {
+    for folders in [false, true] {
+        let root = temp_root("manual-result-isolation");
+        init_tasks(&root, folders).unwrap();
+        insert_task(
+            &root,
+            TaskStatus::Doing,
+            None,
+            "Manual changes clt:manual codex:manual-session",
+            None,
+        )
+        .unwrap();
+        insert_task(
+            &root,
+            TaskStatus::Doing,
+            None,
+            "Automated changes codex:auto-session",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            automated_codex_session_to_resume(&root, AgentTaskSelection::ResumeDoing)
+                .unwrap()
+                .as_deref(),
+            Some("auto-session")
+        );
+        insert_task(
+            &root,
+            TaskStatus::Todo,
+            None,
+            "Waiting manual work. BLOCKED 2026-10-20: input clt:manual codex:blocked-manual",
+            None,
+        )
+        .unwrap();
+        assert!(blocked_tasks(&root).unwrap().is_empty());
+        let scan = scan_agent_project(&root);
+        assert!(!scan.has_schedulable_work());
+        assert_eq!(scan.available_todo_count(), 0);
+        assert_eq!(scan.todo_count, 1);
+        assert_eq!(scan.doing_count, 2);
+        let before = completed_task_contents(&root).unwrap();
+        move_task(&root, TaskStatus::Doing, TaskStatus::Done, "1").unwrap();
+        assert!(newly_completed_task(&root, &before).unwrap().is_none());
+        move_task(&root, TaskStatus::Doing, TaskStatus::Done, "1").unwrap();
+        assert_eq!(
+            recoverable_codex_session_id_from_task_content(
+                &newly_completed_task(&root, &before)
+                    .unwrap()
+                    .unwrap()
+                    .content
+            ),
+            Some("auto-session")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+}

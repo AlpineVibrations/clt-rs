@@ -1467,7 +1467,7 @@ fn activation_fixture(folders: bool) -> (PathBuf, TursoAgentStore, AgentProject)
         .write_entry_content(
             TaskStatus::Todo,
             &task,
-            &format!("Finish feature. codex:{SESSION}"),
+            &format!("Finish newly queued feature. codex:{SESSION}"),
         )
         .unwrap();
     board
@@ -1520,6 +1520,22 @@ fn record_failed_activation_worker_without_session(
 }
 
 fn record_activation_worker(store: &TursoAgentStore, project: &AgentProject, blocked: bool) {
+    record_activation_worker_result(
+        store,
+        project,
+        if blocked { "blocked" } else { "failure" },
+        blocked.then_some(SESSION),
+        "Failed while observing the Codex run: Git-enabled automated work requires the selected task to be committed exactly once in Todo or Doing before the task starts (found 0)",
+    );
+}
+
+fn record_activation_worker_result(
+    store: &TursoAgentStore,
+    project: &AgentProject,
+    status: &str,
+    session: Option<&str>,
+    summary: &str,
+) {
     let holder = "activation-test-scheduler";
     assert!(
         store
@@ -1554,20 +1570,25 @@ fn record_activation_worker(store: &TursoAgentStore, project: &AgentProject, blo
             )
             .unwrap()
     );
-    assert!(store.finalize_worker_blocking(AgentWorkerFinalization {
-        worker_token: "old-run",
-        expected_worker_pid: Some(12345),
-        expected_lease_holder: &agent::worker_lease_holder("old-run"),
-        status: if blocked { "blocked" } else { "failure" },
-        finished_at: "105",
-        exit_code: None,
-        log_dir: None,
-        stdout_path: None,
-        stderr_path: None,
-        summary: Some("Failed while observing the Codex run: Git-enabled automated work requires the selected task to be committed exactly once in Todo or Doing before the task starts (found 0)"),
-        codex_session_id: blocked.then_some(SESSION),
-        error: None,
-    }).unwrap().is_some());
+    assert!(
+        store
+            .finalize_worker_blocking(AgentWorkerFinalization {
+                worker_token: "old-run",
+                expected_worker_pid: Some(12345),
+                expected_lease_holder: &agent::worker_lease_holder("old-run"),
+                status,
+                finished_at: "105",
+                exit_code: None,
+                log_dir: None,
+                stdout_path: None,
+                stderr_path: None,
+                summary: Some(summary),
+                codex_session_id: session,
+                error: None,
+            })
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[test]
@@ -1730,6 +1751,95 @@ fn scheduler_recovers_failed_activation_and_preserves_queue_and_checkout() {
 }
 
 #[test]
+fn scheduler_recovers_a_blocked_missing_todo_with_unchanged_head() {
+    for folders in [false, true] {
+        for missing_control in [false, true] {
+            for missing_run_session in [false, true] {
+                let (root, store, project) = activation_fixture(folders);
+                record_activation_worker_result(
+                    &store,
+                    &project,
+                    "blocked",
+                    (!missing_run_session).then_some(SESSION),
+                    "Todo activation refused; existing staged and unstaged work preserved",
+                );
+                if missing_control {
+                    assert!(
+                        store
+                            .clear_orphaned_resume_requested_session_blocking(
+                                project.id,
+                                SESSION,
+                                u64::MAX,
+                            )
+                            .unwrap()
+                    );
+                }
+                let board = TaskBoard::new(get_tasks_dir(&project.path));
+                let task = board.entries(TaskStatus::Todo).unwrap().remove(1);
+                board.write_entry_content(TaskStatus::Todo, &task, &format!(
+                    "Finish newly queued feature. — BLOCKED 2026-10-20: clt refused activation: selected task must be committed exactly once in Todo or Doing (found 0). Task is absent from frozen starting HEAD; it is an uncommitted Todo addition. No implementation edits or tests. codex:{SESSION}"
+                )).unwrap();
+                let before = board.entries(TaskStatus::Todo).unwrap();
+                let journal = store
+                    .git_finalization_blocking(project.id, SESSION)
+                    .unwrap()
+                    .unwrap();
+                let head = run_test_git(&project.path, &["rev-parse", "HEAD"]);
+                let index = run_test_git(&project.path, &["write-tree"]);
+                assert_eq!(journal.starting_head.as_deref(), Some(head.as_str()));
+                assert_eq!(
+                    crate::managed_git::git_ref_active_task_identity_count(
+                        &project.path,
+                        &head,
+                        &durable_task_identity(&before[1].content).unwrap(),
+                    )
+                    .unwrap(),
+                    0
+                );
+
+                let pass = run_agent_scheduler_pass_with_max_global_jobs(
+                    &root.join("state"),
+                    false,
+                    &[],
+                    1,
+                    None,
+                )
+                .unwrap();
+                assert!(pass.jobs.is_empty());
+                let retired = store
+                    .git_finalization_blocking(project.id, SESSION)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(retired.state, GitFinalizationState::Cancelled);
+                assert_eq!(retired.starting_head, journal.starting_head);
+                assert_eq!(retired.worktree_baseline, journal.worktree_baseline);
+                let after = board.entries(TaskStatus::Todo).unwrap();
+                assert_eq!(after[0].content, before[0].content);
+                assert_eq!(after[0].source, before[0].source);
+                assert_eq!(after[1].source, before[1].source);
+                assert!(task_entry_is_ready(&after[1]));
+                assert!(
+                    after[1]
+                        .content
+                        .contains("absent from the old launch checkpoint")
+                );
+                assert!(
+                    recoverable_codex_session_id_from_task_content(&after[1].content).is_none()
+                );
+                assert_eq!(run_test_git(&project.path, &["rev-parse", "HEAD"]), head);
+                assert_eq!(run_test_git(&project.path, &["write-tree"]), index);
+                assert_eq!(
+                    fs::read_to_string(project.path.join("feature.txt")).unwrap(),
+                    "additional user changes\n"
+                );
+                drop(store);
+                fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
 fn failed_activation_recovery_preserves_stops_owners_and_started_work() {
     use super::recover_failed_activation_automatically;
     for scenario in [
@@ -1743,7 +1853,8 @@ fn failed_activation_recovery_preserves_stops_owners_and_started_work() {
         "child",
         "token",
         "sealed",
-        "different-error",
+        "committed-task",
+        "later-blocker",
     ] {
         let (root, store, project) = activation_fixture(false);
         match scenario {
@@ -1851,7 +1962,19 @@ fn failed_activation_recovery_preserves_stops_owners_and_started_work() {
                         .unwrap()
                 );
             }
-            "different-error" => {
+            "committed-task" | "later-blocker" => {
+                let board = TaskBoard::new(get_tasks_dir(&project.path));
+                let task = board.entries(TaskStatus::Todo).unwrap().remove(1);
+                let content = if scenario == "committed-task" {
+                    format!("Finish feature. codex:{SESSION}")
+                } else {
+                    format!(
+                        "Finish newly queued feature. BLOCKED 2026-10-19: task must be committed exactly once (found 0). BLOCKED 2026-10-20: needs input codex:{SESSION}"
+                    )
+                };
+                board
+                    .write_entry_content(TaskStatus::Todo, &task, &content)
+                    .unwrap();
                 store
                     .record_run_outcome_blocking(AgentRunOutcome {
                         project_id: project.id,
@@ -1890,6 +2013,60 @@ fn failed_activation_recovery_preserves_stops_owners_and_started_work() {
         drop(store);
         fs::remove_dir_all(root).unwrap();
     }
+}
+
+#[test]
+fn failed_activation_waits_without_blocking_another_tasks_git_finalization() {
+    let (root, store, project) = activation_fixture(false);
+    let start = capture_agent_git_start_state(&project.path, AgentGitMode::Commit).unwrap();
+    assert!(
+        store
+            .create_git_finalization_blocking(NewGitFinalization {
+                project_id: project.id,
+                codex_session_id: "another-session",
+                git_mode: AgentGitMode::Commit,
+                starting_head: Some(&start.starting_head),
+                branch_ref: start.branch_ref.as_deref(),
+                upstream_ref: None,
+                worktree_baseline: &start.worktree_baseline,
+                task_identity: Some("another task"),
+                owner_run_token: None,
+                created_at: "103",
+            })
+            .unwrap()
+    );
+    assert!(
+        store
+            .compare_and_set_git_finalization_blocking(
+                project.id,
+                "another-session",
+                0,
+                GitFinalizationState::Tracking,
+                None,
+                None,
+                None,
+                "104",
+            )
+            .unwrap()
+    );
+    let before = store
+        .list_pending_git_finalizations_blocking(Some(project.id))
+        .unwrap();
+    // Returning None lets the scheduler continue to the Git finalizer; an
+    // error here would skip the project and strand the sealed neighbor.
+    assert!(
+        super::recover_failed_activation_automatically(&store, &project)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .list_pending_git_finalizations_blocking(Some(project.id))
+            .unwrap(),
+        before
+    );
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
 }
 
 fn stale_activation_fixture(folders: bool) -> (PathBuf, TursoAgentStore, AgentProject) {
@@ -2373,7 +2550,20 @@ fn writer_conflict_fixture(folders: bool, git: bool) -> (PathBuf, TursoAgentStor
         let stdout = root.join(format!("conflict-{number}.out"));
         let stderr = root.join(format!("conflict-{number}.err"));
         fs::write(&stdout, "").unwrap();
-        fs::write(&stderr, format!("CLT launch fast mode: off\nError: thread/resume: thread/resume failed: thread {SESSION} already has an active writer (code -32600)\n")).unwrap();
+        let error = if number == 1 {
+            format!(
+                "Error: thread/resume: thread/resume failed: thread {SESSION} already has an active writer (code -32600)"
+            )
+        } else {
+            format!(
+                "Error: Codex thread/resume: {}",
+                serde_json::json!({
+                    "code": -32600,
+                    "message": format!("thread {SESSION} already has an active writer"),
+                })
+            )
+        };
+        fs::write(&stderr, format!("CLT launch fast mode: off\n{error}\n")).unwrap();
         let token = format!("conflict-{number}");
         let holder = "conflict-test-scheduler";
         assert!(
@@ -2533,6 +2723,9 @@ fn writer_conflict_recovery_rejects_unsafe_or_insufficient_evidence() {
     for scenario in [
         "one-failure",
         "wrong-session",
+        "json-wrong-session",
+        "json-wrong-code",
+        "json-invalid",
         "output",
         "missing-log",
         "large-log",
@@ -2556,6 +2749,14 @@ fn writer_conflict_recovery_rejects_unsafe_or_insufficient_evidence() {
         match scenario {
             "one-failure" => fs::write(root.join("conflict-1.err"), "different failure").unwrap(),
             "wrong-session" => fs::write(root.join("conflict-2.err"), "Error: thread/resume: thread/resume failed: thread another-session already has an active writer (code -32600)").unwrap(),
+            "json-wrong-session" | "json-wrong-code" => {
+                let session = if scenario == "json-wrong-session" { "another-session" } else { SESSION };
+                let code = if scenario == "json-wrong-code" { -32000 } else { -32600 };
+                fs::write(root.join("conflict-2.err"), format!("Error: Codex thread/resume: {}", serde_json::json!({
+                    "code": code, "message": format!("thread {session} already has an active writer"),
+                }))).unwrap();
+            }
+            "json-invalid" => fs::write(root.join("conflict-2.err"), "Error: Codex thread/resume: {invalid JSON}").unwrap(),
             "output" => fs::write(root.join("conflict-2.out"), "agent started working").unwrap(),
             "missing-log" => fs::remove_file(root.join("conflict-2.err")).unwrap(),
             "large-log" => fs::write(root.join("conflict-2.err"), "x".repeat(65537)).unwrap(),

@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn shared_completed_conversation_does_not_block_commit_or_publication() {
+fn shared_completed_conversation_and_manual_task_do_not_block_commit_or_publication() {
     for folders in [false, true] {
         for mode in [AgentGitMode::Commit, AgentGitMode::CommitAndPush] {
             for prior_journal in [false, true] {
@@ -19,6 +19,14 @@ fn shared_completed_conversation_does_not_block_commit_or_publication() {
                 add_task(&project_root, "Active task codex:active-session", None).unwrap();
                 move_task(&project_root, TaskStatus::Todo, TaskStatus::Doing, "1").unwrap();
                 add_task(&project_root, "Later queued task", None).unwrap();
+                insert_task(
+                    &project_root,
+                    TaskStatus::Doing,
+                    None,
+                    "Independent direct work clt:manual codex:manual-session",
+                    None,
+                )
+                .unwrap();
                 initialize_test_git_repository(&project_root);
                 let branch = run_test_git(&project_root, &["branch", "--show-current"]);
                 if mode == AgentGitMode::CommitAndPush {
@@ -256,7 +264,13 @@ fn shared_completed_conversation_does_not_block_commit_or_publication() {
                 );
                 assert_eq!(completed.commit_oid.as_deref(), Some(task_commit.as_str()));
                 assert!(completed.acknowledged_at.is_some());
-                assert!(board.entries(TaskStatus::Doing).unwrap().is_empty());
+                let doing = board.entries(TaskStatus::Doing).unwrap();
+                assert_eq!(doing.len(), 1);
+                assert_eq!(
+                    recoverable_codex_session_id_from_task_content(&doing[0].content),
+                    Some("manual-session")
+                );
+                assert!(task_content_is_manual(&doing[0].content));
                 let done = board.entries(TaskStatus::Done).unwrap();
                 assert_eq!(done.len(), 2);
                 assert_eq!(done[1].content, older_task.content);

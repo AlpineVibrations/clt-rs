@@ -178,6 +178,7 @@ pub(super) struct AgentCleanSummary {
 pub(super) struct AgentProjectScan {
     pub(super) status: AgentProjectScanStatus,
     pub(super) todo_count: usize,
+    pub(super) manual_todo_count: usize,
     pub(super) blocked_todo_count: usize,
     pub(super) stopped_todo_count: usize,
     pub(super) doing_count: usize,
@@ -958,10 +959,11 @@ pub(super) fn delete_task(root: &Path, status: &str, task_index_str: &str) -> Re
     )
 }
 
-pub(super) fn reseal_provisional_done_task(root: &Path, task_index_str: &str) -> Result<bool> {
-    let Some(context) = automated_agent_child_context()? else {
-        return Ok(false);
-    };
+fn reseal_provisional_done_task(
+    root: &Path,
+    task_index_str: &str,
+    context: &AutomatedAgentChildContext,
+) -> Result<bool> {
     let store = open_agent_store()?;
     let project = store
         .list_projects_blocking()?
@@ -973,8 +975,8 @@ pub(super) fn reseal_provisional_done_task(root: &Path, task_index_str: &str) ->
                 context.project_id
             )
         })?;
-    let session_id = running_session_for_automated_child(&store, &context)?;
-    if effective_agent_git_mode(&store, &project, Some(&session_id))? == AgentGitMode::Off {
+    let running_session_id = running_session_for_automated_child(&store, context)?;
+    if effective_agent_git_mode(&store, &project, Some(&running_session_id))? == AgentGitMode::Off {
         return Ok(false);
     }
     let root = canonicalize_existing_path(root)?;
@@ -993,6 +995,10 @@ pub(super) fn reseal_provisional_done_task(root: &Path, task_index_str: &str) ->
     let session_id = codex_session_id_from_task_content(&entry.content).context(
         "Resealing a provisional Done task requires its terminal codex:<session-id> marker",
     )?;
+    anyhow::ensure!(
+        session_id == running_session_id,
+        "The selected task belongs to another Codex session; list tasks and select this conversation's task"
+    );
     if !task_content_has_completed_note(&entry.content) {
         anyhow::bail!("Resealing requires the task's dated COMPLETED note");
     }
@@ -1362,12 +1368,79 @@ pub(super) fn move_task_to_doing_with_agent_git_journal(
     Ok(())
 }
 
+// A resumed Codex shell can retain CODEX_THREAD_ID while losing CLT's launch
+// environment. Recover only that exact live conversation, never the project's
+// latest run. The completion transaction still checks the current run token.
+fn automated_completion_context(root: &Path) -> Result<Option<AutomatedAgentChildContext>> {
+    if let Some(context) = automated_agent_child_context()? {
+        return Ok(Some(context));
+    }
+    let Ok(session) = std::env::var("CODEX_THREAD_ID") else {
+        return Ok(None);
+    };
+    if !crate::task::codex_session_id_is_uuid(&session) {
+        return Ok(None);
+    }
+    let state_dir = agent_state_dir()?;
+    if !state_dir.join(AGENT_DB_FILE).try_exists()? {
+        return Ok(None);
+    }
+    recover_completion_context(&open_agent_store_at(&state_dir)?, root, &session)
+}
+
+fn recover_completion_context(
+    store: &agent::TursoAgentStore,
+    root: &Path,
+    session: &str,
+) -> Result<Option<AutomatedAgentChildContext>> {
+    let root = canonicalize_existing_path(root)?;
+    let Some(project) = store
+        .list_projects_blocking()?
+        .into_iter()
+        .find(|project| project.path == root)
+    else {
+        return Ok(None);
+    };
+    let control = store.session_control_blocking(project.id, session)?;
+    let run_token = control
+        .filter(|control| {
+            control.state == AgentSessionControlState::Running
+                && control.child_pid.is_some_and(|pid| {
+                    crate::platform::local_process_is_running(pid) != Some(false)
+                })
+                && control.interactive_holder.is_none()
+                && control.interactive_launch_token.is_none()
+        })
+        .and_then(|control| control.run_token);
+    let Some(run_token) = run_token else {
+        // Missing launch variables must not silently turn the owning agent's
+        // completion into a user override that cancels its unfinished journal.
+        anyhow::ensure!(
+            store
+                .git_finalization_blocking(project.id, session)?
+                .is_none_or(|journal| journal.state.is_terminal()),
+            "This conversation has unfinished managed Git work but no running owner; resume the exact CLT session before completing it"
+        );
+        return Ok(None);
+    };
+    crate::worker::validate_agent_worker_token(&run_token)?;
+    let context = AutomatedAgentChildContext {
+        project_id: project.id,
+        run_token,
+    };
+    anyhow::ensure!(
+        running_session_for_automated_child(store, &context)? == session,
+        "The running Codex conversation changed before completion; retry from its owning session"
+    );
+    Ok(Some(context))
+}
+
 pub(super) fn move_task_to_done(
     root: &Path,
     from: TaskStatus,
     task_index_str: &str,
 ) -> Result<TaskDoneOutcome> {
-    let Some(context) = automated_agent_child_context()? else {
+    let Some(context) = automated_completion_context(root)? else {
         return Ok(
             match move_task_in_board(&get_tasks_dir(root), from, TaskStatus::Done, task_index_str)?
             {
@@ -1377,7 +1450,7 @@ pub(super) fn move_task_to_done(
         );
     };
     let provisional = if from == TaskStatus::Done {
-        reseal_provisional_done_task(root, task_index_str)?
+        reseal_provisional_done_task(root, task_index_str, &context)?
     } else {
         move_task_to_done_with_agent_context(root, from, task_index_str, &context)?
     };
@@ -1433,6 +1506,11 @@ pub(super) fn move_task_to_done_with_agent_store(
     let session_id = codex_session_id_from_task_content(&entry.content).with_context(|| {
         "Automated Git completion requires the selected task's terminal codex:<session-id> marker"
     })?;
+    let running_session_id = running_session_for_automated_child(store, context)?;
+    anyhow::ensure!(
+        session_id == running_session_id,
+        "The selected task belongs to another Codex session; list tasks and select this conversation's task"
+    );
     if !task_content_has_completed_note(&entry.content) {
         anyhow::bail!(
             "Automated Git completion requires a dated COMPLETED YYYY-MM-DD: note before moving the task to Done"
@@ -1796,7 +1874,17 @@ pub(super) fn move_task_in_board_after_lock(
     }
     // Publish the destination while still claimed. The shared board lock keeps
     // scheduling out until the move succeeds and ownership is released.
-    board.move_task_after_lock(from, to, task_index)?;
+    if from != to
+        && task_content_is_manual(&entry.content)
+        && (matches!(entry.source, TaskSource::MarkdownLine { .. })
+            || matches!(board.status_store(to)?, StatusStore::Directory(_)))
+    {
+        // A neighboring task may have a sealed Git path. Manual moves must not
+        // renumber that task while its automated run is still in progress.
+        board.move_task_without_reordering_after_lock(from, to, task_index)?;
+    } else {
+        board.move_task_after_lock(from, to, task_index)?;
+    }
     if to == TaskStatus::Done && task_content_is_interactive_done(&entry.content) {
         let session = recoverable_codex_session_id_from_task_content(&entry.content)
             .context("Reopened task needs its attached Codex conversation before completion")?;

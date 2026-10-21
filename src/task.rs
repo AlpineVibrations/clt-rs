@@ -289,17 +289,29 @@ pub(super) fn task_content_with_manual_session(content: &str, session_id: &str) 
     )
 }
 
-/// Manual claims fence the whole checkout, including claims on nested boards.
+/// Detect unfinished manual work, including claims on nested boards.
 /// Done tasks retain their conversation history but no longer reserve work.
 pub(super) fn board_has_manual_task(board_dir: &Path) -> Result<bool> {
+    board_has_manual_task_matching(board_dir, None)
+}
+
+pub(super) fn board_has_manual_session(board_dir: &Path, session: &str) -> Result<bool> {
+    board_has_manual_task_matching(board_dir, Some(session))
+}
+
+fn board_has_manual_task_matching(board_dir: &Path, session: Option<&str>) -> Result<bool> {
     for status in [TaskStatus::Backlog, TaskStatus::Todo, TaskStatus::Doing] {
         for task in read_task_entries(board_dir, status)? {
-            if task_content_is_manual(&task.content) {
+            if task_content_is_manual(&task.content)
+                && session.is_none_or(|session| {
+                    recoverable_codex_session_id_from_task_content(&task.content) == Some(session)
+                })
+            {
                 return Ok(true);
             }
             if task.has_subtasks
                 && let TaskSource::Path { path, is_dir: true } = &task.source
-                && board_has_manual_task(path)?
+                && board_has_manual_task_matching(path, session)?
             {
                 return Ok(true);
             }
@@ -335,19 +347,25 @@ pub(super) fn task_entry_is_ready(entry: &TaskEntry) -> bool {
 }
 
 pub(super) fn task_content_is_blocked(content: &str) -> bool {
-    let mut state = None;
+    task_blocking_note(content).is_some()
+}
 
-    for line in content.lines() {
+pub(super) fn task_blocking_note(content: &str) -> Option<&str> {
+    let mut note = None;
+    let mut offset = 0;
+
+    for line in content.split_inclusive('\n') {
         let heading = line.trim().trim_start_matches(['#', '-', '*', ' ']).trim();
         if heading.eq_ignore_ascii_case("blocked note:") {
-            state = Some(TaskBlockingState::Blocked);
+            note = Some(&content[offset..]);
         }
-        if let Some(line_state) = latest_task_blocking_state_on_line(line) {
-            state = Some(line_state);
+        if let Some((index, state)) = latest_task_blocking_note_on_line(line) {
+            note = (state == TaskBlockingState::Blocked).then(|| &content[offset + index..]);
         }
+        offset += line.len();
     }
 
-    state == Some(TaskBlockingState::Blocked)
+    note
 }
 
 pub(super) fn follow_up_session(content: &str) -> Option<&str> {
@@ -377,6 +395,10 @@ pub(super) fn follow_up_matches_status(content: &str, status: TaskStatus) -> boo
 }
 
 pub(super) fn latest_task_blocking_state_on_line(line: &str) -> Option<TaskBlockingState> {
+    latest_task_blocking_note_on_line(line).map(|(_, state)| state)
+}
+
+fn latest_task_blocking_note_on_line(line: &str) -> Option<(usize, TaskBlockingState)> {
     let uppercase = line.to_ascii_uppercase();
     let mut latest = None;
 
@@ -401,7 +423,7 @@ pub(super) fn latest_task_blocking_state_on_line(line: &str) -> Option<TaskBlock
         }
     }
 
-    latest.map(|(_, state)| state)
+    latest
 }
 
 pub(super) fn starts_with_task_note_date(value: &[u8]) -> bool {

@@ -183,18 +183,6 @@ fn lock_project_board(
     Ok((board, lock))
 }
 
-fn lock_project_without_manual_claim(
-    store: &agent::TursoAgentStore,
-    project_id: i64,
-) -> Result<crate::task::BoardMutationLock> {
-    let (board, lock) = lock_project_board(store, project_id)?;
-    anyhow::ensure!(
-        !board.is_dir() || !crate::task::board_has_manual_task(&board)?,
-        "Project is reserved by a directly opened Codex session; use clt handoff to release it"
-    );
-    Ok(lock)
-}
-
 pub(super) fn automated_session_control_action_for_generation(
     control: &agent::AgentSessionControlRecord,
     child_pid: u32,
@@ -633,7 +621,7 @@ impl InteractiveAgentLease {
         let acquired_at = agent_timestamp();
         let expires_at = agent_timestamp_after(timeout_seconds);
         let acquired = with_agent_store_at(state_dir, |store| {
-            let _lock = lock_project_without_manual_claim(store, project_id)?;
+            let (_board, _lock) = lock_project_board(store, project_id)?;
             store.try_acquire_lease_blocking(project_id, holder, &acquired_at, &expires_at)
         })?;
 
@@ -1965,8 +1953,8 @@ fn reserve_idle_codex_session_interactive(
 ) -> Result<Option<InteractiveCodexResumeMode>> {
     let (board, _lock) = lock_project_board(store, project_id)?;
     anyhow::ensure!(
-        !crate::task::board_has_manual_task(&board)?,
-        "Project is reserved by a directly opened Codex session; use clt handoff to release it"
+        !crate::task::board_has_manual_session(&board, session_id)?,
+        "This Codex session owns a manual task; continue it in its directly opened session"
     );
     let control = store.session_control_blocking(project_id, session_id)?;
     let mut tasks = Vec::new();

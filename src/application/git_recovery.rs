@@ -12,16 +12,19 @@ use crate::{
         AgentRunRecord, AgentSessionControlState, GitFinalizationRecord, GitFinalizationState,
         TursoAgentStore,
     },
-    managed_git::{current_agent_git_branch, current_agent_git_head},
+    managed_git::{
+        current_agent_git_branch, current_agent_git_head, git_ref_active_task_identity_count,
+    },
     runner::{agent_timestamp, agent_timestamp_after, automated_agent_child_context},
     session_control::InteractiveAgentLease,
     task::{
         TASK_STATUSES, TASK_STOPPED_MARKER, TaskBoard, TaskEntry, TaskSource, TaskStatus,
-        acquire_board_mutation_lock, board_has_manual_task, get_tasks_dir,
-        move_task_without_reordering_after_lock, prioritize_task_after_lock, read_task_entries,
-        recoverable_codex_session_id_from_task_content,
-        task_content_without_recoverable_codex_session, task_content_without_stop_marker,
-        task_display_text, task_entry_is_blocked, task_entry_is_ready, task_entry_is_stopped,
+        acquire_board_mutation_lock, board_has_manual_session, durable_task_identity,
+        get_tasks_dir, move_task_without_reordering_after_lock, prioritize_task_after_lock,
+        read_task_entries, recoverable_codex_session_id_from_task_content, task_blocking_note,
+        task_content_is_manual, task_content_without_recoverable_codex_session,
+        task_content_without_stop_marker, task_display_text, task_entry_is_blocked,
+        task_entry_is_ready, task_entry_is_stopped,
     },
 };
 
@@ -117,6 +120,33 @@ fn linked_tasks(board_dir: &Path, tasks: &mut Vec<(PathBuf, TaskStatus, TaskEntr
         }
     }
     Ok(())
+}
+
+fn restart_preserves_other_git_work(
+    store: &TursoAgentStore,
+    project_id: i64,
+    session: &str,
+    tasks: &[(PathBuf, TaskStatus, TaskEntry)],
+) -> Result<bool> {
+    for journal in store.list_pending_git_finalizations_blocking(Some(project_id))? {
+        if journal.codex_session_id == session {
+            continue;
+        }
+        let linked = tasks
+            .iter()
+            .filter(|(_, _, task)| {
+                recoverable_codex_session_id_from_task_content(&task.content)
+                    == Some(journal.codex_session_id.as_str())
+            })
+            .collect::<Vec<_>>();
+        if journal.state != GitFinalizationState::Working
+            || !matches!(linked.as_slice(), [(_, TaskStatus::Todo, task)]
+                if task_entry_is_blocked(task) || task_entry_is_stopped(task))
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// A preview carries the exact run and task contents the user is accepting.
@@ -360,10 +390,22 @@ fn writer_conflict_at_startup(run: &AgentRunRecord, session: &str) -> bool {
     let Some(stderr) = read_small_log(run.stderr_path.as_deref()) else {
         return false;
     };
-    let diagnostic = format!(
-        "Error: thread/resume: thread/resume failed: thread {session} already has an active writer (code -32600)"
-    );
-    stdout.trim().is_empty() && stderr.lines().any(|line| line.trim() == diagnostic)
+    let message = format!("thread {session} already has an active writer");
+    let diagnostic = format!("Error: thread/resume: thread/resume failed: {message} (code -32600)");
+    stdout.trim().is_empty()
+        && stderr.lines().any(|line| {
+            let line = line.trim();
+            if line == diagnostic {
+                return true;
+            }
+            line.strip_prefix("Error: Codex thread/resume: ")
+                .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+                .is_some_and(|error| {
+                    error.get("code").and_then(|code| code.as_i64()) == Some(-32600)
+                        && error.get("message").and_then(|message| message.as_str())
+                            == Some(message.as_str())
+                })
+        })
 }
 
 /// Two consecutive failed resumes establish a persistent startup conflict.
@@ -447,86 +489,80 @@ pub(crate) fn recover_failed_activation_automatically(
             continue;
         }
         let session = &journal.codex_session_id;
-        // HEAD can advance after launch but before task activation. Resuming
-        // this unbound journal can never satisfy its original launch checks.
-        // Use the exact task run, not a later successful supervisor assessment.
-        if let Some(run) = store.latest_run_for_codex_session_blocking(project.id, session)?
-            && matches!(run.status.as_str(), "failure" | "blocked" | "timeout")
-            && run.finished_at.is_some()
-            && journal.starting_head.is_some()
-            && journal.branch_ref.is_some()
-            && current_agent_git_branch(&project.path)? == journal.branch_ref
-        {
-            let head = current_agent_git_head(&project.path)?;
-            if journal.starting_head.as_deref() != Some(head.as_str()) {
-                let control = store.session_control_blocking(project.id, session)?;
-                if control.as_ref().is_some_and(|control| {
-                    control.state != AgentSessionControlState::ResumeRequested
-                        || control.child_pid.is_some()
-                        || control.interactive_holder.is_some()
-                        || control.interactive_launch_token.is_some()
-                        || control.run_token != journal.owner_run_token
-                }) {
-                    continue;
-                }
-                let plan = plan_task_restart(store, project, session)?;
-                if plan.journal.as_ref() != Some(&journal)
-                    || !plan.linked.as_ref().is_some_and(|linked| {
-                        linked.status.is_active() && !task_entry_is_stopped(&linked.task)
-                    })
-                {
-                    continue;
-                }
-                let plan = GitRecoveryPlan {
-                    run_id: run.id,
-                    stale_head: Some(head),
-                    ..plan
-                };
-                return execute_git_recovery(store, &plan, false).map(Some);
-            }
-        }
-        let run = journal
+        // A terminal worker can lack its session ID when observation failed.
+        // Select the newest exact-session or exact-owner run, never a later
+        // unrelated supervisor assessment or an obsolete owner result.
+        let owner_run = journal
             .owner_run_token
             .as_deref()
             .map(|token| store.run_for_worker_token_blocking(project.id, token))
             .transpose()?
-            .flatten()
-            .or(store.latest_run_for_codex_session_blocking(project.id, session)?);
-        let Some(run) = run else {
+            .flatten();
+        let session_run = store.latest_run_for_codex_session_blocking(project.id, session)?;
+        let Some(run) = owner_run
+            .into_iter()
+            .chain(session_run)
+            .max_by_key(|run| run.id)
+        else {
             continue;
         };
-        if run.status != "failure"
+        if !matches!(run.status.as_str(), "failure" | "blocked" | "timeout")
             || run.finished_at.is_none()
-            || !run.summary.as_deref().is_some_and(|summary| summary.contains(
-                "requires the selected task to be committed exactly once in Todo or Doing before the task starts (found 0)"
-            ))
+            || journal.starting_head.is_none()
+            || journal.branch_ref.is_none()
+            || current_agent_git_branch(&project.path)? != journal.branch_ref
         {
             continue;
         }
-        let Some(control) = store.session_control_blocking(project.id, session)? else {
-            continue;
-        };
-        if control.state != AgentSessionControlState::ResumeRequested
-            || control.child_pid.is_some()
-            || control.interactive_holder.is_some()
-            || control.interactive_launch_token.is_some()
-            || journal.owner_run_token.is_none()
-            || control.run_token != journal.owner_run_token
-        {
+        let control = store.session_control_blocking(project.id, session)?;
+        if control.as_ref().is_some_and(|control| {
+            control.state != AgentSessionControlState::ResumeRequested
+                || control.child_pid.is_some()
+                || control.interactive_holder.is_some()
+                || control.interactive_launch_token.is_some()
+                || control.run_token != journal.owner_run_token
+        }) {
             continue;
         }
         let mut plan = plan_task_restart(store, project, session)?;
+        let Some(linked) = plan.linked.as_ref() else {
+            continue;
+        };
         if plan.journal.as_ref() != Some(&journal)
-            || !plan.linked.as_ref().is_some_and(|linked| {
-                matches!(linked.status, TaskStatus::Todo | TaskStatus::Doing)
-                    && task_entry_is_ready(&linked.task)
-            })
+            || !linked.status.is_active()
+            || task_entry_is_stopped(&linked.task)
+            || task_content_is_manual(&linked.task.content)
         {
             continue;
         }
+        let head = current_agent_git_head(&project.path)?;
+        let head_changed = journal.starting_head.as_deref() != Some(head.as_str());
+        if !head_changed {
+            let Some(identity) = durable_task_identity(&linked.task.content) else {
+                continue;
+            };
+            // Prove the missing task from Git, not one exact wording of the
+            // worker's error. Only clear a blocked note about this startup
+            // failure; a later dependency or input blocker remains authoritative.
+            if git_ref_active_task_identity_count(&project.path, &head, &identity)? != 0
+                || task_blocking_note(&linked.task.content).is_some_and(|note| {
+                    !note.contains("committed exactly once") || !note.contains("(found 0)")
+                })
+            {
+                continue;
+            }
+        }
         plan.run_id = run.id;
-        plan.preactivation = true;
-        return execute_git_recovery(store, &plan, true).map(Some);
+        plan.preactivation = !head_changed;
+        plan.stale_head = Some(head);
+        let mut tasks = Vec::new();
+        linked_tasks(&get_tasks_dir(&project.path), &mut tasks)?;
+        if !restart_preserves_other_git_work(store, project.id, session, &tasks)? {
+            // This is a normal wait, not a project error. Let the scheduler
+            // reach another task's commit verification/publication first.
+            continue;
+        }
+        return execute_git_recovery(store, &plan, false).map(Some);
     }
     Ok(None)
 }
@@ -573,8 +609,8 @@ fn execute_git_recovery(
     let project_board = get_tasks_dir(&plan.project.path);
     let _lock = acquire_board_mutation_lock(&project_board)?;
     anyhow::ensure!(
-        !board_has_manual_task(&project_board)?,
-        "A manually owned task reserves this project; finish or hand it off before recovery"
+        !board_has_manual_session(&project_board, &plan.session_id)?,
+        "This task is manually owned; finish or hand it off before recovery"
     );
     let mut linked_tasks_now = Vec::new();
     linked_tasks(&project_board, &mut linked_tasks_now)?;
@@ -597,24 +633,15 @@ fn execute_git_recovery(
         Ok((linked, board, index))
     }).transpose()?;
     if plan.restart {
-        for journal in store.list_pending_git_finalizations_blocking(Some(plan.project.id))? {
-            if journal.codex_session_id == plan.session_id {
-                continue;
-            }
-            let linked: Vec<_> = linked_tasks_now
-                .iter()
-                .filter(|(_, _, task)| {
-                    recoverable_codex_session_id_from_task_content(&task.content)
-                        == Some(journal.codex_session_id.as_str())
-                })
-                .collect();
-            anyhow::ensure!(
-                journal.state == GitFinalizationState::Working
-                    && matches!(linked.as_slice(), [(_, TaskStatus::Todo, task)]
-                    if task_entry_is_blocked(task) || task_entry_is_stopped(task)),
-                "Another unfinished task owns this project; return its dependency wait to Todo before restarting the prerequisite"
-            );
-        }
+        anyhow::ensure!(
+            restart_preserves_other_git_work(
+                store,
+                plan.project.id,
+                &plan.session_id,
+                &linked_tasks_now
+            )?,
+            "Another unfinished task owns this project; return its dependency wait to Todo before restarting the prerequisite"
+        );
     }
     let holder = InteractiveAgentLease::holder_for_current_process();
     if plan.journal.is_some() || plan.restart {
@@ -711,10 +738,10 @@ fn execute_git_recovery(
             // history, and the next attempt must get its own session and journal.
             let reason = if plan.writer_conflict.is_some() {
                 "two consecutive resumes failed at startup because the old conversation already has an active writer; the idle attempt was retired automatically".to_string()
-            } else if plan.stale_head.is_some() {
-                "HEAD changed before task activation and the worker ended; the stale unbound attempt was retired automatically".to_string()
             } else if plan.preactivation {
                 "the selected Todo was absent from the old launch checkpoint and its worker failed before activation; the unbound attempt was retired automatically".to_string()
+            } else if plan.stale_head.is_some() {
+                "HEAD changed before task activation and the worker ended; the stale unbound attempt was retired automatically".to_string()
             } else if plan.restart {
                 "the owner explicitly restarted this unfinished task; the old attempt remains in history".to_string()
             } else if let Some(journal) = &plan.journal {

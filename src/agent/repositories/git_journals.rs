@@ -82,14 +82,14 @@ impl TursoAgentStore {
                 "SELECT COUNT(*) FROM runs WHERE id = ?1 AND project_id = ?2
                  AND (?4 = 1 OR status IN ('failure', 'timeout'))
                  AND EXISTS (SELECT 1 FROM projects WHERE id = ?2 AND path = ?3)
-                 AND id = CASE WHEN ?6 = 1 THEN COALESCE(
-                     (SELECT id FROM runs WHERE project_id = ?2 AND worker_token = ?7),
-                     (SELECT MAX(id) FROM runs WHERE project_id = ?2 AND codex_session_id = ?5))
+                 AND id = CASE WHEN ?6 = 1 THEN MAX(
+                     COALESCE((SELECT id FROM runs WHERE project_id = ?2 AND worker_token = ?7), 0),
+                     COALESCE((SELECT MAX(id) FROM runs WHERE project_id = ?2 AND codex_session_id = ?5), 0))
                    WHEN ?4 = 1 THEN COALESCE(
                      (SELECT MAX(id) FROM runs WHERE project_id = ?2 AND codex_session_id = ?5),
                      (SELECT id FROM runs WHERE project_id = ?2 AND worker_token = ?7))
                    ELSE (SELECT MAX(id) FROM runs WHERE project_id = ?2) END",
-                params![expected_run_id, project_id, project_path.to_string_lossy().as_ref(), i64::from(restart), session_id, i64::from(restart && require_resume_requested), expected_journal.and_then(|journal| journal.owner_run_token.as_deref())],
+                params![expected_run_id, project_id, project_path.to_string_lossy().as_ref(), i64::from(restart), session_id, i64::from(restart && (require_resume_requested || stale_start)), expected_journal.and_then(|journal| journal.owner_run_token.as_deref())],
             ).await? == 1, "The latest run changed; review recovery again");
             if let Some(expected) = expected_journal {
                 let mut rows = tx.query(
@@ -161,9 +161,10 @@ impl TursoAgentStore {
                     "Stale activation recovery requires an unbound attempt");
                 anyhow::ensure!(query_count(&tx,
                     "SELECT COUNT(*) FROM runs r WHERE r.id = ?1 AND r.project_id = ?2
-                       AND r.codex_session_id = ?3 AND r.status IN ('failure', 'blocked', 'timeout')
+                       AND (r.codex_session_id = ?3 OR (r.codex_session_id IS NULL AND r.worker_token = ?4))
+                       AND r.status IN ('failure', 'blocked', 'timeout')
                        AND r.finished_at IS NOT NULL
-                       AND (r.worker_token = ?4 OR (r.worker_token IS NULL AND ?4 IS NULL))
+                       AND (r.worker_token = ?4 OR (r.worker_token IS NULL AND r.codex_session_id = ?3))
                        AND NOT EXISTS (SELECT 1 FROM agent_workers w WHERE w.worker_token = r.worker_token
                            AND (w.state <> 'completed' OR w.run_id IS NULL OR w.run_id <> r.id))
                        AND NOT EXISTS (SELECT 1 FROM session_controls sc WHERE sc.project_id = ?2

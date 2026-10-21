@@ -203,6 +203,69 @@ fn planned_todo_selection_preserves_queue_order_and_skips_unavailable_tasks() {
     }
 }
 
+#[test]
+fn fresh_launch_keeps_its_selected_todo_and_rejects_a_new_uncommitted_selection() {
+    for folders in [false, true] {
+        let root = temp_root("fresh-todo-selection");
+        init_tasks(&root, folders).unwrap();
+        add_task(&root, "Waiting. BLOCKED 2026-10-20: needs input", None).unwrap();
+        add_task(&root, "Original ready work.", None).unwrap();
+        initialize_test_git_repository(&root);
+        let start = capture_agent_git_start_state(&root, AgentGitMode::Commit).unwrap();
+        let mut project = crate::tui::tests::tui_agent_project_for_test(1, "project").project;
+        project.path = root.clone();
+        project.git_mode = AgentGitMode::Commit;
+        let mut command = Command::new("codex");
+        crate::runner::configure_automated_codex_subcommand_with_direction(
+            &mut command,
+            &project,
+            AgentTaskSelection::NextTodo,
+            None,
+            None,
+            Some(&start),
+        )
+        .unwrap();
+
+        // A new Todo arrives while the child is starting. Its prepared prompt
+        // still names the original task instead of delegating a live selection.
+        TaskBoard::new(get_tasks_dir(&root))
+            .insert_content(TaskStatus::Todo, Some(0), "Newly added work.")
+            .unwrap();
+        let prompt = command.get_args().last().unwrap().to_string_lossy();
+        assert!(prompt.contains("Selected task for this run:\nOriginal ready work."));
+        assert!(!prompt.contains("Newly added work."));
+        assert!(prompt.contains("do not substitute a Todo added or reordered after launch"));
+
+        // A selection change before spawning is caught against the existing
+        // frozen commit, before it can create an unbound failed conversation.
+        let index = run_test_git(&root, &["write-tree"]);
+        let mut second = Command::new("codex");
+        let error = crate::runner::configure_automated_codex_subcommand_with_direction(
+            &mut second,
+            &project,
+            AgentTaskSelection::NextTodo,
+            None,
+            None,
+            Some(&start),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("retry before starting Codex"));
+        assert_eq!(
+            run_test_git(&root, &["rev-parse", "HEAD"]),
+            start.starting_head
+        );
+        assert_eq!(run_test_git(&root, &["write-tree"]), index);
+        assert_eq!(
+            TaskBoard::new(get_tasks_dir(&root))
+                .entries(TaskStatus::Todo)
+                .unwrap()
+                .len(),
+            3
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn todo_runner_starts_plans_and_resumes_prior_work_with_each_git_mode() {

@@ -55,7 +55,7 @@ use crate::{
     },
     session_recovery::{ensure_orphaned_session_supervision, recovered_supervisor_pid},
     task::{
-        TaskStatus, acquire_board_mutation_lock, board_has_manual_task, ensure_existing_board,
+        TaskStatus, acquire_board_mutation_lock, board_has_manual_session, ensure_existing_board,
         get_tasks_dir, read_task_entries, recoverable_codex_session_id_from_task_content,
         task_content_is_manual, task_entry_is_blocked, task_entry_is_stopped,
         task_for_codex_session_in_board, task_status_for_codex_session_in_board,
@@ -177,10 +177,20 @@ pub(super) fn acquire_agent_job_stage(
         task_selection,
         resume_session_id,
     } = request;
-    // Serialize the manual claim/lease boundary. A stale scheduling snapshot
-    // must not create a worker after a direct Codex session has claimed work.
-    let _board_lock = acquire_board_mutation_lock(&get_tasks_dir(&project.path))?;
-    if board_has_manual_task(&get_tasks_dir(&project.path))? {
+    // Recheck the selected conversation under the claim lock. Other manual
+    // tasks do not own this run, and a stale resume must not take their task.
+    let board = get_tasks_dir(&project.path);
+    let _board_lock = acquire_board_mutation_lock(&board)?;
+    if let Some(session) = resume_session_id.as_deref()
+        && board_has_manual_session(&board, session)?
+    {
+        return Ok(AgentJobAcquisitionResult::SessionSuspended);
+    }
+    if task_selection == AgentTaskSelection::NextTodo
+        && !read_task_entries(&board, TaskStatus::Todo)?
+            .iter()
+            .any(crate::task::task_entry_is_ready)
+    {
         return Ok(AgentJobAcquisitionResult::SessionSuspended);
     }
     if matches!(
@@ -1013,33 +1023,6 @@ pub(super) fn run_agent_scheduler_pass_with_max_global_jobs(
         )?;
         existing_lease = agent_lease_for_project(state_dir, project.id)?;
         let scan = scan_agent_project(&project.path);
-        let has_manual_task = match board_has_manual_task(&get_tasks_dir(&project.path)) {
-            Ok(manual) => manual,
-            Err(error) => {
-                let error = format!("Unable to check manual task ownership: {error:#}");
-                with_agent_store_at(state_dir, |store| {
-                    store.record_project_daemon_scan_blocking(
-                        project.id,
-                        "unavailable",
-                        Some(&error),
-                    )
-                })?;
-                eprintln!(
-                    "Project {}: action=skip reason=board_unavailable error={error} path={}",
-                    project.name,
-                    project.path.display()
-                );
-                continue;
-            }
-        };
-        if has_manual_task {
-            println!(
-                "Project {}: action=skip reason=manual_session path={}",
-                project.name,
-                project.path.display()
-            );
-            continue;
-        }
         // Retire task-less journals whose owning run already ended before the
         // guarded finalization lease is attempted. Their recorded owner token
         // can never be matched again, so leaving them pending would skip this
@@ -2351,6 +2334,16 @@ pub(super) fn scan_agent_project(project_root: &Path) -> AgentProjectScan {
         Ok(entries) => entries,
         Err(err) => return AgentProjectScan::unavailable(err),
     };
+    let total_todo_count = todo_entries.len();
+    let total_doing_count = doing_entries.len();
+    let todo_entries = todo_entries
+        .into_iter()
+        .filter(|task| !task_content_is_manual(&task.content))
+        .collect::<Vec<_>>();
+    let doing_entries = doing_entries
+        .into_iter()
+        .filter(|task| !task_content_is_manual(&task.content))
+        .collect::<Vec<_>>();
     let todo_count = todo_entries.len();
     let stopped_todo_count = todo_entries
         .iter()
@@ -2366,13 +2359,19 @@ pub(super) fn scan_agent_project(project_root: &Path) -> AgentProjectScan {
         .filter(|entry| task_entry_is_blocked(entry) && !task_entry_is_stopped(entry))
         .count();
 
-    AgentProjectScan::from_counts(
+    let mut scan = AgentProjectScan::from_counts(
         todo_count,
         blocked_todo_count,
         stopped_todo_count,
         doing_count,
         blocked_doing_count,
-    )
+    );
+    // Keep display totals while availability and blocked recovery exclude
+    // independently owned manual work.
+    scan.manual_todo_count = total_todo_count - todo_count;
+    scan.todo_count = total_todo_count;
+    scan.doing_count = total_doing_count;
+    scan
 }
 
 #[cfg(test)]
@@ -2414,6 +2413,7 @@ impl AgentProjectScan {
         Self {
             status,
             todo_count,
+            manual_todo_count: 0,
             blocked_todo_count,
             stopped_todo_count,
             doing_count,
@@ -2430,6 +2430,7 @@ impl AgentProjectScan {
         Self {
             status: AgentProjectScanStatus::Missing,
             todo_count: 0,
+            manual_todo_count: 0,
             blocked_todo_count: 0,
             stopped_todo_count: 0,
             doing_count: 0,
@@ -2441,6 +2442,7 @@ impl AgentProjectScan {
         Self {
             status: AgentProjectScanStatus::Uninitialized,
             todo_count: 0,
+            manual_todo_count: 0,
             blocked_todo_count: 0,
             stopped_todo_count: 0,
             doing_count: 0,
@@ -2452,6 +2454,7 @@ impl AgentProjectScan {
         Self {
             status: AgentProjectScanStatus::Unavailable(format!("{err:#}")),
             todo_count: 0,
+            manual_todo_count: 0,
             blocked_todo_count: 0,
             stopped_todo_count: 0,
             doing_count: 0,
@@ -2474,6 +2477,7 @@ impl AgentProjectScan {
 
     pub(super) fn available_todo_count(&self) -> usize {
         self.todo_count
+            .saturating_sub(self.manual_todo_count)
             .saturating_sub(self.blocked_todo_count)
             .saturating_sub(self.stopped_todo_count)
     }

@@ -117,8 +117,9 @@ A provisional Done entry with unfinished Git proof retains its existing controls
 
 When Codex is working directly in a CLT-enabled project, outside a `clt agent`
 run, create and claim the task directly in Doing with `clt start`. This attaches
-the current conversation and reserves the project against automated pickup and
-interrupted-task recovery. Use it even when project automation is disabled.
+the current conversation and reserves that task against automated pickup and
+interrupted-task recovery. Other manual sessions and unrelated automation may
+continue in the same project. Use it even when project automation is disabled.
 
 Use the exact current session ID supplied by the Codex runtime (for example,
 `CODEX_THREAD_ID` when available). Do not guess an ID, use a process ID, or take
@@ -146,7 +147,9 @@ status, and run `clt handoff doing <index>`. Handoff moves the task to Todo and
 keeps the same conversation. Stop editing after handoff because an enabled
 daemon may resume immediately. Do not hand off automatically just because a
 turn ends. Existing automated sessions keep their established CLT controls;
-never replace another session's link or bypass an active owner.
+never replace another session's link or take over its task. Another task running
+tests or doing independent work is not a reason to stop this task. Coordinate
+overlapping edits, and leave staging alone while another task seals its commit.
 
 Preserve both `clt:manual` and the final `codex:<session-id>` token when adding
 notes. `clt start` and `clt claim` write these markers for you. Use an updated
@@ -210,6 +213,11 @@ clt done doing <index>
 
 In an automated Git-enabled run, use this command only after the implementation and completion note are verified, all file-mutating formatters/hooks have run, and the implementation plus active Doing task have been staged and inspected. CLT projects the selected task's Done move and seals the exact resulting full repository tree, then treats the worktree's Done entry as provisional until Git finalization succeeds. Stage only the resulting board transition and include it in the same task commit. If a later commit hook changes or rejects files, stage the complete correction, list Done to confirm its current index, and run `clt done done <index>` to reseal the provisional entry before retrying that one commit.
 
+When a resumed shell has lost both CLT launch variables, `clt done` can recover
+its context using the exact current `CODEX_THREAD_ID` and matching live run.
+Do not copy identifiers from another task or the latest project run. If the
+conversation is stopped or interactive, use its existing session controls.
+
 ### Independent failures and follow-ups
 
 A failed command does not automatically mean the implementation is blocked. First establish whether the task's acceptance criteria are satisfied and its relevant checks pass. For a separate pre-existing or environment-only failure, reproduce the same failure on the frozen starting revision in an isolated directory, without switching or resetting the active checkout. Record the revision, commands, matching failure, passing task checks, and what is needed to unblock the independent work. If acceptance or independence is uncertain, keep the original task blocked and do not commit incomplete work.
@@ -254,7 +262,7 @@ clt delete <status> <index>
 - **Independent Failures**: Use `clt follow-up` when acceptance is satisfied and a separate failure is evidenced as pre-existing or environment-only. Commit the verified original task and linked follow-up together; never leave finished implementation uncommitted solely because that independent failure remains. Do not work on the follow-up in the same run.
 - **Blocked Notes**: If a task cannot be completed safely, add `BLOCKED YYYY-MM-DD:` followed by the blocker, what was attempted, and what is needed to continue. In an automated run, return the unsealed task to `todo` with `clt status`, preserving its session marker, partial work, and Git journal, then exit. CLT also performs this deferral after the worker exits. Never move a sealed provisional Done task backward. A direct manual session keeps its claim until completion or an explicitly requested handoff. Normal automated selection skips blocked Todo tasks; explicit stops remain in effect until the user restarts them.
 - **Unblocked Notes**: When a recorded blocker is resolved but the task still needs the normal Todo workflow, add `UNBLOCKED YYYY-MM-DD:` with the resolution and move the same task to `todo`. The automated scheduler treats the latest dated `BLOCKED`, `UNBLOCKED`, or `COMPLETED` state note as current, so blocker history can remain in the task.
-- **Atomic Transitions**: Only move one task to `doing` at a time to maintain focus and clear project state.
+- **Task Ownership**: Work on the task claimed by this conversation. Independent conversations may each own a Doing task; a claim does not lock the whole project. Never reuse another conversation's task or automated run identifiers.
 - **Metadata Usage**: Use the metadata field for tracking issue numbers, priority, or assignees. Use standardized, comma-separated tags for better scannability (e.g., `clt add "Fix memory leak" "BUG, HIGH"`).
 - **Consistency**: Ensure every significant change or feature implementation is tracked as a task. If a task is too large, break it into smaller sub-tasks in the `todo` list.
 
@@ -278,7 +286,7 @@ clt list todo
 1. Fix memory leak in parser
 ```
 
-**3. Check nothing is already in progress before activating:**
+**3. Inspect current work and preserve other sessions' tasks:**
 ```bash
 clt list doing
 ```
