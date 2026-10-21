@@ -15,6 +15,11 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ### Fixed
 
+- Keep agent logs readable by formatting command, patch and tool events as text,
+  omitting empty reasoning records and avoiding repeated streamed command output.
+- Allow deletion of an idle stopped task while another task runs in the same
+  project, preserving that task's worker, lease and Git journal. Report unresolved
+  project ownership accurately instead of claiming the stopped task is running.
 - Scope manual claims to their task and conversation so independent Codex sessions
   can work alongside running tests and automated tasks. Preserve other task paths,
   session ownership and Git finalization; keep manual tasks out of automated pickup.

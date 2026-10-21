@@ -23,6 +23,8 @@ use crate::{
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(20);
 
+mod log;
+
 #[derive(Debug, Serialize, Deserialize)]
 struct LaunchSpec {
     program: PathBuf,
@@ -202,6 +204,7 @@ struct Protocol<'a, W> {
     turn_count: usize,
     used_tools: bool,
     final_text: String,
+    log: log::EventLog,
 }
 
 impl<'a, W: Write> Protocol<'a, W> {
@@ -220,6 +223,7 @@ impl<'a, W: Write> Protocol<'a, W> {
             turn_count: 0,
             used_tools: false,
             final_text: String::new(),
+            log: log::EventLog::default(),
         }
     }
 
@@ -367,6 +371,7 @@ impl<'a, W: Write> Protocol<'a, W> {
         self.turn_count += 1;
         self.used_tools = false;
         self.final_text.clear();
+        self.log.start_turn();
         let target = SteeringTarget {
             project_id: self.spec.project_id,
             session_id: self.session_id.clone(),
@@ -443,25 +448,20 @@ impl<'a, W: Write> Protocol<'a, W> {
                 ) {
                     self.used_tools = true;
                 }
-                if event["method"] == "item/completed" {
-                    if kind == "agentMessage" {
-                        if let Some(text) = item["text"].as_str() {
-                            eprintln!("codex\n{text}");
-                            self.final_text = text.to_string();
-                        }
-                    } else {
-                        eprintln!("{kind}: {item}");
-                    }
-                }
-            }
-            "error" => eprintln!("Codex: {}", params["error"]),
-            method if method.ends_with("/outputDelta") => {
-                if let Some(delta) = params["delta"].as_str() {
-                    eprint!("{delta}");
+                if event["method"] == "item/completed"
+                    && kind == "agentMessage"
+                    && let Some(text) = item["text"].as_str()
+                {
+                    self.final_text = text.to_string();
                 }
             }
             _ => {}
         }
+        eprint!(
+            "{}",
+            self.log
+                .event(event["method"].as_str().unwrap_or_default(), params)
+        );
         Ok(())
     }
 

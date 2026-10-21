@@ -56,6 +56,71 @@ async fn session_can_enable_git(
     ).await? == 1)
 }
 
+/// A stopped/idle session can be cancelled under the board lock without taking
+/// another task's project lease. Every live worker and lease must be attributable
+/// to a different conversation; unregistered launches remain project-wide fences.
+async fn can_delete_idle_task(
+    conn: &Connection,
+    project_id: i64,
+    session_id: &str,
+    generation: i64,
+    task_identity: Option<&str>,
+    now: &str,
+) -> Result<bool> {
+    Ok(query_count(
+        conn,
+        "SELECT COUNT(*) FROM git_finalizations g
+          WHERE g.project_id = ?1 AND g.codex_session_id = ?2
+            AND g.state = 'working' AND g.generation = ?3
+            AND g.task_identity IS ?4 AND g.commit_oid IS NULL
+            AND NOT EXISTS (
+                SELECT 1 FROM session_controls sc
+                 WHERE sc.project_id = ?1 AND sc.codex_session_id = ?2
+                   AND (sc.state NOT IN ('stopped', 'resume_requested')
+                        OR sc.child_pid IS NOT NULL
+                        OR sc.interactive_holder IS NOT NULL
+                        OR sc.interactive_launch_token IS NOT NULL)
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM agent_workers w
+                 WHERE w.project_id = ?1
+                   AND w.state IN ('dispatching', 'running', 'finalizing')
+                   AND (w.worker_token IS g.owner_run_token
+                        OR w.resume_session_id IS ?2
+                        OR EXISTS (
+                            SELECT 1 FROM session_controls sc
+                             WHERE sc.project_id = ?1 AND sc.codex_session_id = ?2
+                               AND sc.run_token = w.worker_token
+                        )
+                        OR (w.resume_session_id IS NULL AND NOT EXISTS (
+                            SELECT 1 FROM session_controls other
+                             WHERE other.project_id = ?1 AND other.codex_session_id <> ?2
+                               AND other.run_token = w.worker_token
+                        )))
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM agent_git_launch_states WHERE project_id = ?1
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM leases l
+                 WHERE l.project_id = ?1 AND CAST(l.expires_at AS INTEGER) > CAST(?5 AS INTEGER)
+                   AND NOT EXISTS (
+                       SELECT 1 FROM agent_workers w
+                        WHERE w.project_id = ?1 AND w.lease_holder = l.holder
+                          AND w.state IN ('dispatching', 'running', 'finalizing')
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM session_controls other
+                        WHERE other.project_id = ?1 AND other.codex_session_id <> ?2
+                          AND other.interactive_holder = l.holder
+                   )
+            )",
+        params![project_id, session_id, generation, task_identity, now],
+    )
+    .await?
+        == 1)
+}
+
 impl TursoAgentStore {
     /// Reserve an idle project for explicit recovery. A reviewed branch-mismatch
     /// journal is retired atomically with stopping its session, retaining its proof.
@@ -686,24 +751,35 @@ impl TursoAgentStore {
                 format!("Failed to begin {action} for Codex session {codex_session_id}")
             })?;
 
-        if query_count(
-            &transaction,
-            "SELECT COUNT(*) FROM agent_workers
+        let session_scoped_deletion = cancellation == GitTaskCancellation::Deletion
+            && can_delete_idle_task(
+                &transaction,
+                project_id,
+                codex_session_id,
+                expected_generation,
+                task_identity,
+                acquired_at,
+            )
+            .await?;
+        if !session_scoped_deletion {
+            if query_count(
+                &transaction,
+                "SELECT COUNT(*) FROM agent_workers
               WHERE project_id = ?1
                 AND state IN ('dispatching', 'running', 'finalizing')",
-            [project_id],
-        )
-        .await?
-            > 0
-        {
-            anyhow::bail!(
-                "Task {codex_session_id} still has an active agent worker; stop it before {action}"
-            );
-        }
+                [project_id],
+            )
+            .await?
+                > 0
+            {
+                anyhow::bail!(
+                    "This project still has an active agent worker whose ownership prevents {action}; wait for it to settle or stop the running task"
+                );
+            }
 
-        if query_count(
-            &transaction,
-            "SELECT COUNT(*) FROM session_controls
+            if query_count(
+                &transaction,
+                "SELECT COUNT(*) FROM session_controls
               WHERE project_id = ?1
                 AND NOT (
                     state IN ('stopped', 'resume_requested')
@@ -711,28 +787,28 @@ impl TursoAgentStore {
                     AND interactive_holder IS NULL
                     AND interactive_launch_token IS NULL
                 )",
-            [project_id],
-        )
-        .await?
-            > 0
-        {
-            anyhow::bail!(
-                "A Codex session in this project is still active; stop it before {action}"
-            );
-        }
-
-        anyhow::ensure!(
-            query_count(
-                &transaction,
-                "SELECT COUNT(*) FROM agent_git_launch_states WHERE project_id = ?1",
                 [project_id],
             )
             .await?
-                == 0,
-            "The project has an unconsumed Git launch boundary; recover it before {action}"
-        );
+                > 0
+            {
+                anyhow::bail!(
+                    "A Codex session in this project is still active; stop it before {action}"
+                );
+            }
 
-        transaction
+            anyhow::ensure!(
+                query_count(
+                    &transaction,
+                    "SELECT COUNT(*) FROM agent_git_launch_states WHERE project_id = ?1",
+                    [project_id],
+                )
+                .await?
+                    == 0,
+                "The project has an unconsumed Git launch boundary; recover it before {action}"
+            );
+
+            transaction
             .execute(
                 "DELETE FROM leases
                   WHERE project_id = ?1
@@ -745,21 +821,21 @@ impl TursoAgentStore {
                     "Failed to clear an expired project lease before {action} for {codex_session_id}"
                 )
             })?;
-        if query_count(
-            &transaction,
-            "SELECT COUNT(*) FROM leases WHERE project_id = ?1",
-            [project_id],
-        )
-        .await?
-            > 0
-        {
-            anyhow::bail!(
-                "Task {codex_session_id} still has an active project lease; stop its agent session before {action}"
-            );
-        }
-        let lease_inserted = transaction
-            .execute(
-                "INSERT OR IGNORE INTO leases (project_id, holder, acquired_at, expires_at)
+            if query_count(
+                &transaction,
+                "SELECT COUNT(*) FROM leases WHERE project_id = ?1",
+                [project_id],
+            )
+            .await?
+                > 0
+            {
+                anyhow::bail!(
+                    "This project still has an active project lease; wait for its owner to settle before {action}"
+                );
+            }
+            let lease_inserted = transaction
+                .execute(
+                    "INSERT OR IGNORE INTO leases (project_id, holder, acquired_at, expires_at)
                  SELECT ?1, ?2, ?3, ?4
                   WHERE EXISTS (
                       SELECT 1 FROM git_finalizations
@@ -768,25 +844,26 @@ impl TursoAgentStore {
                          AND task_identity IS ?7
                          AND commit_oid IS NULL
                   )",
-                params![
-                    project_id,
-                    lease_holder,
-                    acquired_at,
-                    expires_at,
-                    codex_session_id,
-                    expected_generation,
-                    task_identity,
-                ],
-            )
-            .await
-            .with_context(|| {
-                format!("Failed to fence the project while {action} for {codex_session_id}")
-            })?;
-        if lease_inserted != 1 {
-            transaction.commit().await.with_context(|| {
-                format!("Failed to finish rejecting {action} for {codex_session_id}")
-            })?;
-            return Ok(false);
+                    params![
+                        project_id,
+                        lease_holder,
+                        acquired_at,
+                        expires_at,
+                        codex_session_id,
+                        expected_generation,
+                        task_identity,
+                    ],
+                )
+                .await
+                .with_context(|| {
+                    format!("Failed to fence the project while {action} for {codex_session_id}")
+                })?;
+            if lease_inserted != 1 {
+                transaction.commit().await.with_context(|| {
+                    format!("Failed to finish rejecting {action} for {codex_session_id}")
+                })?;
+                return Ok(false);
+            }
         }
 
         clear_cancelled_attempt_failure(&transaction, project_id, codex_session_id, acquired_at)

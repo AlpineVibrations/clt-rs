@@ -376,7 +376,12 @@ while IFS= read -r line; do
     *'"method":"thread/resume"'*) printf '{"id":%s,"result":{"thread":{"id":"SESSION"},"model":"mock-model","reasoningEffort":"high"}}\n' "$id" ;;
     *'"method":"turn/start"'*)
       printf '{"id":%s,"result":{"turn":{"id":"active"}}}\n' "$id"
-      printf '%s\n' '{"method":"turn/started","params":{"threadId":"SESSION","turn":{"id":"active"}}}' ;;
+      printf '%s\n' '{"method":"turn/started","params":{"threadId":"SESSION","turn":{"id":"active"}}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"other-thread","item":{"type":"agentMessage","text":"foreign thread output"}}}'
+      printf '%s\n' '{"method":"item/started","params":{"threadId":"SESSION","item":{"type":"commandExecution","id":"cmd-one","command":"cargo test","cwd":"/project","status":"inProgress"}}}'
+      printf '%s\n' '{"method":"item/commandExecution/outputDelta","params":{"threadId":"SESSION","itemId":"cmd-one","delta":"first test passed\nsecond test passed"}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"SESSION","item":{"type":"commandExecution","id":"cmd-one","command":"cargo test","cwd":"/project","status":"completed","exitCode":0,"aggregatedOutput":"first test passed\nsecond test passed","commandActions":[{"command":"cargo test"}]}}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"SESSION","item":{"type":"reasoning","summary":[],"content":[]}}}' ;;
     *'"method":"turn/steer"'*)
       printf '{"id":%s,"result":{"turnId":"active"}}\n' "$id"
       printf '%s\n' '{"method":"item/completed","params":{"threadId":"SESSION","item":{"type":"agentMessage","text":"Steering received"}}}'
@@ -485,6 +490,26 @@ done
         assert_eq!(unsafe { libc::kill(server_pid as libc::pid_t, 0) }, -1);
         if !cancel {
             assert_eq!(result.exit_code, Some(0));
+            let transcript = fs::read_to_string(&result.stderr_path).unwrap();
+            assert!(transcript.contains("exec\nin /project\ncargo test\nfirst test passed\nsecond test passed\nexec: completed (exit code 0)\n"));
+            assert_eq!(transcript.matches("first test passed").count(), 1);
+            assert!(transcript.contains("codex\nSteering received\n"));
+            for unwanted in [
+                "aggregatedOutput",
+                "commandActions",
+                "reasoning: {",
+                "foreign thread output",
+            ] {
+                assert!(
+                    !transcript.contains(unwanted),
+                    "Unexpected {unwanted} in log"
+                );
+            }
+            assert_eq!(
+                fs::read_to_string(&result.stdout_path).unwrap().trim(),
+                // The test-only adapter entry point adds the harness banner.
+                "running 1 test\nSteering received"
+            );
             let settings =
                 crate::runner::agent_run_settings_from_log(Path::new(&result.stderr_path)).unwrap();
             assert_eq!(settings.model.as_deref(), Some("mock-model"));
