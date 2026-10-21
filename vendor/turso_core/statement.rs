@@ -453,7 +453,7 @@ impl Statement {
         self.state.reset_stmt_status(counter);
     }
 
-    pub fn mv_store(&self) -> impl Deref<Target = Option<Arc<MvStore>>> {
+    pub fn mv_store(&self) -> impl Deref<Target = Option<Arc<MvStore>>> + use<> {
         self.program.connection.mv_store()
     }
 

@@ -36,7 +36,7 @@ pub trait FailureInjector: Debug + Send + Sync {
 // At a safe resumable boundary, ask the active yield injector whether this
 // state machine should return a synthetic TransitionResult::Io yield here.
 macro_rules! inject_transition_yield {
-    ($state_machine:expr, $point:expr) => {{
+    ($state_machine:expr_2021, $point:expr_2021) => {{
         #[cfg(any(clt_turso_tests, injected_yields))]
         {
             use $crate::mvcc::yield_hooks::ProvidesYieldContext;
@@ -58,7 +58,7 @@ pub(crate) use inject_transition_yield;
 // At a safe resumable boundary, ask the active yield injector whether this
 // state machine should return a synthetic IOResult::IO yield here.
 macro_rules! inject_io_yield {
-    ($state_machine:expr, $point:expr) => {{
+    ($state_machine:expr_2021, $point:expr_2021) => {{
         #[cfg(any(clt_turso_tests, injected_yields))]
         {
             use $crate::mvcc::yield_hooks::ProvidesYieldContext;
@@ -81,7 +81,7 @@ pub(crate) use inject_io_yield;
 // state machine should return Err here. Used to reproduce mid-commit failures
 // in tests without requiring a real I/O fault.
 macro_rules! inject_transition_failure {
-    ($state_machine:expr, $point:expr) => {{
+    ($state_machine:expr_2021, $point:expr_2021) => {{
         #[cfg(any(clt_turso_tests, injected_yields))]
         {
             use $crate::mvcc::yield_hooks::ProvidesYieldContext;

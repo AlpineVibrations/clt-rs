@@ -87,7 +87,7 @@ pub fn current_allocation_site() -> Option<AllocationSite> {
 
 #[macro_export]
 macro_rules! without_allocation_faults {
-    ($expr:expr) => {{
+    ($expr:expr_2021) => {{
         #[cfg(clt_turso_feature = "allocation_metric")]
         let _turso_allocation_site_guard =
             $crate::alloc::enter_allocation_site($crate::alloc::AllocationSite::NoFaultInjection);
@@ -97,7 +97,7 @@ macro_rules! without_allocation_faults {
 
 #[macro_export]
 macro_rules! with_mv_store_allocation_site {
-    ($site:ident, $expr:expr) => {{
+    ($site:ident, $expr:expr_2021) => {{
         #[cfg(clt_turso_feature = "allocation_metric")]
         let _turso_allocation_site_guard =
             $crate::alloc::enter_allocation_site($crate::alloc::MvStoreAllocationSite::$site);

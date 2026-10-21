@@ -579,7 +579,7 @@ impl ProgramBuilderOpts {
 /// because we want to avoid allocating a String if we are not in explain mode.
 #[macro_export]
 macro_rules! emit_explain {
-    ($builder:expr, $push:expr, $detail:expr) => {
+    ($builder:expr_2021, $push:expr_2021, $detail:expr_2021) => {
         if let $crate::QueryMode::ExplainQueryPlan = $builder.get_query_mode() {
             $builder.emit_explain($push, $detail);
         }
@@ -1913,7 +1913,7 @@ impl ProgramBuilder {
                 _ => break 'value None,
             };
 
-            let Some(ref default_expr) = default else {
+            let Some(default_expr) = default else {
                 break 'value None;
             };
 

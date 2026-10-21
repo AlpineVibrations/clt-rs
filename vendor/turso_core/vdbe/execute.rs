@@ -164,7 +164,7 @@ type MvccCheckpointStateMachine = CheckpointStateMachine<MvccClock, DynAllocator
 /// Macro to destructure an Insn enum variant, only to be used when it
 /// is *impossible* to be another variant.
 macro_rules! load_insn {
-    ($variant:ident { $($field:tt $(: $binding:pat)?),* $(,)? }, $insn:expr) => {
+    ($variant:ident { $($field:tt $(: $binding:pat)?),* $(,)? }, $insn:expr_2021) => {
         #[cfg(debug_assertions)]
         let Insn::$variant { $($field $(: $binding)?),* } = $insn else {
             panic!("Expected Insn::{}, got {:?}", stringify!($variant), $insn);
@@ -178,7 +178,7 @@ macro_rules! load_insn {
 }
 
 macro_rules! return_if_io {
-    ($expr:expr) => {
+    ($expr:expr_2021) => {
         match $expr {
             Ok(IOResult::Done(v)) => v,
             Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
@@ -191,7 +191,7 @@ macro_rules! return_if_io {
 }
 
 macro_rules! check_arg_count {
-    ($actual:expr, $expected:expr) => {
+    ($actual:expr_2021, $expected:expr_2021) => {
         if unlikely($actual != $expected) {
             return Err(LimboError::InternalError(format!(
                 "expected {} argument(s), got {}",
@@ -1901,7 +1901,7 @@ pub fn op_column(
                         };
 
                         // DEFAULT handling
-                        let Some(ref default) = default else {
+                        let Some(default) = default else {
                             state.registers[*dest].set_null();
                             break;
                         };
@@ -3392,21 +3392,22 @@ fn open_connection_named_savepoints_for_db(
             return Ok(IOResult::Done(()));
         }
 
-        if let Some(mv_store) = conn.mv_store_for_db(db) {
-            let Some(tx_id) = conn.get_mv_tx_id_for_db(db) else {
-                return Ok(IOResult::Done(()));
-            };
-            for frame in frames {
-                mv_store.begin_named_savepoint(
-                    tx_id,
-                    frame.name.clone(),
-                    frame.starts_transaction,
-                    frame.deferred_fk_violations,
-                );
+        match conn.mv_store_for_db(db) {
+            Some(mv_store) => {
+                let Some(tx_id) = conn.get_mv_tx_id_for_db(db) else {
+                    return Ok(IOResult::Done(()));
+                };
+                for frame in frames {
+                    mv_store.begin_named_savepoint(
+                        tx_id,
+                        frame.name.clone(),
+                        frame.starts_transaction,
+                        frame.deferred_fk_violations,
+                    );
+                }
+                Ok(IOResult::Done(()))
             }
-            Ok(IOResult::Done(()))
-        } else {
-            open_named_savepoint_frames_on_wal_pager(pager, frames)
+            _ => open_named_savepoint_frames_on_wal_pager(pager, frames),
         }
     })
 }
@@ -4693,20 +4694,20 @@ pub fn op_program(
                 // When we have triggers or fk-actions with multi-row inserts, we can re-use
                 // cached statements by storing them key'd by the state.pc if we are in a loop
                 let pc_key = state.pc as usize;
-                let mut statement =
-                    if let Some(mut cached) = state.subprogram_stmt_cache.remove(&pc_key) {
+                let mut statement = match state.subprogram_stmt_cache.remove(&pc_key) {
+                    Some(mut cached) => {
                         cached.reset_for_subprogram_reuse();
                         cached
-                    } else {
-                        Box::new(Statement::new_with_origin(
-                            Program::from_prepared(subprogram.clone(), program.connection.clone()),
-                            pager.clone(),
-                            QueryMode::Normal,
-                            0,
-                            crate::statement::StatementOrigin::Subprogram,
-                            false,
-                        ))
-                    };
+                    }
+                    _ => Box::new(Statement::new_with_origin(
+                        Program::from_prepared(subprogram.clone(), program.connection.clone()),
+                        pager.clone(),
+                        QueryMode::Normal,
+                        0,
+                        crate::statement::StatementOrigin::Subprogram,
+                        false,
+                    )),
+                };
 
                 // Check if this is a trigger subprogram - if so, track execution
                 // and save last_insert_rowid so it can be restored after the trigger finishes.
@@ -5525,7 +5526,7 @@ pub fn seek_internal(
                                     .expect("op_seek: cursor should be allocated")
                                     .as_btree_mut();
                                 let record = match &registers[*record_reg] {
-                                    Register::Record(ref record) => record,
+                                    Register::Record(record) => record,
                                     _ => unreachable!(
                                         "op_seek: record_reg should be a Record register when OpSeekKey::IndexKeyFromRegister is used"
                                     ),
@@ -9488,7 +9489,7 @@ pub fn op_function(
                                                     column_def.col_name.as_str(),
                                                 );
                                             }
-                                            ast::TableConstraint::Check(ref mut expr) => {
+                                            ast::TableConstraint::Check(expr) => {
                                                 rename_identifiers(
                                                     expr,
                                                     &rename_from,
@@ -10532,7 +10533,7 @@ pub fn op_idx_insert(
     }
 
     let record_to_insert = match &state.registers[record_reg] {
-        Register::Record(ref r) => r,
+        Register::Record(r) => r,
         o => {
             return Err(LimboError::InternalError(format!(
                 "expected record, got {o:?}"
@@ -11553,7 +11554,7 @@ pub fn op_destroy(
                 *state.active_op_state.destroy() =
                     OpDestroyState::DestroyBtree(Arc::new(RwLock::new(cursor)));
             }
-            OpDestroyState::DestroyBtree(ref mut cursor) => {
+            OpDestroyState::DestroyBtree(cursor) => {
                 let maybe_former_root_page = return_if_io!(cursor.write().btree_destroy());
                 state.registers[*former_root_reg]
                     .set_int(maybe_former_root_page.unwrap_or(0) as i64);
@@ -11621,7 +11622,7 @@ fn op_clear_btree_inner(
             OpClearBtreeState::ClearBtree { pager, cursor } => {
                 return_if_io!(cursor.write().clear_btree());
                 for other_cursor_opt in state.cursors.iter_mut().flatten() {
-                    if let Cursor::BTree(ref mut btree_cursor) = other_cursor_opt {
+                    if let Cursor::BTree(btree_cursor) = other_cursor_opt {
                         if Arc::ptr_eq(&btree_cursor.get_pager(), pager) {
                             btree_cursor.invalidate_btree_cache();
                         }
@@ -14306,7 +14307,7 @@ pub fn op_rename_table(
             if normalize_ident(tname) == normalized_to {
                 continue;
             }
-            if let Table::BTree(ref mut child_btree_arc) = Arc::make_mut(t_arc) {
+            if let Table::BTree(child_btree_arc) = Arc::make_mut(t_arc) {
                 let child_btree = Arc::make_mut(child_btree_arc);
                 for fk_arc in &mut child_btree.foreign_keys {
                     if normalize_ident(&fk_arc.parent_table) == normalized_from {
@@ -14667,7 +14668,7 @@ pub fn op_alter_column(
             .expect("table being ALTERed should be in schema");
         let table = Arc::make_mut(table_arc);
 
-        let Table::BTree(ref mut btree_arc) = table else {
+        let Table::BTree(btree_arc) = table else {
             panic!("only btree tables can be altered");
         };
         let btree = Arc::make_mut(btree_arc);
@@ -14788,7 +14789,7 @@ pub fn op_alter_column(
             if normalize_ident(tname) == normalized_table_name {
                 continue;
             }
-            if let Table::BTree(ref mut child_btree_arc) = Arc::make_mut(t_arc) {
+            if let Table::BTree(child_btree_arc) = Arc::make_mut(t_arc) {
                 let child_btree = Arc::make_mut(child_btree_arc);
                 for fk_arc in &mut child_btree.foreign_keys {
                     if normalize_ident(&fk_arc.parent_table) != normalized_table_name {
@@ -16687,15 +16688,15 @@ fn op_vacuum_into_inner(
                     .get_pager_from_database_index(&source_db_id)?;
                 let source_auto_vacuum_mode = source_pager.get_auto_vacuum_mode();
                 reject_unsupported_vacuum_auto_vacuum_mode(source_auto_vacuum_mode)?;
-                let header_meta = if let Some(mv_store) =
-                    program.connection.mv_store_for_db(source_db_id)
-                {
-                    let tx_id = program.connection.get_mv_tx_id_for_db(source_db_id);
-                    mv_store.with_header(VacuumDbHeaderMeta::from_source_header, tx_id.as_ref())?
-                } else {
-                    source_pager.io.block(|| {
+                let header_meta = match program.connection.mv_store_for_db(source_db_id) {
+                    Some(mv_store) => {
+                        let tx_id = program.connection.get_mv_tx_id_for_db(source_db_id);
+                        mv_store
+                            .with_header(VacuumDbHeaderMeta::from_source_header, tx_id.as_ref())?
+                    }
+                    _ => source_pager.io.block(|| {
                         source_pager.with_header(VacuumDbHeaderMeta::from_source_header)
-                    })?
+                    })?,
                 };
 
                 let reserved_space: u8 = if !is_attached_db(source_db_id) {

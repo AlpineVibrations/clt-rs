@@ -2593,12 +2593,10 @@ impl JoinedTable {
                     ))
                 } else {
                     // Check if this is a materialized view
-                    let cursor_type =
-                        if let Some(view_mutex) = schema.get_materialized_view(&btree.name) {
-                            CursorType::MaterializedView(btree.clone(), view_mutex)
-                        } else {
-                            CursorType::BTreeTable(btree.clone())
-                        };
+                    let cursor_type = match schema.get_materialized_view(&btree.name) {
+                        Some(view_mutex) => CursorType::MaterializedView(btree.clone(), view_mutex),
+                        _ => CursorType::BTreeTable(btree.clone()),
+                    };
                     Some(program.alloc_cursor_id_keyed_if_not_exists(
                         CursorKey::table(self.internal_id),
                         cursor_type,

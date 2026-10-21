@@ -6,6 +6,12 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+### Fixed
+
+- Remove the deprecated library edition override that warned during builds and
+  package verification. Migrate the bundled database sources to the package's
+  Rust 2024 edition and reject target edition overrides in the release audit.
+
 ## [0.8.4] - 2026-10-21
 
 ### Added

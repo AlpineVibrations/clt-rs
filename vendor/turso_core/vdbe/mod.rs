@@ -507,7 +507,7 @@ struct ActiveOpStateSlot {
 }
 
 macro_rules! active_state_accessor {
-    ($name:ident, $variant:ident, $ty:ty, $init:expr) => {
+    ($name:ident, $variant:ident, $ty:ty, $init:expr_2021) => {
         fn $name(&mut self) -> &mut $ty {
             if matches!(self.state, ActiveOpState::None) {
                 self.state = ActiveOpState::$variant($init);
@@ -1339,7 +1339,7 @@ impl Register {
 
 #[macro_export]
 macro_rules! must_be_btree_cursor {
-    ($cursor_id:expr, $cursor_ref:expr, $state:expr, $insn_name:expr) => {{
+    ($cursor_id:expr_2021, $cursor_ref:expr_2021, $state:expr_2021, $insn_name:expr_2021) => {{
         let (_, cursor_type) = $cursor_ref.get($cursor_id).unwrap();
         if matches!(
             cursor_type,
@@ -1358,7 +1358,7 @@ macro_rules! must_be_btree_cursor {
 /// and nothing else
 #[macro_export]
 macro_rules! get_cursor {
-    ($state:expr, $cursor_id:expr) => {
+    ($state:expr_2021, $cursor_id:expr_2021) => {
         $state
             .cursors
             .get_mut($cursor_id)
@@ -1586,12 +1586,15 @@ impl Program {
                 break;
             }
             // Current program is done, pop next subprogram from queue
-            if let Some(next) = explain_state.pending.pop_front() {
-                explain_state.current = Some(next);
-                state.pc = 0;
-            } else {
-                explain_state.current = None;
-                return Ok(StepResult::Done);
+            match explain_state.pending.pop_front() {
+                Some(next) => {
+                    explain_state.current = Some(next);
+                    state.pc = 0;
+                }
+                _ => {
+                    explain_state.current = None;
+                    return Ok(StepResult::Done);
+                }
             }
         }
 
@@ -2171,9 +2174,9 @@ impl Program {
             CommitState::CommittingAttachedMvcc { .. }
         ) {
             let (step_result, db_id) = {
-                let CommitState::CommittingAttachedMvcc {
-                    state_machine,
-                    db_id,
+                let &mut CommitState::CommittingAttachedMvcc {
+                    ref mut state_machine,
+                    ref mut db_id,
                     mv_store: ref attached_mv,
                 } = &mut program_state.commit_state
                 else {

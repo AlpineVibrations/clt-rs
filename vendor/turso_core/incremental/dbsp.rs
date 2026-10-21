@@ -326,7 +326,7 @@ impl<T: std::hash::Hash + Eq + Ord + Clone> SimpleZSet<T> {
     pub fn to_vec(&self) -> Vec<T> {
         self.data
             .iter()
-            .filter(|(_, &weight)| weight > 0)
+            .filter(|&(_, &weight)| weight > 0)
             .map(|(item, _)| item.clone())
             .collect()
     }

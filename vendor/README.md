@@ -40,9 +40,13 @@ Original crates.io archive SHA-256 checksums:
 | `turso_sdk_kit` | `18c1dc1c0304348c39b97bc6b27cdcb1d7292454ebd0de0f30b5ee3a4c61f9bb` |
 | `turso` | `f9491d7a80312c5abe66a4409e4dce02065503a235453c94b9e4133877e39ffc` |
 
-The engine keeps its upstream Rust 2021 edition; CLT's binary uses Rust 2024.
-The bundled sources are formatted by the package-wide `cargo fmt --all` check.
-Cargo currently warns that per-target editions are deprecated.
+The engine, SDK and Rust API use the package's Rust 2024 edition alongside CLT's
+binary, without deprecated target edition overrides. Edition migration adjusts
+reference patterns, unsafe exports and operations, and opaque type captures;
+explicit matches preserve Rust 2021 temporary lifetimes where needed, and
+`expr_2021` macro fragments preserve the original matching behavior.
+The bundled sources retain their upstream formatting style through
+`vendor/rustfmt.toml` and are checked by package-wide `cargo fmt --all`.
 The core remains at the library crate root so upstream macros and internal
 imports keep working. SDK/API imports are adjusted to their module locations.
 Engine `feature` checks use the private `clt_turso_feature` cfg, with the original

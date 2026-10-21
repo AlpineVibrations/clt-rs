@@ -2609,11 +2609,14 @@ impl OngoingCheckpoint {
                 return true;
             }
             if slot.completion.succeeded() {
-                if let Some(buf) = slot.buf.lock().take() {
-                    self.pending_writes.insert(slot.page_id, buf);
-                    moved = true;
-                } else {
-                    err = Some(CompletionError::IOError(std::io::ErrorKind::Other, "read"));
+                match slot.buf.lock().take() {
+                    Some(buf) => {
+                        self.pending_writes.insert(slot.page_id, buf);
+                        moved = true;
+                    }
+                    _ => {
+                        err = Some(CompletionError::IOError(std::io::ErrorKind::Other, "read"));
+                    }
                 }
             } else {
                 err = Some(

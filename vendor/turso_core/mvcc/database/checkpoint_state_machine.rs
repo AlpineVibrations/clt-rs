@@ -36,7 +36,7 @@ use super::lookup_tx_state;
 const COLLECT_PREEMPTION_THRESHOLD: usize = 1024;
 
 macro_rules! with_mvcc_checkpoint_allocation_site {
-    ($site:ident, $expr:expr) => {{
+    ($site:ident, $expr:expr_2021) => {{
         #[cfg(clt_turso_feature = "allocation_metric")]
         let _turso_allocation_site_guard =
             crate::alloc::enter_allocation_site(crate::alloc::MvccCheckpointAllocationSite::$site);
@@ -1714,35 +1714,38 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 continue;
             }
             let row_id = &self.write_set[current].0.row.id;
-            if let Some(entry) = self.mvstore.rows.get(row_id) {
-                let is_now_empty = {
-                    let mut versions = entry.value().write();
-                    self.mvstore.stamp_chain_materialized(
-                        &mut versions,
-                        materialized_frame,
-                        snapshot_ts,
-                    );
-                    MvStore::<Clock, A>::gc_version_chain(
-                        &mut versions,
-                        lwm,
-                        ckpt_max,
-                        self.mvstore.experimental_mvcc_passive_checkpoint,
-                        min_reader_mark,
-                    );
-                    versions.is_empty()
-                };
-                if is_now_empty && remove_empty_slots {
-                    self.mvstore.rows.remove(row_id);
+            match self.mvstore.rows.get(row_id) {
+                Some(entry) => {
+                    let is_now_empty = {
+                        let mut versions = entry.value().write();
+                        self.mvstore.stamp_chain_materialized(
+                            &mut versions,
+                            materialized_frame,
+                            snapshot_ts,
+                        );
+                        MvStore::<Clock, A>::gc_version_chain(
+                            &mut versions,
+                            lwm,
+                            ckpt_max,
+                            self.mvstore.experimental_mvcc_passive_checkpoint,
+                            min_reader_mark,
+                        );
+                        versions.is_empty()
+                    };
+                    if is_now_empty && remove_empty_slots {
+                        self.mvstore.rows.remove(row_id);
+                    }
                 }
-            } else {
-                // The MVCC metadata table row (persistent_tx_ts_max) is staged
-                // directly into the write set by maybe_stage_mvcc_metadata_write() and do not
-                // have a backing in-memory MVCC version chain. Skip GC for these.
-                assert!(
+                _ => {
+                    // The MVCC metadata table row (persistent_tx_ts_max) is staged
+                    // directly into the write set by maybe_stage_mvcc_metadata_write() and do not
+                    // have a backing in-memory MVCC version chain. Skip GC for these.
+                    assert!(
                     self.mvcc_meta_table
                         .is_some_and(|(tid, _)| tid == row_id.table_id),
                     "row {row_id:?} missing from MVCC store but is not an MVCC metadata table row"
                 );
+                }
             }
             processed += 1;
             if processed >= COLLECT_PREEMPTION_THRESHOLD {

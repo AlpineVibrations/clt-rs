@@ -544,7 +544,7 @@ pub fn translate_expr(
             translate_expr(program, referenced_tables, expr, target_register, resolver)?;
 
             // Check if casting to a custom type
-            if let Some(ref tn) = type_name {
+            if let Some(tn) = type_name {
                 if let Some(resolved) = resolver.schema().resolve_type_unchecked(&tn.name)? {
                     // Build ty_params from AST TypeSize so parametric types
                     // (e.g. numeric(10,2)) get their parameters passed through.
@@ -1692,7 +1692,7 @@ pub fn translate_expr(
                                 );
                             }
 
-                            if let ast::Expr::Literal(ast::Literal::Numeric(ref value)) =
+                            if let ast::Expr::Literal(ast::Literal::Numeric(value)) =
                                 args[1].as_ref()
                             {
                                 if let Ok(probability) = value.parse::<f64>() {
@@ -2225,7 +2225,7 @@ pub fn translate_expr(
                 match self_table_context {
                     Some(SelfTableContext::ForSelect {
                         table_ref_id: real_id,
-                        ref referenced_tables,
+                        referenced_tables,
                     }) => {
                         let real_col = Expr::Column {
                             database: None,
@@ -2320,15 +2320,12 @@ pub fn translate_expr(
                         // cannot know whether a table cursor, index cursor, or both were opened for that table reference.
                         // Hence: currently we first try to resolve a table cursor, and if that fails,
                         // we resolve an index cursor.
-                        if let Some(table_cursor_id) =
-                            program.resolve_cursor_id_safe(&CursorKey::table(*table_ref_id))
-                        {
-                            (Some(table_cursor_id), None)
-                        } else {
-                            (
+                        match program.resolve_cursor_id_safe(&CursorKey::table(*table_ref_id)) {
+                            Some(table_cursor_id) => (Some(table_cursor_id), None),
+                            _ => (
                                 None,
                                 Some(program.resolve_any_index_cursor_id_for_table(*table_ref_id)),
-                            )
+                            ),
                         }
                     } else {
                         let table_cursor_id = if use_index_method.is_some() {

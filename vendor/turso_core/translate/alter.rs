@@ -2672,7 +2672,7 @@ fn rewrite_trigger_sql_for_column_rename(
         let _ = walk_expr_mut(
             &mut when_expr.clone(),
             &mut |ex: &mut ast::Expr| -> Result<WalkControl> {
-                if let ast::Expr::Id(ref name) | ast::Expr::Name(ref name) = ex {
+                if let &mut ast::Expr::Id(ref name) | &mut ast::Expr::Name(ref name) = ex {
                     if normalize_ident(name.as_str()) == *old_col_norm {
                         has_bare_old_col = true;
                     }
@@ -3357,7 +3357,7 @@ fn apply_one_select_for_column_rename(
                 }
             }
 
-            if let Some(ref mut from_clause) = from {
+            if let Some(from_clause) = from {
                 apply_from_clause_for_column_rename(
                     mode,
                     from_clause,
@@ -3371,7 +3371,7 @@ fn apply_one_select_for_column_rename(
                 )?;
             }
 
-            if let Some(ref mut where_expr) = where_clause {
+            if let Some(where_expr) = where_clause {
                 apply_expr_for_column_rename(
                     mode,
                     where_expr,
@@ -3387,7 +3387,7 @@ fn apply_one_select_for_column_rename(
                 )?;
             }
 
-            if let Some(ref mut group_by) = group_by {
+            if let Some(group_by) = group_by {
                 for expr in &mut group_by.exprs {
                     apply_expr_for_column_rename(
                         mode,
@@ -4053,7 +4053,7 @@ fn validate_trigger_columns_after_drop(
                         return Ok(Some(bad));
                     }
                 }
-                if let Some(ref where_expr) = where_clause {
+                if let Some(where_expr) = where_clause {
                     if let Some(bad) = validate_expr_column_refs_after_drop(
                         where_expr,
                         cmd_table_cols.as_deref().unwrap_or(&[]),
@@ -4102,7 +4102,7 @@ fn validate_trigger_columns_after_drop(
                     altered_database_id,
                     None,
                 );
-                if let Some(ref where_expr) = where_clause {
+                if let Some(where_expr) = where_clause {
                     if let Some(bad) = validate_expr_column_refs_after_drop(
                         where_expr,
                         cmd_table_cols.as_deref().unwrap_or(&[]),
@@ -5520,7 +5520,7 @@ fn check_column_ref_valid(
             let col_norm = normalize_ident(col.as_str());
             if ns_norm.eq_ignore_ascii_case("new") || ns_norm.eq_ignore_ascii_case("old") {
                 // NEW.col / OLD.col — validate against owning table columns
-                if let Some(ref cols) = owning_table_columns {
+                if let Some(cols) = owning_table_columns {
                     if !cols.contains(&col_norm) {
                         return Some(format!("{ns}.{col}"));
                     }

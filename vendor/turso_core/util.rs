@@ -22,14 +22,14 @@ use turso_parser::parser::Parser;
 
 #[macro_export]
 macro_rules! io_yield_one {
-    ($c:expr) => {
+    ($c:expr_2021) => {
         return Ok(IOResult::IO(IOCompletions::Single($c)));
     };
 }
 
 #[macro_export]
 macro_rules! eq_ignore_ascii_case {
-    ( $var:expr, $value:literal ) => {{
+    ( $var:expr_2021, $value:literal ) => {{
         match_ignore_ascii_case!(match $var {
             $value => true,
             _ => false,
@@ -39,7 +39,7 @@ macro_rules! eq_ignore_ascii_case {
 
 #[macro_export]
 macro_rules! contains_ignore_ascii_case {
-    ( $var:expr, $value:literal ) => {{
+    ( $var:expr_2021, $value:literal ) => {{
         let compare_to_idx = $var.len().saturating_sub($value.len());
         if $var.len() < $value.len() {
             false
@@ -59,7 +59,7 @@ macro_rules! contains_ignore_ascii_case {
 
 #[macro_export]
 macro_rules! starts_with_ignore_ascii_case {
-    ( $var:expr, $value:literal ) => {{
+    ( $var:expr_2021, $value:literal ) => {{
         if $var.len() < $value.len() {
             false
         } else {
@@ -70,7 +70,7 @@ macro_rules! starts_with_ignore_ascii_case {
 
 #[macro_export]
 macro_rules! ends_with_ignore_ascii_case {
-    ( $var:expr, $value:literal ) => {{
+    ( $var:expr_2021, $value:literal ) => {{
         if $var.len() < $value.len() {
             false
         } else {
@@ -1861,7 +1861,7 @@ pub fn extract_view_columns(
 
     // Navigate to the first SELECT in the statement
     if let ast::OneSelect::Select {
-        ref from,
+        from,
         columns: select_columns,
         ..
     } = &select_stmt.body.select
@@ -2008,14 +2008,18 @@ pub fn extract_view_columns(
                     // For table.*, expand to all columns from the specified table
                     let table_name_str = normalize_ident(table_ref.as_str());
                     if let Some(table_idx) = find_table_index(&table_name_str) {
-                        if let Some(table) = schema.get_table(&tables[table_idx].name) {
-                            for table_column in table.columns() {
-                                let col_name =
-                                    table_column.name.clone().unwrap_or_else(|| "?".to_string());
+                        match schema.get_table(&tables[table_idx].name) {
+                            Some(table) => {
+                                for table_column in table.columns() {
+                                    let col_name = table_column
+                                        .name
+                                        .clone()
+                                        .unwrap_or_else(|| "?".to_string());
 
-                                // Handle duplicate column names by adding suffix
-                                let final_name =
-                                    if let Some(count) = column_name_counts.get_mut(&col_name) {
+                                    // Handle duplicate column names by adding suffix
+                                    let final_name = if let Some(count) =
+                                        column_name_counts.get_mut(&col_name)
+                                    {
                                         *count += 1;
                                         format!("{}:{}", col_name, *count - 1)
                                     } else {
@@ -2023,29 +2027,31 @@ pub fn extract_view_columns(
                                         col_name.clone()
                                     };
 
+                                    columns.push(ViewColumn {
+                                        table_index: table_idx,
+                                        column: Column::new(
+                                            Some(final_name),
+                                            table_column.ty_str.clone(),
+                                            None,
+                                            None,
+                                            table_column.ty(),
+                                            table_column.collation_opt(),
+                                            ColDef::default(),
+                                        ),
+                                    });
+                                }
+                            }
+                            _ => {
+                                // Table not found, create placeholder
                                 columns.push(ViewColumn {
-                                    table_index: table_idx,
-                                    column: Column::new(
-                                        Some(final_name),
-                                        table_column.ty_str.clone(),
+                                    table_index: usize::MAX,
+                                    column: Column::new_default_text(
+                                        Some(format!("{table_name_str}.*")),
+                                        "TEXT".to_string(),
                                         None,
-                                        None,
-                                        table_column.ty(),
-                                        table_column.collation_opt(),
-                                        ColDef::default(),
                                     ),
                                 });
                             }
-                        } else {
-                            // Table not found, create placeholder
-                            columns.push(ViewColumn {
-                                table_index: usize::MAX,
-                                column: Column::new_default_text(
-                                    Some(format!("{table_name_str}.*")),
-                                    "TEXT".to_string(),
-                                    None,
-                                ),
-                            });
                         }
                     }
                 }
@@ -2110,12 +2116,12 @@ pub fn rename_identifiers(expr: &mut ast::Expr, from: &str, to: &str) {
         expr,
         &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
             match e {
-                ast::Expr::Id(ref name) | ast::Expr::Name(ref name)
+                &mut ast::Expr::Id(ref name) | &mut ast::Expr::Name(ref name)
                     if name.as_str().eq_ignore_ascii_case(from) =>
                 {
                     *e = ast::Expr::Id(ast::Name::exact(to.to_owned()));
                 }
-                ast::Expr::Qualified(ref tbl, ref col_name)
+                &mut ast::Expr::Qualified(ref tbl, ref col_name)
                     if col_name.as_str().eq_ignore_ascii_case(from) =>
                 {
                     let tbl = tbl.clone();
@@ -2196,12 +2202,12 @@ fn rename_identifiers_scoped_inner(
                     );
                     // lhs will be walked by walk_expr_mut
                 }
-                ast::Expr::Id(ref name) | ast::Expr::Name(ref name)
+                &mut ast::Expr::Id(ref name) | &mut ast::Expr::Name(ref name)
                     if rename_unqualified && name.as_str().eq_ignore_ascii_case(from) =>
                 {
                     *e = ast::Expr::Id(ast::Name::exact(to.to_owned()));
                 }
-                ast::Expr::Qualified(ref tbl, ref col_name)
+                &mut ast::Expr::Qualified(ref tbl, ref col_name)
                     if col_name.as_str().eq_ignore_ascii_case(from) =>
                 {
                     let tbl_norm = normalize_ident(tbl.as_str());
@@ -2558,7 +2564,7 @@ mod rename_column_view {
                 window_clause,
                 ..
             } => {
-                let sources = if let Some(ref mut from_clause) = from {
+                let sources = if let Some(from_clause) = from {
                     rewrite_from_clause_for_column_rename(
                         from_clause,
                         ctx,
@@ -2584,7 +2590,7 @@ mod rename_column_view {
                     }
                 }
 
-                if let Some(ref mut where_expr) = where_clause {
+                if let Some(where_expr) = where_clause {
                     rewrite_expr_in_scope(
                         where_expr,
                         &sources,
@@ -2595,7 +2601,7 @@ mod rename_column_view {
                     )?;
                 }
 
-                if let Some(ref mut group_by) = group_by {
+                if let Some(group_by) = group_by {
                     for expr in &mut group_by.exprs {
                         rewrite_expr_in_scope(
                             expr,
@@ -2741,7 +2747,7 @@ mod rename_column_view {
                     .map(|db| normalize_ident(db.as_str()));
                 let mut qualifiers = Vec::new();
                 qualifiers.push(table_name_norm.clone());
-                if let Some(ref alias) = alias {
+                if let &mut Some(ref alias) = alias {
                     qualifiers.push(normalize_ident(alias_name(alias)));
                 }
                 if table_db_norm.is_none() {
@@ -3394,10 +3400,10 @@ pub fn rewrite_trigger_cmd_table_refs(cmd: &mut ast::TriggerCmd, old_tbl: &str, 
             for set in sets {
                 rewrite_check_expr_table_refs(&mut set.expr, old_tbl, new_tbl);
             }
-            if let Some(ref mut from) = from {
+            if let Some(from) = from {
                 rewrite_from_clause_table_refs(from, old_tbl, new_tbl);
             }
-            if let Some(ref mut wc) = where_clause {
+            if let Some(wc) = where_clause {
                 rewrite_check_expr_table_refs(wc, old_tbl, new_tbl);
             }
         }
@@ -3411,7 +3417,7 @@ pub fn rewrite_trigger_cmd_table_refs(cmd: &mut ast::TriggerCmd, old_tbl: &str, 
                 *tbl_name = ast::Name::exact(new_tbl.to_owned());
             }
             rewrite_select_table_refs(select, old_tbl, new_tbl);
-            if let Some(ref mut upsert) = upsert {
+            if let Some(upsert) = upsert {
                 rewrite_upsert_table_refs(upsert, old_tbl, new_tbl);
             }
         }
@@ -3422,7 +3428,7 @@ pub fn rewrite_trigger_cmd_table_refs(cmd: &mut ast::TriggerCmd, old_tbl: &str, 
             if tbl_name.as_str().eq_ignore_ascii_case(old_tbl) {
                 *tbl_name = ast::Name::exact(new_tbl.to_owned());
             }
-            if let Some(ref mut wc) = where_clause {
+            if let Some(wc) = where_clause {
                 rewrite_check_expr_table_refs(wc, old_tbl, new_tbl);
             }
         }
@@ -3672,7 +3678,7 @@ fn rewrite_one_select_column_refs_scoped(
             let rename_unqualified =
                 !target_qualifiers.is_empty() || target_table.eq_ignore_ascii_case(trigger_table);
 
-            if let Some(ref mut from) = from {
+            if let Some(from) = from {
                 rewrite_from_clause_column_refs_scoped(
                     from,
                     target_table,
@@ -3682,7 +3688,7 @@ fn rewrite_one_select_column_refs_scoped(
                     target_qualifiers,
                 );
             }
-            if let Some(ref mut wc) = where_clause {
+            if let Some(wc) = where_clause {
                 rename_identifiers_scoped_inner(
                     wc,
                     target_table,
@@ -3694,7 +3700,7 @@ fn rewrite_one_select_column_refs_scoped(
                 );
             }
             for col in columns {
-                if let ast::ResultColumn::Expr(ref mut expr, _) = col {
+                if let ast::ResultColumn::Expr(expr, _) = col {
                     rename_result_identifiers_scoped(
                         expr,
                         target_table,
@@ -3706,7 +3712,7 @@ fn rewrite_one_select_column_refs_scoped(
                     );
                 }
             }
-            if let Some(ref mut gb) = group_by {
+            if let Some(gb) = group_by {
                 for expr in &mut gb.exprs {
                     rename_identifiers_scoped_inner(
                         expr,
@@ -3790,12 +3796,12 @@ fn rename_result_identifiers_scoped(
                         &mut quals,
                     );
                 }
-                ast::Expr::Id(ref name) | ast::Expr::Name(ref name)
+                &mut ast::Expr::Id(ref name) | &mut ast::Expr::Name(ref name)
                     if rename_unqualified && name.as_str().eq_ignore_ascii_case(from) =>
                 {
                     *e = ast::Expr::Id(ast::Name::exact(to.to_owned()));
                 }
-                ast::Expr::Qualified(ref tbl, ref col_name)
+                &mut ast::Expr::Qualified(ref tbl, ref col_name)
                     if col_name.as_str().eq_ignore_ascii_case(from) =>
                 {
                     let tbl_norm = normalize_ident(tbl.as_str());
@@ -3907,7 +3913,7 @@ fn rewrite_select_table_entry_column_refs_scoped(
     target_qualifiers: &mut Vec<String>,
 ) {
     match st {
-        ast::SelectTable::TableCall(_, ref mut args, _) => {
+        ast::SelectTable::TableCall(_, args, _) => {
             for arg in args {
                 rename_identifiers_scoped_inner(
                     arg,
@@ -3920,7 +3926,7 @@ fn rewrite_select_table_entry_column_refs_scoped(
                 );
             }
         }
-        ast::SelectTable::Select(ref mut select, _) => {
+        ast::SelectTable::Select(select, _) => {
             rewrite_select_column_refs_scoped(
                 select,
                 target_table,
@@ -3930,7 +3936,7 @@ fn rewrite_select_table_entry_column_refs_scoped(
                 target_qualifiers,
             );
         }
-        ast::SelectTable::Sub(ref mut from, _) => {
+        ast::SelectTable::Sub(from, _) => {
             rewrite_from_clause_column_refs_scoped(
                 from,
                 target_table,
@@ -4576,7 +4582,7 @@ fn rewrite_upsert_column_refs_scoped(
             }
             rewrite_expr(&mut set.expr);
         }
-        if let Some(ref mut wc) = where_clause {
+        if let Some(wc) = where_clause {
             rewrite_expr(wc);
         }
     }
@@ -4626,7 +4632,7 @@ pub fn rewrite_trigger_cmd_column_refs(
                         new_col,
                     );
                 }
-                if let Some(ref mut wc) = where_clause {
+                if let Some(wc) = where_clause {
                     rename_identifiers_scoped(wc, table, trigger_table, old_col, new_col);
                 }
             } else {
@@ -4639,7 +4645,7 @@ pub fn rewrite_trigger_cmd_column_refs(
                         new_col,
                     );
                 }
-                if let Some(ref mut wc) = where_clause {
+                if let Some(wc) = where_clause {
                     rename_identifiers_scoped_when_clause(
                         wc,
                         table,
@@ -4649,7 +4655,7 @@ pub fn rewrite_trigger_cmd_column_refs(
                     );
                 }
             }
-            if let Some(ref mut from) = from {
+            if let Some(from) = from {
                 rewrite_from_clause_column_refs_scoped(
                     from,
                     table,
@@ -4683,7 +4689,7 @@ pub fn rewrite_trigger_cmd_column_refs(
                 new_col,
                 &mut Vec::new(),
             );
-            if let Some(ref mut upsert) = upsert {
+            if let Some(upsert) = upsert {
                 rewrite_upsert_column_refs_scoped(
                     upsert,
                     table,
@@ -4700,10 +4706,10 @@ pub fn rewrite_trigger_cmd_column_refs(
         } => {
             let targets_renamed_table = tbl_name.as_str().eq_ignore_ascii_case(table);
             if targets_renamed_table {
-                if let Some(ref mut wc) = where_clause {
+                if let Some(wc) = where_clause {
                     rename_identifiers_scoped(wc, table, trigger_table, old_col, new_col);
                 }
-            } else if let Some(ref mut wc) = where_clause {
+            } else if let Some(wc) = where_clause {
                 rename_identifiers_scoped_when_clause(wc, table, trigger_table, old_col, new_col);
             }
         }
@@ -4744,18 +4750,18 @@ fn rewrite_one_select_table_refs(one: &mut ast::OneSelect, old_tbl: &str, new_tb
             group_by,
             ..
         } => {
-            if let Some(ref mut from) = from {
+            if let Some(from) = from {
                 rewrite_from_clause_table_refs(from, old_tbl, new_tbl);
             }
-            if let Some(ref mut wc) = where_clause {
+            if let Some(wc) = where_clause {
                 rewrite_check_expr_table_refs(wc, old_tbl, new_tbl);
             }
             for col in columns {
                 match col {
-                    ast::ResultColumn::Expr(ref mut expr, _) => {
+                    ast::ResultColumn::Expr(expr, _) => {
                         rewrite_check_expr_table_refs(expr, old_tbl, new_tbl);
                     }
-                    ast::ResultColumn::TableStar(ref mut name) => {
+                    ast::ResultColumn::TableStar(name) => {
                         if name.as_str().eq_ignore_ascii_case(old_tbl) {
                             *name = ast::Name::exact(new_tbl.to_owned());
                         }
@@ -4763,7 +4769,7 @@ fn rewrite_one_select_table_refs(one: &mut ast::OneSelect, old_tbl: &str, new_tb
                     ast::ResultColumn::Star => {}
                 }
             }
-            if let Some(ref mut gb) = group_by {
+            if let Some(gb) = group_by {
                 for expr in &mut gb.exprs {
                     rewrite_check_expr_table_refs(expr, old_tbl, new_tbl);
                 }
@@ -4794,12 +4800,12 @@ fn rewrite_from_clause_table_refs(from: &mut ast::FromClause, old_tbl: &str, new
 
 fn rewrite_select_table_entry_table_refs(st: &mut ast::SelectTable, old_tbl: &str, new_tbl: &str) {
     match st {
-        ast::SelectTable::Table(ref mut name, _, _) => {
+        ast::SelectTable::Table(name, _, _) => {
             if name.name.as_str().eq_ignore_ascii_case(old_tbl) {
                 name.name = ast::Name::exact(new_tbl.to_owned());
             }
         }
-        ast::SelectTable::TableCall(ref mut name, ref mut args, _) => {
+        ast::SelectTable::TableCall(name, args, _) => {
             if name.name.as_str().eq_ignore_ascii_case(old_tbl) {
                 name.name = ast::Name::exact(new_tbl.to_owned());
             }
@@ -4807,10 +4813,10 @@ fn rewrite_select_table_entry_table_refs(st: &mut ast::SelectTable, old_tbl: &st
                 rewrite_check_expr_table_refs(arg, old_tbl, new_tbl);
             }
         }
-        ast::SelectTable::Select(ref mut select, _) => {
+        ast::SelectTable::Select(select, _) => {
             rewrite_select_table_refs(select, old_tbl, new_tbl);
         }
-        ast::SelectTable::Sub(ref mut from, _) => {
+        ast::SelectTable::Sub(from, _) => {
             rewrite_from_clause_table_refs(from, old_tbl, new_tbl);
         }
     }
@@ -4830,7 +4836,7 @@ fn rewrite_upsert_table_refs(upsert: &mut ast::Upsert, old_tbl: &str, new_tbl: &
         for set in sets {
             rewrite_check_expr_table_refs(&mut set.expr, old_tbl, new_tbl);
         }
-        if let Some(ref mut wc) = where_clause {
+        if let Some(wc) = where_clause {
             rewrite_check_expr_table_refs(wc, old_tbl, new_tbl);
         }
     }

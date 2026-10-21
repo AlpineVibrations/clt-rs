@@ -2,10 +2,10 @@ macro_rules! trace_stack {
     () => {
         let _stack = $crate::stack::trace_scope(concat!("line:", line!()));
     };
-    ($label:expr $(,)?) => {
+    ($label:expr_2021 $(,)?) => {
         let _stack = $crate::stack::trace_scope($label);
     };
-    ($label:expr, $detail:expr $(,)?) => {
+    ($label:expr_2021, $detail:expr_2021 $(,)?) => {
         let _stack = $crate::stack::trace_scope_with_detail($label, $detail);
     };
 }

@@ -541,55 +541,56 @@ pub fn emit_upsert(
     // - excluded.column references also see decoded values (Bug 7)
     // current_start itself stays encoded for trigger OLD registers and before_start.
     // After SET evaluation, we encode ALL columns in new_start before writing to disk.
-    let (decoded_current_start, excluded_decoded_start) = if let Some(bt) = table.btree() {
-        if bt.is_strict {
-            // Create decoded copy of current_start for WHERE/SET expressions
-            let decoded_current = program.alloc_registers(num_cols);
-            program.emit_insn(Insn::Copy {
-                src_reg: current_start,
-                dst_reg: decoded_current,
-                extra_amount: num_cols - 1,
-            });
-            crate::translate::expr::emit_custom_type_decode_columns(
-                program,
-                resolver,
-                bt.columns(),
-                decoded_current,
-                None,
-                &layout,
-            )?;
-            // Decode new_start in-place (was copied from encoded current_start;
-            // after SET applies decoded values, we encode ALL columns)
-            crate::translate::expr::emit_custom_type_decode_columns(
-                program,
-                resolver,
-                bt.columns(),
-                new_start,
-                None,
-                &layout,
-            )?;
-            // Create decoded copies of excluded (insertion) registers so that
-            // excluded.column references see user-facing values
-            let decoded_excluded = program.alloc_registers(num_cols);
-            program.emit_insn(Insn::Copy {
-                src_reg: insertion.first_col_register(),
-                dst_reg: decoded_excluded,
-                extra_amount: num_cols - 1,
-            });
-            crate::translate::expr::emit_custom_type_decode_columns(
-                program,
-                resolver,
-                bt.columns(),
-                decoded_excluded,
-                None,
-                &layout,
-            )?;
-            (Some(decoded_current), Some(decoded_excluded))
-        } else {
-            (None, None)
+    let (decoded_current_start, excluded_decoded_start) = match table.btree() {
+        Some(bt) => {
+            if bt.is_strict {
+                // Create decoded copy of current_start for WHERE/SET expressions
+                let decoded_current = program.alloc_registers(num_cols);
+                program.emit_insn(Insn::Copy {
+                    src_reg: current_start,
+                    dst_reg: decoded_current,
+                    extra_amount: num_cols - 1,
+                });
+                crate::translate::expr::emit_custom_type_decode_columns(
+                    program,
+                    resolver,
+                    bt.columns(),
+                    decoded_current,
+                    None,
+                    &layout,
+                )?;
+                // Decode new_start in-place (was copied from encoded current_start;
+                // after SET applies decoded values, we encode ALL columns)
+                crate::translate::expr::emit_custom_type_decode_columns(
+                    program,
+                    resolver,
+                    bt.columns(),
+                    new_start,
+                    None,
+                    &layout,
+                )?;
+                // Create decoded copies of excluded (insertion) registers so that
+                // excluded.column references see user-facing values
+                let decoded_excluded = program.alloc_registers(num_cols);
+                program.emit_insn(Insn::Copy {
+                    src_reg: insertion.first_col_register(),
+                    dst_reg: decoded_excluded,
+                    extra_amount: num_cols - 1,
+                });
+                crate::translate::expr::emit_custom_type_decode_columns(
+                    program,
+                    resolver,
+                    bt.columns(),
+                    decoded_excluded,
+                    None,
+                    &layout,
+                )?;
+                (Some(decoded_current), Some(decoded_excluded))
+            } else {
+                (None, None)
+            }
         }
-    } else {
-        (None, None)
+        _ => (None, None),
     };
 
     // For WHERE and SET, use decoded_current_start if available (STRICT with custom types),
@@ -800,105 +801,106 @@ pub fn emit_upsert(
 
     // Fire BEFORE UPDATE triggers
     let upsert_database_id = ctx.database_id;
-    let preserved_old_registers: Option<Vec<usize>> = if let Some(btree_table) = table.btree() {
-        let updated_column_indices: ColumnMask = set_pairs
-            .iter()
-            .map(|(col_idx, _)| *col_idx)
-            .try_collect()?;
-        let relevant_before_update_triggers = get_triggers_including_temp(
-            resolver,
-            upsert_database_id,
-            TriggerEvent::Update,
-            TriggerTime::Before,
-            Some(updated_column_indices.clone()),
-            &btree_table,
-        );
-        // OLD row values are in current_start registers
-        let old_registers: Vec<usize> = (0..num_cols)
-            .map(|i| layout.to_register(current_start, i))
-            .chain(std::iter::once(ctx.conflict_rowid_reg))
-            .collect();
-        if !relevant_before_update_triggers.is_empty() {
-            // NEW row values are in new_start registers. At this point they are
-            // encoded (post-encode for STRICT custom types). Mark new_encoded=true
-            // so fire_trigger's decode_trigger_registers will decode them.
-            let new_rowid_for_trigger = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
-            let new_registers: Vec<usize> = (0..num_cols)
-                .map(|i| layout.to_register(new_start, i))
-                .chain(std::iter::once(new_rowid_for_trigger))
+    let preserved_old_registers: Option<Vec<usize>> = match table.btree() {
+        Some(btree_table) => {
+            let updated_column_indices: ColumnMask = set_pairs
+                .iter()
+                .map(|(col_idx, _)| *col_idx)
+                .try_collect()?;
+            let relevant_before_update_triggers = get_triggers_including_temp(
+                resolver,
+                upsert_database_id,
+                TriggerEvent::Update,
+                TriggerTime::Before,
+                Some(updated_column_indices.clone()),
+                &btree_table,
+            );
+            // OLD row values are in current_start registers
+            let old_registers: Vec<usize> = (0..num_cols)
+                .map(|i| layout.to_register(current_start, i))
+                .chain(std::iter::once(ctx.conflict_rowid_reg))
                 .collect();
-
-            // In UPSERT DO UPDATE context, trigger's INSERT/UPDATE OR IGNORE/REPLACE
-            // clauses should not suppress errors. Override conflict resolution to Abort.
-            // Use new_after variant because NEW values are encoded at this point.
-            let trigger_ctx = TriggerContext::new_after_with_override_conflict(
-                btree_table.clone(),
-                Some(new_registers),
-                Some(old_registers.clone()),
-                ast::ResolveType::Abort,
-            );
-
-            for trigger in relevant_before_update_triggers {
-                fire_trigger(
-                    program,
-                    resolver,
-                    trigger,
-                    &trigger_ctx,
-                    connection,
-                    upsert_database_id,
-                    ctx.loop_labels.row_done,
-                )?;
-            }
-
-            // BEFORE UPDATE triggers may have altered the btree, need to re-seek
-            program.emit_insn(Insn::NotExists {
-                cursor: ctx.cursor_id,
-                rowid_reg: ctx.conflict_rowid_reg,
-                target_pc: ctx.loop_labels.row_done,
-            });
-
-            let has_relevant_after_triggers = has_triggers_including_temp(
-                resolver,
-                upsert_database_id,
-                TriggerEvent::Update,
-                Some(&updated_column_indices),
-                &btree_table,
-            );
-            if has_relevant_after_triggers {
-                // Preserve OLD registers for AFTER triggers
-                let preserved: Vec<usize> = old_registers
-                    .iter()
-                    .map(|old_reg| {
-                        let preserved_reg = program.alloc_register();
-                        program.emit_insn(Insn::Copy {
-                            src_reg: *old_reg,
-                            dst_reg: preserved_reg,
-                            extra_amount: 0,
-                        });
-                        preserved_reg
-                    })
+            if !relevant_before_update_triggers.is_empty() {
+                // NEW row values are in new_start registers. At this point they are
+                // encoded (post-encode for STRICT custom types). Mark new_encoded=true
+                // so fire_trigger's decode_trigger_registers will decode them.
+                let new_rowid_for_trigger = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
+                let new_registers: Vec<usize> = (0..num_cols)
+                    .map(|i| layout.to_register(new_start, i))
+                    .chain(std::iter::once(new_rowid_for_trigger))
                     .collect();
-                Some(preserved)
+
+                // In UPSERT DO UPDATE context, trigger's INSERT/UPDATE OR IGNORE/REPLACE
+                // clauses should not suppress errors. Override conflict resolution to Abort.
+                // Use new_after variant because NEW values are encoded at this point.
+                let trigger_ctx = TriggerContext::new_after_with_override_conflict(
+                    btree_table.clone(),
+                    Some(new_registers),
+                    Some(old_registers.clone()),
+                    ast::ResolveType::Abort,
+                );
+
+                for trigger in relevant_before_update_triggers {
+                    fire_trigger(
+                        program,
+                        resolver,
+                        trigger,
+                        &trigger_ctx,
+                        connection,
+                        upsert_database_id,
+                        ctx.loop_labels.row_done,
+                    )?;
+                }
+
+                // BEFORE UPDATE triggers may have altered the btree, need to re-seek
+                program.emit_insn(Insn::NotExists {
+                    cursor: ctx.cursor_id,
+                    rowid_reg: ctx.conflict_rowid_reg,
+                    target_pc: ctx.loop_labels.row_done,
+                });
+
+                let has_relevant_after_triggers = has_triggers_including_temp(
+                    resolver,
+                    upsert_database_id,
+                    TriggerEvent::Update,
+                    Some(&updated_column_indices),
+                    &btree_table,
+                );
+                if has_relevant_after_triggers {
+                    // Preserve OLD registers for AFTER triggers
+                    let preserved: Vec<usize> = old_registers
+                        .iter()
+                        .map(|old_reg| {
+                            let preserved_reg = program.alloc_register();
+                            program.emit_insn(Insn::Copy {
+                                src_reg: *old_reg,
+                                dst_reg: preserved_reg,
+                                extra_amount: 0,
+                            });
+                            preserved_reg
+                        })
+                        .collect();
+                    Some(preserved)
+                } else {
+                    None
+                }
             } else {
-                None
-            }
-        } else {
-            // Check if we need to preserve for AFTER triggers
-            let has_relevant_after_triggers = has_triggers_including_temp(
-                resolver,
-                upsert_database_id,
-                TriggerEvent::Update,
-                Some(&updated_column_indices),
-                &btree_table,
-            );
-            if has_relevant_after_triggers {
-                Some(old_registers)
-            } else {
-                None
+                // Check if we need to preserve for AFTER triggers
+                let has_relevant_after_triggers = has_triggers_including_temp(
+                    resolver,
+                    upsert_database_id,
+                    TriggerEvent::Update,
+                    Some(&updated_column_indices),
+                    &btree_table,
+                );
+                if has_relevant_after_triggers {
+                    Some(old_registers)
+                } else {
+                    None
+                }
             }
         }
-    } else {
-        None
+        _ => None,
     };
     let rowid_alias_idx = table.columns().iter().position(|c| c.is_rowid_alias());
     let has_direct_rowid_update = set_pairs

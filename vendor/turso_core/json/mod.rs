@@ -43,7 +43,7 @@ pub enum OutputVariant {
 
 pub fn get_json(json_value: &Value, indent: Option<&str>) -> crate::Result<Value> {
     match json_value {
-        Value::Text(ref t) if t.subtype == TextSubtype::Json && indent.is_none() => {
+        Value::Text(t) if t.subtype == TextSubtype::Json && indent.is_none() => {
             // optimization: once we know the subtype is a valid JSON, we do not have
             // to go through parsing JSON and serializing it back to string
             Ok(json_value.to_owned())

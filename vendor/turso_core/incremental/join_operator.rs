@@ -606,7 +606,7 @@ impl IncrementalOperator for JoinOperator {
                         eval_state: deltas.clone().into(),
                     }
                 }
-                JoinCommitState::Eval { ref mut eval_state } => {
+                JoinCommitState::Eval { eval_state } => {
                     let output = return_and_restore_if_io!(
                         &mut self.commit_state,
                         state,
@@ -623,7 +623,7 @@ impl IncrementalOperator for JoinOperator {
                     deltas,
                     output,
                     current_idx,
-                    ref mut write_row,
+                    write_row,
                 } => {
                     if *current_idx >= deltas.left.changes.len() {
                         self.commit_state = JoinCommitState::CommitRightDelta {
@@ -677,7 +677,7 @@ impl IncrementalOperator for JoinOperator {
                     deltas,
                     output,
                     current_idx,
-                    ref mut write_row,
+                    write_row,
                 } => {
                     if *current_idx >= deltas.right.changes.len() {
                         // Reset to Idle state for next commit

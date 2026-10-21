@@ -864,7 +864,7 @@ impl EncryptionContext {
     /// encrypts raw data with associated data using the configured cipher
     fn encrypt_raw_with_ad(&self, plaintext: &[u8], ad: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
         macro_rules! encrypt_cipher {
-            ($cipher:expr) => {{
+            ($cipher:expr_2021) => {{
                 let (ciphertext, nonce) = $cipher.encrypt(plaintext, ad)?;
                 Ok((ciphertext, nonce.to_vec()))
             }};
@@ -901,7 +901,7 @@ impl EncryptionContext {
         out: &mut Vec<u8>,
     ) -> Result<()> {
         macro_rules! decrypt_with_nonce {
-            ($cipher:expr, $nonce_size:literal, $name:literal) => {{
+            ($cipher:expr_2021, $nonce_size:literal, $name:literal) => {{
                 let nonce_array: [u8; $nonce_size] = nonce.try_into().map_err(|_| {
                     LimboError::InternalError(format!(
                         "Invalid nonce size for {}: expected {}, got {}",

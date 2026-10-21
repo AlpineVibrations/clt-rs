@@ -1714,35 +1714,38 @@ fn emit_fk_action_subprogram(
     let parent_change = ctx.parent_change();
     let compile_stack = resolver.fk_action_compile_stack.clone();
 
-    let subprogram = if let Some(slot) = compile_stack.find(&foreign_key, parent_change) {
-        assert!(
+    let subprogram = match compile_stack.find(&foreign_key, parent_change) {
+        Some(slot) => {
+            assert!(
             program.flags.is_subprogram(),
             "recursive foreign-key action calls must be emitted from a foreign-key action subprogram"
         );
-        Subprogram::Pending(slot)
-    } else {
-        let mut subprogram_builder = ProgramBuilder::new_for_subprogram(
-            QueryMode::Normal,
-            program.capture_data_changes_info().clone(),
-            FK_SUBPROGRAM_OPTS,
-        );
-        let entry = compile_stack.push(foreign_key, parent_change);
-        subprogram_builder.prologue();
-        translate_inner(
-            stmt,
-            resolver,
-            &mut subprogram_builder,
-            connection,
-            description,
-        )?;
-        subprogram_builder.epilogue(resolver.schema());
-        let built = subprogram_builder.build(connection.clone(), true, description)?;
-        let prepared = built.prepared().clone();
-        entry
-            .slot
-            .set(Arc::downgrade(&prepared))
-            .expect("foreign-key action subprogram should be set exactly once");
-        Subprogram::PreparedProgram(prepared)
+            Subprogram::Pending(slot)
+        }
+        _ => {
+            let mut subprogram_builder = ProgramBuilder::new_for_subprogram(
+                QueryMode::Normal,
+                program.capture_data_changes_info().clone(),
+                FK_SUBPROGRAM_OPTS,
+            );
+            let entry = compile_stack.push(foreign_key, parent_change);
+            subprogram_builder.prologue();
+            translate_inner(
+                stmt,
+                resolver,
+                &mut subprogram_builder,
+                connection,
+                description,
+            )?;
+            subprogram_builder.epilogue(resolver.schema());
+            let built = subprogram_builder.build(connection.clone(), true, description)?;
+            let prepared = built.prepared().clone();
+            entry
+                .slot
+                .set(Arc::downgrade(&prepared))
+                .expect("foreign-key action subprogram should be set exactly once");
+            Subprogram::PreparedProgram(prepared)
+        }
     };
 
     // Foreign-key action subprograms can't contain RAISE(IGNORE), so ignore_jump_target

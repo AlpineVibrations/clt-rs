@@ -231,7 +231,7 @@ impl CloseLoop {
                     });
                     program.preassign_label_to_next_insn(loop_labels.loop_end);
                 }
-                Operation::HashJoin(ref hash_join_op) => {
+                Operation::HashJoin(hash_join_op) => {
                     if let Some(hash_ctx) = t_ctx
                         .hash_table_contexts
                         .get(&hash_join_op.build_table_idx)

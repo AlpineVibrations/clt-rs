@@ -360,10 +360,10 @@ pub(crate) type MvccIterator<'l, T, A = TursoAllocator> =
 /// - For index iterators: The `MvStore.index_rows` SkipMap is held in an `Arc<MvStore>`
 ///   that outlives the cursor.
 macro_rules! static_iterator_hack {
-    ($iter:expr, $key_type:ty) => {
+    ($iter:expr_2021, $key_type:ty) => {
         static_iterator_hack!($iter, $key_type, crate::alloc::TursoAllocator)
     };
-    ($iter:expr, $key_type:ty, $alloc:ty) => {
+    ($iter:expr_2021, $key_type:ty, $alloc:ty) => {
         // SAFETY: See macro documentation above.
         unsafe {
             std::mem::transmute::<

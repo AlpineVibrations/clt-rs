@@ -26,12 +26,10 @@ include = [
     "scripts/check_release.py",
 ]
 
-# Compile the bundled engine as part of this package, using its upstream edition.
-# CLT application modules are included by src/main.rs and keep Rust 2024.
+# Compile the bundled engine with the same Rust edition as the application.
 [lib]
 name = "clt_database"
 path = "vendor/turso_core/lib.rs"
-edition = "2021"
 doctest = false
 
 [[bin]]

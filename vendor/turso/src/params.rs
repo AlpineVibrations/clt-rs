@@ -287,7 +287,7 @@ macro_rules! params {
     () => {
        ()
     };
-    ($($value:expr),* $(,)?) => {{
+    ($($value:expr_2021),* $(,)?) => {{
         use $crate::turso::params::IntoValue;
         [$($value.into_value()),*]
 
@@ -300,7 +300,7 @@ macro_rules! named_params {
     () => {
         ()
     };
-    ($($param_name:literal: $value:expr),* $(,)?) => {{
+    ($($param_name:literal: $value:expr_2021),* $(,)?) => {{
         use $crate::turso::params::IntoValue;
         [$(($param_name, $value.into_value())),*]
     }};

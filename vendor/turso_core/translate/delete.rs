@@ -194,12 +194,14 @@ pub fn prepare_delete_plan(
     let schema = resolver.schema();
 
     let btree_table_for_triggers = table.btree();
-    let table = if let Some(table) = table.virtual_table() {
-        Table::Virtual(table)
-    } else if let Some(table) = table.btree() {
-        Table::BTree(table)
-    } else {
-        crate::bail_parse_error!("Table is neither a virtual table nor a btree table");
+    let table = match table.virtual_table() {
+        Some(table) => Table::Virtual(table),
+        _ => match table.btree() {
+            Some(table) => Table::BTree(table),
+            _ => {
+                crate::bail_parse_error!("Table is neither a virtual table nor a btree table");
+            }
+        },
     };
     let indexes = schema.get_indices(table.get_name()).cloned().collect();
     let joined_tables = vec![JoinedTable {

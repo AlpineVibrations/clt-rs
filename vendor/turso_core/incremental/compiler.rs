@@ -573,8 +573,8 @@ impl DbspCircuit {
                     };
                 }
                 CommitState::CommitOperators {
-                    ref mut execute_state,
-                    ref mut state_cursors,
+                    execute_state,
+                    state_cursors,
                 } => {
                     let delta = return_and_restore_if_io!(
                         &mut self.commit_state,

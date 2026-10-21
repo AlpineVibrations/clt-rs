@@ -222,23 +222,24 @@ pub fn emit_program_for_compound_select(
     program.result_columns = leftmost_result_columns;
 
     // When ORDER BY is present, sort the collected results and emit to the real destination.
-    if let (Some(order_by), Some(collection_cursor_id), Some(collection_idx)) =
-        (order_by_owned, collection_cursor, collection_index)
-    {
-        let result_reg = emit_compound_order_by(
-            program,
-            &order_by,
-            collection_cursor_id,
-            &collection_idx,
-            num_result_cols,
-            limit_owned.as_deref(),
-            offset_owned.as_deref(),
-            &real_query_destination,
-            &right_most_ctx,
-        )?;
-        program.reg_result_cols_start = result_reg;
-    } else {
-        program.reg_result_cols_start = reg_result_cols_start;
+    match (order_by_owned, collection_cursor, collection_index) {
+        (Some(order_by), Some(collection_cursor_id), Some(collection_idx)) => {
+            let result_reg = emit_compound_order_by(
+                program,
+                &order_by,
+                collection_cursor_id,
+                &collection_idx,
+                num_result_cols,
+                limit_owned.as_deref(),
+                offset_owned.as_deref(),
+                &real_query_destination,
+                &right_most_ctx,
+            )?;
+            program.reg_result_cols_start = result_reg;
+        }
+        _ => {
+            program.reg_result_cols_start = reg_result_cols_start;
+        }
     }
 
     Ok(program.reg_result_cols_start)

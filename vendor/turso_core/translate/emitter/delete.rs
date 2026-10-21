@@ -124,141 +124,144 @@ pub fn emit_program_for_delete(
 
     // If there's a rowset_plan, materialize rowids into a RowSet first and then iterate the RowSet
     // to delete the rows.
-    if let Some(rowset_plan) = plan.rowset_plan.take() {
-        let rowset_reg = plan
-            .rowset_reg
-            .expect("rowset_reg must be Some if rowset_plan is Some");
+    match plan.rowset_plan.take() {
+        Some(rowset_plan) => {
+            let rowset_reg = plan
+                .rowset_reg
+                .expect("rowset_reg must be Some if rowset_plan is Some");
 
-        // Initialize the RowSet register with NULL (RowSet will be created on first RowSetAdd)
-        program.emit_insn(Insn::Null {
-            dest: rowset_reg,
-            dest_end: None,
-        });
-
-        // Execute the rowset SELECT plan to populate the rowset.
-        program.nested(|program| emit_program_for_select(program, resolver, rowset_plan))?;
-
-        // Close the read cursor(s) opened by the rowset plan before opening for writing
-        let table_ref = plan.table_references.joined_tables().first().unwrap();
-        let table_cursor_id_read =
-            program.resolve_cursor_id(&CursorKey::table(table_ref.internal_id));
-        program.emit_insn(Insn::Close {
-            cursor_id: table_cursor_id_read,
-        });
-
-        // Open the table cursor for writing
-        let table_cursor_id = table_cursor_id_read;
-
-        if let Some(btree_table) = table_ref.table.btree() {
-            program.emit_insn(Insn::OpenWrite {
-                cursor_id: table_cursor_id,
-                root_page: RegisterOrLiteral::Literal(btree_table.root_page),
-                db: table_ref.database_id,
-            });
-
-            // Open all indexes for writing (needed for DELETE)
-            let write_indices: Vec<_> = resolver.with_schema(table_ref.database_id, |s| {
-                s.get_indices(table_ref.table.get_name()).cloned().collect()
-            });
-            for index in &write_indices {
-                let index_cursor_id = program.alloc_cursor_index(
-                    Some(CursorKey::index(table_ref.internal_id, index.clone())),
-                    index,
-                )?;
-                program.emit_insn(Insn::OpenWrite {
-                    cursor_id: index_cursor_id,
-                    root_page: RegisterOrLiteral::Literal(index.root_page),
-                    db: table_ref.database_id,
-                });
-            }
-        }
-
-        // Now iterate over the RowSet and delete each rowid
-        let rowset_loop_start = program.allocate_label();
-        let rowset_loop_end = program.allocate_label();
-        let rowid_reg = program.alloc_register();
-        if table_ref.table.virtual_table().is_some() {
-            // VUpdate requires a NULL second argument ("new rowid") for deletion
-            let new_rowid_reg = program.alloc_register();
+            // Initialize the RowSet register with NULL (RowSet will be created on first RowSetAdd)
             program.emit_insn(Insn::Null {
-                dest: new_rowid_reg,
+                dest: rowset_reg,
                 dest_end: None,
             });
+
+            // Execute the rowset SELECT plan to populate the rowset.
+            program.nested(|program| emit_program_for_select(program, resolver, rowset_plan))?;
+
+            // Close the read cursor(s) opened by the rowset plan before opening for writing
+            let table_ref = plan.table_references.joined_tables().first().unwrap();
+            let table_cursor_id_read =
+                program.resolve_cursor_id(&CursorKey::table(table_ref.internal_id));
+            program.emit_insn(Insn::Close {
+                cursor_id: table_cursor_id_read,
+            });
+
+            // Open the table cursor for writing
+            let table_cursor_id = table_cursor_id_read;
+
+            if let Some(btree_table) = table_ref.table.btree() {
+                program.emit_insn(Insn::OpenWrite {
+                    cursor_id: table_cursor_id,
+                    root_page: RegisterOrLiteral::Literal(btree_table.root_page),
+                    db: table_ref.database_id,
+                });
+
+                // Open all indexes for writing (needed for DELETE)
+                let write_indices: Vec<_> = resolver.with_schema(table_ref.database_id, |s| {
+                    s.get_indices(table_ref.table.get_name()).cloned().collect()
+                });
+                for index in &write_indices {
+                    let index_cursor_id = program.alloc_cursor_index(
+                        Some(CursorKey::index(table_ref.internal_id, index.clone())),
+                        index,
+                    )?;
+                    program.emit_insn(Insn::OpenWrite {
+                        cursor_id: index_cursor_id,
+                        root_page: RegisterOrLiteral::Literal(index.root_page),
+                        db: table_ref.database_id,
+                    });
+                }
+            }
+
+            // Now iterate over the RowSet and delete each rowid
+            let rowset_loop_start = program.allocate_label();
+            let rowset_loop_end = program.allocate_label();
+            let rowid_reg = program.alloc_register();
+            if table_ref.table.virtual_table().is_some() {
+                // VUpdate requires a NULL second argument ("new rowid") for deletion
+                let new_rowid_reg = program.alloc_register();
+                program.emit_insn(Insn::Null {
+                    dest: new_rowid_reg,
+                    dest_end: None,
+                });
+            }
+
+            program.preassign_label_to_next_insn(rowset_loop_start);
+
+            // Read next rowid from RowSet
+            // Note: rowset_loop_end will be resolved later when we assign it
+            program.emit_insn(Insn::RowSetRead {
+                rowset_reg,
+                pc_if_empty: rowset_loop_end,
+                dest_reg: rowid_reg,
+            });
+
+            emit_delete_insns_when_triggers_present(
+                connection,
+                program,
+                &mut t_ctx,
+                &mut plan.table_references,
+                &mut plan.non_from_clause_subqueries,
+                &plan.result_columns,
+                rowid_reg,
+                table_cursor_id,
+                resolver,
+                returning_buffer.as_ref(),
+            )?;
+
+            // Continue loop
+            program.emit_insn(Insn::Goto {
+                target_pc: rowset_loop_start,
+            });
+
+            // Assign the end label here, after all loop body code
+            program.preassign_label_to_next_insn(rowset_loop_end);
         }
+        _ => {
+            // Normal DELETE path without RowSet
 
-        program.preassign_label_to_next_insn(rowset_loop_start);
+            // Emit EXPLAIN QUERY PLAN annotation
+            let table_ref = plan
+                .table_references
+                .joined_tables()
+                .first()
+                .expect("DELETE always has one joined table");
+            emit_explain!(program, true, format_eqp_detail(table_ref));
 
-        // Read next rowid from RowSet
-        // Note: rowset_loop_end will be resolved later when we assign it
-        program.emit_insn(Insn::RowSetRead {
-            rowset_reg,
-            pc_if_empty: rowset_loop_end,
-            dest_reg: rowid_reg,
-        });
+            // Set up main query execution loop
+            OpenLoop::emit(
+                program,
+                &mut t_ctx,
+                &plan.table_references,
+                &join_order,
+                &plan.where_clause,
+                None,
+                OperationMode::DELETE,
+                &mut plan.non_from_clause_subqueries,
+            )?;
 
-        emit_delete_insns_when_triggers_present(
-            connection,
-            program,
-            &mut t_ctx,
-            &mut plan.table_references,
-            &mut plan.non_from_clause_subqueries,
-            &plan.result_columns,
-            rowid_reg,
-            table_cursor_id,
-            resolver,
-            returning_buffer.as_ref(),
-        )?;
+            emit_delete_insns(
+                connection,
+                program,
+                &mut t_ctx,
+                &mut plan.table_references,
+                &mut plan.non_from_clause_subqueries,
+                &plan.result_columns,
+                resolver,
+                returning_buffer.as_ref(),
+            )?;
 
-        // Continue loop
-        program.emit_insn(Insn::Goto {
-            target_pc: rowset_loop_start,
-        });
-
-        // Assign the end label here, after all loop body code
-        program.preassign_label_to_next_insn(rowset_loop_end);
-    } else {
-        // Normal DELETE path without RowSet
-
-        // Emit EXPLAIN QUERY PLAN annotation
-        let table_ref = plan
-            .table_references
-            .joined_tables()
-            .first()
-            .expect("DELETE always has one joined table");
-        emit_explain!(program, true, format_eqp_detail(table_ref));
-
-        // Set up main query execution loop
-        OpenLoop::emit(
-            program,
-            &mut t_ctx,
-            &plan.table_references,
-            &join_order,
-            &plan.where_clause,
-            None,
-            OperationMode::DELETE,
-            &mut plan.non_from_clause_subqueries,
-        )?;
-
-        emit_delete_insns(
-            connection,
-            program,
-            &mut t_ctx,
-            &mut plan.table_references,
-            &mut plan.non_from_clause_subqueries,
-            &plan.result_columns,
-            resolver,
-            returning_buffer.as_ref(),
-        )?;
-
-        // Clean up and close the main execution loop
-        CloseLoop::emit(
-            program,
-            &mut t_ctx,
-            &plan.table_references,
-            &join_order,
-            OperationMode::DELETE,
-            None,
-        )?;
+            // Clean up and close the main execution loop
+            CloseLoop::emit(
+                program,
+                &mut t_ctx,
+                &plan.table_references,
+                &join_order,
+                OperationMode::DELETE,
+                None,
+            )?;
+        }
     }
     program.preassign_label_to_next_insn(after_main_loop_label);
     if let Some(cdc_cursor_id) = t_ctx.cdc_cursor_id {
@@ -634,40 +637,41 @@ fn emit_delete_row_common(
     // CASCADE/SetNull/SetDefault actions are prepared but deferred until after Delete.
     let prepared_fk_actions = if connection.foreign_keys_enabled() {
         let delete_db_id = unsafe { (*table_reference).database_id };
-        if let Some(table) = unsafe { &*table_reference }.btree() {
-            let prepared = if t_ctx
-                .resolver
-                .with_schema(delete_db_id, |s| s.any_resolved_fks_referencing(table_name))
-            {
-                ForeignKeyActions::prepare_fk_delete_actions(
-                    program,
-                    &mut t_ctx.resolver,
-                    table_name,
-                    main_table_cursor_id,
-                    rowid_reg,
-                    None,
-                    delete_db_id,
-                )?
-            } else {
-                ForeignKeyActions::default()
-            };
-            if t_ctx
-                .resolver
-                .with_schema(delete_db_id, |s| s.has_child_fks(table_name))
-            {
-                emit_fk_child_decrement_on_delete(
-                    program,
-                    &table,
-                    table_name,
-                    main_table_cursor_id,
-                    rowid_reg,
-                    delete_db_id,
-                    &t_ctx.resolver,
-                )?;
+        match unsafe { &*table_reference }.btree() {
+            Some(table) => {
+                let prepared = if t_ctx
+                    .resolver
+                    .with_schema(delete_db_id, |s| s.any_resolved_fks_referencing(table_name))
+                {
+                    ForeignKeyActions::prepare_fk_delete_actions(
+                        program,
+                        &mut t_ctx.resolver,
+                        table_name,
+                        main_table_cursor_id,
+                        rowid_reg,
+                        None,
+                        delete_db_id,
+                    )?
+                } else {
+                    ForeignKeyActions::default()
+                };
+                if t_ctx
+                    .resolver
+                    .with_schema(delete_db_id, |s| s.has_child_fks(table_name))
+                {
+                    emit_fk_child_decrement_on_delete(
+                        program,
+                        &table,
+                        table_name,
+                        main_table_cursor_id,
+                        rowid_reg,
+                        delete_db_id,
+                        &t_ctx.resolver,
+                    )?;
+                }
+                prepared
             }
-            prepared
-        } else {
-            ForeignKeyActions::default()
+            _ => ForeignKeyActions::default(),
         }
     } else {
         ForeignKeyActions::default()

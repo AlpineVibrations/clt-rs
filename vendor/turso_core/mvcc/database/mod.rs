@@ -4666,13 +4666,18 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         *st = BootstrapState::Recover {
                             recover_st: RecoverLogicalLogState::default(),
                         };
-                    } else if let Some(next) = self.bootstrap_issue_metadata_io(bootstrap_conn)? {
-                        *st = BootstrapState::MetadataIo(next);
                     } else {
-                        self.bootstrap_map_root_pages(bootstrap_conn)?;
-                        *st = BootstrapState::Recover {
-                            recover_st: RecoverLogicalLogState::default(),
-                        };
+                        match self.bootstrap_issue_metadata_io(bootstrap_conn)? {
+                            Some(next) => {
+                                *st = BootstrapState::MetadataIo(next);
+                            }
+                            _ => {
+                                self.bootstrap_map_root_pages(bootstrap_conn)?;
+                                *st = BootstrapState::Recover {
+                                    recover_st: RecoverLogicalLogState::default(),
+                                };
+                            }
+                        }
                     }
                 }
                 BootstrapState::MetadataIo(phase) => {
@@ -8958,13 +8963,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                     )?
                                 }
                             );
-                            if let Some(versions) = self.rows.get(&rowid) {
-                                // Row exists in memory — try to find the current (non-ended) version
-                                // that was committed before this delete, and mark it as ended. If no
-                                // such version exists (e.g. it was already GC'd or this is a B-tree
-                                // resident row not yet in memory), insert a tombstone instead.
-                                let mut versions = versions.value().write();
-                                if let Some(existing) = versions.iter_mut().rev().find(|rv| {
+                            match self.rows.get(&rowid) {
+                                Some(versions) => {
+                                    // Row exists in memory — try to find the current (non-ended) version
+                                    // that was committed before this delete, and mark it as ended. If no
+                                    // such version exists (e.g. it was already GC'd or this is a B-tree
+                                    // resident row not yet in memory), insert a tombstone instead.
+                                    let mut versions = versions.value().write();
+                                    if let Some(existing) = versions.iter_mut().rev().find(|rv| {
                                     rv.end().is_none()
                                         && matches!(rv.begin(), Some(TxTimestampOrID::Timestamp(b)) if b < commit_ts)
                                 }) {
@@ -8988,24 +8994,26 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                     };
                                     self.insert_version_raw(&mut versions, row_version)?;
                                 }
-                            } else {
-                                let version_id = self.get_version_id();
-                                let row_version = RowVersion {
-                                    id: version_id,
-                                    begin: crate::mvcc::database::PackedTs::pack(None),
-                                    end: crate::mvcc::database::PackedTs::pack(Some(
-                                        TxTimestampOrID::Timestamp(commit_ts),
-                                    )),
-                                    row: tombstone_row,
-                                    // Same invariant as above: no replayed version means the
-                                    // deleted row is already durable in the DB file.
-                                    btree_resident: true,
-                                    materialized_at: crate::mvcc::database::WalPos::ORIGIN,
-                                };
-                                let versions =
-                                    self.get_or_create_table_row_versions(rowid.clone())?;
-                                let mut versions = versions.write();
-                                self.insert_version_raw(&mut versions, row_version)?;
+                                }
+                                _ => {
+                                    let version_id = self.get_version_id();
+                                    let row_version = RowVersion {
+                                        id: version_id,
+                                        begin: crate::mvcc::database::PackedTs::pack(None),
+                                        end: crate::mvcc::database::PackedTs::pack(Some(
+                                            TxTimestampOrID::Timestamp(commit_ts),
+                                        )),
+                                        row: tombstone_row,
+                                        // Same invariant as above: no replayed version means the
+                                        // deleted row is already durable in the DB file.
+                                        btree_resident: true,
+                                        materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+                                    };
+                                    let versions =
+                                        self.get_or_create_table_row_versions(rowid.clone())?;
+                                    let mut versions = versions.write();
+                                    self.insert_version_raw(&mut versions, row_version)?;
+                                }
                             }
                             if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
                                 let rowid_int = rowid.row_id.to_int_or_panic();
@@ -9366,10 +9374,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     pub fn tx_should_abort(&self, tx_id: u64) -> bool {
-        if let Some(tx) = self.txs.get(&tx_id) {
-            tx.value().abort_now.load(Ordering::Acquire)
-        } else {
-            false
+        match self.txs.get(&tx_id) {
+            Some(tx) => tx.value().abort_now.load(Ordering::Acquire),
+            _ => false,
         }
     }
 }

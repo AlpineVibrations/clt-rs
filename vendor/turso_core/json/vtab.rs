@@ -528,8 +528,8 @@ mod columns {
 
         fn key_representation(&self) -> Value {
             match self {
-                Key::Integer(ref i) => Value::from_i64(*i),
-                Key::String(ref s) => Value::Text(Text::new(s.to_owned().replace("\\\"", "\""))),
+                Key::Integer(i) => Value::from_i64(*i),
+                Key::String(s) => Value::Text(Text::new(s.to_owned().replace("\\\"", "\""))),
                 Key::None => Value::Null,
             }
         }

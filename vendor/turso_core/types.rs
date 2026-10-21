@@ -609,7 +609,7 @@ impl FromValue for Value {
 impl Sealed for crate::Value {}
 
 macro_rules! impl_int_from_value {
-    ($ty:ty, $cast:expr) => {
+    ($ty:ty, $cast:expr_2021) => {
         impl FromValue for $ty {
             fn from_sql(val: Value) -> Result<Self> {
                 match val {
@@ -3158,7 +3158,7 @@ impl<T> IOResult<T> {
 /// Evaluate a Result<IOResult<T>>, if IO return IO.
 #[macro_export]
 macro_rules! return_if_io {
-    ($expr:expr) => {
+    ($expr:expr_2021) => {
         match $expr {
             Ok(IOResult::Done(v)) => v,
             Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
@@ -3172,7 +3172,7 @@ macro_rules! return_if_io {
 
 #[macro_export]
 macro_rules! return_and_restore_if_io {
-    ($field:expr, $saved_state:expr, $e:expr) => {
+    ($field:expr_2021, $saved_state:expr_2021, $e:expr_2021) => {
         match $e {
             Ok(IOResult::Done(v)) => v,
             Ok(IOResult::IO(io)) => {

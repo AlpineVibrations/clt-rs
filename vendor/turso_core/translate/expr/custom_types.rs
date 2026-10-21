@@ -261,7 +261,7 @@ pub(super) fn find_custom_type_operator(
     };
 
     // Case 1: Both operands are custom type columns of the SAME type.
-    if let (Some(ref lhs), Some(ref rhs)) = (&lhs_info, &rhs_info) {
+    if let (Some(lhs), Some(rhs)) = (&lhs_info, &rhs_info) {
         if lhs.type_name == rhs.type_name {
             if let Some((func_name, swap_args, negate)) = find_in_type_def(&lhs.type_def) {
                 return Some(ResolvedOperator {

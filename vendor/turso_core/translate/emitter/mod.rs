@@ -700,14 +700,11 @@ impl<'a> Resolver<'a> {
                 "temp" => Ok(crate::TEMP_DB_ID),
                 _ => {
                     // Look up attached database
-                    if let Some((idx, _attached_db)) =
-                        self.get_attached_database(&db_name_normalized)
-                    {
-                        Ok(idx)
-                    } else {
-                        Err(LimboError::InvalidArgument(format!(
+                    match self.get_attached_database(&db_name_normalized) {
+                        Some((idx, _attached_db)) => Ok(idx),
+                        _ => Err(LimboError::InvalidArgument(format!(
                             "no such database: {db_name_normalized}"
-                        )))
+                        ))),
                     }
                 }
             }
@@ -2055,7 +2052,7 @@ fn emit_index_column_value_new_image(
             .get(idx_col.pos_in_table)
             .expect("column index out of bounds");
         match col_in_table.generated_type() {
-            GeneratedType::Virtual { ref expr, .. } => {
+            GeneratedType::Virtual { expr, .. } => {
                 gencol::emit_gencol_expr_from_registers(
                     program,
                     expr,

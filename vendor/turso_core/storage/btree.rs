@@ -140,7 +140,7 @@ pub const MAX_NEW_SIBLING_PAGES_AFTER_BALANCE: usize = 5;
 
 /// Validate cells in a page are in a valid state. Only in debug mode.
 macro_rules! debug_validate_cells {
-    ($page_contents:expr, $usable_space:expr) => {
+    ($page_contents:expr_2021, $usable_space:expr_2021) => {
         #[cfg(debug_assertions)]
         {
             debug_validate_cells_core($page_contents, $usable_space);
@@ -2666,7 +2666,7 @@ impl BTreeCursor {
                     page,
                     cell_idx,
                     new_payload,
-                    ref mut fill_cell_payload_state,
+                    fill_cell_payload_state,
                 } => {
                     return_if_io!(fill_cell_payload(
                         &PinGuard::new(page.clone()),
@@ -2714,7 +2714,7 @@ impl BTreeCursor {
                 WriteState::Overwrite {
                     page,
                     cell_idx,
-                    ref mut state,
+                    state,
                 } => {
                     turso_assert!(page.is_loaded(), "page is not loaded", { "page_id": page.get().id });
                     let page = page.clone();

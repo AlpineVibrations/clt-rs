@@ -239,7 +239,7 @@ macro_rules! bail_corrupt_error {
 /// Accepts any range expression: `buf, pos..`, `buf, start..end`, etc.
 #[macro_export]
 macro_rules! slice_in_bounds_or_corrupt {
-    ($buf:expr, $range:expr) => {
+    ($buf:expr_2021, $range:expr_2021) => {
         $buf.get($range).ok_or_else(|| {
             $crate::error::cold_return($crate::error::LimboError::Corrupt(format!(
                 "range {:?} out of bounds for buffer size {}",
@@ -256,7 +256,7 @@ macro_rules! slice_in_bounds_or_corrupt {
 ///   `assert_or_bail_corrupt!(condition, "message {}", arg)`
 #[macro_export]
 macro_rules! assert_or_bail_corrupt {
-    ($cond:expr, $($arg:tt)*) => {
+    ($cond:expr_2021, $($arg:tt)*) => {
         if !($cond) {
             $crate::bail_corrupt_error!($($arg)*);
         }

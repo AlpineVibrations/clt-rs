@@ -1,0 +1,2 @@
+# Preserve upstream formatting while compiling the bundled sources as Rust 2024.
+style_edition = "2021"

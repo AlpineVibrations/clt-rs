@@ -249,7 +249,7 @@ fn try_match_index_method_pattern(
         columns,
         from: Some(ast::FromClause { select, joins }),
         distinctness: None,
-        where_clause: ref mut pattern_where_clause,
+        where_clause: pattern_where_clause,
         group_by: None,
         window_clause,
     } = &mut pattern.body.select
@@ -437,7 +437,7 @@ fn build_covered_columns_mapping(
 /// Sort parameters by key and extract just the expressions as a Vec.
 fn sorted_arguments_from_parameters(parameters: &HashMap<i32, ast::Expr>) -> Vec<ast::Expr> {
     let mut arguments: Vec<_> = parameters.iter().collect();
-    arguments.sort_by_key(|(&i, _)| i);
+    arguments.sort_by_key(|&(&i, _)| i);
     arguments.iter().map(|(_, e)| (*e).clone()).collect()
 }
 
@@ -750,7 +750,7 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, resolver: &Resolver) -> Resul
                 plan: Some(inner), ..
             } = &mut sub.state
             {
-                if let Plan::Select(ref mut inner) = inner.as_mut() {
+                if let Plan::Select(inner) = inner.as_mut() {
                     if inner.limit.is_none() {
                         inner.limit = Some(Box::new(Expr::Literal(ast::Literal::Numeric(
                             "1".to_string(),
@@ -1369,7 +1369,7 @@ fn reoptimize_correlated_subqueries(plan: &mut SelectPlan, resolver: &Resolver) 
         else {
             continue;
         };
-        let Plan::Select(ref mut inner_plan) = inner_plan.as_mut() else {
+        let Plan::Select(inner_plan) = inner_plan.as_mut() else {
             continue;
         };
         if !select_plan_contains_cte_from_clause_subquery(inner_plan) {

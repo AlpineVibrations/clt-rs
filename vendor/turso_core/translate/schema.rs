@@ -83,30 +83,36 @@ pub(crate) fn validate_check_expr(
                 if filter_over.over_clause.is_some() {
                     bail_parse_error!("misuse of window function {}()", name.as_str());
                 }
-                if let Some(func) = resolver.resolve_function(name.as_str(), args.len())? {
-                    if matches!(func, Func::Agg(..)) {
-                        bail_parse_error!("misuse of aggregate function {}()", name.as_str());
+                match resolver.resolve_function(name.as_str(), args.len())? {
+                    Some(func) => {
+                        if matches!(func, Func::Agg(..)) {
+                            bail_parse_error!("misuse of aggregate function {}()", name.as_str());
+                        }
+                        if matches!(func, Func::Window(..)) {
+                            bail_parse_error!("misuse of window function {}()", name.as_str());
+                        }
                     }
-                    if matches!(func, Func::Window(..)) {
-                        bail_parse_error!("misuse of window function {}()", name.as_str());
+                    _ => {
+                        bail_parse_error!("no such function: {}", name.as_str());
                     }
-                } else {
-                    bail_parse_error!("no such function: {}", name.as_str());
                 }
             }
             ast::Expr::FunctionCallStar { name, filter_over } => {
                 if filter_over.over_clause.is_some() {
                     bail_parse_error!("misuse of window function {}()", name.as_str());
                 }
-                if let Some(func) = resolver.resolve_function(name.as_str(), 0)? {
-                    if matches!(func, Func::Agg(..)) {
-                        bail_parse_error!("misuse of aggregate function {}()", name.as_str());
+                match resolver.resolve_function(name.as_str(), 0)? {
+                    Some(func) => {
+                        if matches!(func, Func::Agg(..)) {
+                            bail_parse_error!("misuse of aggregate function {}()", name.as_str());
+                        }
+                        if matches!(func, Func::Window(..)) {
+                            bail_parse_error!("misuse of window function {}()", name.as_str());
+                        }
                     }
-                    if matches!(func, Func::Window(..)) {
-                        bail_parse_error!("misuse of window function {}()", name.as_str());
+                    _ => {
+                        bail_parse_error!("no such function: {}", name.as_str());
                     }
-                } else {
-                    bail_parse_error!("no such function: {}", name.as_str());
                 }
             }
             ast::Expr::Variable(_) => {
@@ -257,7 +263,7 @@ fn resolve_check_expr_type(
             }
         }
         ast::Expr::Cast { type_name, .. } => {
-            if let Some(ref tn) = type_name {
+            if let Some(tn) = type_name {
                 resolve_type_name(&tn.name, resolver)
             } else {
                 bail_parse_error!(
@@ -344,27 +350,33 @@ fn resolve_check_expr_type(
         }
         ast::Expr::NotNull(_) | ast::Expr::IsNull(_) => Ok(CheckExprType::Integer),
         ast::Expr::FunctionCall { name, args, .. } => {
-            if let Some(func) = resolver.resolve_function(name.as_str(), args.len())? {
-                resolve_func_return_type(&func, name.as_str(), args, columns, resolver)
-            } else {
-                bail_parse_error!(
-                    "cannot determine return type of function {}() in CHECK constraint; \
+            match resolver.resolve_function(name.as_str(), args.len())? {
+                Some(func) => {
+                    resolve_func_return_type(&func, name.as_str(), args, columns, resolver)
+                }
+                _ => {
+                    bail_parse_error!(
+                        "cannot determine return type of function {}() in CHECK constraint; \
                      wrap with CAST to specify the type, e.g. CAST({}(...) AS INTEGER)",
-                    name.as_str(),
-                    name.as_str()
-                );
+                        name.as_str(),
+                        name.as_str()
+                    );
+                }
             }
         }
         ast::Expr::FunctionCallStar { name, .. } => {
-            if let Some(func) = resolver.resolve_function(name.as_str(), 0)? {
-                resolve_func_return_type(&func, name.as_str(), &[], columns, resolver)
-            } else {
-                bail_parse_error!(
-                    "cannot determine return type of function {}() in CHECK constraint; \
+            match resolver.resolve_function(name.as_str(), 0)? {
+                Some(func) => {
+                    resolve_func_return_type(&func, name.as_str(), &[], columns, resolver)
+                }
+                _ => {
+                    bail_parse_error!(
+                        "cannot determine return type of function {}() in CHECK constraint; \
                      wrap with CAST to specify the type, e.g. CAST({}(...) AS INTEGER)",
-                    name.as_str(),
-                    name.as_str()
-                );
+                        name.as_str(),
+                        name.as_str()
+                    );
+                }
             }
         }
         _ => {
@@ -2487,49 +2499,52 @@ fn persist_type_definition(
     let types_table: Arc<BTreeTable>;
     let types_root_page: RegisterOrLiteral<i64>;
 
-    if let Some(existing) = resolver.schema().get_btree_table(TURSO_TYPES_TABLE_NAME) {
-        types_table = existing.clone();
-        types_root_page = RegisterOrLiteral::Literal(existing.root_page);
-    } else {
-        // Create the sqlite_turso_types btree
-        let table_root_reg = program.alloc_register();
-        program.emit_insn(Insn::CreateBtree {
-            db: MAIN_DB_ID,
-            root: table_root_reg,
-            flags: CreateBTreeFlags::new_table(),
-        });
-        let create_sql =
-            format!("CREATE TABLE {TURSO_TYPES_TABLE_NAME}(name TEXT PRIMARY KEY, sql TEXT)");
-        types_table = Arc::new(BTreeTable::from_sql(&create_sql, 0)?);
-        types_root_page = RegisterOrLiteral::Register(table_root_reg);
+    match resolver.schema().get_btree_table(TURSO_TYPES_TABLE_NAME) {
+        Some(existing) => {
+            types_table = existing.clone();
+            types_root_page = RegisterOrLiteral::Literal(existing.root_page);
+        }
+        _ => {
+            // Create the sqlite_turso_types btree
+            let table_root_reg = program.alloc_register();
+            program.emit_insn(Insn::CreateBtree {
+                db: MAIN_DB_ID,
+                root: table_root_reg,
+                flags: CreateBTreeFlags::new_table(),
+            });
+            let create_sql =
+                format!("CREATE TABLE {TURSO_TYPES_TABLE_NAME}(name TEXT PRIMARY KEY, sql TEXT)");
+            types_table = Arc::new(BTreeTable::from_sql(&create_sql, 0)?);
+            types_root_page = RegisterOrLiteral::Register(table_root_reg);
 
-        // Register it in sqlite_schema so it persists
-        let schema_table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
-        let schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(schema_table));
-        program.emit_insn(Insn::OpenWrite {
-            cursor_id: schema_cursor_id,
-            root_page: 1i64.into(),
-            db: MAIN_DB_ID,
-        });
-        emit_schema_entry(
-            program,
-            resolver,
-            schema_cursor_id,
-            None,
-            SchemaEntryType::Table,
-            TURSO_TYPES_TABLE_NAME,
-            TURSO_TYPES_TABLE_NAME,
-            table_root_reg,
-            Some(create_sql),
-        )?;
+            // Register it in sqlite_schema so it persists
+            let schema_table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
+            let schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(schema_table));
+            program.emit_insn(Insn::OpenWrite {
+                cursor_id: schema_cursor_id,
+                root_page: 1i64.into(),
+                db: MAIN_DB_ID,
+            });
+            emit_schema_entry(
+                program,
+                resolver,
+                schema_cursor_id,
+                None,
+                SchemaEntryType::Table,
+                TURSO_TYPES_TABLE_NAME,
+                TURSO_TYPES_TABLE_NAME,
+                table_root_reg,
+                Some(create_sql),
+            )?;
 
-        // Parse schema to register the new table in-memory
-        program.emit_insn(Insn::ParseSchema {
-            db: schema_cursor_id,
-            where_clause: Some(format!(
-                "tbl_name = '{TURSO_TYPES_TABLE_NAME}' AND type != 'trigger'"
-            )),
-        });
+            // Parse schema to register the new table in-memory
+            program.emit_insn(Insn::ParseSchema {
+                db: schema_cursor_id,
+                where_clause: Some(format!(
+                    "tbl_name = '{TURSO_TYPES_TABLE_NAME}' AND type != 'trigger'"
+                )),
+            });
+        }
     }
 
     // Open sqlite_turso_types for writing
@@ -2612,16 +2627,11 @@ pub fn translate_create_type(
     }
 
     // Validate encode/decode expressions for safety (only for custom types)
-    if let ast::CreateTypeBody::CustomType {
-        ref encode,
-        ref decode,
-        ..
-    } = body
-    {
-        if let Some(ref encode) = encode {
+    if let ast::CreateTypeBody::CustomType { encode, decode, .. } = body {
+        if let Some(encode) = encode {
             validate_type_expr(encode, "ENCODE", resolver)?;
         }
-        if let Some(ref decode) = decode {
+        if let Some(decode) = decode {
             validate_type_expr(decode, "DECODE", resolver)?;
         }
     }
@@ -2669,13 +2679,13 @@ fn build_create_type_sql(name: &str, body: &ast::CreateTypeBody) -> String {
                     quote_ident(base)
                 )
             };
-            if let Some(ref encode) = encode {
+            if let Some(encode) = encode {
                 sql.push_str(&format!(" ENCODE {encode}"));
             }
-            if let Some(ref decode) = decode {
+            if let Some(decode) = decode {
                 sql.push_str(&format!(" DECODE {decode}"));
             }
-            if let Some(ref default) = default {
+            if let Some(default) = default {
                 sql.push_str(&format!(" DEFAULT {default}"));
             }
             for op in operators {

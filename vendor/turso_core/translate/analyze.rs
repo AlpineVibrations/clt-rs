@@ -283,56 +283,59 @@ pub fn translate_analyze(
             collation: None,
         });
 
-        if let Some(idx) = target_index.clone() {
-            let idx_col_reg = program.alloc_register();
-            program.emit_insn(Insn::Column {
-                cursor_id: stat_cursor,
-                column: 1,
-                dest: idx_col_reg,
-                default: None,
-            });
-            let target_idx_reg = program.alloc_register();
-            program.emit_insn(Insn::String8 {
-                value: idx.name.to_string(),
-                dest: target_idx_reg,
-            });
-            program.mark_last_insn_constant();
-            program.emit_insn(Insn::Ne {
-                lhs: idx_col_reg,
-                rhs: target_idx_reg,
-                target_pc: skip_label,
-                flags: Default::default(),
-                collation: None,
-            });
-            let rowid_reg = program.alloc_register();
-            program.emit_insn(Insn::RowId {
-                cursor_id: stat_cursor,
-                dest: rowid_reg,
-            });
-            program.emit_insn(Insn::Delete {
-                cursor_id: stat_cursor,
-                table_name: "sqlite_stat1".to_string(),
-                is_part_of_update: false,
-            });
-            program.emit_insn(Insn::Next {
-                cursor_id: stat_cursor,
-                pc_if_next: loop_start,
-            });
-        } else {
-            let rowid_reg = program.alloc_register();
-            program.emit_insn(Insn::RowId {
-                cursor_id: stat_cursor,
-                dest: rowid_reg,
-            });
-            program.emit_insn(Insn::Delete {
-                cursor_id: stat_cursor,
-                table_name: "sqlite_stat1".to_string(),
-                is_part_of_update: false,
-            });
-            program.emit_insn(Insn::Next {
-                cursor_id: stat_cursor,
-                pc_if_next: loop_start,
-            });
+        match target_index.clone() {
+            Some(idx) => {
+                let idx_col_reg = program.alloc_register();
+                program.emit_insn(Insn::Column {
+                    cursor_id: stat_cursor,
+                    column: 1,
+                    dest: idx_col_reg,
+                    default: None,
+                });
+                let target_idx_reg = program.alloc_register();
+                program.emit_insn(Insn::String8 {
+                    value: idx.name.to_string(),
+                    dest: target_idx_reg,
+                });
+                program.mark_last_insn_constant();
+                program.emit_insn(Insn::Ne {
+                    lhs: idx_col_reg,
+                    rhs: target_idx_reg,
+                    target_pc: skip_label,
+                    flags: Default::default(),
+                    collation: None,
+                });
+                let rowid_reg = program.alloc_register();
+                program.emit_insn(Insn::RowId {
+                    cursor_id: stat_cursor,
+                    dest: rowid_reg,
+                });
+                program.emit_insn(Insn::Delete {
+                    cursor_id: stat_cursor,
+                    table_name: "sqlite_stat1".to_string(),
+                    is_part_of_update: false,
+                });
+                program.emit_insn(Insn::Next {
+                    cursor_id: stat_cursor,
+                    pc_if_next: loop_start,
+                });
+            }
+            _ => {
+                let rowid_reg = program.alloc_register();
+                program.emit_insn(Insn::RowId {
+                    cursor_id: stat_cursor,
+                    dest: rowid_reg,
+                });
+                program.emit_insn(Insn::Delete {
+                    cursor_id: stat_cursor,
+                    table_name: "sqlite_stat1".to_string(),
+                    is_part_of_update: false,
+                });
+                program.emit_insn(Insn::Next {
+                    cursor_id: stat_cursor,
+                    pc_if_next: loop_start,
+                });
+            }
         }
 
         program.preassign_label_to_next_insn(skip_label);

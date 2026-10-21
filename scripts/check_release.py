@@ -38,7 +38,12 @@ def audit_archives(package_dir):
         require(manifest["lib"]["path"] == "vendor/turso_core/lib.rs",
                 "CLT must compile the bundled core as its own library target")
         require(manifest["lib"]["name"] == "clt_database", "Unexpected bundled library target")
-        require(manifest["lib"]["edition"] == "2021", "Keep the engine's upstream Rust edition")
+        require(manifest["package"]["edition"] == "2024",
+                "All CLT targets must use the package's Rust 2024 edition")
+        for kind in ("lib", "bin", "example", "test", "bench"):
+            targets = [manifest[kind]] if kind == "lib" else manifest.get(kind, [])
+            require(all("edition" not in target for target in targets),
+                    f"Published manifest contains a deprecated {kind} edition override")
         lock = tomllib.loads(read("Cargo.lock").decode())
         for package in lock["package"]:
             name = package["name"]

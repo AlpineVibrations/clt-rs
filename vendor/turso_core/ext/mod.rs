@@ -79,16 +79,19 @@ pub(crate) unsafe extern "C" fn register_vtab_module(
         }
 
         if kind == VTabKind::TableValuedFunction {
-            if let Ok(vtab) = VirtualTable::function(&name_str, syms) {
-                let table = Arc::new(Table::Virtual(vtab));
-                let mutex = &*(ext_ctx.schema as *mut Mutex<Arc<Schema>>);
-                let mut guard = mutex.lock();
-                let Ok(schema) = Schema::try_make_mut(&mut guard) else {
+            match VirtualTable::function(&name_str, syms) {
+                Ok(vtab) => {
+                    let table = Arc::new(Table::Virtual(vtab));
+                    let mutex = &*(ext_ctx.schema as *mut Mutex<Arc<Schema>>);
+                    let mut guard = mutex.lock();
+                    let Ok(schema) = Schema::try_make_mut(&mut guard) else {
+                        return ResultCode::Error;
+                    };
+                    schema.tables.insert(name_str, table);
+                }
+                _ => {
                     return ResultCode::Error;
-                };
-                schema.tables.insert(name_str, table);
-            } else {
-                return ResultCode::Error;
+                }
             }
         }
     }

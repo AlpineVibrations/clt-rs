@@ -10,9 +10,10 @@ src/main.rs -> run() -> cli::run()
 `src/main.rs` includes `src/lib.rs`, which declares the application's private modules
 and its `run() -> anyhow::Result<()>` entry point. The application's code remains in
 the Rust 2024 binary target. The package's `clt_database` library target compiles the
-vendored Turso core with its upstream Rust 2021 edition and includes the SDK kit and
-local Rust API as modules. Both targets ship in the same `clt-rs` archive; there are
-no separately published database forks or nested Cargo packages.
+vendored Turso core, SDK kit and local Rust API with the same package-wide Rust 2024
+edition, without deprecated target overrides. Both targets ship in the same
+`clt-rs` archive; there are no separately published database forks or nested Cargo
+packages.
 
 The engine's feature configuration is fixed in `build.rs` to match the previously
 used Turso dependency. Application modules import its local API through
@@ -133,7 +134,7 @@ command works without a task board.
 The required verification gates are:
 
 ```bash
-rustfmt --edition 2024 --check build.rs src/main.rs src/lib.rs tests/architecture.rs tests/cli.rs
+cargo fmt --all -- --check
 cargo clippy --no-deps --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-targets --all-features
 ```

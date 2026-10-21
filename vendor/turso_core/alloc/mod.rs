@@ -141,10 +141,10 @@ pub use crate::{__turso_alloc_try_vec as try_vec, __turso_alloc_vec as vec};
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __turso_alloc_vec_count {
-    ($($element:expr),*) => {
+    ($($element:expr_2021),*) => {
         <[()]>::len(&[$($crate::__turso_alloc_vec_count!(@sub $element)),*])
     };
-    (@sub $element:expr) => {
+    (@sub $element:expr_2021) => {
         ()
     };
 }
@@ -155,14 +155,14 @@ macro_rules! __turso_alloc_vec {
     () => {
         <$crate::alloc::Vec<_> as $crate::alloc::TursoAllocExt>::new()
     };
-    ($element:expr; $count:expr) => {{
+    ($element:expr_2021; $count:expr_2021) => {{
         let count = $count;
         let mut values =
             <$crate::alloc::Vec<_> as $crate::alloc::TursoVecExt<_>>::with_capacity(count);
         values.resize(count, $element);
         values
     }};
-    ($($element:expr),+ $(,)?) => {{
+    ($($element:expr_2021),+ $(,)?) => {{
         let mut values =
             <$crate::alloc::Vec<_> as $crate::alloc::TursoVecExt<_>>::with_capacity(
                 $crate::__turso_alloc_vec_count!($($element),+),
@@ -180,7 +180,7 @@ macro_rules! __turso_alloc_try_vec {
             <$crate::alloc::Vec<_> as $crate::alloc::TursoAllocExt>::new(),
         )
     };
-    ($element:expr; $count:expr) => {{
+    ($element:expr_2021; $count:expr_2021) => {{
         (|| {
             let count = $count;
             let mut values =
@@ -191,7 +191,7 @@ macro_rules! __turso_alloc_try_vec {
             Ok::<_, $crate::alloc::TryReserveError>(values)
         })()
     }};
-    ($($element:expr),+ $(,)?) => {{
+    ($($element:expr_2021),+ $(,)?) => {{
         (|| {
             let mut values =
                 <$crate::alloc::Vec<_> as $crate::alloc::TursoTryWithCapacityExt>::try_with_capacity_ext(

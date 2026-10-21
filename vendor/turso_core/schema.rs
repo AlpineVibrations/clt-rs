@@ -1333,7 +1333,7 @@ impl Schema {
     pub fn get_triggers_for_table(
         &self,
         table_name: &str,
-    ) -> impl Iterator<Item = &Arc<Trigger>> + Clone {
+    ) -> impl Iterator<Item = &Arc<Trigger>> + Clone + use<'_> {
         let table_name = normalize_ident(table_name);
         self.triggers
             .get(&table_name)
@@ -1461,7 +1461,7 @@ impl Schema {
         Ok(())
     }
 
-    pub fn get_indices(&self, table_name: &str) -> impl Iterator<Item = &Arc<Index>> {
+    pub fn get_indices(&self, table_name: &str) -> impl Iterator<Item = &Arc<Index>> + use<'_> {
         let name = normalize_ident(table_name);
         self.indexes
             .get(&name)
@@ -3146,7 +3146,7 @@ impl GeneratedColGraph {
 
         // walk each virtual column's expression once to extract edges
         for (j, col) in columns.iter().enumerate() {
-            let GeneratedType::Virtual { ref expr, .. } = col.generated_type() else {
+            let GeneratedType::Virtual { expr, .. } = col.generated_type() else {
                 continue;
             };
             let mut direct = BitSet::default();
@@ -4536,11 +4536,11 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
 
                 let ty_params: std::vec::Vec<Box<Expr>> = match col_type {
                     Some(ast::Type {
-                        size: Some(ast::TypeSize::MaxSize(ref expr)),
+                        size: Some(ast::TypeSize::MaxSize(expr)),
                         ..
                     }) => std::vec![expr.clone()],
                     Some(ast::Type {
-                        size: Some(ast::TypeSize::TypeSize(ref e1, ref e2)),
+                        size: Some(ast::TypeSize::TypeSize(e1, e2)),
                         ..
                     }) => std::vec![e1.clone(), e2.clone()],
                     _ => std::vec::Vec::new(),
@@ -4619,7 +4619,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             explicit_notnull = !nullable;
                             notnull_conflict_clause = *conflict_clause;
                         }
-                        ast::ColumnConstraint::Default(ref expr) => {
+                        ast::ColumnConstraint::Default(expr) => {
                             default = Some(
                                 translate_ident_to_string_literal(expr)
                                     .unwrap_or_else(|| expr.clone()),
@@ -4634,7 +4634,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                 conflict_clause: *conflict,
                             })?;
                         }
-                        ast::ColumnConstraint::Collate { ref collation_name } => {
+                        ast::ColumnConstraint::Collate { collation_name } => {
                             let collation_seq = CollationSeq::new(collation_name.as_str())?;
                             if collation_seq.is_custom() {
                                 crate::bail_parse_error!(
@@ -5458,11 +5458,11 @@ impl TryFrom<&ColumnDefinition> for Column {
 
         let ty_params: std::vec::Vec<Box<turso_parser::ast::Expr>> = match &value.col_type {
             Some(ast::Type {
-                size: Some(ast::TypeSize::MaxSize(ref expr)),
+                size: Some(ast::TypeSize::MaxSize(expr)),
                 ..
             }) => std::vec![expr.clone()],
             Some(ast::Type {
-                size: Some(ast::TypeSize::TypeSize(ref e1, ref e2)),
+                size: Some(ast::TypeSize::TypeSize(e1, e2)),
                 ..
             }) => std::vec![e1.clone(), e2.clone()],
             _ => std::vec::Vec::new(),

@@ -446,28 +446,32 @@ mod arena {
     use std::ffi::c_void;
 
     pub unsafe fn alloc(len: usize) -> *mut u8 {
-        let ptr = mmap(
-            std::ptr::null_mut(),
-            len,
-            PROT_READ | PROT_WRITE,
-            MAP_PRIVATE | MAP_ANONYMOUS,
-            -1,
-            0,
-        );
-        if ptr == libc::MAP_FAILED {
-            panic!("mmap failed: {}", std::io::Error::last_os_error());
+        unsafe {
+            let ptr = mmap(
+                std::ptr::null_mut(),
+                len,
+                PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS,
+                -1,
+                0,
+            );
+            if ptr == libc::MAP_FAILED {
+                panic!("mmap failed: {}", std::io::Error::last_os_error());
+            }
+            #[cfg(target_os = "linux")]
+            {
+                libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
+            }
+            ptr as *mut u8
         }
-        #[cfg(target_os = "linux")]
-        {
-            libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
-        }
-        ptr as *mut u8
     }
 
     pub unsafe fn dealloc(ptr: *mut u8, len: usize) {
-        let result = munmap(ptr as *mut c_void, len);
-        if result != 0 {
-            panic!("munmap failed: {}", std::io::Error::last_os_error());
+        unsafe {
+            let result = munmap(ptr as *mut c_void, len);
+            if result != 0 {
+                panic!("munmap failed: {}", std::io::Error::last_os_error());
+            }
         }
     }
 }

@@ -399,8 +399,8 @@ pub fn resolve_window_and_aggregate_functions(
                             );
                         }
                     }
-                    None => {
-                        if let Some(f) = resolver.symbol_table.resolve_function(name.as_str(), 0) {
+                    None => match resolver.symbol_table.resolve_function(name.as_str(), 0) {
+                        Some(f) => {
                             let func = AggFunc::External(f.func.clone().into());
                             if let ExtFunc::Aggregate { .. } = f.as_ref().func {
                                 if let Some(over_clause) = filter_over.over_clause.as_ref() {
@@ -426,10 +426,11 @@ pub fn resolve_window_and_aggregate_functions(
                                 }
                                 return Ok(WalkControl::SkipChildren);
                             }
-                        } else {
+                        }
+                        _ => {
                             crate::bail_parse_error!("no such function: {}", name.as_str());
                         }
-                    }
+                    },
                 }
             }
             _ => {}
@@ -1132,8 +1133,7 @@ fn parse_table(
         } = view_select.body.select
         {
             for (col, result_col) in view.columns.iter().zip(columns.iter_mut()) {
-                if let (Some(name_str), ast::ResultColumn::Expr(_, ref mut alias)) =
-                    (&col.name, result_col)
+                if let (Some(name_str), ast::ResultColumn::Expr(_, alias)) = (&col.name, result_col)
                 {
                     *alias = Some(ast::As::As(ast::Name::exact(name_str.clone())));
                 }

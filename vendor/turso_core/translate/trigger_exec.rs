@@ -264,7 +264,7 @@ fn rewrite_upsert_exprs_for_subprogram(
             for set in sets.iter_mut() {
                 rewrite_trigger_expr_for_subprogram(&mut set.expr, ctx)?;
             }
-            if let Some(ref mut wc) = where_clause {
+            if let Some(wc) = where_clause {
                 rewrite_trigger_expr_for_subprogram(wc, ctx)?;
             }
         }

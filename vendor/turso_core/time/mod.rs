@@ -68,13 +68,13 @@ pub fn register_extension(ext_api: &mut ExtensionApi) {
 }
 
 macro_rules! ok_tri {
-    ($e:expr) => {
+    ($e:expr_2021) => {
         match $e {
             Some(val) => val,
             None => return Value::error(ResultCode::Error),
         }
     };
-    ($e:expr, $msg:expr) => {
+    ($e:expr_2021, $msg:expr_2021) => {
         match $e {
             Some(val) => val,
             None => return Value::error_with_message($msg.to_string()),
@@ -83,13 +83,13 @@ macro_rules! ok_tri {
 }
 
 macro_rules! tri {
-    ($e:expr) => {
+    ($e:expr_2021) => {
         match $e {
             Ok(val) => val,
             Err(err) => return Value::error_with_message(err.to_string()),
         }
     };
-    ($e:expr, $msg:expr) => {
+    ($e:expr_2021, $msg:expr_2021) => {
         match $e {
             Ok(val) => val,
             Err(_) => return Value::error_with_message($msg.to_string()),
@@ -99,13 +99,13 @@ macro_rules! tri {
 
 /// Checks to see if e's enum is of type val
 macro_rules! value_tri {
-    ($e:expr, $val:pat) => {
+    ($e:expr_2021, $val:pat) => {
         match $e {
             $val => (),
             _ => return Value::error(ResultCode::InvalidArgs),
         }
     };
-    ($e:expr, $val:pat, $msg:expr) => {
+    ($e:expr_2021, $val:pat, $msg:expr_2021) => {
         match $e {
             $val => (),
             _ => return Value::error_with_message($msg.to_string()),

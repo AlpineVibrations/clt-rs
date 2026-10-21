@@ -19,9 +19,9 @@ python3 scripts/check_release.py
 ```
 
 Formatting applies to the whole package, including the bundled engine. Strict
-lints apply to CLT; the bundled engine retains its upstream lint policy. Its
-library keeps Rust 2021 while CLT uses Rust 2024.
-Cargo currently accepts this target edition override with a deprecation warning.
+lints apply to CLT; the bundled engine retains its upstream lint policy and
+formatting style. All targets inherit Rust 2024 from the package, without
+deprecated per-target edition overrides.
 
 During preparation, use `python3 scripts/check_release.py --allow-dirty`.
 Before publishing, commit the reviewed changes and repeat the check from that
@@ -31,9 +31,9 @@ The release check runs `cargo package --locked` with verification enabled. Cargo
 builds the extracted archive using its normalized published manifest. The script
 then verifies that the archive contains the tested application and engine source,
 the upstream licenses and provenance, and the compile-time WAL patch marker. It
-rejects separate Turso core/SDK/fork dependencies, nested Cargo packages, and
-unexpected vendor directories. The four upstream Turso leaf dependencies remain
-pinned to 0.7.2.
+rejects per-target edition overrides, separate Turso core/SDK/fork dependencies,
+nested Cargo packages, and unexpected vendor directories. The four upstream Turso
+leaf dependencies remain pinned to 0.7.2.
 
 Finally, the check runs the archive-built native binary against temporary task
 and registry directories. It checks version output and registry persistence

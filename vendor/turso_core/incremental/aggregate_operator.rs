@@ -1800,7 +1800,7 @@ impl IncrementalOperator for AggregateOperator {
                     let eval_state = EvalState::from_delta(delta.clone());
                     self.commit_state = AggregateCommitState::Eval { eval_state };
                 }
-                AggregateCommitState::Eval { ref mut eval_state } => {
+                AggregateCommitState::Eval { eval_state } => {
                     // Clone the delta for MIN/MAX processing before eval consumes it
                     // We need to get the delta from the eval_state if it's still in Init
                     let input_delta = match eval_state {

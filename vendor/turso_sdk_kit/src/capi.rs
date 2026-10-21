@@ -38,13 +38,13 @@ type CStepFunction = unsafe extern "C" fn(
 ) -> c::turso_value_t;
 type CFinalizeFunction = unsafe extern "C" fn(usize, *mut c::turso_agg_ctx_t) -> c::turso_value_t;
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[signature(c)]
 pub extern "C" fn turso_version() -> *const std::ffi::c_char {
     PKG_VERSION_C.as_ptr() as *const std::ffi::c_char
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[signature(c)]
 pub extern "C" fn turso_setup(
     config: *const c::turso_config_t,
@@ -60,7 +60,7 @@ pub extern "C" fn turso_setup(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[signature(c)]
 pub extern "C" fn turso_database_new(
     config: *const c::turso_database_config_t,
@@ -75,7 +75,7 @@ pub extern "C" fn turso_database_new(
     c::turso_status_code_t::TURSO_OK
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[signature(c)]
 pub extern "C" fn turso_database_open(
     database: *const c::turso_database_t,
@@ -92,7 +92,7 @@ pub extern "C" fn turso_database_open(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[signature(c)]
 pub extern "C" fn turso_database_connect(
     database: *const c::turso_database_t,
@@ -112,7 +112,7 @@ pub extern "C" fn turso_database_connect(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[signature(c)]
 pub extern "C" fn turso_connection_set_busy_timeout_ms(
     connection: *const c::turso_connection_t,
@@ -126,7 +126,7 @@ pub extern "C" fn turso_connection_set_busy_timeout_ms(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[signature(c)]
 pub extern "C" fn turso_connection_get_autocommit(
     connection: *const c::turso_connection_t,
@@ -137,7 +137,7 @@ pub extern "C" fn turso_connection_get_autocommit(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[signature(c)]
 pub extern "C" fn turso_connection_last_insert_rowid(
     connection: *const c::turso_connection_t,
@@ -150,7 +150,7 @@ pub extern "C" fn turso_connection_last_insert_rowid(
 
 /// # Safety
 /// All pointers must be valid according to `turso.h`; callback function pointers must use the declared C ABI.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[signature(c)]
 pub unsafe extern "C" fn turso_connection_register_scalar_function(
     connection: *const c::turso_connection_t,
@@ -163,46 +163,50 @@ pub unsafe extern "C" fn turso_connection_register_scalar_function(
     value_destructor: c::turso_value_destructor_t,
     error_opt_out: *mut *const std::ffi::c_char,
 ) -> c::turso_status_code_t {
-    let callback = match callback {
-        Some(callback) => {
-            std::mem::transmute::<CScalarFunction, turso_ext::ScalarFunction>(callback)
-        }
-        None => {
-            return unsafe {
-                rsapi::TursoError::Misuse("expected scalar callback, got null pointer".to_string())
+    unsafe {
+        let callback = match callback {
+            Some(callback) => {
+                std::mem::transmute::<CScalarFunction, turso_ext::ScalarFunction>(callback)
+            }
+            None => {
+                return unsafe {
+                    rsapi::TursoError::Misuse(
+                        "expected scalar callback, got null pointer".to_string(),
+                    )
                     .to_capi(error_opt_out)
-            };
-        }
-    };
-    let value_destructor = value_destructor.map(|destructor| {
-        std::mem::transmute::<CValueDestructor, turso_ext::ValueDestructor>(destructor)
-    });
-    let name = match unsafe { str_from_c_str(name) } {
-        Ok(name) => name,
-        Err(err) => return unsafe { err.to_capi(error_opt_out) },
-    };
-    let connection = match unsafe { TursoConnection::ref_from_capi(connection) } {
-        Ok(connection) => connection,
-        Err(err) => return unsafe { err.to_capi(error_opt_out) },
-    };
+                };
+            }
+        };
+        let value_destructor = value_destructor.map(|destructor| {
+            std::mem::transmute::<CValueDestructor, turso_ext::ValueDestructor>(destructor)
+        });
+        let name = match unsafe { str_from_c_str(name) } {
+            Ok(name) => name,
+            Err(err) => return unsafe { err.to_capi(error_opt_out) },
+        };
+        let connection = match unsafe { TursoConnection::ref_from_capi(connection) } {
+            Ok(connection) => connection,
+            Err(err) => return unsafe { err.to_capi(error_opt_out) },
+        };
 
-    match connection.register_external_scalar_function(
-        name.to_string(),
-        argc,
-        deterministic,
-        context,
-        callback,
-        context_destructor,
-        value_destructor,
-    ) {
-        Ok(()) => c::turso_status_code_t::TURSO_OK,
-        Err(err) => unsafe { err.to_capi(error_opt_out) },
+        match connection.register_external_scalar_function(
+            name.to_string(),
+            argc,
+            deterministic,
+            context,
+            callback,
+            context_destructor,
+            value_destructor,
+        ) {
+            Ok(()) => c::turso_status_code_t::TURSO_OK,
+            Err(err) => unsafe { err.to_capi(error_opt_out) },
+        }
     }
 }
 
 /// # Safety
 /// All pointers must be valid according to `turso.h`; callback function pointers must use the declared C ABI.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[signature(c)]
 pub unsafe extern "C" fn turso_connection_register_aggregate_function(
     connection: *const c::turso_connection_t,
@@ -217,50 +221,52 @@ pub unsafe extern "C" fn turso_connection_register_aggregate_function(
     value_destructor: c::turso_value_destructor_t,
     error_opt_out: *mut *const std::ffi::c_char,
 ) -> c::turso_status_code_t {
-    let (init, step, finalize) = match (init, step, finalize) {
-        (Some(init), Some(step), Some(finalize)) => (
-            std::mem::transmute::<CInitAggFunction, turso_ext::InitAggFunction>(init),
-            std::mem::transmute::<CStepFunction, turso_ext::StepFunction>(step),
-            std::mem::transmute::<CFinalizeFunction, turso_ext::FinalizeFunction>(finalize),
-        ),
-        _ => {
-            return unsafe {
-                rsapi::TursoError::Misuse(
-                    "expected aggregate callbacks, got null pointer".to_string(),
-                )
-                .to_capi(error_opt_out)
-            };
-        }
-    };
-    let value_destructor = value_destructor.map(|destructor| {
-        std::mem::transmute::<CValueDestructor, turso_ext::ValueDestructor>(destructor)
-    });
-    let name = match unsafe { str_from_c_str(name) } {
-        Ok(name) => name,
-        Err(err) => return unsafe { err.to_capi(error_opt_out) },
-    };
-    let connection = match unsafe { TursoConnection::ref_from_capi(connection) } {
-        Ok(connection) => connection,
-        Err(err) => return unsafe { err.to_capi(error_opt_out) },
-    };
+    unsafe {
+        let (init, step, finalize) = match (init, step, finalize) {
+            (Some(init), Some(step), Some(finalize)) => (
+                std::mem::transmute::<CInitAggFunction, turso_ext::InitAggFunction>(init),
+                std::mem::transmute::<CStepFunction, turso_ext::StepFunction>(step),
+                std::mem::transmute::<CFinalizeFunction, turso_ext::FinalizeFunction>(finalize),
+            ),
+            _ => {
+                return unsafe {
+                    rsapi::TursoError::Misuse(
+                        "expected aggregate callbacks, got null pointer".to_string(),
+                    )
+                    .to_capi(error_opt_out)
+                };
+            }
+        };
+        let value_destructor = value_destructor.map(|destructor| {
+            std::mem::transmute::<CValueDestructor, turso_ext::ValueDestructor>(destructor)
+        });
+        let name = match unsafe { str_from_c_str(name) } {
+            Ok(name) => name,
+            Err(err) => return unsafe { err.to_capi(error_opt_out) },
+        };
+        let connection = match unsafe { TursoConnection::ref_from_capi(connection) } {
+            Ok(connection) => connection,
+            Err(err) => return unsafe { err.to_capi(error_opt_out) },
+        };
 
-    match connection.register_external_aggregate_function(
-        name.to_string(),
-        argc,
-        context,
-        init,
-        step,
-        finalize,
-        context_destructor,
-        aggregate_destructor,
-        value_destructor,
-    ) {
-        Ok(()) => c::turso_status_code_t::TURSO_OK,
-        Err(err) => unsafe { err.to_capi(error_opt_out) },
+        match connection.register_external_aggregate_function(
+            name.to_string(),
+            argc,
+            context,
+            init,
+            step,
+            finalize,
+            context_destructor,
+            aggregate_destructor,
+            value_destructor,
+        ) {
+            Ok(()) => c::turso_status_code_t::TURSO_OK,
+            Err(err) => unsafe { err.to_capi(error_opt_out) },
+        }
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[signature(c)]
 pub extern "C" fn turso_connection_unregister_function(
     connection: *const c::turso_connection_t,
@@ -284,7 +290,7 @@ pub extern "C" fn turso_connection_unregister_function(
 
 /// # Safety
 /// All pointers must be valid according to `turso.h`; callback function pointers must use the declared C ABI.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[signature(c)]
 pub unsafe extern "C" fn turso_connection_register_collation(
     connection: *const c::turso_connection_t,
@@ -318,7 +324,7 @@ pub unsafe extern "C" fn turso_connection_register_collation(
     c::turso_status_code_t::TURSO_OK
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[signature(c)]
 pub extern "C" fn turso_connection_unregister_collation(
     connection: *const c::turso_connection_t,
@@ -338,7 +344,7 @@ pub extern "C" fn turso_connection_unregister_collation(
     c::turso_status_code_t::TURSO_OK
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[signature(c)]
 pub extern "C" fn turso_connection_enable_load_extension(
     connection: *const c::turso_connection_t,
@@ -354,7 +360,7 @@ pub extern "C" fn turso_connection_enable_load_extension(
     c::turso_status_code_t::TURSO_OK
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[signature(c)]
 pub extern "C" fn turso_connection_load_extension(
     connection: *const c::turso_connection_t,
@@ -376,7 +382,7 @@ pub extern "C" fn turso_connection_load_extension(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[signature(c)]
 pub extern "C" fn turso_connection_prepare_single(
     connection: *const c::turso_connection_t,
@@ -402,7 +408,7 @@ pub extern "C" fn turso_connection_prepare_single(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[signature(c)]
 pub extern "C" fn turso_connection_prepare_first(
     connection: *const c::turso_connection_t,
@@ -437,7 +443,7 @@ pub extern "C" fn turso_connection_prepare_first(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[signature(c)]
 pub extern "C" fn turso_connection_close(
     connection: *const c::turso_connection_t,
@@ -453,7 +459,7 @@ pub extern "C" fn turso_connection_close(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[signature(c)]
 pub extern "C" fn turso_statement_run_io(
     statement: *const c::turso_statement_t,
@@ -469,7 +475,7 @@ pub extern "C" fn turso_statement_run_io(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[signature(c)]
 pub extern "C" fn turso_statement_execute(
     statement: *const c::turso_statement_t,
@@ -491,7 +497,7 @@ pub extern "C" fn turso_statement_execute(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[signature(c)]
 pub extern "C" fn turso_statement_step(
     statement: *const c::turso_statement_t,
@@ -507,7 +513,7 @@ pub extern "C" fn turso_statement_step(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[signature(c)]
 pub extern "C" fn turso_statement_reset(
     statement: *const c::turso_statement_t,
@@ -523,7 +529,7 @@ pub extern "C" fn turso_statement_reset(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[signature(c)]
 pub extern "C" fn turso_statement_finalize(
     statement: *const c::turso_statement_t,
@@ -539,7 +545,7 @@ pub extern "C" fn turso_statement_finalize(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[signature(c)]
 pub extern "C" fn turso_statement_n_change(statement: *const c::turso_statement_t) -> i64 {
     let statement = match unsafe { TursoStatement::ref_from_capi(statement) } {
@@ -549,7 +555,7 @@ pub extern "C" fn turso_statement_n_change(statement: *const c::turso_statement_
     statement.n_change()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[signature(c)]
 pub extern "C" fn turso_statement_column_name(
     statement: *const c::turso_statement_t,
@@ -566,7 +572,7 @@ pub extern "C" fn turso_statement_column_name(
     str_to_c_string(&column)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[signature(c)]
 pub extern "C" fn turso_statement_column_count(statement: *const c::turso_statement_t) -> i64 {
     let statement = match unsafe { TursoStatement::ref_from_capi(statement) } {
@@ -576,7 +582,7 @@ pub extern "C" fn turso_statement_column_count(statement: *const c::turso_statem
     statement.column_count() as i64
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[signature(c)]
 pub extern "C" fn turso_statement_column_decltype(
     statement: *const c::turso_statement_t,
@@ -625,7 +631,7 @@ fn column_type_kind_to_c(kind: turso_core::ColumnTypeKind) -> i32 {
 ///
 /// Returns NULL when no type info is available (see [`TURSO_COLUMN_KIND_NONE`]).
 /// The returned C string must be freed with `turso_str_deinit`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[signature(c)]
 pub extern "C" fn turso_statement_column_declared_name(
     statement: *const c::turso_statement_t,
@@ -646,7 +652,7 @@ pub extern "C" fn turso_statement_column_declared_name(
 /// and `0` when no type info is available — call
 /// `turso_statement_column_kind` first to distinguish "scalar column"
 /// (returns 0) from "no info" (kind == -1).
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[signature(c)]
 pub extern "C" fn turso_statement_column_array_dimensions(
     statement: *const c::turso_statement_t,
@@ -670,7 +676,7 @@ pub extern "C" fn turso_statement_column_array_dimensions(
 /// when no type info is available, or when the column is not a direct
 /// table-column reference. The returned C string must be freed with
 /// `turso_str_deinit`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[signature(c)]
 pub extern "C" fn turso_statement_column_base_type(
     statement: *const c::turso_statement_t,
@@ -694,7 +700,7 @@ pub extern "C" fn turso_statement_column_base_type(
 /// when no type information is available — statement finalized, index out
 /// of bounds, or the column is not a direct table-column reference (e.g.
 /// `SELECT id + 1`).
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[signature(c)]
 pub extern "C" fn turso_statement_column_kind(
     statement: *const c::turso_statement_t,
@@ -714,7 +720,7 @@ pub extern "C" fn turso_statement_column_kind(
 /// Returns None if the statement is null, finalized, has no row, or index is out of bounds.
 /// The returned MutexGuard must be kept alive for the duration of ValueRef use.
 macro_rules! with_row_value {
-    ($statement:expr, $index:expr, $default:expr, $body:expr) => {{
+    ($statement:expr_2021, $index:expr_2021, $default:expr_2021, $body:expr_2021) => {{
         let statement = match unsafe { TursoStatement::ref_from_capi($statement) } {
             Ok(s) => s,
             Err(_) => return $default,
@@ -735,7 +741,7 @@ macro_rules! with_row_value {
     }};
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[signature(c)]
 pub extern "C" fn turso_statement_row_value_kind(
     statement: *const c::turso_statement_t,
@@ -761,7 +767,7 @@ pub extern "C" fn turso_statement_row_value_kind(
     )
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[signature(c)]
 pub extern "C" fn turso_statement_row_value_bytes_count(
     statement: *const c::turso_statement_t,
@@ -776,7 +782,7 @@ pub extern "C" fn turso_statement_row_value_bytes_count(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[signature(c)]
 pub extern "C" fn turso_statement_row_value_bytes_ptr(
     statement: *const c::turso_statement_t,
@@ -798,7 +804,7 @@ pub extern "C" fn turso_statement_row_value_bytes_ptr(
     )
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[signature(c)]
 pub extern "C" fn turso_statement_row_value_int(
     statement: *const c::turso_statement_t,
@@ -812,7 +818,7 @@ pub extern "C" fn turso_statement_row_value_int(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[signature(c)]
 pub extern "C" fn turso_statement_row_value_double(
     statement: *const c::turso_statement_t,
@@ -826,7 +832,7 @@ pub extern "C" fn turso_statement_row_value_double(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[signature(c)]
 pub extern "C" fn turso_statement_named_position(
     statement: *const c::turso_statement_t,
@@ -846,7 +852,7 @@ pub extern "C" fn turso_statement_named_position(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[signature(c)]
 pub extern "C" fn turso_statement_parameters_count(statement: *const c::turso_statement_t) -> i64 {
     let statement = match unsafe { TursoStatement::ref_from_capi(statement) } {
@@ -860,7 +866,7 @@ pub extern "C" fn turso_statement_parameters_count(statement: *const c::turso_st
 /// prefix (e.g. `:name`, `@name`, `$name`). Returns NULL for positional-only
 /// parameters or out-of-range indices. The caller must free the returned
 /// string with `turso_str_deinit`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[signature(c)]
 pub extern "C" fn turso_statement_parameter_name(
     statement: *const c::turso_statement_t,
@@ -879,7 +885,7 @@ pub extern "C" fn turso_statement_parameter_name(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[signature(c)]
 pub extern "C" fn turso_statement_bind_positional_null(
     statement: *const c::turso_statement_t,
@@ -895,7 +901,7 @@ pub extern "C" fn turso_statement_bind_positional_null(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[signature(c)]
 pub extern "C" fn turso_statement_bind_positional_int(
     statement: *const c::turso_statement_t,
@@ -912,7 +918,7 @@ pub extern "C" fn turso_statement_bind_positional_int(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[signature(c)]
 pub extern "C" fn turso_statement_bind_positional_double(
     statement: *const c::turso_statement_t,
@@ -929,7 +935,7 @@ pub extern "C" fn turso_statement_bind_positional_double(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[signature(c)]
 pub extern "C" fn turso_statement_bind_positional_text(
     statement: *const c::turso_statement_t,
@@ -955,7 +961,7 @@ pub extern "C" fn turso_statement_bind_positional_text(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[signature(c)]
 pub extern "C" fn turso_statement_bind_positional_blob(
     statement: *const c::turso_statement_t,
@@ -977,7 +983,7 @@ pub extern "C" fn turso_statement_bind_positional_blob(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[signature(c)]
 pub extern "C" fn turso_str_deinit(s: *const std::ffi::c_char) {
     if !s.is_null() {
@@ -985,7 +991,7 @@ pub extern "C" fn turso_str_deinit(s: *const std::ffi::c_char) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[signature(c)]
 pub extern "C" fn turso_database_deinit(database: *const c::turso_database_t) {
     if !database.is_null() {
@@ -993,7 +999,7 @@ pub extern "C" fn turso_database_deinit(database: *const c::turso_database_t) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[signature(c)]
 pub extern "C" fn turso_connection_deinit(connection: *const c::turso_connection_t) {
     if !connection.is_null() {
@@ -1001,7 +1007,7 @@ pub extern "C" fn turso_connection_deinit(connection: *const c::turso_connection
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[signature(c)]
 pub extern "C" fn turso_statement_deinit(statement: *const c::turso_statement_t) {
     if !statement.is_null() {

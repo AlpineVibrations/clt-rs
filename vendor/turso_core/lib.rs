@@ -2624,8 +2624,9 @@ impl Database {
 
         #[cfg(host_shared_wal)]
         let (coordination_open_mode, sanitized_backfill_proof_on_open) =
-            if let Some(authority) = self.shared_wal_coordination()? {
-                let mode = match authority.open_mode() {
+            match self.shared_wal_coordination()? {
+                Some(authority) => {
+                    let mode = match authority.open_mode() {
                 storage::shared_wal_coordination::SharedWalCoordinationOpenMode::Exclusive => {
                     SharedWalCoordinationOpenTelemetryMode::Exclusive
                 }
@@ -2633,9 +2634,9 @@ impl Database {
                     SharedWalCoordinationOpenTelemetryMode::MultiProcess
                 }
             };
-                (Some(mode), authority.sanitized_backfill_proof_on_open())
-            } else {
-                (None, false)
+                    (Some(mode), authority.sanitized_backfill_proof_on_open())
+                }
+                _ => (None, false),
             };
         #[cfg(not(host_shared_wal))]
         let (coordination_open_mode, sanitized_backfill_proof_on_open) = (None, false);
@@ -2943,7 +2944,7 @@ impl Database {
         }
     }
 
-    pub fn get_mv_store(&self) -> impl Deref<Target = Option<Arc<MvStore>>> {
+    pub fn get_mv_store(&self) -> impl Deref<Target = Option<Arc<MvStore>>> + use<> {
         self.mv_store.load()
     }
 
@@ -3160,7 +3161,7 @@ impl DatabaseCatalog {
     fn get_name_by_index(&self, index: usize) -> Option<String> {
         self.name_to_index
             .iter()
-            .find(|(_, &idx)| idx == index)
+            .find(|&(_, &idx)| idx == index)
             .map(|(name, _)| name.clone())
     }
 

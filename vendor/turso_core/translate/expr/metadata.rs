@@ -157,8 +157,8 @@ pub(super) fn supports_row_value_binary_comparison(operator: &ast::Operator) -> 
 
 macro_rules! expect_arguments_exact {
     (
-        $args:expr,
-        $expected_arguments:expr,
+        $args:expr_2021,
+        $expected_arguments:expr_2021,
         $func:ident
     ) => {{
         let args = $args;
@@ -181,8 +181,8 @@ macro_rules! expect_arguments_exact {
 
 macro_rules! expect_arguments_max {
     (
-        $args:expr,
-        $expected_arguments:expr,
+        $args:expr_2021,
+        $expected_arguments:expr_2021,
         $func:ident
     ) => {{
         let args = $args;
@@ -209,7 +209,7 @@ macro_rules! expect_arguments_max {
 ///
 /// Used by: Array (MakeArray), struct_pack (also MakeArray).
 macro_rules! translate_variadic_insn {
-    ($program:expr, $referenced_tables:expr, $resolver:expr, $args:expr, $dest:expr,
+    ($program:expr_2021, $referenced_tables:expr_2021, $resolver:expr_2021, $args:expr_2021, $dest:expr_2021,
      $Insn:ident) => {{
         let start_reg = $program.alloc_registers($args.len());
         for (i, arg) in $args.iter().enumerate() {
@@ -233,8 +233,8 @@ macro_rules! translate_variadic_insn {
 ///
 /// Used by: ArrayElement, ArraySetElement, UnionTag, UnionExtract, UnionValue.
 macro_rules! translate_fixed_insn {
-    ($program:expr, $referenced_tables:expr, $resolver:expr, $args:expr, $dest:expr,
-     [$($reg_name:ident <- $idx:expr),+], $insn_expr:expr) => {{
+    ($program:expr_2021, $referenced_tables:expr_2021, $resolver:expr_2021, $args:expr_2021, $dest:expr_2021,
+     [$($reg_name:ident <- $idx:expr_2021),+], $insn_expr:expr_2021) => {{
         $(
             let $reg_name = $program.alloc_register();
             translate_expr($program, $referenced_tables, &$args[$idx], $reg_name, $resolver)?;
@@ -291,8 +291,8 @@ pub(super) fn try_emit_expression_index_value(
 
 macro_rules! expect_arguments_min {
     (
-        $args:expr,
-        $expected_arguments:expr,
+        $args:expr_2021,
+        $expected_arguments:expr_2021,
         $func:ident
     ) => {{
         let args = $args;
@@ -315,7 +315,7 @@ macro_rules! expect_arguments_min {
 #[allow(unused_macros)]
 macro_rules! expect_arguments_even {
     (
-        $args:expr,
+        $args:expr_2021,
         $func:ident
     ) => {{
         let args = $args;

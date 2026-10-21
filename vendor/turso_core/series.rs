@@ -13,7 +13,7 @@ pub fn register_extension(ext_api: &mut ExtensionApi) {
 }
 
 macro_rules! extract_arg_integer {
-    ($args:expr, $idx:expr) => {
+    ($args:expr_2021, $idx:expr_2021) => {
         $args.get($idx).and_then(|v| v.to_integer())
     };
 }

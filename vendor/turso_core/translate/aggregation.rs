@@ -600,7 +600,7 @@ pub fn translate_aggregation_step(
             });
             target_register
         }
-        AggFunc::External(ref func) => {
+        AggFunc::External(func) => {
             let registered_argc = func.agg_args().map_err(|_| {
                 LimboError::ExtensionError(
                     "External aggregate function called with wrong number of arguments".to_string(),

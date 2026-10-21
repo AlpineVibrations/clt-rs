@@ -158,28 +158,33 @@ fn emit_table_list_rows_for_schema(
 
     if let Some(filter_name) = filter_name {
         let lookup_name = normalize_table_pragma_lookup_name(database_id, filter_name);
-        if let Some(table) = schema.get_table(&lookup_name) {
-            let (wr, strict) = match table.btree() {
-                Some(bt) => (!bt.has_rowid, bt.is_strict),
-                None => (false, false),
-            };
-            emit_table_row(
-                program,
-                table.get_name(),
-                "table",
-                table.columns().len(),
-                wr,
-                strict,
-            );
-        } else if let Some(view) = schema.get_view(&lookup_name) {
-            emit_table_row(
-                program,
-                &view.name,
-                "view",
-                view.columns.len(),
-                false,
-                false,
-            );
+        match schema.get_table(&lookup_name) {
+            Some(table) => {
+                let (wr, strict) = match table.btree() {
+                    Some(bt) => (!bt.has_rowid, bt.is_strict),
+                    None => (false, false),
+                };
+                emit_table_row(
+                    program,
+                    table.get_name(),
+                    "table",
+                    table.columns().len(),
+                    wr,
+                    strict,
+                );
+            }
+            _ => {
+                if let Some(view) = schema.get_view(&lookup_name) {
+                    emit_table_row(
+                        program,
+                        &view.name,
+                        "view",
+                        view.columns.len(),
+                        false,
+                        false,
+                    );
+                }
+            }
         }
         return;
     }
@@ -1302,14 +1307,32 @@ fn query_pragma(
                 )?;
                 let lookup_name = normalize_table_pragma_lookup_name(table_database_id, &name);
                 resolver.with_schema(table_database_id, |db_schema| {
-                    if let Some(table) = db_schema.get_table(&lookup_name) {
-                        emit_columns_for_table_info(program, table.columns(), base_reg, false);
-                    } else if let Some(view_mutex) = db_schema.get_materialized_view(&lookup_name) {
-                        let view = view_mutex.lock();
-                        let flat_columns = view.column_schema.flat_columns();
-                        emit_columns_for_table_info(program, &flat_columns, base_reg, false);
-                    } else if let Some(view) = db_schema.get_view(&lookup_name) {
-                        emit_columns_for_table_info(program, &view.columns, base_reg, false);
+                    match db_schema.get_table(&lookup_name) {
+                        Some(table) => {
+                            emit_columns_for_table_info(program, table.columns(), base_reg, false);
+                        }
+                        _ => match db_schema.get_materialized_view(&lookup_name) {
+                            Some(view_mutex) => {
+                                let view = view_mutex.lock();
+                                let flat_columns = view.column_schema.flat_columns();
+                                emit_columns_for_table_info(
+                                    program,
+                                    &flat_columns,
+                                    base_reg,
+                                    false,
+                                );
+                            }
+                            _ => {
+                                if let Some(view) = db_schema.get_view(&lookup_name) {
+                                    emit_columns_for_table_info(
+                                        program,
+                                        &view.columns,
+                                        base_reg,
+                                        false,
+                                    );
+                                }
+                            }
+                        },
                     }
                 });
             }
@@ -1337,14 +1360,27 @@ fn query_pragma(
                 )?;
                 let lookup_name = normalize_table_pragma_lookup_name(table_database_id, &name);
                 resolver.with_schema(table_database_id, |db_schema| {
-                    if let Some(table) = db_schema.get_table(&lookup_name) {
-                        emit_columns_for_table_info(program, table.columns(), base_reg, true);
-                    } else if let Some(view_mutex) = db_schema.get_materialized_view(&lookup_name) {
-                        let view = view_mutex.lock();
-                        let flat_columns = view.column_schema.flat_columns();
-                        emit_columns_for_table_info(program, &flat_columns, base_reg, true);
-                    } else if let Some(view) = db_schema.get_view(&lookup_name) {
-                        emit_columns_for_table_info(program, &view.columns, base_reg, true);
+                    match db_schema.get_table(&lookup_name) {
+                        Some(table) => {
+                            emit_columns_for_table_info(program, table.columns(), base_reg, true);
+                        }
+                        _ => match db_schema.get_materialized_view(&lookup_name) {
+                            Some(view_mutex) => {
+                                let view = view_mutex.lock();
+                                let flat_columns = view.column_schema.flat_columns();
+                                emit_columns_for_table_info(program, &flat_columns, base_reg, true);
+                            }
+                            _ => {
+                                if let Some(view) = db_schema.get_view(&lookup_name) {
+                                    emit_columns_for_table_info(
+                                        program,
+                                        &view.columns,
+                                        base_reg,
+                                        true,
+                                    );
+                                }
+                            }
+                        },
                     }
                 });
             }

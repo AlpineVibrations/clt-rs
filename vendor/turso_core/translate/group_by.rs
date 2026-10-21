@@ -472,7 +472,7 @@ fn collect_result_columns<'a>(
                 if is_deferred_grouped_output_subquery(plan, *subquery_id) {
                     return Ok(WalkControl::SkipChildren);
                 }
-                if let Some(ref lhs) = lhs {
+                if let Some(lhs) = lhs {
                     let mut lhs_contains_agg = false;
                     walk_expr(lhs, &mut |expr: &ast::Expr| -> Result<WalkControl> {
                         if plan.aggregates.iter().any(|a| a.original_expr == *expr) {

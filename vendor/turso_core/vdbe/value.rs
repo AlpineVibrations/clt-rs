@@ -76,7 +76,7 @@ mod cmath {
 // we use exactly same math function as SQLite in tests in order to avoid mismatch in the differential tests due to floating-point precision issues
 #[cfg(clt_turso_tests)]
 mod cmath {
-    extern "C" {
+    unsafe extern "C" {
         pub fn exp(x: f64) -> f64;
         pub fn log(x: f64) -> f64;
         pub fn log10(x: f64) -> f64;

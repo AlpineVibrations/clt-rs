@@ -2065,11 +2065,7 @@ fn bind_insert(
         program.set_resolve_type(on_conflict);
     }
     while let Some(mut upsert_opt) = upsert.take() {
-        if let UpsertDo::Set {
-            ref mut sets,
-            ref mut where_clause,
-        } = &mut upsert_opt.do_clause
-        {
+        if let UpsertDo::Set { sets, where_clause } = &mut upsert_opt.do_clause {
             for set in sets.iter_mut() {
                 bind_and_rewrite_expr(
                     &mut set.expr,
@@ -2079,7 +2075,7 @@ fn bind_insert(
                     BindingBehavior::AllowUnboundIdentifiers,
                 )?;
             }
-            if let Some(ref mut where_expr) = where_clause {
+            if let Some(where_expr) = where_clause {
                 bind_and_rewrite_expr(
                     where_expr,
                     None,
@@ -2645,7 +2641,7 @@ fn translate_rows_multiple<'short, 'long: 'short>(
     temp_table_ctx: &Option<TempTableCtx>,
     is_strict: bool,
 ) -> Result<()> {
-    if let Some(ref temp_table_ctx) = temp_table_ctx {
+    if let Some(temp_table_ctx) = temp_table_ctx {
         // Rewind loop to read from ephemeral table
         program.emit_insn(Insn::Rewind {
             cursor_id: temp_table_ctx.cursor_id,

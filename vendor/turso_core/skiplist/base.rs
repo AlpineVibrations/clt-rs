@@ -2066,7 +2066,7 @@ where
         };
         match (&next_head, &self.tail) {
             // The next key is larger than the latest tail key we observed with this iterator.
-            (Some(ref next), Some(t))
+            (Some(next), Some(t))
                 if self.parent.comparator.compare(next.key(), t.key()).is_ge() =>
             {
                 unsafe {

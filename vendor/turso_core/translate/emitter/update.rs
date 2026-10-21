@@ -300,7 +300,7 @@ pub fn emit_program_for_update(
     let target_database_id = target_table.database_id;
     let mut index_cursors = Vec::with_capacity(plan.indexes_to_update.len());
     for index in &plan.indexes_to_update {
-        let index_cursor = if let Some(cursor) = program.resolve_cursor_id_safe(&CursorKey::index(
+        let index_cursor = match program.resolve_cursor_id_safe(&CursorKey::index(
             write_phase_tables
                 .joined_tables()
                 .first()
@@ -308,15 +308,16 @@ pub fn emit_program_for_update(
                 .internal_id,
             index.clone(),
         )) {
-            cursor
-        } else {
-            let cursor = program.alloc_cursor_index(None, index)?;
-            program.emit_insn(Insn::OpenWrite {
-                cursor_id: cursor,
-                root_page: RegisterOrLiteral::Literal(index.root_page),
-                db: target_database_id,
-            });
-            cursor
+            Some(cursor) => cursor,
+            _ => {
+                let cursor = program.alloc_cursor_index(None, index)?;
+                program.emit_insn(Insn::OpenWrite {
+                    cursor_id: cursor,
+                    root_page: RegisterOrLiteral::Literal(index.root_page),
+                    db: target_database_id,
+                });
+                cursor
+            }
         };
         let record_reg = program.alloc_register();
         index_cursors.push((index_cursor, record_reg));
@@ -1155,16 +1156,15 @@ fn emit_update_insns<'a>(
         .iter()
         .map(|set_clause| set_clause.column_index)
         .try_collect()?;
-    let has_any_update_triggers = if let Some(btree_table) = target_table.table.btree() {
-        has_triggers_including_temp(
+    let has_any_update_triggers = match target_table.table.btree() {
+        Some(btree_table) => has_triggers_including_temp(
             &t_ctx.resolver,
             update_database_id,
             TriggerEvent::Update,
             Some(&updated_column_indices),
             &btree_table,
-        )
-    } else {
-        false
+        ),
+        _ => false,
     };
 
     let check_rowid_not_exists_label = if not_exists_check_required || has_any_update_triggers {
@@ -1300,8 +1300,8 @@ fn emit_update_insns<'a>(
     // Fire BEFORE UPDATE triggers and preserve old_registers for AFTER triggers
     let mut has_before_triggers = false;
     let mut has_after_triggers = false;
-    let preserved_old_registers: Option<Vec<usize>> =
-        if let Some(btree_table) = target_table.table.btree() {
+    let preserved_old_registers: Option<Vec<usize>> = match target_table.table.btree() {
+        Some(btree_table) => {
             let relevant_before_update_triggers = get_triggers_including_temp(
                 &t_ctx.resolver,
                 update_database_id,
@@ -1434,9 +1434,9 @@ fn emit_update_insns<'a>(
                 // No BEFORE triggers — pass through whatever old_registers we have
                 old_registers
             }
-        } else {
-            None
-        };
+        }
+        _ => None,
+    };
 
     // If BEFORE UPDATE triggers fired, they may have modified the row being updated.
     // According to the SQLite documentation, the behavior in these cases is undefined:
@@ -2239,7 +2239,7 @@ fn emit_update_insns<'a>(
     }
 
     match &target_table.table {
-        Table::BTree(ref table) => {
+        Table::BTree(table) => {
             let record_reg = program.alloc_register();
             emit_make_record(
                 program,

@@ -2834,7 +2834,7 @@ impl Connection {
         self.db.mvcc_enabled()
     }
 
-    pub fn mv_store(&self) -> impl Deref<Target = Option<Arc<MvStore>>> {
+    pub fn mv_store(&self) -> impl Deref<Target = Option<Arc<MvStore>>> + use<> {
         struct TransparentWrapper<T>(T);
 
         impl<T> Deref for TransparentWrapper<T> {

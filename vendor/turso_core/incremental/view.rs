@@ -466,21 +466,24 @@ impl IncrementalView {
 
         // Skip CTEs - they're not real tables
         if !cte_names.contains(table_name) {
-            if let Some(table) = schema.get_btree_table(table_name) {
-                table_map.insert(table_name.to_string(), table);
-                qualified_names.insert(table_name.to_string(), qualified_name);
+            match schema.get_btree_table(table_name) {
+                Some(table) => {
+                    table_map.insert(table_name.to_string(), table);
+                    qualified_names.insert(table_name.to_string(), qualified_name);
 
-                // Store the alias mapping if there is an alias
-                if let Some(alias_enum) = alias {
-                    aliases.insert(
-                        alias_enum.name().as_str().to_string(),
-                        table_name.to_string(),
-                    );
+                    // Store the alias mapping if there is an alias
+                    if let Some(alias_enum) = alias {
+                        aliases.insert(
+                            alias_enum.name().as_str().to_string(),
+                            table_name.to_string(),
+                        );
+                    }
                 }
-            } else {
-                return Err(LimboError::ParseError(format!(
-                    "Table '{table_name}' not found in schema"
-                )));
+                _ => {
+                    return Err(LimboError::ParseError(format!(
+                        "Table '{table_name}' not found in schema"
+                    )));
+                }
             }
         }
         Ok(())
@@ -496,8 +499,7 @@ impl IncrementalView {
         cte_names: &HashSet<String>,
     ) -> Result<()> {
         if let ast::OneSelect::Select {
-            from: Some(ref from),
-            ..
+            from: Some(from), ..
         } = select
         {
             // Get the main table from FROM clause
@@ -530,7 +532,7 @@ impl IncrementalView {
         }
         // Extract WHERE conditions for this SELECT
         let where_expr = if let ast::OneSelect::Select {
-            where_clause: Some(ref where_expr),
+            where_clause: Some(where_expr),
             ..
         } = select
         {
