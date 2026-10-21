@@ -6,6 +6,8 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+## [0.8.4] - 2026-10-21
+
 ### Added
 
 - Press Enter on a running Doing task to send steering text to its active Codex
