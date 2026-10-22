@@ -6,6 +6,8 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-22
+
 ### Fixed
 
 - Recover an unpublished task commit whose only sealed-tree mismatch is the
