@@ -2,6 +2,37 @@ use crate::test_support::prelude::*;
 use crate::test_support::*;
 
 #[test]
+fn recovery_prompt_identifies_the_owned_task_even_when_todo_has_other_ready_work() {
+    for folders in [false, true] {
+        let root = temp_root("exact-recovery-prompt");
+        init_tasks(&root, folders).unwrap();
+        add_task(&root, "Style references", None).unwrap();
+        add_task(
+            &root,
+            "Feather mask. BLOCKED 2026-10-22: Waiting for recovery. codex:feather",
+            None,
+        )
+        .unwrap();
+        let mut project = crate::tui::tests::tui_agent_project_for_test(1, "project").project;
+        project.path = root.clone();
+        let mut command = Command::new("codex");
+        configure_automated_codex_subcommand(
+            &mut command,
+            &project,
+            AgentTaskSelection::ResumeSession,
+            Some("feather"),
+        )
+        .unwrap();
+        let prompt = command.get_args().last().unwrap().to_string_lossy();
+        assert!(prompt.contains("Exact task session for this run: codex:feather"));
+        assert!(prompt.contains("Linked task (todo):\nFeather mask."));
+        assert!(!prompt.contains("Style references"));
+        assert!(prompt.contains("stop without selecting or blocking another task"));
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
 fn returned_todo_keeps_session_fences_and_refuses_missing_git_boundary() {
     for scenario in [
         "missing-journal",

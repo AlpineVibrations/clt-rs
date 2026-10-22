@@ -166,7 +166,8 @@ fn actionable_follow_up_is_committed_and_can_start_a_fresh_git_run() {
                 AgentTaskSelection::NextTodo,
                 &[],
                 &[],
-                "follow-up-session"
+                "follow-up-session",
+                None,
             )
             .unwrap()
         );
@@ -401,7 +402,8 @@ fn blocked_follow_up_is_sealed_resealable_and_recoverable_in_both_board_formats(
                 AgentTaskSelection::RecoverBlocked,
                 &doing_before,
                 &blocked_before,
-                "follow-up-own-session"
+                "follow-up-own-session",
+                None,
             )
             .unwrap()
         );

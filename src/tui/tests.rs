@@ -2,6 +2,83 @@ use crate::test_support::prelude::*;
 use crate::test_support::*;
 
 #[test]
+fn worker_task_activity_stays_visible_on_board_projects_and_logs() {
+    use crate::application::activity::{WorkerActivity, WorkerActivityPhase};
+    let root = temp_root("visible-worker-task");
+    init_tasks(&root, false).unwrap();
+    add_task(&root, "Feather mask codex:owned", None).unwrap();
+    let mut app = TuiApp::new(&root, true);
+    app.refresh_task_snapshot();
+    let mut project = tui_agent_project_for_test(1, "project");
+    project.project.path = root.clone();
+    project.runtime_state = TuiAgentRuntimeState::Resuming;
+    project.activity = Some(WorkerActivity {
+        phase: WorkerActivityPhase::Resuming,
+        summary: "Resuming: TODO #1 — Feather mask".into(),
+        session_id: Some("owned".into()),
+    });
+    app.agent_panel.projects = vec![project];
+    app.agent_panel.state.select(Some(0));
+    app.task_agent_session_states
+        .insert("owned".into(), AgentSessionControlState::Running);
+    for width in [80, 160] {
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(width, 24)).unwrap();
+        for pane in [TuiPane::Tasks, TuiPane::AgentProjects] {
+            app.current_pane = pane;
+            for logs in [false, true] {
+                app.agent_log_view = logs
+                    .then(|| TuiAgentLogView::message("project".into(), "Worker output".into()));
+                app.feedback_buffer = "Deletion refused: task is still running".into();
+                app.prepare_render(Rect::new(0, 0, width, 24));
+                terminal.draw(|frame| render_tui(frame, &app)).unwrap();
+                let buffer = terminal.backend().buffer();
+                let text = (0..24)
+                    .map(|y| {
+                        (0..width)
+                            .map(|x| buffer[(x, y)].symbol())
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(
+                    text.contains("Agent: Resuming: TODO #1 — Feather mask"),
+                    "{text}"
+                );
+                assert!(
+                    text.contains(if logs {
+                        "Worker output"
+                    } else {
+                        "Deletion refused"
+                    }),
+                    "{text}"
+                );
+                if pane == TuiPane::Tasks {
+                    assert!(text.contains("[RUNNING]"), "{text}");
+                }
+            }
+        }
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn worker_phase_labels_distinguish_review_startup_and_cleanup() {
+    use crate::application::activity::WorkerActivityPhase;
+    for (phase, label) in [
+        (WorkerActivityPhase::Starting, "STARTING"),
+        (WorkerActivityPhase::Running, "RUNNING"),
+        (WorkerActivityPhase::Resuming, "RESUMING"),
+        (WorkerActivityPhase::Reviewing, "REVIEWING"),
+        (WorkerActivityPhase::Settling, "SETTLING"),
+    ] {
+        let state = TuiAgentRuntimeState::from_worker_phase(phase);
+        assert_eq!(state.label(), label);
+        assert!(state.is_running());
+    }
+    assert!(!TuiAgentRuntimeState::Waiting.is_running());
+}
+
+#[test]
 fn tui_requests_unambiguous_reporting_for_board_shortcuts() {
     let flags = tui_keyboard_enhancement_flags(false);
 
@@ -478,6 +555,7 @@ pub(crate) fn tui_agent_project_for_test(id: i64, name: &str) -> TuiAgentProject
         runtime_state: TuiAgentRuntimeState::Idle,
         daemon_scan_problem: None,
         failure_problem: None,
+        activity: None,
         resolved_codex: TuiAgentResolvedCodexTarget::default(),
     }
 }
@@ -902,6 +980,7 @@ fn tui_agent_project_removal_requires_confirmation_and_only_unregisters() {
             runtime_state: TuiAgentRuntimeState::Idle,
             daemon_scan_problem: None,
             failure_problem: None,
+            activity: None,
             resolved_codex: TuiAgentResolvedCodexTarget::default(),
         }],
         current_project_registration: None,
@@ -1009,6 +1088,7 @@ fn tui_working_project_removal_fixture(protection: &str) -> TuiWorkingProjectRem
             runtime_state: TuiAgentRuntimeState::Finalizing,
             daemon_scan_problem: None,
             failure_problem: None,
+            activity: None,
             resolved_codex: TuiAgentResolvedCodexTarget::default(),
         }],
         current_project_registration: None,
@@ -1398,6 +1478,7 @@ fn reaped_session_logs_are_latest_while_project_runtime_still_looks_active() {
                 runtime_state: TuiAgentRuntimeState::Running,
                 daemon_scan_problem: None,
                 failure_problem: None,
+                activity: None,
                 resolved_codex: TuiAgentResolvedCodexTarget::default(),
             }],
             current_project_registration: None,
@@ -1511,6 +1592,7 @@ fn git_recovery_without_logs_keeps_exact_completed_session_output() {
             runtime_state: TuiAgentRuntimeState::Idle,
             daemon_scan_problem: None,
             failure_problem: None,
+            activity: None,
             resolved_codex: TuiAgentResolvedCodexTarget::default(),
         }],
         current_project_registration: None,
@@ -1625,6 +1707,7 @@ fn completed_log_is_latest_but_a_newer_attempt_of_the_same_session_is_live() {
             runtime_state: TuiAgentRuntimeState::Running,
             daemon_scan_problem: None,
             failure_problem: None,
+            activity: None,
             resolved_codex: TuiAgentResolvedCodexTarget::default(),
         }],
         current_project_registration: None,
@@ -1726,6 +1809,7 @@ fn fenced_agent_log_view_keeps_the_orphaned_session_controllable() {
             runtime_state: TuiAgentRuntimeState::Fenced,
             daemon_scan_problem: None,
             failure_problem: None,
+            activity: None,
             resolved_codex: TuiAgentResolvedCodexTarget::default(),
         }],
         current_project_registration: None,
@@ -1805,6 +1889,7 @@ fn completed_task_keeps_reaped_session_output_without_run_history() {
             runtime_state: TuiAgentRuntimeState::Idle,
             daemon_scan_problem: None,
             failure_problem: None,
+            activity: None,
             resolved_codex: TuiAgentResolvedCodexTarget::default(),
         }],
         current_project_registration: None,
@@ -2115,6 +2200,7 @@ fn open_kanban_agent_log_follows_the_selected_task() {
             runtime_state: TuiAgentRuntimeState::Idle,
             daemon_scan_problem: None,
             failure_problem: None,
+            activity: None,
             resolved_codex: TuiAgentResolvedCodexTarget::default(),
         }],
         current_project_registration: None,
@@ -2294,6 +2380,7 @@ fn open_agent_log_follows_the_highlighted_project() {
                 runtime_state: TuiAgentRuntimeState::Idle,
                 daemon_scan_problem: None,
                 failure_problem: None,
+                activity: None,
                 resolved_codex: TuiAgentResolvedCodexTarget::default(),
             })
             .collect(),
@@ -2415,7 +2502,17 @@ fn tui_agent_runtime_state_surfaces_failed_recovery_over_pending_finalization() 
             Some(GitFinalizationState::Working),
             false,
         ),
-        TuiAgentRuntimeState::Finalizing
+        TuiAgentRuntimeState::Fenced
+    );
+    assert_eq!(
+        resolve_tui_agent_runtime_state(
+            TuiAgentRuntimeState::Idle,
+            false,
+            false,
+            Some(GitFinalizationState::Working),
+            false,
+        ),
+        TuiAgentRuntimeState::Waiting
     );
     assert_eq!(
         resolve_tui_agent_runtime_state(

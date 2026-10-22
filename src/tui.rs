@@ -40,6 +40,7 @@ use crate::{
         set_codex_model_reasoning_if_default_at, upsert_codex_provider_config_at,
         valid_environment_variable_name,
     },
+    application::activity::{WorkerActivity, WorkerActivityPhase, describe_worker_activity},
     application::git_recovery::{
         GitRecoveryPlan, failure_has_git_recovery, failure_has_missing_git_start,
         plan_git_recovery, recover_git_task,
@@ -225,12 +226,24 @@ pub(super) fn prefix_task_agent_flag(
     entry: &TaskEntry,
     session_states: &TaskAgentSessionStates,
 ) -> String {
-    if status != TaskStatus::Done && crate::task::task_content_is_manual(&entry.content) {
+    let session_state = recoverable_codex_session_id_from_task_content(&entry.content)
+        .and_then(|session| session_states.get(session));
+    let text = if status != TaskStatus::Done && crate::task::task_content_is_manual(&entry.content)
+    {
         format!("[MANUAL] {text}")
-    } else if task_has_stopped_agent_flag(status, entry, session_states) {
+    } else if !matches!(
+        session_state,
+        Some(AgentSessionControlState::Running | AgentSessionControlState::StopRequested)
+    ) && task_has_stopped_agent_flag(status, entry, session_states)
+    {
         format!("[STOPPED] {text}")
     } else {
         text
+    };
+    match session_state {
+        Some(AgentSessionControlState::Running) => format!("[RUNNING] {text}"),
+        Some(AgentSessionControlState::StopRequested) => format!("[STOPPING] {text}"),
+        _ => text,
     }
 }
 
@@ -1210,6 +1223,7 @@ pub(super) struct TuiAgentProject {
     pub(super) project: agent::AgentProject,
     pub(super) scan: AgentProjectScan,
     pub(super) runtime_state: TuiAgentRuntimeState,
+    pub(super) activity: Option<WorkerActivity>,
     pub(super) daemon_scan_problem: Option<String>,
     pub(super) failure_problem: Option<String>,
     /// What Codex runs for this project when its own settings are unset.
@@ -1229,7 +1243,12 @@ impl TuiAgentProject {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum TuiAgentRuntimeState {
     Idle,
+    Starting,
     Running,
+    Resuming,
+    Reviewing,
+    Settling,
+    Waiting,
     Finalizing,
     PushPending,
     Interactive,
@@ -1242,7 +1261,12 @@ impl TuiAgentRuntimeState {
     pub(super) fn label(self) -> &'static str {
         match self {
             Self::Idle => "IDLE",
+            Self::Starting => "STARTING",
             Self::Running => "RUNNING",
+            Self::Resuming => "RESUMING",
+            Self::Reviewing => "REVIEWING",
+            Self::Settling => "SETTLING",
+            Self::Waiting => "WAITING",
             Self::Finalizing => "FINAL",
             Self::PushPending => "PUSH",
             Self::Interactive => "INTERACTIVE",
@@ -1253,11 +1277,27 @@ impl TuiAgentRuntimeState {
     }
 
     pub(super) fn is_running(self) -> bool {
-        self == Self::Running
+        matches!(
+            self,
+            Self::Starting | Self::Running | Self::Resuming | Self::Reviewing | Self::Settling
+        )
+    }
+
+    fn from_worker_phase(phase: WorkerActivityPhase) -> Self {
+        match phase {
+            WorkerActivityPhase::Starting => Self::Starting,
+            WorkerActivityPhase::Running => Self::Running,
+            WorkerActivityPhase::Resuming => Self::Resuming,
+            WorkerActivityPhase::Reviewing => Self::Reviewing,
+            WorkerActivityPhase::Settling => Self::Settling,
+        }
     }
 
     pub(super) fn explanation(self) -> Option<&'static str> {
         match self {
+            Self::Waiting => Some(
+                "Unfinished task work is saved for recovery. No agent worker is currently running for this project.",
+            ),
             Self::Interactive => Some(
                 "Interactive Codex session is open. Queued tasks wait until it releases this project. Press s to stop the session, or l to view its output.",
             ),
@@ -2769,14 +2809,25 @@ pub(super) fn load_tui_agent_panel_snapshot_inner(
     };
     let projects = store.list_projects_blocking()?;
     let active_leases = store.list_active_leases_blocking(&agent_timestamp())?;
+    let active_workers = store.list_active_workers_blocking()?;
     let pending_git_finalizations = if store.pending_migration_version().is_some() {
         HashMap::new()
     } else {
         store
             .list_pending_git_finalizations_blocking(None)?
             .into_iter()
-            .map(|finalization| (finalization.project_id, finalization.state))
-            .collect::<HashMap<_, _>>()
+            .fold(HashMap::new(), |mut states, finalization| {
+                // A saved WORKING task must not hide another task's sealed proof.
+                states
+                    .entry(finalization.project_id)
+                    .and_modify(|state| {
+                        if finalization.state.is_finalizing() {
+                            *state = finalization.state;
+                        }
+                    })
+                    .or_insert(finalization.state);
+                states
+            })
     };
     let suspending_session_projects = store.suspending_session_project_ids_blocking()?;
     let failure_backoff = agent_failure_backoff()?;
@@ -2826,8 +2877,21 @@ pub(super) fn load_tui_agent_panel_snapshot_inner(
                 .or_else(|| {
                     tui_agent_failure_problem(&project, relevant_failure, now, failure_backoff)
                 });
+            let activity = active_workers
+                .iter()
+                .find(|worker| worker.project_id == project.id)
+                .map(|worker| {
+                    Ok::<_, anyhow::Error>(describe_worker_activity(
+                        worker,
+                        &store.session_controls_for_project_blocking(project.id)?,
+                    ))
+                })
+                .transpose()?;
             let runtime_state = resolve_tui_agent_runtime_state(
-                tui_agent_runtime_state(project.id, &active_leases),
+                activity
+                    .as_ref()
+                    .map(|activity| TuiAgentRuntimeState::from_worker_phase(activity.phase))
+                    .unwrap_or_else(|| tui_agent_runtime_state(project.id, &active_leases)),
                 interactive_session_projects.contains(&project.id),
                 suspending_session_projects.contains(&project.id),
                 pending_git_finalizations.get(&project.id).copied(),
@@ -2838,6 +2902,7 @@ pub(super) fn load_tui_agent_panel_snapshot_inner(
                 project,
                 scan,
                 runtime_state,
+                activity,
                 daemon_scan_problem,
                 failure_problem,
                 resolved_codex,
@@ -2906,7 +2971,13 @@ pub(super) fn resolve_tui_agent_runtime_state(
         TuiAgentRuntimeState::Idle | TuiAgentRuntimeState::Fenced
     ) && let Some(finalization_state) = pending_git_finalization
     {
-        runtime_state = if finalization_state == GitFinalizationState::PushPending {
+        runtime_state = if finalization_state == GitFinalizationState::Working {
+            if runtime_state == TuiAgentRuntimeState::Fenced {
+                TuiAgentRuntimeState::Fenced
+            } else {
+                TuiAgentRuntimeState::Waiting
+            }
+        } else if finalization_state == GitFinalizationState::PushPending {
             TuiAgentRuntimeState::PushPending
         } else {
             TuiAgentRuntimeState::Finalizing
@@ -4371,6 +4442,11 @@ pub(super) fn format_agent_project_table_row(
     let path_or_error = item
         .displayed_problem()
         .and_then(|problem| problem.lines().next())
+        .or_else(|| {
+            item.activity
+                .as_ref()
+                .map(|activity| activity.summary.as_str())
+        })
         .unwrap_or_else(|| item.project.path.to_str().unwrap_or("<non-UTF-8 path>"));
 
     if width < 120 {
@@ -4526,7 +4602,7 @@ pub(super) fn format_agent_project_table_header(
                 fit_cell("CODEX", codex_width),
                 TUI_AGENT_TABLE_CODEX_LAST_RUN_GAP,
                 fit_cell("LAST RUN", 11),
-                fit_cell("PATH / ERROR", path_width)
+                fit_cell("ACTIVITY / PATH / ERROR", path_width)
             ),
             width,
         );
@@ -4567,7 +4643,7 @@ pub(super) fn format_agent_project_table_header(
             fit_cell("CODEX", codex_width),
             TUI_AGENT_TABLE_CODEX_LAST_RUN_GAP,
             fit_cell("LAST RUN", last_run_width),
-            fit_cell("PATH / ERROR", path_width)
+            fit_cell("ACTIVITY / PATH / ERROR", path_width)
         ),
         width,
     )
@@ -5237,14 +5313,36 @@ pub(super) fn tui_console_content<'a>(
         && (feedback.is_empty()
             || feedback == tui_agent_panel_instructions()
             || feedback == TUI_NO_ACTIVE_BOARD_MESSAGE)
-        && let Some(explanation) = panel
-            .selected_project()
-            .and_then(|project| project.runtime_state.explanation())
+        && let Some(explanation) = panel.selected_project().and_then(|project| {
+            project
+                .activity
+                .as_ref()
+                .map(|activity| activity.summary.as_str())
+                .or_else(|| project.runtime_state.explanation())
+        })
     {
         return (explanation, Color::Gray);
     }
 
     (feedback, Color::Gray)
+}
+
+fn tui_worker_activity(app: &TuiApp) -> Option<&str> {
+    let project = match app.current_pane {
+        TuiPane::AgentProjects if !app.agent_panel.supervisor_selected => {
+            app.agent_panel.selected_project()
+        }
+        TuiPane::Tasks => app
+            .agent_panel
+            .projects
+            .iter()
+            .find(|project| project.project.path == app.active_root),
+        _ => None,
+    }?;
+    project
+        .activity
+        .as_ref()
+        .map(|activity| activity.summary.as_str())
 }
 
 pub(super) fn tui_keyboard_enhancement_flags(text_input: bool) -> KeyboardEnhancementFlags {
@@ -6347,6 +6445,7 @@ impl TuiApp {
         let content_height = size
             .height
             .saturating_sub(input_height)
+            .saturating_sub(u16::from(tui_worker_activity(self).is_some()))
             .saturating_sub(console_height);
 
         if self.current_pane == TuiPane::AgentProjects {
@@ -6869,15 +6968,28 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
         )
     };
 
-    // Main layout: active pane, input area (if active), and feedback console
+    // Keep worker ownership visible beside the board and while viewing logs.
+    let activity = tui_worker_activity(app);
     let main_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(0),
+            Constraint::Length(u16::from(activity.is_some())),
             Constraint::Length(input_height),
             Constraint::Length(console_height),
         ])
         .split(size);
+
+    if let Some(activity) = activity {
+        f.render_widget(
+            Paragraph::new(truncate_to_width(
+                &format!("Agent: {activity}"),
+                size.width as usize,
+            ))
+            .style(Style::default().fg(Color::Yellow)),
+            main_layout[1],
+        );
+    }
 
     let content_area = main_layout[0];
     if app.current_pane == TuiPane::AgentProjects {
@@ -7106,8 +7218,37 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
                     height: visible_height,
                 };
 
-                let item_text = format!("{}. {}", idx + 1, wrapped_content);
-                f.render_widget(Paragraph::new(item_text).style(style), item_area);
+                let mut badge_remaining =
+                    if recoverable_codex_session_id_from_task_content(&entry.content)
+                        .and_then(|session| app.task_agent_session_states.get(session))
+                        == Some(&AgentSessionControlState::Running)
+                    {
+                        "[RUNNING]".len()
+                    } else {
+                        0
+                    };
+                let mut item_lines: Vec<Line<'_>> = wrapped_content
+                    .lines()
+                    .map(|line| {
+                        // Keep the badge readable even on the yellow selected row.
+                        // Only its ASCII characters receive these colors.
+                        let badge_end = badge_remaining.min(line.len());
+                        badge_remaining -= badge_end;
+                        Line::from(vec![
+                            Span::styled(
+                                &line[..badge_end],
+                                Style::default()
+                                    .fg(Color::Rgb(80, 240, 150))
+                                    .bg(Color::Rgb(18, 45, 30)),
+                            ),
+                            Span::raw(&line[badge_end..]),
+                        ])
+                    })
+                    .collect();
+                if let Some(first) = item_lines.first_mut() {
+                    first.spans.insert(0, Span::raw(format!("{}. ", idx + 1)));
+                }
+                f.render_widget(Paragraph::new(item_lines).style(style), item_area);
 
                 current_y += line_count;
                 if current_y >= task_list_inner.height as usize {
@@ -7127,9 +7268,9 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
                     .title("Models Input (Enter advances/saves, Esc cancels)"),
             )
             .style(Style::default().fg(Color::White));
-        f.render_widget(input_paragraph, main_layout[1]);
+        f.render_widget(input_paragraph, main_layout[2]);
         let cursor = label.chars().count() + model_input.input.visual_cursor();
-        let input_inner = main_layout[1].inner(ratatui::layout::Margin {
+        let input_inner = main_layout[2].inner(ratatui::layout::Margin {
             horizontal: 1,
             vertical: 1,
         });
@@ -7163,14 +7304,14 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
                 },
             ))
             .style(Style::default().fg(Color::White));
-        f.render_widget(input_paragraph, main_layout[1]);
+        f.render_widget(input_paragraph, main_layout[2]);
 
         let (cursor_x, cursor_y) = input_cursor_offset_at(
             &input_text,
             available_width,
             label.len() + byte_index_at_char(&display_value, app.task_input.display_cursor()),
         );
-        let input_inner = main_layout[1].inner(ratatui::layout::Margin {
+        let input_inner = main_layout[2].inner(ratatui::layout::Margin {
             horizontal: 1,
             vertical: 1,
         });

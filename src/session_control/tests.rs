@@ -3027,6 +3027,7 @@ fn live_codex_session_is_attached_when_a_todo_task_enters_doing() {
             &before,
             &[],
             "session-live",
+            None,
         )
         .unwrap()
     );
@@ -3063,6 +3064,7 @@ fn live_codex_session_is_not_reattached_after_its_task_leaves_doing() {
             &[],
             &[],
             "session-live",
+            None,
         )
         .unwrap()
     );
@@ -3140,6 +3142,7 @@ fn exact_session_without_its_marker_does_not_guess_an_unrelated_doing_task() {
             &[],
             &[],
             "session-live",
+            None,
         )
         .unwrap()
     );
@@ -3194,6 +3197,7 @@ fn nested_session_marker_prevents_top_level_reattachment() {
             &[],
             &[],
             "session-live",
+            None,
         )
         .unwrap()
     );
@@ -3227,6 +3231,7 @@ fn blocked_recovery_does_not_guess_among_multiple_pre_run_candidates() {
             &doing_before,
             &blocked_before,
             "session-live",
+            None,
         )
         .unwrap()
     );
@@ -3253,6 +3258,7 @@ fn live_session_attachment_does_not_guess_between_multiple_new_doing_tasks() {
             &[],
             &[],
             "session-live",
+            None,
         )
         .unwrap()
     );
@@ -3378,6 +3384,7 @@ fn interactive_c_busy_check_honors_persisted_session_fences_without_a_live_log()
             runtime_state: TuiAgentRuntimeState::Idle,
             daemon_scan_problem: None,
             failure_problem: None,
+            activity: None,
             resolved_codex: TuiAgentResolvedCodexTarget::default(),
         }],
         current_project_registration: None,
@@ -3539,6 +3546,7 @@ fn writable_shared_interactive_reservation_coexists_with_another_active_session(
             runtime_state: TuiAgentRuntimeState::Interactive,
             daemon_scan_problem: None,
             failure_problem: None,
+            activity: None,
             resolved_codex: TuiAgentResolvedCodexTarget::default(),
         }],
         current_project_registration: None,

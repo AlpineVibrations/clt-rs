@@ -1,5 +1,107 @@
 use super::*;
 
+#[test]
+fn user_delete_deferred_task_during_read_only_supervisor_review() {
+    for folders in [false, true] {
+        for registered_session in [false, true] {
+            let (root, project_root, store, journal) = deletion_fixture("delete-during-review");
+            let board = TaskBoard::new(get_tasks_dir(&project_root));
+            board
+                .move_task_after_lock(TaskStatus::Doing, TaskStatus::Todo, 1)
+                .unwrap();
+            if folders {
+                expand_status_for_command(board.path(), TaskStatus::Todo).unwrap();
+            }
+            assert!(
+                store
+                    .try_acquire_lease_blocking(
+                        journal.project_id,
+                        "scheduler",
+                        "100",
+                        "9999999999"
+                    )
+                    .unwrap()
+            );
+            assert!(
+                store
+                    .reserve_worker_blocking(agent::AgentWorkerReservation {
+                        project_id: journal.project_id,
+                        worker_token: "review-worker",
+                        expected_lease_holder: "scheduler",
+                        max_active_workers: 1,
+                        protocol_version: AGENT_WORKER_PROTOCOL_VERSION,
+                        service_label: "review-worker-service",
+                        binary_path: Path::new("/tmp/review-worker"),
+                        command_arguments: "[]",
+                        path_env: OsStr::new("/usr/bin"),
+                        codex_path: None,
+                        task_selection: "supervisor_review",
+                        resume_session_id: None,
+                        created_at: "101",
+                    })
+                    .unwrap()
+            );
+            assert!(
+                store
+                    .claim_worker_blocking("review-worker", std::process::id(), "102")
+                    .unwrap()
+            );
+            if registered_session {
+                store
+                    .mark_session_running_blocking(
+                        journal.project_id,
+                        "review-session",
+                        std::process::id(),
+                        "review-worker",
+                        &root.join("review.out"),
+                        &root.join("review.err"),
+                    )
+                    .unwrap();
+            }
+            let worker = store.list_active_workers_blocking().unwrap();
+            let lease = store
+                .lease_for_project_blocking(journal.project_id)
+                .unwrap()
+                .unwrap();
+            let controls = store
+                .session_control_blocking(journal.project_id, "review-session")
+                .unwrap();
+            let evidence =
+                crate::supervisor::evidence(&store.list_projects_blocking().unwrap()[0]).unwrap();
+            delete_task_in_board_with_store(board.path(), TaskStatus::Todo, "1", &store).unwrap();
+            assert!(board.entries(TaskStatus::Todo).unwrap().is_empty());
+            assert_eq!(
+                store
+                    .git_finalization_blocking(journal.project_id, "session-deletion")
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                GitFinalizationState::Cancelled
+            );
+            assert_eq!(store.list_active_workers_blocking().unwrap(), worker);
+            assert_eq!(
+                store
+                    .lease_for_project_blocking(journal.project_id)
+                    .unwrap()
+                    .unwrap()
+                    .holder,
+                lease.holder
+            );
+            assert_eq!(
+                store
+                    .session_control_blocking(journal.project_id, "review-session")
+                    .unwrap(),
+                controls
+            );
+            assert_ne!(
+                crate::supervisor::evidence(&store.list_projects_blocking().unwrap()[0]).unwrap(),
+                evidence
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+}
+
 fn deletion_fixture(
     name: &str,
 ) -> (

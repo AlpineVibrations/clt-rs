@@ -13,6 +13,7 @@ use std::{
 
 use anyhow::{Context, Result};
 
+pub(super) mod activity;
 pub(super) mod git_recovery;
 
 use crate::{
@@ -528,11 +529,17 @@ pub(super) fn show_agent_status(store: &agent::TursoAgentStore) -> Result<()> {
         println!();
         println!("Independent workers:");
         for worker in &active_workers {
+            let activity = activity::describe_worker_activity(
+                worker,
+                &store.session_controls_for_project_blocking(worker.project_id)?,
+            );
             println!(
-                "project={} {} state={} protocol={} token={} pid={} service={} binary={} path={}",
+                "project={} {} state={} selection={} session={} protocol={} token={} pid={} service={} binary={} path={}",
                 worker.project_id,
                 worker.project_name,
                 worker.state,
+                worker.task_selection,
+                activity.session_id.as_deref().unwrap_or("-"),
                 worker.protocol_version,
                 worker.worker_token,
                 worker
@@ -543,6 +550,7 @@ pub(super) fn show_agent_status(store: &agent::TursoAgentStore) -> Result<()> {
                 worker.binary_path.display(),
                 worker.project_path.display()
             );
+            println!("   activity  {}", activity.summary);
         }
     }
 
@@ -1717,16 +1725,40 @@ fn mutate_user_managed_task_with_store_after_lock(
     let acquired_at = agent_timestamp();
     let expires_at = agent_timestamp_after(AGENT_TASK_CANCELLATION_LEASE_SECONDS);
     let lease_holder = task_cancellation_lease_holder();
-    if !store.cancel_idle_working_git_finalization_blocking(
-        project.id,
-        session_id,
-        finalization.generation,
-        bound_identity,
-        &lease_holder,
-        &acquired_at,
-        &expires_at,
-        cancellation,
-    )? {
+    if !store
+        .cancel_idle_working_git_finalization_blocking(
+            project.id,
+            session_id,
+            finalization.generation,
+            bound_identity,
+            &lease_holder,
+            &acquired_at,
+            &expires_at,
+            cancellation,
+        )
+        .map_err(|error| {
+            // Preserve the authoritative transaction failure even if a later
+            // activity snapshot is unavailable or the worker has just exited.
+            let activity = store
+                .list_active_workers_blocking()
+                .ok()
+                .and_then(|workers| {
+                    workers
+                        .into_iter()
+                        .find(|worker| worker.project_id == project.id)
+                })
+                .and_then(|worker| {
+                    store
+                        .session_controls_for_project_blocking(project.id)
+                        .ok()
+                        .map(|controls| activity::describe_worker_activity(&worker, &controls))
+                });
+            match activity {
+                Some(activity) => error.context(format!("Agent activity: {}", activity.summary)),
+                None => error,
+            }
+        })?
+    {
         let current = store.git_finalization_blocking(project.id, session_id)?;
         let state = current
             .as_ref()

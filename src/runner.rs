@@ -794,6 +794,18 @@ fn configure_automated_codex_subcommand_with_direction(
             .arg(&project.path);
     }
     let mut prompt = agent_codex_prompt(project, task_selection);
+    if let Some(session) = session_id.as_deref() {
+        let mut linked = Vec::new();
+        crate::session_control::collect_codex_session_tasks_in_board(
+            &get_tasks_dir(&project.path),
+            session,
+            &mut linked,
+        )?;
+        prompt.push_str(&format!("\n\nExact task session for this run: codex:{session}. Work only on the task carrying this marker. If its link is missing or ambiguous, stop without selecting or blocking another task.\n"));
+        if let [(status, task)] = linked.as_slice() {
+            prompt.push_str(&format!("Linked task ({status}):\n{}\n", task.content));
+        }
+    }
     if task_selection == AgentTaskSelection::NextTodo
         && let Some(session_id) = session_id.as_deref()
     {
@@ -2058,6 +2070,14 @@ impl CodexAgentRunner {
         } else {
             None
         };
+        let selected_task_identity = if task_selection == AgentTaskSelection::NextTodo {
+            read_task_entries(&get_tasks_dir(&project.path), TaskStatus::Todo)?
+                .into_iter()
+                .find(task_entry_is_ready)
+                .and_then(|task| durable_task_identity(&task.content))
+        } else {
+            None
+        };
         let resumed_todo_index = if let Some(session_id) = known_session_id
             .as_deref()
             .filter(|_| !starting_planning_session && todo_launch_lock.is_some())
@@ -2304,6 +2324,7 @@ impl CodexAgentRunner {
                         &doing_task_contents_before,
                         &blocked_task_snapshots_before,
                         session_id,
+                        selected_task_identity.as_deref(),
                     ) {
                         Ok(attached) => {
                             session_linked = attached;

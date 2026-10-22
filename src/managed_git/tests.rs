@@ -13,6 +13,7 @@ mod orphan;
 mod projection;
 mod shared_interactive;
 mod staged_start;
+mod superseded;
 
 #[test]
 fn agent_store_git_finalization_crud_is_idempotent_and_generation_fenced() {
@@ -1654,7 +1655,8 @@ fn user_done_move_refuses_an_active_managed_git_worker() {
         &store,
     )
     .unwrap_err();
-    assert!(format!("{error:#}").contains("still has an active agent worker"));
+    assert!(format!("{error:#}").contains("active agent worker"));
+    assert!(format!("{error:#}").contains("Agent activity:"));
     assert_eq!(
         store
             .git_finalization_blocking(finalization.project_id, session_id)
@@ -2312,6 +2314,45 @@ fn working_link_repair_finishes_marker_and_duplicate_activation_crashes() {
     assert_eq!(doing[0].content, linked);
 
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn working_link_repair_preserves_a_different_sessions_task_marker() {
+    for folders in [false, true] {
+        let (root, project_root, store, journal) = working_git_link_race_fixture_with_mode(
+            "working-repair-other-session",
+            "Feather mask",
+            "old-session",
+            "old-run",
+            AgentGitMode::Commit,
+        );
+        let board = TaskBoard::new(get_tasks_dir(&project_root));
+        let task = board.entry(TaskStatus::Todo, 1).unwrap();
+        board
+            .write_entry_content(
+                TaskStatus::Todo,
+                &task,
+                "Feather mask codex:replacement-session",
+            )
+            .unwrap();
+        if folders {
+            expand_status_for_command(board.path(), TaskStatus::Todo).unwrap();
+        }
+        let before = board.entry(TaskStatus::Todo, 1).unwrap();
+        assert!(!repair_working_git_task_link(&store, &project_root, &journal).unwrap());
+        let after = board.entry(TaskStatus::Todo, 1).unwrap();
+        assert_eq!(after.source, before.source);
+        assert_eq!(after.content, before.content);
+        assert!(board.entries(TaskStatus::Doing).unwrap().is_empty());
+        assert_eq!(
+            store
+                .git_finalization_blocking(journal.project_id, "old-session")
+                .unwrap()
+                .unwrap(),
+            journal
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[test]

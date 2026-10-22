@@ -2322,6 +2322,11 @@ pub(super) fn attach_codex_session_to_task_after_lock(
     if current.content != entry.content {
         anyhow::bail!("Task content changed before its Codex session could be attached; retry");
     }
+    anyhow::ensure!(
+        recoverable_codex_session_id_from_task_content(&current.content)
+            .is_none_or(|owner| owner == session_id),
+        "Task already belongs to another Codex session; preserve its existing task and Git journal"
+    );
     let content = task_content_with_codex_session(&current.content, session_id);
     write_task_entry_content_with_before_replace(
         &board_dir,

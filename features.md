@@ -142,6 +142,18 @@ When the current project is registered, the Kanban console title appends its age
 
 ### Agent Projects
 
+The `AGENT` column distinguishes `STARTING`, `RUNNING`, `RESUMING`, `REVIEWING`
+and `SETTLING`. The activity column and the line above the console show the
+worker's exact linked task, its current board column and its number, including
+tasks still in Todo or already in Done. The activity line also stays visible
+while viewing logs. `REVIEWING` means the supervisor is assessing blocked work;
+`SETTLING` means the worker is finishing cleanup. `WAITING` means unfinished work
+is saved without a running worker. A worker awaiting its task link says so.
+Task cards and CLI listings mark active sessions `[RUNNING]` or `[STOPPING]`.
+The TUI displays the `[RUNNING]` badge in bright mint green on a dark green
+background, keeping it readable on highlighted task rows.
+`clt agent status` includes each worker's selection, session and task activity.
+
 Press `Tab` to toggle between the task board and the full-screen Agent Projects pane. In Agent Projects, Up/Down selects a registered project, `Enter` opens that project's task board, `Space` toggles the project `ON` or `OFF`, `Delete` removes it from the agent list after a `y`/`n` confirmation, and `g` cycles the `GIT` column through `OFF`, `COM`, and `PUSH`. These modes disable Git automation, ask Codex to create a task commit, or ask Codex to create that commit and let CLT publish it. Removing a project unregisters it from the agent list and clears its stored agent history, including unfinished Git finalizations and launch boundaries. It leaves the project, task files, and Git checkout unchanged. Removal is refused while an independent worker or agent lease is active. The currently open project is marked with `*`, the pane's top border shows the current local time before the daemon status, and the terminal title updates to the active project.
 
 The daemon persists its own project-scan result separately from the TUI's local task count. If the background service cannot read a project, or a pending project is waiting after a failed run, the `AGENT` column shows `ERROR`, the row turns red, and selecting it shows the full cause and recovery guidance in the console. Retryable failures include their automatic-retry timing; after correcting the cause, press `r` to clear the cooldown and retry immediately. Missing Git starting records instead show `Git recovery available - press r`; `r` opens a [task recovery confirmation](#missing-git-recovery-records). External projects under `/Volumes` specifically direct macOS users to enable Full Disk Access for CLT and restart the agent; missing external projects instead prompt users to check that the drive is mounted. The `AGENT` column shows `INTERACTIVE` in full for a live guarded Codex handoff. This session reserves the project, so queued tasks wait until it releases the reservation. `FENCED` means CLT is preserving a handoff or lease reservation without claiming that an automated agent is running. `STALE` identifies a reservation whose generated owner process has exited; the daemon reclaims it once no matching session or worker still needs the fence. Selecting any of these rows explains the waiting state in the console. Press `s` directly on `INTERACTIVE` or session-backed `FENCED` rows to request a safe stop, or open its output with `l` for exact-session `s`/`i` controls.
@@ -546,6 +558,16 @@ If the externally completed task is already in Done, pause the project with `clt
 
 An abandoned `WORKING` journal that never acquired a task identity can outlive its original checkout. Before scheduling or removing a registered project, CLT retires it only when no task marker remains anywhere in the task tree (including nested and archived tasks), no commit proof was sealed, and the project is idle. The cancelled journal retains its original Git boundaries and a recovery reason. To apply this cleanup while a project is paused, run `clt agent reconcile /path/to/project`. This command preserves project settings, files and commits. The TUI's `r` key requests another scheduling attempt; it does not reset Git history or discard pending proof.
 
+If an older ownership mix-up left two sessions for the same task, CLT also
+retires the unused `WORKING` attempt once the other session's completion is
+proven. The old attempt must be unsealed, have no remaining task link, and have
+no active project owners. There must be exactly one matching task in Done,
+with a completed journal and its verified commit retained on the original
+branch. Ambiguous task copies or unfinished commit proof prevent this cleanup.
+Both journals and conversation history remain available; only the obsolete
+resume request and its failure cooldown are cleared. This recovery runs before
+automatic retries and through `clt agent reconcile /path/to/project`.
+
 `FINALIZING` local-commit work takes priority over all queued work and resumes the exact linked Codex session. `PUSH-PENDING` also blocks every later project task, but it is retried entirely by CLT without launching or resuming Codex. A `WORKING` journal is earlier and more permissive: if its linked task is durably blocked and its blocked-recovery backoff is active, CLT preserves that journal and history while allowing another ready Todo to run. It deliberately skips startup synchronization for the later task so the blocked proof boundary remains reachable; after backoff, the exact blocked session is eligible for recovery again. If a crashed worker instead left an ordinary task in `doing`, the scheduler uses its durable worker record to resume that task. When exactly one interrupted or blocked task carries a session marker, recovery resumes that session instead of opening a new one. Explicit stop and interactive-handoff states suppress ordinary scheduling; an interactive `i` handback is prioritized as an exact-session resume before any Todo selection.
 
 ### Goals and blocked tasks
@@ -761,6 +783,14 @@ For an older follow-up that was marked blocked merely because its own work remai
 Keep the original task blocked when acceptance is incomplete, a relevant check fails, or the failure's independence is uncertain. A follow-up does not waive task requirements or commit hooks.
 
 ### Deleting Tasks
+
+A task's board column and its worker ownership are separate. Returning a task
+to Todo does not stop its process. If deletion is refused, the error shows the
+current worker activity; inspect that task with `l` and stop its run with `s`
+before retrying. An idle task can be deleted while another task runs or while
+the read-only supervisor reviews blockers. Deleting during a review changes its
+evidence, so CLT discards that review's obsolete decision. Unconsumed Git launch
+boundaries and sealed completion proof still prevent deletion.
 Remove a task from a specific list:
 ```bash
 clt delete todo 1

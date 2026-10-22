@@ -192,7 +192,7 @@ enum AgentCommands {
         /// Project path to retry. Defaults to the current directory.
         path: Option<PathBuf>,
     },
-    /// Retires unused Git journals with no linked task or commit proof
+    /// Retires unused or superseded Git journals after checking task and commit proof
     Reconcile {
         /// Project path to reconcile. Defaults to the current directory.
         path: Option<PathBuf>,

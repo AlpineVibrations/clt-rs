@@ -3,6 +3,88 @@ use crate::test_support::prelude::*;
 use crate::test_support::*;
 
 #[test]
+fn live_linking_preserves_recovered_task_ownership_and_launch_selection() {
+    for folders in [false, true] {
+        for marker in [
+            "",
+            " codex:feather-session",
+            " codex:feather-session clt:stopped",
+        ] {
+            let root = temp_root("live-link-recovered-task");
+            init_tasks(&root, folders).unwrap();
+            let board = TaskBoard::new(get_tasks_dir(&root));
+            board
+                .insert_content(TaskStatus::Todo, None, "Style references")
+                .unwrap();
+            let selected = durable_task_identity("Style references").unwrap();
+            // The recovery pass moves an older task after the new run's snapshot.
+            board
+                .insert_content(TaskStatus::Doing, None, &format!("Feather mask{marker}"))
+                .unwrap();
+            let older = board.entry(TaskStatus::Doing, 1).unwrap();
+            assert!(
+                !attach_codex_session_to_active_task(
+                    &root,
+                    AgentTaskSelection::NextTodo,
+                    &[],
+                    &[],
+                    "style-session",
+                    Some(&selected)
+                )
+                .unwrap()
+            );
+            assert_eq!(
+                board.entry(TaskStatus::Doing, 1).unwrap().content,
+                older.content
+            );
+            if !marker.is_empty() {
+                // The low-level writer also refuses a conflicting owner, even
+                // for callers without a selected-task snapshot.
+                assert!(
+                    attach_codex_session_to_task(&root, TaskStatus::Doing, &older, "style-session")
+                        .is_err()
+                );
+                assert!(
+                    !attach_codex_session_to_active_task(
+                        &root,
+                        AgentTaskSelection::NextTodo,
+                        &[],
+                        &[],
+                        "style-session",
+                        None
+                    )
+                    .unwrap()
+                );
+            }
+            let before = task_contents_for_status(&root, TaskStatus::Doing).unwrap();
+            board
+                .move_task_after_lock(TaskStatus::Todo, TaskStatus::Doing, 1)
+                .unwrap();
+            assert!(
+                attach_codex_session_to_active_task(
+                    &root,
+                    AgentTaskSelection::NextTodo,
+                    &before,
+                    &[],
+                    "style-session",
+                    Some(&selected)
+                )
+                .unwrap()
+            );
+            assert_eq!(
+                board.entry(TaskStatus::Doing, 1).unwrap().content,
+                older.content
+            );
+            assert_eq!(
+                codex_session_for_task(&board.entry(TaskStatus::Doing, 2).unwrap()).as_deref(),
+                Some("style-session")
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+}
+
+#[test]
 fn manual_completion_reclaims_only_proven_exited_unchanged_project_workers() {
     for scenario in [
         "dead",
@@ -297,7 +379,8 @@ fn queued_follow_up_keeps_parent_successful_and_scheduler_selects_next_todo() {
                 AgentTaskSelection::NextTodo,
                 &[],
                 &[],
-                "parent-session"
+                "parent-session",
+                None,
             )
             .unwrap()
         );

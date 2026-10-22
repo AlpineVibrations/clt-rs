@@ -58,7 +58,8 @@ async fn session_can_enable_git(
 
 /// A stopped/idle session can be cancelled under the board lock without taking
 /// another task's project lease. Every live worker and lease must be attributable
-/// to a different conversation; unregistered launches remain project-wide fences.
+/// to a different conversation or a read-only supervisor review. Reviews recheck
+/// board evidence before applying a decision; implementation launches still fence.
 async fn can_delete_idle_task(
     conn: &Connection,
     project_id: i64,
@@ -92,7 +93,8 @@ async fn can_delete_idle_task(
                              WHERE sc.project_id = ?1 AND sc.codex_session_id = ?2
                                AND sc.run_token = w.worker_token
                         )
-                        OR (w.resume_session_id IS NULL AND NOT EXISTS (
+                        OR (w.resume_session_id IS NULL
+                            AND w.task_selection <> 'supervisor_review' AND NOT EXISTS (
                             SELECT 1 FROM session_controls other
                              WHERE other.project_id = ?1 AND other.codex_session_id <> ?2
                                AND other.run_token = w.worker_token
@@ -705,6 +707,83 @@ impl TursoAgentStore {
         })
     }
 
+    /// Caller holds the board lock and has verified the replacement task's
+    /// retained commit. Recheck both exact journals and every live owner here.
+    pub(crate) fn retire_superseded_working_git_finalization_blocking(
+        &self,
+        expected: &GitFinalizationRecord,
+        completed: &GitFinalizationRecord,
+        updated_at: &str,
+    ) -> Result<bool> {
+        if expected.state != GitFinalizationState::Working
+            || expected.commit_oid.is_some()
+            || expected.completed_at.is_some()
+            || expected.acknowledged_at.is_some()
+            || expected.task_identity.is_none()
+            || completed.state != GitFinalizationState::Completed
+            || completed.commit_oid.is_none()
+            || expected.project_id != completed.project_id
+            || expected.codex_session_id == completed.codex_session_id
+            || expected.task_identity != completed.task_identity
+        {
+            return Ok(false);
+        }
+        self.blocking.block_on_persist(async {
+            let mut conn = self.repositories.git_journals.connect().await?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).await?;
+            for snapshot in [expected, completed] {
+                let mut rows = tx.query(
+                    "SELECT project_id, codex_session_id, state, git_mode, starting_head,
+                            branch_ref, upstream_ref, worktree_baseline, task_identity,
+                            owner_run_token, commit_oid, generation, last_error, created_at,
+                            updated_at, completed_at, acknowledged_at, acknowledged_run_id
+                       FROM git_finalizations WHERE project_id = ?1 AND codex_session_id = ?2",
+                    params![snapshot.project_id, snapshot.codex_session_id.as_str()],
+                ).await?;
+                let current = rows.next().await?
+                    .map(|row| git_finalization_record_from_row(&row)).transpose()?;
+                if current.as_ref() != Some(snapshot) {
+                    tx.rollback().await?;
+                    return Ok(false);
+                }
+            }
+            let busy = query_count(&tx,
+                "SELECT EXISTS (SELECT 1 FROM agent_workers WHERE project_id = ?1
+                    AND state IN ('dispatching', 'running', 'finalizing'))
+                 OR EXISTS (SELECT 1 FROM agent_git_launch_states WHERE project_id = ?1)
+                 OR EXISTS (SELECT 1 FROM leases WHERE project_id = ?1
+                    AND CAST(expires_at AS INTEGER) > CAST(?2 AS INTEGER))
+                 OR EXISTS (SELECT 1 FROM session_controls WHERE project_id = ?1
+                    AND (state NOT IN ('stopped', 'resume_requested') OR child_pid IS NOT NULL
+                         OR interactive_holder IS NOT NULL OR interactive_launch_token IS NOT NULL))",
+                params![expected.project_id, updated_at],
+            ).await? != 0;
+            if busy {
+                tx.rollback().await?;
+                return Ok(false);
+            }
+            clear_cancelled_attempt_failure(
+                &tx, expected.project_id, &expected.codex_session_id, updated_at,
+            ).await?;
+            let reason = format!(
+                "Superseded unsealed attempt: the same task was completed in Codex session {} with verified commit {}",
+                completed.codex_session_id, completed.commit_oid.as_deref().expect("verified commit"),
+            );
+            tx.execute(
+                "UPDATE git_finalizations SET state = 'cancelled', owner_run_token = NULL,
+                    generation = generation + 1, last_error = ?3, updated_at = ?4, completed_at = ?4
+                 WHERE project_id = ?1 AND codex_session_id = ?2",
+                params![expected.project_id, expected.codex_session_id.as_str(), reason, updated_at],
+            ).await?;
+            tx.execute(
+                "DELETE FROM session_controls WHERE project_id = ?1 AND codex_session_id = ?2",
+                params![expected.project_id, expected.codex_session_id.as_str()],
+            ).await?;
+            tx.commit().await?;
+            Ok(true)
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn cancel_idle_working_git_finalization_blocking(
         &self,
@@ -773,7 +852,7 @@ impl TursoAgentStore {
                 > 0
             {
                 anyhow::bail!(
-                    "This project still has an active agent worker whose ownership prevents {action}; wait for it to settle or stop the running task"
+                    "An active agent worker still owns this task or has not registered its task ownership, preventing {action}. Moving a task to Todo does not stop its process. Check the activity shown in Agent Projects or `clt agent status`; stop the owning task with s, or retry after its worker finishes"
                 );
             }
 

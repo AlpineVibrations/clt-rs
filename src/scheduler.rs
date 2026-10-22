@@ -39,7 +39,8 @@ use crate::{
         agent_git_push_retry_backoff_remaining, reconcile_pending_agent_git_finalizations,
         record_agent_git_push_retry_error, record_agent_git_push_retry_error_message,
         repair_working_git_task_link, retire_abandoned_unbound_git_journals,
-        try_acquire_agent_git_finalization_lease, verify_agent_git_resume_branch,
+        retire_superseded_working_git_journals, try_acquire_agent_git_finalization_lease,
+        verify_agent_git_resume_branch,
     },
     platform::{
         AgentPlatform, automated_agent_process_group_is_running, local_process_is_running,
@@ -1027,7 +1028,10 @@ pub(super) fn run_agent_scheduler_pass_with_max_global_jobs(
         // guarded finalization lease is attempted. Their recorded owner token
         // can never be matched again, so leaving them pending would skip this
         // project forever with reason=active_lease.
-        if retire_abandoned_unbound_git_journals(state_dir, &project)? > 0 {
+        if retire_abandoned_unbound_git_journals(state_dir, &project)?
+            + retire_superseded_working_git_journals(state_dir, &project)?
+            > 0
+        {
             // Cancellation may have cleared this attempt's failure cooldown.
             project = with_agent_store_at(state_dir, |store| {
                 store

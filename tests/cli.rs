@@ -830,14 +830,16 @@ fn user_delete_cancels_an_idle_working_journal_but_automated_deletion_stays_fenc
                 SELECT id,'cli-deletion','stopped','100' FROM projects",
         );
         let (before, _) = assert_success(&workspace.run(&["list", "doing"]));
-        for (sql, expected) in [
+        for (sql, expected, flag) in [
             (
                 "UPDATE session_controls SET state = 'running'",
                 "is still active",
+                "[RUNNING]",
             ),
             (
                 "UPDATE session_controls SET state = 'stopped'; UPDATE git_finalizations SET state = 'commit_pending'",
                 "commit proof is already sealed",
+                "[STOPPED]",
             ),
         ] {
             // Execute each statement separately; the connector accepts one at a time.
@@ -847,7 +849,10 @@ fn user_delete_cancels_an_idle_working_journal_but_automated_deletion_stays_fenc
             let output = workspace.run(&["delete", "doing", "1"]);
             assert!(!output.status.success());
             assert!(output_text(&output).1.contains(expected));
-            assert_eq!(assert_success(&workspace.run(&["list", "doing"])).0, before);
+            assert_eq!(
+                assert_success(&workspace.run(&["list", "doing"])).0,
+                before.replace("[STOPPED]", flag)
+            );
         }
         update("UPDATE git_finalizations SET state = 'working'");
         let automated = Command::new(env!("CARGO_BIN_EXE_clt"))

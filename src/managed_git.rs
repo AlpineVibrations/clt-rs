@@ -474,12 +474,143 @@ pub(super) fn retire_abandoned_unbound_git_journals(
     Ok(retired)
 }
 
-/// Retire only unbound orphan journals; this does not finalize or publish work.
+/// Recover a legacy ownership mix-up only when the same task has a proven
+/// completion in another session. Keep both journals and all checkout evidence.
+pub(super) fn retire_superseded_working_git_journals(
+    state_dir: &Path,
+    project: &agent::AgentProject,
+) -> Result<usize> {
+    let store = open_agent_store_at(state_dir)?;
+    let candidates = store.list_pending_git_finalizations_blocking(Some(project.id))?;
+    let mut retired = 0;
+    for journal in candidates {
+        let Some(identity) = journal.task_identity.as_deref() else {
+            continue;
+        };
+        if journal.state != GitFinalizationState::Working || journal.commit_oid.is_some() {
+            continue;
+        }
+        let Ok(baseline) = AgentGitWorktreeBaseline::from_json(&journal.worktree_baseline) else {
+            continue;
+        };
+        // Even partial or malformed seals retain their proof requirements.
+        let raw: serde_json::Value = serde_json::from_str(&journal.worktree_baseline)?;
+        if [
+            "staged_non_task_patch_ids",
+            "staged_index_tree",
+            "manifest_parent_head",
+        ]
+        .iter()
+        .any(|field| raw.get(field).is_some_and(|value| !value.is_null()))
+        {
+            continue;
+        }
+        let board = get_tasks_dir(&project.path);
+        let _lock = acquire_board_mutation_lock(&board)?;
+        if task_tree_contains_session_marker(&board, &journal.codex_session_id)? {
+            continue;
+        }
+        let mut matches = Vec::new();
+        collect_task_identity_entries(&board, identity, &mut matches)?;
+        let [(TaskStatus::Done, task)] = matches.as_slice() else {
+            continue;
+        };
+        let Some(session) = codex_session_id_from_task_content(&task.content) else {
+            continue;
+        };
+        let Some(completed) = store.git_finalization_blocking(project.id, session)? else {
+            continue;
+        };
+        if completed.state != GitFinalizationState::Completed
+            || completed.task_identity != journal.task_identity
+            || completed.branch_ref != journal.branch_ref
+            || completed.git_mode != journal.git_mode
+            || completed.upstream_ref != journal.upstream_ref
+            || !task_content_has_completed_note(&task.content)
+        {
+            continue;
+        }
+        let (Some(start), Some(commit), Some(completed_start)) = (
+            journal.starting_head.as_deref(),
+            completed.commit_oid.as_deref(),
+            completed.starting_head.as_deref(),
+        ) else {
+            continue;
+        };
+        let completed_baseline = AgentGitWorktreeBaseline::from_json(&completed.worktree_baseline)?;
+        if baseline.upstream_remote != completed_baseline.upstream_remote
+            || baseline.upstream_merge_ref != completed_baseline.upstream_merge_ref
+            || baseline.upstream_push_url != completed_baseline.upstream_push_url
+            || !git_commit_is_ancestor(&project.path, start, completed_start)?
+            || !local_agent_git_task_commit_is_retained(
+                &project.path,
+                completed.branch_ref.as_deref(),
+                commit,
+                session,
+                identity,
+            )?
+            || find_agent_git_task_commit_with_policy(
+                &project.path,
+                completed_baseline
+                    .manifest_parent_head
+                    .as_deref()
+                    .unwrap_or(completed_start),
+                completed.branch_ref.as_deref(),
+                session,
+                identity,
+                completed_baseline.version == 1,
+            )?
+            .as_deref()
+                != Some(commit)
+            || !git_commit_matches_agent_staged_manifest(
+                &project.path,
+                commit,
+                session,
+                identity,
+                &completed.worktree_baseline,
+                true,
+            )?
+        {
+            continue;
+        }
+        if store.retire_superseded_working_git_finalization_blocking(
+            &journal,
+            &completed,
+            &agent_timestamp(),
+        )? {
+            retired += 1;
+        }
+    }
+    Ok(retired)
+}
+
+fn collect_task_identity_entries(
+    board: &Path,
+    identity: &str,
+    matches: &mut Vec<(TaskStatus, TaskEntry)>,
+) -> Result<()> {
+    for status in TASK_STATUSES {
+        for entry in read_task_entries(board, status)? {
+            if entry.has_subtasks
+                && let TaskSource::Path { path, is_dir: true } = &entry.source
+            {
+                collect_task_identity_entries(path, identity, matches)?;
+            }
+            if durable_task_identity(&entry.content).as_deref() == Some(identity) {
+                matches.push((status, entry));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Retire unused or provably superseded journals; never finalize or publish work.
 pub(super) fn reconcile_orphaned_agent_git_journals(
     state_dir: &Path,
     project: &agent::AgentProject,
 ) -> Result<usize> {
-    let retired = retire_abandoned_unbound_git_journals(state_dir, project)?;
+    let retired = retire_abandoned_unbound_git_journals(state_dir, project)?
+        + retire_superseded_working_git_journals(state_dir, project)?;
     let pending = with_agent_store_at(state_dir, |store| {
         store.list_pending_git_finalizations_blocking(Some(project.id))
     })?;
@@ -730,7 +861,10 @@ pub(super) fn repair_working_git_task_link_with_lock_callbacks(
     let [(status, index, entry)] = matches.as_slice() else {
         return Ok(false);
     };
-    if task_content_is_manual(&entry.content) {
+    if task_content_is_manual(&entry.content)
+        || crate::task::recoverable_codex_session_id_from_task_content(&entry.content)
+            .is_some_and(|session| session != finalization.codex_session_id)
+    {
         return Ok(false);
     }
     attach_codex_session_to_task_after_lock(

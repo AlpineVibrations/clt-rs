@@ -1847,6 +1847,7 @@ pub(super) fn attach_codex_session_to_active_task(
     doing_task_contents_before: &[String],
     blocked_task_snapshots_before: &[BlockedTaskSnapshot],
     session_id: &str,
+    selected_task_identity: Option<&str>,
 ) -> Result<bool> {
     if task_selection == AgentTaskSelection::SupervisorReview {
         return Ok(true);
@@ -1891,6 +1892,15 @@ pub(super) fn attach_codex_session_to_active_task(
     let Some(task) = task else {
         return Ok(false);
     };
+    // Another task may enter Doing during journal recovery or a user move.
+    // Neither a new row nor a changed count proves it belongs to this worker.
+    if codex_session_for_task(task).is_some_and(|owner| owner != session_id)
+        || selected_task_identity.is_some_and(|identity| {
+            crate::task::durable_task_identity(&task.content).as_deref() != Some(identity)
+        })
+    {
+        return Ok(false);
+    }
 
     attach_codex_session_to_task_after_lock(
         project_root,

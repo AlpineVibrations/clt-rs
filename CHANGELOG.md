@@ -6,6 +6,28 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-10-22
+
+### Changed
+
+- Give the task board's `[RUNNING]` badge a bright mint green color and a dark
+  green background for contrast, including on selected rows.
+
+### Fixed
+
+- Preserve an existing task's Codex session when another worker starts. Live
+  task linking now checks the task selected at launch, so recovering an older
+  task in Doing cannot bind a fresh worker to the wrong Git journal.
+- Retire an idle, unsealed attempt left behind when the same task was proven
+  complete in another session, clearing its retry loop while preserving both
+  journals, the completed task, files, staging and commits.
+- Allow deletion of an idle, unsealed task during a read-only supervisor review.
+  Deletion errors identify current worker activity; active task owners and
+  unfinished Git launch boundaries retain their protections.
+- Show the worker's linked task and board location in Agent Projects, on the
+  task board and in `clt agent status`. Distinguish startup, resumed work,
+  supervisor review and worker cleanup, and label saved idle work as waiting.
+
 ## [0.9.0] - 2026-10-22
 
 ### Fixed
@@ -494,7 +516,8 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 - Fixed task moves so destination write failures do not remove the source task.
 - Fixed TUI navigation on empty boards.
 
-[Unreleased]: https://github.com/AlpineVibrations/clt-rs/compare/v0.8.3...HEAD
+[Unreleased]: https://github.com/AlpineVibrations/clt-rs/compare/v0.9.1...HEAD
+[0.9.1]: https://github.com/AlpineVibrations/clt-rs/compare/v0.9.0...v0.9.1
 [0.8.3]: https://github.com/AlpineVibrations/clt-rs/compare/v0.8.2...v0.8.3
 [0.8.2]: https://github.com/AlpineVibrations/clt-rs/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/AlpineVibrations/clt-rs/compare/v0.8.0...v0.8.1
