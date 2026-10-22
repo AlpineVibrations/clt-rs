@@ -4,6 +4,7 @@ use crate::test_support::*;
 use crate::worker::tests::reserve_test_worker;
 
 mod advanced_branch;
+mod board_repair;
 mod deletion;
 mod enable_on_resume;
 mod follow_up;
@@ -2527,8 +2528,20 @@ fn sealed_git_finalization_rejects_a_same_path_rewrite() {
         Some("run-exact-bytes"),
         None,
     )
-    .unwrap();
-    assert_eq!(unchanged.state, GitFinalizationState::CommitPending);
+    .unwrap_err();
+    assert!(
+        unchanged
+            .to_string()
+            .contains("differing paths: feature.txt")
+    );
+    assert_eq!(
+        store
+            .git_finalization_blocking(project.id, "session-exact-bytes")
+            .unwrap()
+            .unwrap()
+            .state,
+        GitFinalizationState::CommitPending
+    );
 
     fs::remove_dir_all(root).unwrap();
 }

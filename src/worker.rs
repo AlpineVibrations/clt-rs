@@ -1315,8 +1315,12 @@ pub(super) fn run_agent_job_inner(
                 git_finalization_pending = true;
                 status = "failure";
                 summary = format!(
-                    "Task Git finalization remains {}; CLT will resume this exact Codex session before scheduling other project work.",
-                    finalization.state.status_label()
+                    "Task Git finalization remains {}: {} CLT preserves this exact session; the enabled supervisor will assess recovery before another attempt.",
+                    finalization.state.status_label(),
+                    crate::managed_git::agent_git_finalization_diagnostic(
+                        &job.project.path,
+                        &finalization
+                    )?
                 );
             }
             Ok(Some(_)) => {}

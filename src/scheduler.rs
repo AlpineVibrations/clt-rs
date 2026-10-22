@@ -1385,6 +1385,59 @@ pub(super) fn run_agent_scheduler_pass_with_max_global_jobs(
             }
             continue;
         }
+        // Roll forward valid commits first, then assess stalled sealed work.
+        // A held review must never prevent acceptance of a repaired commit.
+        if rolled_forward_git_finalization
+            || finalizations
+                .iter()
+                .any(|journal| journal.state.is_finalizing())
+        {
+            let gate = with_agent_store_at(state_dir, |store| {
+                crate::supervisor::gate(store, &project, scan.has_blocked_task())
+            })?;
+            let supervised = match gate {
+                crate::supervisor::Gate::Normal => None,
+                crate::supervisor::Gate::Hold(message) => {
+                    println!(
+                        "Project {}: action=supervisor_wait reason={} path={}",
+                        project.name,
+                        message,
+                        project.path.display()
+                    );
+                    continue;
+                }
+                crate::supervisor::Gate::Review => {
+                    Some((AgentTaskSelection::SupervisorReview, None))
+                }
+                crate::supervisor::Gate::Retry(session) => {
+                    Some((AgentTaskSelection::SupervisorRetry, Some(session)))
+                }
+            };
+            if let Some((task_selection, resume_session_id)) = supervised {
+                pass.pending_projects += 1;
+                if pass.active_agent_jobs + jobs.len() >= max_global_jobs {
+                    pass.deferred_projects += 1;
+                    continue;
+                }
+                let acquisition = acquire_agent_job_stage(AgentJobAcquisitionRequest {
+                    state_dir,
+                    project: &project,
+                    scan: &scan,
+                    holder: &holder,
+                    lease_timeout,
+                    reclaim_current_process_leases,
+                    max_global_jobs,
+                    task_selection,
+                    resume_session_id,
+                })?;
+                if let AgentJobAcquisitionResult::Acquired { job, .. } = acquisition {
+                    unstarted_leases.track(job.project.id, &job.holder);
+                    pass.runs_started += 1;
+                    jobs.push(*job);
+                }
+                continue;
+            }
+        }
         let pending_git_finalization = finalizations
             .iter()
             .find(|finalization| finalization.state.is_finalizing());

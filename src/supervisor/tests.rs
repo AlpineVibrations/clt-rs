@@ -702,3 +702,79 @@ fn old_wait_hold_gets_one_fresh_assessment_without_resetting_retry_budget() {
     drop(store);
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn repeated_exact_session_failures_are_reviewed_without_a_blocked_note() {
+    for interrupted_by_success in [false, true] {
+        let (root, state, store, project) = fixture("supervisor-repeated-runtime-failure");
+        enable(&store);
+        fs::write(
+            project.path.join("tasks/doing.md"),
+            "# Doing Tasks\n- Fix renderer. codex:original-session\n",
+        )
+        .unwrap();
+        for (index, status) in [
+            "failure",
+            if interrupted_by_success {
+                "success"
+            } else {
+                "timeout"
+            },
+        ]
+        .iter()
+        .enumerate()
+        {
+            store
+                .record_run_outcome_blocking(agent::AgentRunOutcome {
+                    project_id: project.id,
+                    status,
+                    started_at: &format!("{}", 100 + index),
+                    finished_at: Some(&format!("{}", 101 + index)),
+                    exit_code: Some(1),
+                    log_dir: None,
+                    stdout_path: None,
+                    stderr_path: None,
+                    summary: Some("Repeated task runtime failure"),
+                    codex_session_id: Some("original-session"),
+                })
+                .unwrap();
+            if index == 0 {
+                assert!(matches!(
+                    gate(&store, &project, false).unwrap(),
+                    Gate::Normal
+                ));
+            }
+        }
+        if interrupted_by_success {
+            assert!(matches!(
+                gate(&store, &project, false).unwrap(),
+                Gate::Normal
+            ));
+        } else {
+            assert!(matches!(
+                gate(&store, &project, false).unwrap(),
+                Gate::Review
+            ));
+            let pass = run_agent_scheduler_pass(&state, false, &[]).unwrap();
+            assert_eq!(pass.jobs.len(), 1);
+            assert_eq!(
+                pass.jobs[0].task_selection,
+                AgentTaskSelection::SupervisorReview
+            );
+            store
+                .release_lease_blocking(project.id, &pass.jobs[0].holder)
+                .unwrap();
+            fs::write(
+                project.path.join("tasks/doing.md"),
+                "# Doing Tasks\n- Fix renderer. clt:manual codex:original-session\n",
+            )
+            .unwrap();
+            assert!(matches!(
+                gate(&store, &project, false).unwrap(),
+                Gate::Normal
+            ));
+        }
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+}

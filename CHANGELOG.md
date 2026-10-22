@@ -6,6 +6,21 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+### Fixed
+
+- Recover an unpublished task commit whose only sealed-tree mismatch is the
+  selected Markdown Done entry's position. CLT verifies ownership and remote
+  refs, runs normal hooks in an isolated checkout, preserves unrelated staged
+  work, and accepts only the original sealed tree and parent.
+- Alert the supervisor after two consecutive failed or timed-out attempts in
+  the same task session, including errors without a BLOCKED task note.
+- Show the exact commit, expected tree, and differing paths when Git proof
+  fails. Let the task supervisor assess stalled finalization, preserve
+  provisional Done placement, and direct bounded retries in the original
+  session instead of repeating an unexplained FINALIZING failure.
+- Reseal the reviewed index after staging the Done transition and before the
+  task commit, preventing custom staging from silently changing its sealed tree.
+
 ## [0.8.5] - 2026-10-21
 
 ### Fixed

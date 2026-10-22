@@ -572,6 +572,33 @@ Automated runs configure Codex with `danger-full-access`, approval policy `never
 
 ### Task supervisor
 
+Two consecutive failed or timed-out attempts in the same task session trigger
+supervisor assessment even when the worker did not write a BLOCKED note. A
+successful attempt breaks that sequence; manual and stopped tasks remain excluded.
+
+The supervisor also assesses a stalled `FINALIZING` task after CLT has tried
+Git reconciliation. A provisional Done entry remains in Done and keeps its
+original session and sealed manifest. Reviews receive the exact commit/tree
+mismatch, differing paths, repair errors, and that session's logs. A concrete
+retry resumes that same conversation without moving the task backwards.
+Unchanged held evidence does not launch another review; a changed Git boundary
+invalidates an older decision. A successfully repaired commit is accepted before
+any saved supervisor hold can block it.
+
+For the specific case where the task commit appended its Markdown Done entry
+instead of placing it first, CLT can repair the commit automatically. It requires
+the task's current branch tip, matching task identity/trailer/parent, and a diff
+containing only that one entry's position. It checks every configured fetch/push
+destination's advertised refs; published commits, unreachable remotes, and tips
+unavailable locally require explicit recovery. It creates the exact sealed tree
+with normal commit hooks and signing in an isolated checkout, verifies the result,
+and replaces only the still-matching branch tip. It preserves the worktree and
+unrelated staging, including notes in the same board file. Changed task content,
+code differences, conflicting ownership, or failed checks remain pending with a
+specific reason. This deterministic repair runs even when model supervision is
+disabled. CLT never relaxes the sealed-tree proof or deletes its journal.
+
+
 The optional supervisor reviews execution blockers in Doing before CLT starts another task, and reviews queued blockers when no ready Todo work remains. Blocked Todo tasks waiting on prerequisites do not prevent a ready Todo from running, regardless of its position in the list or an existing WORKING Git journal. Git recovery preserves that deliberate Todo placement and lets its queued resume request wait. A saved review hold from a queued dependency wait is cleared when ready work can proceed. It defaults to off, the CLT default model, high thinking, and fast mode off. Configure it on the single line at the top of Agent Projects (`u` selects the line; `Space`, `m`, `t`, and `f` change its settings). Install the updated binary and restart the scheduler to use the feature.
 
 After the implementation worker exits and saves its blocker evidence, a separate review worker takes the project's lease. It uses a read-only sandbox, the supervisor's model settings, and a three-minute deadline. It examines task notes, relevant project files and the latest available logs for each blocked task’s exact session, then returns one structured decision. Errors from other project sessions are not supplied as current failure evidence:
@@ -584,7 +611,7 @@ After the implementation worker exits and saves its blocker evidence, a separate
 
 Retry and dependency-wait deferral are automatic actions. The scheduler handles supported pre-activation Git repairs before applying supervisor holds. A queued wait holds only when no ready Todo remains. User, Replan and remaining Repair decisions hold the project and show the reasoning and next action in the selected project's console. Replanning is a proposal, not an automatic rewrite of the task board. Resolve a prerequisite or answer a question in the task notes to provide new evidence, or press `r` on the project to request a fresh review explicitly. Unchanged task evidence reuses the saved decision instead of repeatedly launching a model. The supervisor allows at most two implementation retries before requiring user review; explicit `r` resets that budget. A crashed assessment can be attempted twice on the same evidence. Invalid, stale, failed, or timed-out assessments cannot authorize task changes.
 
-Supervisor settings and decisions survive scheduler restarts and registry recovery. Explicit stops, manual ownership, active leases, and sealed Git finalization retain their protections. Turning the supervisor off restores ordinary scheduling without deleting its saved decisions or changing task sessions. A review already running when it is switched off cannot apply its decision. Supervisor output remains available with the project's usual `l` log control.
+Supervisor settings and decisions survive scheduler restarts and registry recovery. Explicit stops, manual ownership, active leases, and the sealed Git manifest retain their protections. Turning the supervisor off restores ordinary scheduling without deleting its saved decisions or changing task sessions. A review already running when it is switched off cannot apply its decision. Supervisor output remains available with the project's usual `l` log control.
 
 ### Background services and workers
 

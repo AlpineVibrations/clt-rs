@@ -403,13 +403,26 @@ pub(super) fn launch_agent_runner_stage(
             }
         ),
     )?;
-    let supervisor_direction = if task_selection == AgentTaskSelection::SupervisorRetry {
+    let mut supervisor_direction = if task_selection == AgentTaskSelection::SupervisorRetry {
         store
             .supervisor_review_blocking(project.id)?
             .map(|review| review.message())
     } else {
         None
     };
+    if let Some(session) = resume_session_id
+        && let Some(journal) = store.git_finalization_blocking(project.id, session)?
+        && journal.state.is_finalizing()
+    {
+        let diagnostic =
+            crate::managed_git::agent_git_finalization_diagnostic(&project.path, &journal)?;
+        supervisor_direction
+            .get_or_insert_with(String::new)
+            .push_str(&format!(
+                "\nGit finalization evidence: {diagnostic}\nLatest repair error: {}",
+                journal.last_error.as_deref().unwrap_or("none")
+            ));
+    }
     let configured_session_id = if task_selection == AgentTaskSelection::SupervisorReview {
         crate::supervisor::configure_command(&mut command, store, project, &stderr_path)?;
         None
@@ -617,7 +630,7 @@ Git commit:
 - Once the task is Doing, ordinary user commits (such as a patch-version bump) and CLT board checkpoints may advance the same branch. Preserve them, re-read the affected files, reconcile compatible changes, and rerun affected checks; HEAD movement alone is not a blocker. CLT keeps the original launch history and seals against the current parent. Unproven agent commits, task claims, merges, branch switches, and rewritten history still require resolution.
 - After completing and verifying the task, run all formatting, lint, signing, and hook checks that can mutate files before sealing. Add its dated COMPLETED note. Stage the implementation, any linked follow-up created for an independent failure, and the active Doing task, including its terminal `codex:<session-id>` marker, then inspect the staged diff.
 - Run `clt done` only after that staged diff is complete. CLT seals its durable task manifest and makes the board move provisionally; it is not terminal completion by itself.
-- Stage only the resulting board transition, inspect the complete staged diff again, then use the $git-commit skill to create exactly one normal git commit containing the sealed implementation, completion note, and complete task-board move, plus any linked follow-up.
+- Stage only the resulting board transition and inspect the complete staged diff again. Before committing, run `clt list done` and `clt done done <index>` with the same GIT_INDEX_FILE to reseal the final reviewed index, including the exact board entry position. Then use the $git-commit skill to create exactly one normal git commit containing that sealed tree. Never reconstruct the board move by appending the task at a different position.
 - Give that commit one exact final message paragraph: `CLT-Task: codex:<session-id>`.
 - If a commit hook changes files or fails after the seal, fix and stage the complete corrected payload, run `clt done done <index>` to reseal that provisional Done entry, inspect it, and retry the one commit.
 - If a user commit advances the branch after sealing but before the task commit, inspect the new HEAD and existing task-commit evidence, preserve the user's changes, rerun affected checks, and reseal the complete staged payload with `clt done done <index>` before committing. Never duplicate an existing task commit.

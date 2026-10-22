@@ -50,6 +50,8 @@ pub(super) const AGENT_GIT_IDENTITY_NAME: &str = "CLT Agent";
 pub(super) const AGENT_GIT_IDENTITY_EMAIL: &str = "clt-agent@localhost";
 const AGENT_GIT_BOARD_CHECKPOINT_MESSAGE: &str = "Record CLT task board";
 
+mod repair;
+
 pub(super) struct AgentGitFinalizationLease {
     lease: Option<InteractiveAgentLease>,
     pub(super) holder: String,
@@ -3946,6 +3948,60 @@ pub(super) fn worktree_completed_task_identity(
     Ok(durable_task_identity(&task.content))
 }
 
+/// Explain a stalled seal without changing its journal, index, or history. Both
+/// the worker's result and the supervisor must retain the concrete proof failure.
+pub(super) fn agent_git_finalization_diagnostic(
+    project_root: &Path,
+    finalization: &agent::GitFinalizationRecord,
+) -> Result<String> {
+    let baseline = AgentGitWorktreeBaseline::from_json(&finalization.worktree_baseline)?;
+    let (Some(parent), Some(identity)) = (
+        baseline
+            .manifest_parent_head
+            .as_deref()
+            .or(finalization.starting_head.as_deref()),
+        finalization.task_identity.as_deref(),
+    ) else {
+        return Ok("The finalization is missing its frozen parent or task identity; preserve the journal for recovery.".into());
+    };
+    let Some(commit) = find_agent_git_task_commit_with_policy(
+        project_root,
+        parent,
+        finalization.branch_ref.as_deref(),
+        &finalization.codex_session_id,
+        identity,
+        baseline.version == 1,
+    )?
+    else {
+        return Ok(format!(
+            "No single task commit satisfies the frozen parent {parent}, CLT Agent identity, completed task, and exact CLT-Task: codex:{} trailer. Inspect existing commits before retrying; do not duplicate a task commit.",
+            finalization.codex_session_id
+        ));
+    };
+    if let Some(expected) = baseline.staged_index_tree.as_deref() {
+        let actual = git_stdout(
+            project_root,
+            &["rev-parse", &format!("{commit}^{{tree}}")],
+            "read the task commit tree",
+        )?;
+        if actual != expected {
+            let paths = git_nul_separated_paths(
+                project_root,
+                &["diff", "--name-only", "-z", expected, &actual, "--"],
+                "locate the sealed tree mismatch",
+            )?;
+            return Ok(format!(
+                "Task commit {commit} has tree {actual}, but CLT sealed {expected}; differing paths: {}{}. The commit already exists. Repeating it or resealing after it cannot repair this mismatch; inspect the diff and obtain authorization for any required history correction.",
+                paths.iter().take(8).cloned().collect::<Vec<_>>().join(", "),
+                if paths.len() > 8 { ", …" } else { "" },
+            ));
+        }
+    }
+    Ok(format!(
+        "Task commit {commit} exists, but its completed task or frozen branch is no longer retained. Restore the recorded task/branch evidence without creating another task commit."
+    ))
+}
+
 pub(super) fn reconcile_agent_git_finalization(
     store: &agent::TursoAgentStore,
     project_root: &Path,
@@ -4089,14 +4145,32 @@ pub(super) fn reconcile_agent_git_finalization(
                     task_identity,
                     &finalization.worktree_baseline,
                     true,
-                )? || !local_agent_git_task_commit_is_retained(
+                )? {
+                    if repair::repair_board_order(
+                        store,
+                        project_root,
+                        &finalization,
+                        &commit_oid,
+                        finalization_lease,
+                    )? {
+                        continue;
+                    }
+                    anyhow::bail!(agent_git_finalization_diagnostic(
+                        project_root,
+                        &finalization
+                    )?);
+                }
+                if !local_agent_git_task_commit_is_retained(
                     project_root,
                     finalization.branch_ref.as_deref(),
                     &commit_oid,
                     &finalization.codex_session_id,
                     task_identity,
                 )? {
-                    return Ok(finalization);
+                    anyhow::bail!(agent_git_finalization_diagnostic(
+                        project_root,
+                        &finalization
+                    )?);
                 }
                 ensure_agent_git_finalization_fence(finalization_lease)?;
                 let next_state = match finalization.git_mode {
@@ -4252,13 +4326,33 @@ pub(super) fn reconcile_pending_agent_git_finalizations(
         .list_pending_git_finalizations_blocking(Some(project.id))?
         .into_iter()
         .map(|finalization| {
-            reconcile_agent_git_finalization(
+            let result = reconcile_agent_git_finalization(
                 &store,
                 &project.path,
-                finalization,
+                finalization.clone(),
                 None,
                 finalization_lease,
-            )
+            );
+            if let Err(error) = &result
+                && finalization.state.is_finalizing()
+                && let Some(lease) = finalization_lease
+            {
+                lease.ensure_owned()?;
+                let message = format!("{error:#}");
+                if finalization.last_error.as_deref() != Some(&message) {
+                    store.compare_and_set_git_finalization_blocking(
+                        finalization.project_id,
+                        &finalization.codex_session_id,
+                        finalization.generation,
+                        finalization.state,
+                        finalization.owner_run_token.as_deref(),
+                        None,
+                        Some(&message),
+                        &agent_timestamp(),
+                    )?;
+                }
+            }
+            result
         })
         .collect()
 }
