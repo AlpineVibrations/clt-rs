@@ -151,7 +151,9 @@ while viewing logs. `REVIEWING` means the supervisor is assessing blocked work;
 is saved without a running worker. A worker awaiting its task link says so.
 Task cards and CLI listings mark active sessions `[RUNNING]` or `[STOPPING]`.
 The TUI displays the `[RUNNING]` badge in bright mint green on a dark green
-background, keeping it readable on highlighted task rows.
+background. Tasks claimed by a directly opened Codex conversation display
+`[CODEX]` in light golden yellow on a dark warm background. Only the badges are
+colored, keeping them readable on highlighted task rows.
 `clt agent status` includes each worker's selection, session and task activity.
 
 Press `Tab` to toggle between the task board and the full-screen Agent Projects pane. In Agent Projects, Up/Down selects a registered project, `Enter` opens that project's task board, `Space` toggles the project `ON` or `OFF`, `Delete` removes it from the agent list after a `y`/`n` confirmation, and `g` cycles the `GIT` column through `OFF`, `COM`, and `PUSH`. These modes disable Git automation, ask Codex to create a task commit, or ask Codex to create that commit and let CLT publish it. Removing a project unregisters it from the agent list and clears its stored agent history, including unfinished Git finalizations and launch boundaries. It leaves the project, task files, and Git checkout unchanged. Removal is refused while an independent worker or agent lease is active. The currently open project is marked with `*`, the pane's top border shows the current local time before the daemon status, and the terminal title updates to the active project.
@@ -177,7 +179,7 @@ On the task board, select a Todo, Doing, or Done task, then press `c` to open it
 When an automated Codex run moves its selected task from Todo to Doing, CLT saves a terminal `codex:<session-id>` marker as part of that board update, including when Git automation is off. The marker uses the exact session registered for that run; activation fails if the task or session already belongs to different work. This internal marker survives task moves and wording changes, is hidden in task lists, the TUI, and the task editor, and is the task-to-session resume link. While a run is active, the database also records that session's exact run generation and log paths so `l`, stop, and interrupt target the correct live process. Completed run history retains the session ID without associating it to mutable task text. A run is reported as failed if CLT cannot persist the marker on its completed or blocked task.
 
 Opening a completed task with `c` leaves it in Done and opens the existing
-conversation for discussion. It does not claim the task, add `[MANUAL]`, or
+conversation for discussion. It does not claim the task, add `[CODEX]`, or
 schedule automated work or retries. The agent receives this context and waits
 for your request; implementation and status changes require an explicit request.
 Completion notes, the conversation link, and completed Git proof are preserved.
@@ -235,7 +237,7 @@ clt list todo
 clt claim todo 1
 ```
 
-The task appears directly in Doing as `[MANUAL]`, with its conversation attached.
+The task appears directly in Doing as `[CODEX]`, with its conversation attached.
 There is no temporary eligible Todo for the daemon to pick up. Each claim reserves
 only its task and conversation, and persists across Codex exits and daemon
 restarts. Independent manual sessions can work alongside each other and an

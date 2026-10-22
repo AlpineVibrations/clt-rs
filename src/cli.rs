@@ -472,7 +472,7 @@ pub(super) fn run() -> Result<()> {
         }) => {
             start_manual_task(&root, &description, session.as_deref())?;
             println!(
-                "[MANUAL] Task reserved in Doing. Use clt handoff doing <index> to queue automation."
+                "[CODEX] Task reserved in Doing. Use clt handoff doing <index> to queue automation."
             );
         }
         Some(Commands::Claim {
@@ -487,7 +487,7 @@ pub(super) fn run() -> Result<()> {
                 session.as_deref(),
             )?;
             println!(
-                "[MANUAL] Task reserved in Doing. Use clt handoff doing <index> to queue automation."
+                "[CODEX] Task reserved in Doing. Use clt handoff doing <index> to queue automation."
             );
         }
         Some(Commands::Handoff { status, task_index }) => {

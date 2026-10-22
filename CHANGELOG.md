@@ -6,6 +6,13 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-10-22
+
+### Changed
+
+- Rename the `[MANUAL]` task badge to `[CODEX]` and display it in light golden
+  yellow on a dark warm background in the TUI, coloring only the badge.
+
 ## [0.9.1] - 2026-10-22
 
 ### Changed
@@ -516,7 +523,8 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 - Fixed task moves so destination write failures do not remove the source task.
 - Fixed TUI navigation on empty boards.
 
-[Unreleased]: https://github.com/AlpineVibrations/clt-rs/compare/v0.9.1...HEAD
+[Unreleased]: https://github.com/AlpineVibrations/clt-rs/compare/v0.9.2...HEAD
+[0.9.2]: https://github.com/AlpineVibrations/clt-rs/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/AlpineVibrations/clt-rs/compare/v0.9.0...v0.9.1
 [0.8.3]: https://github.com/AlpineVibrations/clt-rs/compare/v0.8.2...v0.8.3
 [0.8.2]: https://github.com/AlpineVibrations/clt-rs/compare/v0.8.1...v0.8.2

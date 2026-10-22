@@ -230,7 +230,7 @@ pub(super) fn prefix_task_agent_flag(
         .and_then(|session| session_states.get(session));
     let text = if status != TaskStatus::Done && crate::task::task_content_is_manual(&entry.content)
     {
-        format!("[MANUAL] {text}")
+        format!("[CODEX] {text}")
     } else if !matches!(
         session_state,
         Some(AgentSessionControlState::Running | AgentSessionControlState::StopRequested)
@@ -7218,31 +7218,57 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
                     height: visible_height,
                 };
 
-                let mut badge_remaining =
-                    if recoverable_codex_session_id_from_task_content(&entry.content)
-                        .and_then(|session| app.task_agent_session_states.get(session))
-                        == Some(&AgentSessionControlState::Running)
-                    {
-                        "[RUNNING]".len()
-                    } else {
-                        0
-                    };
+                let mut badges = Vec::with_capacity(2);
+                match recoverable_codex_session_id_from_task_content(&entry.content)
+                    .and_then(|session| app.task_agent_session_states.get(session))
+                {
+                    Some(AgentSessionControlState::Running) => badges.push((
+                        "[RUNNING]".len(),
+                        Style::default()
+                            .fg(Color::Rgb(80, 240, 150))
+                            .bg(Color::Rgb(18, 45, 30)),
+                    )),
+                    Some(AgentSessionControlState::StopRequested) => {
+                        badges.push(("[STOPPING]".len(), Style::default()));
+                    }
+                    _ => {}
+                }
+                if status != TaskStatus::Done && crate::task::task_content_is_manual(&entry.content)
+                {
+                    badges.push((
+                        "[CODEX]".len(),
+                        Style::default()
+                            .fg(Color::Rgb(255, 218, 110))
+                            .bg(Color::Rgb(50, 39, 16)),
+                    ));
+                }
+                let mut badges = badges.into_iter();
+                let mut badge = badges.next();
                 let mut item_lines: Vec<Line<'_>> = wrapped_content
                     .lines()
                     .map(|line| {
-                        // Keep the badge readable even on the yellow selected row.
-                        // Only its ASCII characters receive these colors.
-                        let badge_end = badge_remaining.min(line.len());
-                        badge_remaining -= badge_end;
-                        Line::from(vec![
-                            Span::styled(
-                                &line[..badge_end],
-                                Style::default()
-                                    .fg(Color::Rgb(80, 240, 150))
-                                    .bg(Color::Rgb(18, 45, 30)),
-                            ),
-                            Span::raw(&line[badge_end..]),
-                        ])
+                        // Only badge characters receive color, even across wrapped lines.
+                        let mut rest = line;
+                        let mut spans = Vec::new();
+                        while let Some((remaining, style)) = badge.as_mut() {
+                            if rest.is_empty() {
+                                break;
+                            }
+                            if let Some(after_space) = rest.strip_prefix(' ') {
+                                spans.push(Span::raw(" "));
+                                rest = after_space;
+                                continue;
+                            }
+                            let end = (*remaining).min(rest.len());
+                            spans.push(Span::styled(&rest[..end], *style));
+                            rest = &rest[end..];
+                            *remaining -= end;
+                            if *remaining == 0 {
+                                badge = badges.next();
+                            }
+                        }
+                        spans.push(Span::raw(rest));
+                        Line::from(spans)
                     })
                     .collect();
                 if let Some(first) = item_lines.first_mut() {

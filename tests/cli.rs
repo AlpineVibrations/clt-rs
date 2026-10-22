@@ -273,7 +273,7 @@ fn concurrent_direct_starts_reserve_distinct_sessions_but_reject_duplicate_ident
             }
             let (doing, _) = assert_success(&workspace.run(&["list", "doing"]));
             assert_eq!(
-                doing.matches("[MANUAL] Direct work").count(),
+                doing.matches("[CODEX] Direct work").count(),
                 if same_session { 1 } else { 2 }
             );
             let (todo, _) = assert_success(&workspace.run(&["list", "todo"]));
@@ -351,7 +351,7 @@ fn manual_tasks_start_in_doing_and_handoff_keeps_the_conversation() {
             MANUAL_SESSION,
         ]));
         let (doing, _) = assert_success(&workspace.run(&["list", "doing"]));
-        assert!(doing.contains("[MANUAL] Plan the feature."));
+        assert!(doing.contains("[CODEX] Plan the feature."));
         assert!(!doing.contains("STOPPED") && !doing.contains("clt:manual"));
         let (todo, _) = assert_success(&workspace.run(&["list", "todo"]));
         assert!(todo.contains("Unrelated queued work") && !todo.contains("Plan the feature"));
@@ -378,7 +378,7 @@ fn manual_tasks_start_in_doing_and_handoff_keeps_the_conversation() {
         // Returning to Todo is the normal handoff, including from the TUI.
         assert_success(&workspace.run(&["status", "doing", "1", "todo"]));
         let (todo, _) = assert_success(&workspace.run(&["list", "todo"]));
-        assert!(!todo.contains("[MANUAL]"));
+        assert!(!todo.contains("[CODEX]"));
         let index = todo
             .lines()
             .find(|line| line.contains("Plan the feature"))
@@ -389,7 +389,7 @@ fn manual_tasks_start_in_doing_and_handoff_keeps_the_conversation() {
         assert_success(&workspace.run(&["claim", "todo", index, "--session", MANUAL_SESSION]));
         assert_success(&workspace.run(&["handoff", "doing", "1"]));
         let (todo, _) = assert_success(&workspace.run(&["list", "todo"]));
-        assert!(!todo.contains("MANUAL"));
+        assert!(!todo.contains("[CODEX]"));
         let stored = if folders {
             fs::read_dir(workspace.path().join("tasks/todo"))
                 .unwrap()
@@ -404,7 +404,7 @@ fn manual_tasks_start_in_doing_and_handoff_keeps_the_conversation() {
         assert_success(&workspace.run(&["claim", "todo", index, "--session", MANUAL_SESSION]));
         assert_success(&workspace.run(&["done", "doing", "1"]));
         let (done, _) = assert_success(&workspace.run(&["list", "done"]));
-        assert!(!done.contains("MANUAL") && !done.contains("STOPPED"));
+        assert!(!done.contains("[CODEX]") && !done.contains("STOPPED"));
         assert_success(&workspace.run(&[
             "start",
             "Next direct task",

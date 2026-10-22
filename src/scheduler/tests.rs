@@ -125,7 +125,7 @@ fn manual_marker_survives_editing_and_reserves_nested_boards() {
         .into_iter()
         .collect(),
     );
-    assert!(display.starts_with("[MANUAL]"));
+    assert!(display.starts_with("[CODEX]"));
     assert!(!display.contains("STOPPED") && !display.contains("clt:manual"));
     assert!(!task_supports_interactive_codex_resume(
         TaskStatus::Todo,
