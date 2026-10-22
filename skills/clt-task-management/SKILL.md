@@ -138,7 +138,7 @@ clt list todo
 clt claim todo <index>
 ```
 
-Directly claimed Codex tasks display `[CODEX]` while claimed. Claims survive session exits,
+Directly claimed Codex tasks display `[CLI]` while claimed. Claims survive session exits,
 restarts, edits, and moves to Backlog. Moving a task to Todo in the TUI or with
 `clt status` releases its manual claim, removes the label, and preserves its
 conversation for normal automation. Finish with `clt done`, or, when the user wants

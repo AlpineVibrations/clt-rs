@@ -230,7 +230,7 @@ pub(super) fn prefix_task_agent_flag(
         .and_then(|session| session_states.get(session));
     let text = if status != TaskStatus::Done && crate::task::task_content_is_manual(&entry.content)
     {
-        format!("[CODEX] {text}")
+        format!("[CLI] {text}")
     } else if !matches!(
         session_state,
         Some(AgentSessionControlState::Running | AgentSessionControlState::StopRequested)
@@ -7236,7 +7236,7 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
                 if status != TaskStatus::Done && crate::task::task_content_is_manual(&entry.content)
                 {
                     badges.push((
-                        "[CODEX]".len(),
+                        "[CLI]".len(),
                         Style::default()
                             .fg(Color::Rgb(255, 218, 110))
                             .bg(Color::Rgb(50, 39, 16)),

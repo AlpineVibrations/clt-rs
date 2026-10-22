@@ -4,4 +4,8 @@ Completion note: COMPLETED 2026-10-22: Renamed the direct-session badge to [CODE
 
 Release note: COMPLETED 2026-10-22: Bumped CLT to 0.9.2 with matching lockfile, release notes and installation examples. Package archive audit and native CLI smoke checks passed; installed locally and verified clt 0.9.2.
 
+Release note: COMPLETED 2026-10-22: Renamed the direct-session badge from [CODEX] to [CLI], preserving its golden color and badge-only styling. Updated CLI messages, documentation, existing expectations and package metadata for 0.9.3. Formatting, strict Clippy, package audit and smoke checks passed; 859 tests passed with one intentional ignore. Cleared disposable CLT build artifacts after a full-disk compilation failure and reran tests without debug symbols or incremental artifacts. Installed locally and verified clt 0.9.3 and the [CLI] listing.
+
+Tracking status: The verified 0.9.3 implementation and installation are complete. CLT refused the Done transition because a disk-full error publishing the global registry snapshot left recovery waiting for the live interactive guardian PID 9741 in multigen (session 01a164be-04a5-77c2-8160-109f49f0bc96). Finish the board transition after that session exits and registry recovery completes.
+
 clt:manual codex:01a1640c-0ded-7e62-a779-32882a71bd9d
