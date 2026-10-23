@@ -426,7 +426,7 @@ pub(super) fn set_agent_project_git_mode(
     let project_root = resolve_agent_project_root(path, local, default_root)?;
     if store.set_project_git_mode_for_path_blocking(&project_root, mode)? {
         println!(
-            "Set Git mode to {} for project: {}",
+            "Set Git mode to {} for project: {} (subsequent runs; active runs keep their current mode)",
             mode.label(),
             project_root.display()
         );

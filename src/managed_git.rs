@@ -1144,10 +1144,13 @@ pub(super) fn prepare_agent_git_start_state_for_run(
     has_existing_session_finalization: bool,
     run_token: &str,
 ) -> Result<Option<AgentGitStartState>> {
-    if project.git_mode == AgentGitMode::Off {
+    if project.git_mode == AgentGitMode::Off && task_selection != AgentTaskSelection::NextTodo {
         return Ok(None);
     }
-    if has_started_session && !has_existing_session_finalization {
+    if project.git_mode != AgentGitMode::Off
+        && has_started_session
+        && !has_existing_session_finalization
+    {
         anyhow::bail!(
             "Known Codex session has no frozen Git start journal; CLT will not reconstruct the task boundary from a later checkout"
         );
@@ -1164,9 +1167,10 @@ pub(super) fn prepare_agent_git_start_state_for_run(
         let (prior_run_token, prior_mode, prior_start) = store
             .git_launch_state_for_project_blocking(project.id)?
             .context("The prior Git launch boundary disappeared during recovery")?;
-        let checkout_is_unchanged = prior_mode == project.git_mode
-            && verify_agent_git_start_state_unchanged(&project.path, prior_mode, &prior_start)
-                .is_ok();
+        // A changed default does not alter the abandoned run's proof. Reclaim
+        // only against its frozen mode, even if the next run will use Git off.
+        let checkout_is_unchanged =
+            verify_agent_git_start_state_unchanged(&project.path, prior_mode, &prior_start).is_ok();
         let reclaimed = checkout_is_unchanged
             && store.reclaim_unchanged_git_launch_state_blocking(
                 project.id,
@@ -1187,6 +1191,9 @@ pub(super) fn prepare_agent_git_start_state_for_run(
         anyhow::bail!(
             "Automated run {run_token} already has an unconsumed Git launch boundary; CLT will not recapture it from a later checkout"
         );
+    }
+    if project.git_mode == AgentGitMode::Off {
+        return Ok(None);
     }
     let project_has_working_boundary = store
         .list_pending_git_finalizations_blocking(Some(project.id))?

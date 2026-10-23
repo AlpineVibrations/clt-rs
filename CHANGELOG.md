@@ -6,6 +6,12 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+### Changed
+
+- Allow project Git-mode changes during automated runs, interactive sessions,
+  and pending Git completion. Save the default for subsequent runs while
+  preserving active runs' original commit and push behavior.
+
 ## [0.9.3] - 2026-10-22
 
 ### Changed

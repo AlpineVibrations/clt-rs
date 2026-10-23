@@ -39,10 +39,9 @@ async fn session_can_enable_git(
 ) -> Result<bool> {
     Ok(query_count(conn,
         "SELECT COUNT(*) FROM session_git_modes m
-         JOIN projects p ON p.id = m.project_id
          JOIN leases l ON l.project_id = m.project_id
          WHERE m.project_id = ?1 AND m.codex_session_id = ?2 AND m.git_mode = 'off'
-           AND p.git_mode <> 'off' AND l.holder = ?3
+           AND l.holder = ?3
            AND CAST(l.expires_at AS INTEGER) > CAST(?4 AS INTEGER)
            AND NOT EXISTS (SELECT 1 FROM git_finalizations g
                WHERE g.project_id = m.project_id AND g.codex_session_id = m.codex_session_id)
@@ -346,8 +345,7 @@ impl TursoAgentStore {
                     project_id, codex_session_id, state, git_mode, starting_head,
                     branch_ref, upstream_ref, worktree_baseline, task_identity,
                     owner_run_token, generation, created_at, updated_at
-                 ) SELECT ?1, ?2, 'working', ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?10
-                   WHERE EXISTS (SELECT 1 FROM projects WHERE id = ?1 AND git_mode = ?3)",
+                 ) VALUES (?1, ?2, 'working', ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?10)",
                 params![journal.project_id, journal.codex_session_id, journal.git_mode.database_value(),
                     journal.starting_head, journal.branch_ref, journal.upstream_ref,
                     journal.worktree_baseline, journal.task_identity, journal.owner_run_token, journal.created_at],

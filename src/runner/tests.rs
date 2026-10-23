@@ -50,6 +50,10 @@ fn enabling_project_git_records_the_unmanaged_session_before_resumption() {
         );
         assert_eq!(
             effective_agent_git_mode(&store, &project, Some("unmanaged")).unwrap(),
+            AgentGitMode::Off
+        );
+        assert_eq!(
+            agent_git_mode_for_launch(&store, &project, Some("unmanaged")).unwrap(),
             AgentGitMode::CommitAndPush
         );
         assert_eq!(

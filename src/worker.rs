@@ -35,8 +35,8 @@ use crate::{
         local_process_is_running, prepare_agent_worker_service, resolve_agent_service_environment,
     },
     runner::{
-        AgentRunRequest, AgentRunner, CodexAgentRunner, agent_timestamp, agent_timestamp_after,
-        agent_timestamp_seconds, effective_agent_git_mode, print_agent_log_tail_with_limit,
+        AgentRunRequest, AgentRunner, CodexAgentRunner, agent_git_mode_for_launch, agent_timestamp,
+        agent_timestamp_after, agent_timestamp_seconds, print_agent_log_tail_with_limit,
         tail_lines,
     },
     scheduler::{
@@ -1038,7 +1038,7 @@ pub(super) fn agent_job_uses_git(job: &AgentRunJob) -> Result<bool> {
     };
     with_agent_store_at(&job.state_dir, |store| {
         Ok(
-            effective_agent_git_mode(store, &job.project, session_id.as_deref())?
+            agent_git_mode_for_launch(store, &job.project, session_id.as_deref())?
                 != AgentGitMode::Off,
         )
     })
@@ -1054,7 +1054,7 @@ pub(super) fn run_agent_job_inner(
         None => automated_codex_session_to_resume(&job.project.path, job.task_selection)?,
     };
     job.project.git_mode = with_agent_store_at(&job.state_dir, |store| {
-        effective_agent_git_mode(store, &job.project, session_id.as_deref())
+        agent_git_mode_for_launch(store, &job.project, session_id.as_deref())
     })?;
     if job.worker_token.is_none() && job.task_selection == AgentTaskSelection::ResumeDoing {
         with_agent_store_at(&job.state_dir, |store| {

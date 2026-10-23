@@ -3382,7 +3382,11 @@ pub(super) fn cycle_selected_tui_agent_project_git_mode(
     panel.refresh(active_root);
 
     if changed {
-        Ok(format!("Git mode for {}: {}", project.name, mode.label()))
+        Ok(format!(
+            "Git mode for {}: {} for subsequent runs; active runs keep their current mode",
+            project.name,
+            mode.label()
+        ))
     } else {
         Ok(format!(
             "Project is no longer registered: {}",

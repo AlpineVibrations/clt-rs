@@ -8,6 +8,7 @@ mod board_repair;
 mod deletion;
 mod enable_on_resume;
 mod follow_up;
+mod git_settings;
 mod launch_edits;
 mod orphan;
 mod projection;
@@ -769,7 +770,12 @@ fn unconsumed_git_launch_boundary_cannot_be_overwritten_after_release() {
 
 #[test]
 fn unchanged_launch_boundary_is_reclaimed_only_after_its_worker_is_dead() {
-    for concurrent_edits in [false, true] {
+    for (concurrent_edits, next_mode) in [
+        (false, AgentGitMode::Commit),
+        (true, AgentGitMode::Commit),
+        (false, AgentGitMode::Off),
+        (true, AgentGitMode::Off),
+    ] {
         let root = temp_root("automated-git-unchanged-launch-reclaim");
         let state_dir = root.join("state/clt");
         let project_root = root.join("project");
@@ -825,6 +831,10 @@ fn unchanged_launch_boundary_is_reclaimed_only_after_its_worker_is_dead() {
             .unwrap();
             fs::write(project_root.join("notes.txt"), "User notes\n").unwrap();
         }
+        store
+            .set_project_git_mode_blocking(project.id, next_mode)
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
         // Worktree edits do not bypass the worker ownership fence.
         assert!(
             prepare_agent_git_start_state_for_run(
@@ -865,7 +875,6 @@ fn unchanged_launch_boundary_is_reclaimed_only_after_its_worker_is_dead() {
             false,
             "replacement-worker",
         )
-        .unwrap()
         .unwrap();
         if concurrent_edits {
             assert_eq!(
@@ -879,13 +888,24 @@ fn unchanged_launch_boundary_is_reclaimed_only_after_its_worker_is_dead() {
                 fs::read_to_string(project_root.join("notes.txt")).unwrap(),
                 "User notes\n"
             );
+            if let Some(recovered) = &recovered {
+                assert_eq!(
+                    run_test_git(&project_root, &["show", "HEAD:tasks/todo.md"]),
+                    "# Todo Tasks\n- Retry after a pre-registration crash\n- Concurrent task"
+                );
+                assert_ne!(recovered.starting_head, launch.starting_head);
+            }
+        } else if next_mode != AgentGitMode::Off {
+            assert_eq!(recovered, Some(launch.clone()));
+        }
+        if next_mode == AgentGitMode::Off {
+            assert!(recovered.is_none());
             assert_eq!(
-                run_test_git(&project_root, &["show", "HEAD:tasks/todo.md"]),
-                "# Todo Tasks\n- Retry after a pre-registration crash\n- Concurrent task"
+                run_test_git(&project_root, &["rev-parse", "HEAD"]),
+                launch.starting_head
             );
-            assert_ne!(recovered.starting_head, launch.starting_head);
         } else {
-            assert_eq!(recovered, launch);
+            assert!(recovered.is_some());
         }
         assert!(
             store

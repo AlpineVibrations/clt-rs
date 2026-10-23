@@ -31,7 +31,7 @@ After release, inspect the frozen state but do not pull, fetch/synchronize, merg
 
 Unstaged task-board edits and other unstaged or untracked changes made after launch do not invalidate activation or terminal-worker launch recovery. Preserve those edits and continue with the selected task; CLT still checks HEAD, branch, upstream, the index, and the selected task identity without replacing the recorded baseline.
 
-An unconsumed pre-registration launch boundary is immutable. Do not retry by recapturing it from the current checkout or by cleaning/unregistering the project. Even if a reaped child exits before announcing a session, CLT preserves the record until the exact worker is terminal, no session-control row owns the run token, and HEAD, branch, upstream, index, and Git mode still match; otherwise it fails closed.
+An unconsumed pre-registration launch boundary is immutable. Do not retry by recapturing it from the current checkout or by cleaning/unregistering the project. Even if a reaped child exits before announcing a session, CLT preserves the record until the exact worker is terminal, no session-control row owns the run token, and HEAD, branch, upstream, and index still match the boundary verified using its frozen Git mode; otherwise it fails closed. Project Git settings may change for subsequent runs, but the active run's recorded mode and publication obligations remain unchanged.
 
 ## Shared Dirty Worktrees
 

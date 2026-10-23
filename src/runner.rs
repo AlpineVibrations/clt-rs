@@ -1711,6 +1711,8 @@ pub(super) fn agent_codex_prompt(
     )
 }
 
+/// Resolve the contract already recorded for a session, including Git off.
+/// Task commands must never adopt a changed project default during a live run.
 pub(super) fn effective_agent_git_mode(
     store: &agent::TursoAgentStore,
     project: &agent::AgentProject,
@@ -1734,11 +1736,7 @@ pub(super) fn effective_agent_git_mode(
         return Ok(project.git_mode);
     }
     if let Some(mode) = store.session_git_mode_blocking(project.id, session_id)? {
-        return Ok(if mode == AgentGitMode::Off {
-            project.git_mode
-        } else {
-            mode
-        });
+        return Ok(mode);
     }
     if finalization.is_none()
         && let Some(control) = store.session_control_blocking(project.id, session_id)?
@@ -1747,14 +1745,25 @@ pub(super) fn effective_agent_git_mode(
     {
         store.recover_unmanaged_session_git_mode_blocking(project.id, session_id, &path)?;
         if let Some(mode) = store.session_git_mode_blocking(project.id, session_id)? {
-            return Ok(if mode == AgentGitMode::Off {
-                project.git_mode
-            } else {
-                mode
-            });
+            return Ok(mode);
         }
     }
     Ok(project.git_mode)
+}
+
+/// Only launch preparation may enable Git for previously unmanaged work. The
+/// runner must capture and register its boundary before releasing the child.
+pub(super) fn agent_git_mode_for_launch(
+    store: &agent::TursoAgentStore,
+    project: &agent::AgentProject,
+    resume_session_id: Option<&str>,
+) -> Result<AgentGitMode> {
+    let mode = effective_agent_git_mode(store, project, resume_session_id)?;
+    Ok(if mode == AgentGitMode::Off {
+        project.git_mode
+    } else {
+        mode
+    })
 }
 
 fn legacy_agent_log_proves_git_off(
@@ -1988,7 +1997,7 @@ impl CodexAgentRunner {
         };
         let mut effective_project = project.clone();
         effective_project.git_mode =
-            effective_agent_git_mode(&store, project, known_session_id.as_deref())?;
+            agent_git_mode_for_launch(&store, project, known_session_id.as_deref())?;
         let project = &effective_project;
         let effective_worker_token = run_token
             .map(str::to_string)

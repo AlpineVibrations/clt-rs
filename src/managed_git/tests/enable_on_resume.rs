@@ -78,6 +78,11 @@ fn fixture(mode: AgentGitMode) -> (PathBuf, TursoAgentStore, AgentProject) {
 fn paused_task_can_enable_git_and_complete_with_commit_or_push() {
     for mode in [AgentGitMode::Commit, AgentGitMode::CommitAndPush] {
         let (root, store, project) = fixture(mode);
+        // The worker already selected its mode. A settings edit during resume
+        // preparation changes the next launch, not this managed phase.
+        store
+            .set_project_git_mode_blocking(project.id, AgentGitMode::Off)
+            .unwrap();
         let before = run_test_git(&project.path, &["rev-parse", "HEAD"]);
         enable_agent_git_for_resumed_session(&store, &project, SESSION, RUN, HOLDER).unwrap();
         let journal = store

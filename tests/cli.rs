@@ -69,6 +69,82 @@ fn assert_success(output: &Output) -> (String, String) {
 const MANUAL_SESSION: &str = "01900000-0000-7000-8000-000000000001";
 
 #[test]
+fn enabling_git_during_an_unmanaged_run_does_not_change_its_task_commands() {
+    for folders in [false, true] {
+        let workspace = TestWorkspace::new("git-default-live-off");
+        assert_success(&workspace.run(if folders {
+            &["init", "--folders"]
+        } else {
+            &["init"]
+        }));
+        assert_success(&workspace.run(&["agent", "register"]));
+        assert_success(&workspace.run(&["add", "Finish live task"]));
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let database = turso::Builder::new_local(workspace.path().join("agent-state/agent.db").to_str().unwrap())
+                .experimental_multiprocess_wal(true).build().await.unwrap();
+            let connection = database.connect().unwrap();
+            connection.execute("INSERT INTO session_controls (project_id, codex_session_id, state, child_pid, run_token, updated_at) SELECT id, 'live-session', 'running', 123, 'live-run', '100' FROM projects", ()).await.unwrap();
+            connection.execute("INSERT INTO session_git_modes (project_id, codex_session_id, git_mode) SELECT id, 'live-session', 'off' FROM projects", ()).await.unwrap();
+            connection.execute("INSERT INTO leases (project_id, holder, acquired_at, expires_at) SELECT id, 'live-owner', '100', '9999999999' FROM projects", ()).await.unwrap();
+        });
+        let (feedback, _) = assert_success(&workspace.run(&["agent", "git-commit", "push"]));
+        assert!(feedback.contains("subsequent runs"));
+        let automated = |args: &[&str]| {
+            Command::new(env!("CARGO_BIN_EXE_clt"))
+                .current_dir(workspace.path())
+                .arg("--local")
+                .args(args)
+                .env("CLT_AGENT_STATE_DIR", workspace.path().join("agent-state"))
+                .env("CLT_AGENT_PROJECT_ID", "1")
+                .env("CLT_AGENT_RUN_TOKEN", "live-run")
+                .output()
+                .unwrap()
+        };
+        // No Git repository exists: adopting PUSH here would fail activation.
+        assert_success(&automated(&["status", "todo", "1", "doing"]));
+        let doing_file = if folders {
+            fs::read_dir(workspace.path().join("tasks/doing"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path()
+        } else {
+            workspace.path().join("tasks/doing.md")
+        };
+        let doing = fs::read_to_string(&doing_file).unwrap();
+        assert!(doing.contains("codex:live-session"));
+        fs::write(
+            &doing_file,
+            doing.replace(
+                "codex:live-session",
+                "— COMPLETED 2026-10-23: verified codex:live-session",
+            ),
+        )
+        .unwrap();
+        assert_success(&automated(&["done", "doing", "1"]));
+        let (remaining, _) = assert_success(&workspace.run(&["list", "doing"]));
+        assert!(remaining.contains("--- DOING ---"));
+        assert!(!remaining.contains("Finish live task"));
+        assert!(
+            assert_success(&workspace.run(&["list", "done"]))
+                .0
+                .contains("Finish live task")
+        );
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let database = turso::Builder::new_local(workspace.path().join("agent-state/agent.db").to_str().unwrap())
+                .experimental_multiprocess_wal(true).build().await.unwrap();
+            let connection = database.connect().unwrap();
+            let mut rows = connection.query("SELECT p.git_mode, m.git_mode, (SELECT COUNT(*) FROM git_finalizations) FROM projects p JOIN session_git_modes m ON m.project_id = p.id", ()).await.unwrap();
+            let row = rows.next().await.unwrap().unwrap();
+            assert_eq!(row.get::<String>(0).unwrap(), "commit-and-push");
+            assert_eq!(row.get::<String>(1).unwrap(), "off");
+            assert_eq!(row.get::<i64>(2).unwrap(), 0);
+        });
+    }
+}
+
+#[test]
 fn manual_claim_preserves_other_runs_and_refuses_its_own_automated_contract() {
     for ownership in ["lease", "prior-run", "launch"] {
         let workspace = TestWorkspace::new("manual-busy");

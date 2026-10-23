@@ -17,6 +17,10 @@ use crate::{
     scheduler::agent_lease_holder_liveness,
 };
 
+#[cfg(test)]
+#[path = "tests/projects_models.rs"]
+mod tests;
+
 /// Persistence for registered projects, provider configuration, and models.
 pub(in crate::agent) struct ProjectsModelsRepository(RepositoryDatabase);
 
@@ -176,38 +180,9 @@ impl TursoAgentStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .await
             .with_context(|| format!("Failed to begin setting project {project_id} Git mode"))?;
-        if query_count(
-            &transaction,
-            "SELECT COUNT(*) FROM git_finalizations
-              WHERE project_id = ?1
-                AND state IN ('working', 'tracking', 'commit_pending', 'push_pending')",
-            [project_id],
-        )
-        .await?
-            > 0
-            || query_count(
-                &transaction,
-                "SELECT COUNT(*) FROM agent_workers
-                  WHERE project_id = ?1
-                    AND state IN ('dispatching', 'running', 'finalizing')",
-                [project_id],
-            )
-            .await?
-                > 0
-            || query_count(
-                &transaction,
-                "SELECT COUNT(*) FROM leases WHERE project_id = ?1",
-                [project_id],
-            )
-            .await?
-                > 0
-        {
-            anyhow::bail!(
-                "Cannot change project {project_id} Git mode while an agent run or Git journal is active"
-            );
-        }
-        // Preserve an idle pre-upgrade automated session's unmanaged contract
-        // before changing the setting used for new sessions.
+        // This is the default for subsequent launches. Existing launch records,
+        // session modes, journals and owners keep their original contract.
+        // Preserve pre-upgrade unmanaged sessions before changing that default.
         transaction
             .execute(
                 "INSERT OR IGNORE INTO session_git_modes (project_id, codex_session_id, git_mode)
@@ -262,37 +237,6 @@ impl TursoAgentStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .await
             .with_context(|| format!("Failed to begin setting project {path} Git mode"))?;
-        if query_count(
-            &transaction,
-            "SELECT COUNT(*) FROM git_finalizations
-              WHERE project_id = (SELECT id FROM projects WHERE path = ?1)
-                AND state IN ('working', 'tracking', 'commit_pending', 'push_pending')",
-            [path.as_str()],
-        )
-        .await?
-            > 0
-            || query_count(
-                &transaction,
-                "SELECT COUNT(*) FROM agent_workers
-                  WHERE project_id = (SELECT id FROM projects WHERE path = ?1)
-                    AND state IN ('dispatching', 'running', 'finalizing')",
-                [path.as_str()],
-            )
-            .await?
-                > 0
-            || query_count(
-                &transaction,
-                "SELECT COUNT(*) FROM leases
-                  WHERE project_id = (SELECT id FROM projects WHERE path = ?1)",
-                [path.as_str()],
-            )
-            .await?
-                > 0
-        {
-            anyhow::bail!(
-                "Cannot change project {path} Git mode while an agent run or Git journal is active"
-            );
-        }
         transaction
             .execute(
                 "INSERT OR IGNORE INTO session_git_modes (project_id, codex_session_id, git_mode)
