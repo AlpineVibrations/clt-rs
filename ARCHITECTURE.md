@@ -182,6 +182,17 @@ Unit tests live under the module that owns the behavior, for example `src/task/t
 `src/test_support.rs` and are compiled only for tests. `tests/cli.rs` remains a black-box
 integration suite for the installed command contract.
 
+The planning runner matrix executes task activation inside its supervised fake
+Codex child, after the real launch gate opens. It checks the registered PID and
+run token as well as task ownership and preserved Git journals. There is no
+separate readiness timer racing Git preparation; the fixture retains a finite
+60-second child deadline and the ordinary supervisor's reaping proof. Run this
+regression with default full-suite concurrency as well as in isolation:
+
+```bash
+cargo test --locked --bin clt runner::tests::planning
+```
+
 The runner records the requested Fast setting as the first line of each automated
 run's stderr log. The log footer reads that launch record and Codex's complete
 startup header from the displayed run, preserving historical settings independently

@@ -299,6 +299,76 @@ fn fresh_launch_keeps_its_selected_todo_and_rejects_a_new_uncommitted_selection(
 
 #[cfg(unix)]
 #[test]
+fn planning_runner_process_entry() {
+    let Ok(mode) = std::env::var("CLT_TEST_PLANNING_RUNNER_MODE") else {
+        return;
+    };
+    let mode = AgentGitMode::from_database(&mode).unwrap();
+    let resumed: bool = std::env::var("CLT_TEST_PLANNING_RUNNER_RESUMED")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let state = PathBuf::from(std::env::var_os(AGENT_STATE_DIR_ENV).unwrap());
+    let context = AutomatedAgentChildContext {
+        project_id: std::env::var(AGENT_PROJECT_ID_ENV).unwrap().parse().unwrap(),
+        run_token: std::env::var(AGENT_RUN_TOKEN_ENV).unwrap(),
+    };
+    let store = agent::TursoAgentStore::open_blocking(&state).unwrap();
+    let mut project = store
+        .list_projects_blocking()
+        .unwrap()
+        .into_iter()
+        .find(|project| project.id == context.project_id)
+        .unwrap();
+    project.git_mode = mode;
+    let control = store
+        .session_control_blocking(project.id, "planning-session")
+        .unwrap()
+        .unwrap();
+    assert_eq!(control.state, AgentSessionControlState::Running);
+    assert_eq!(control.run_token.as_deref(), Some(context.run_token.as_str()));
+    assert_eq!(control.child_pid, Some(std::process::id()));
+    if resumed {
+        let doing = read_task_entries(&get_tasks_dir(&project.path), TaskStatus::Doing).unwrap();
+        assert_eq!(doing.len(), 1);
+        assert_eq!(
+            codex_session_for_task(&doing[0]).as_deref(),
+            Some("planning-session")
+        );
+    } else {
+        let wrong_task = if mode == AgentGitMode::Off {
+            move_task_to_doing_with_agent_session(&project.path, "2", &context, &project, &store)
+        } else {
+            move_task_to_doing_with_agent_git_journal(&project.path, "2", &context, &project, &store)
+        };
+        assert!(
+            wrong_task
+                .unwrap_err()
+                .to_string()
+                .contains("different Codex session")
+        );
+        if mode == AgentGitMode::Off {
+            move_task_to_doing_with_agent_session(&project.path, "1", &context, &project, &store)
+                .unwrap();
+        } else {
+            let journal = store
+                .git_finalization_blocking(project.id, "planning-session")
+                .unwrap()
+                .unwrap();
+            assert_eq!(journal.state, GitFinalizationState::Working);
+            assert_eq!(
+                journal.owner_run_token.as_deref(),
+                Some(context.run_token.as_str())
+            );
+            move_task_to_doing_with_agent_git_journal(&project.path, "1", &context, &project, &store)
+                .unwrap();
+        }
+    }
+    println!("activated");
+}
+
+#[cfg(unix)]
+#[test]
 fn todo_runner_starts_plans_and_resumes_prior_work_with_each_git_mode() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -422,98 +492,26 @@ fn todo_runner_starts_plans_and_resumes_prior_work_with_each_git_mode() {
                 )
                 .unwrap()
         );
-        let started = root.join("started");
-        let activated = root.join("activated");
         let fake = root.join("codex");
-        fs::write(&fake, format!(
-            "#!/bin/sh\nprintf 'arg=%s\\n' \"$@\" >&2\ntouch '{}'\nwhile [ ! -f '{}' ]; do sleep 0.01; done\nprintf 'activated\\n'\n",
-            started.display(), activated.display(),
-        )).unwrap();
+        // Run activation inside the gated child itself. Git preparation and
+        // registration may take longer than ten seconds in the parallel suite;
+        // an observer thread's timer must not race that work. The normal runner
+        // deadline still bounds the child and its supervisor proves it reaped.
+        let executable = std::env::current_exe().unwrap();
+        let quoted_executable = executable.to_str().unwrap().replace('\'', "'\\''");
+        fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\nprintf 'arg=%s\\n' \"$@\" >&2\n\
+                 export CLT_TEST_PLANNING_RUNNER_MODE={}\n\
+                 export CLT_TEST_PLANNING_RUNNER_RESUMED={resumed}\n\
+                 exec '{quoted_executable}' --exact runner::tests::planning::planning_runner_process_entry --nocapture\n",
+                mode.database_value(),
+            ),
+        )
+        .unwrap();
         fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
-        let thread_state = state.clone();
-        let thread_project = project.clone();
-        let activation = thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while !started.exists() && Instant::now() < deadline {
-                thread::sleep(Duration::from_millis(10));
-            }
-            assert!(started.exists(), "Codex was never released");
-            let store = agent::TursoAgentStore::open_blocking(&thread_state).unwrap();
-            let control = store
-                .session_control_blocking(thread_project.id, "planning-session")
-                .unwrap()
-                .unwrap();
-            assert_eq!(control.state, AgentSessionControlState::Running);
-            let context = AutomatedAgentChildContext {
-                project_id: thread_project.id,
-                run_token: control.run_token.unwrap(),
-            };
-            if resumed {
-                let doing =
-                    read_task_entries(&get_tasks_dir(&thread_project.path), TaskStatus::Doing)
-                        .unwrap();
-                assert_eq!(doing.len(), 1);
-                assert_eq!(
-                    codex_session_for_task(&doing[0]).as_deref(),
-                    Some("planning-session")
-                );
-                fs::write(activated, "done").unwrap();
-                return;
-            }
-            let wrong_task = if mode == AgentGitMode::Off {
-                move_task_to_doing_with_agent_session(
-                    &thread_project.path,
-                    "2",
-                    &context,
-                    &thread_project,
-                    &store,
-                )
-            } else {
-                move_task_to_doing_with_agent_git_journal(
-                    &thread_project.path,
-                    "2",
-                    &context,
-                    &thread_project,
-                    &store,
-                )
-            };
-            assert!(
-                wrong_task
-                    .unwrap_err()
-                    .to_string()
-                    .contains("different Codex session")
-            );
-            if mode == AgentGitMode::Off {
-                move_task_to_doing_with_agent_session(
-                    &thread_project.path,
-                    "1",
-                    &context,
-                    &thread_project,
-                    &store,
-                )
-                .unwrap();
-            } else {
-                let journal = store
-                    .git_finalization_blocking(thread_project.id, "planning-session")
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(journal.state, GitFinalizationState::Working);
-                assert_eq!(
-                    journal.owner_run_token.as_deref(),
-                    Some(context.run_token.as_str())
-                );
-                move_task_to_doing_with_agent_git_journal(
-                    &thread_project.path,
-                    "1",
-                    &context,
-                    &thread_project,
-                    &store,
-                )
-                .unwrap();
-            }
-            fs::write(activated, "done").unwrap();
-        });
-        let runner = CodexAgentRunner::with_command(state, Duration::from_secs(15), fake);
+        let runner = CodexAgentRunner::with_command(state, Duration::from_secs(60), fake);
         let result = runner
             .run_project(
                 &project,
@@ -527,9 +525,22 @@ fn todo_runner_starts_plans_and_resumes_prior_work_with_each_git_mode() {
                 None,
                 &new_agent_shutdown_signal(),
             )
-            .unwrap();
-        activation.join().unwrap();
-        assert_eq!(result.status, "success", "{}", result.summary);
+            .unwrap_or_else(|error| {
+                panic!("{mode:?}, registered={registered}, folders={folders}, resumed={resumed}: {error:#}")
+            });
+        assert_eq!(
+            result.status,
+            "success",
+            "{mode:?}, registered={registered}, folders={folders}, resumed={resumed}: {}\nstdout:\n{}\nstderr:\n{}",
+            result.summary,
+            fs::read_to_string(&result.stdout_path).unwrap(),
+            fs::read_to_string(&result.stderr_path).unwrap(),
+        );
+        assert!(
+            fs::read_to_string(&result.stdout_path)
+                .unwrap()
+                .contains("activated\n")
+        );
         assert_eq!(result.codex_session_id.as_deref(), Some("planning-session"));
         assert!(
             fs::read_to_string(&result.stderr_path).unwrap().contains(
