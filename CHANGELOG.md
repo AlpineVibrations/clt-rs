@@ -12,6 +12,15 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
   read-only review of its idle queued session with the original run token,
   preserving the conversation, Git journal, staging and live-owner protections.
 
+### Added
+
+- Coordinate manual and automated tasks with stable dependency references,
+  prerequisite completion/publication waits, declared scope and evidence-bound
+  overlap assessments. Show owners and actionable waits in context, CLI and TUI;
+  refresh automated sessions without replacing their conversations.
+- Add `clt finalize` to coordinate shared staging through sealing and commit,
+  preserving independent editing and the existing Git proof/recovery workflow.
+
 ### Changed
 
 - Allow project Git-mode changes during automated runs, interactive sessions,

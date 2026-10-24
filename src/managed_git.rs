@@ -1195,6 +1195,7 @@ pub(super) fn prepare_agent_git_start_state_for_run(
     if project.git_mode == AgentGitMode::Off {
         return Ok(None);
     }
+    let _coordination_guard = crate::coordination::finalization::acquire(&project.path, run_token)?;
     let project_has_working_boundary = store
         .list_pending_git_finalizations_blocking(Some(project.id))?
         .into_iter()
@@ -1233,6 +1234,8 @@ pub(super) fn enable_agent_git_for_resumed_session(
     {
         return Ok(());
     }
+    let _coordination_guard =
+        crate::coordination::finalization::acquire(&project.path, session_id)?;
     let board_dir = get_tasks_dir(&project.path);
     let _lock = acquire_board_mutation_lock(&board_dir)?;
     let (status, task) = terminal_task_for_codex_session_in_board(&board_dir, session_id)?
@@ -4150,7 +4153,14 @@ pub(super) fn reconcile_agent_git_finalization(
     owner_run_token: Option<&str>,
     finalization_lease: Option<&AgentGitFinalizationLease>,
 ) -> Result<agent::GitFinalizationRecord> {
+    let mut coordination_guard = None;
     for _ in 0..6 {
+        if finalization.state.is_finalizing() && coordination_guard.is_none() {
+            coordination_guard = Some(crate::coordination::finalization::acquire(
+                project_root,
+                &finalization.codex_session_id,
+            )?);
+        }
         ensure_agent_git_finalization_fence(finalization_lease)?;
         let effective_owner = owner_run_token.or(finalization.owner_run_token.as_deref());
         match finalization.state {

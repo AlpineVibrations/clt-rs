@@ -25,12 +25,13 @@ used Turso dependency. Application modules import its local API through
 | --- | --- | --- |
 | `cli` | Clap command definitions and command dispatch | application services, task commands, scheduler, TUI |
 | `application` | User-facing workflows that combine task state with agent and Git policy | task, agent facade, managed Git, platform |
-| `task` | Typed statuses, task parsing, Markdown/folder storage, locks, ordering, archive, nested boards | standard-library filesystem only |
+| `task` | Typed statuses, task parsing, Markdown/folder storage, locks, ordering, archive, nested boards | filesystem and portable metadata serialization |
 | `agent` | Agent domain records, configuration, migrations, and the store facade | repositories, one owned Tokio blocking adapter |
 | `agent::recovery` | Atomic external registry snapshots, lifetime/write locks, quarantine and exclusive reconstruction | agent store and filesystem |
 | `agent::repositories` | Projects/models, workers/leases, sessions/runs, and Git-journal persistence | Turso and agent-domain records |
 | `platform` | launchd/systemd, executable snapshots, process groups, and terminal/process adapters | operating-system APIs |
 | `managed_git` | Git preflight, immutable launch boundaries, commit proof, publication, and recovery | task services and agent journals |
+| `coordination` | Task dependency graph, scope/overlap admission, live context, cooperative finalization ownership | task metadata, agent facade, read-only Git status |
 | `manual_sessions` | Atomic direct-session task creation, claiming, and explicit handoff | task board, application moves, agent ownership checks |
 | `supervisor` | Read-only blocked-work assessments, evidence-bound decisions, bounded exact-session retries | agent store, task services, runner |
 | `scheduler` | Pure scheduling decisions, scans, cooldowns, lease acquisition, and daemon passes | agent store and worker orchestration |
@@ -42,6 +43,30 @@ used Turso dependency. Application modules import its local API through
 | `tui` | `TuiApp` state, pane reducers, explicit effects, terminal ownership, and pure rendering | application services and cached snapshots |
 
 ## Boundary rules
+
+- `task::coordination` owns the portable metadata comment (UUID, dependencies,
+  scope and pair reviews). Task editors preserve it, display hides its encoding,
+  and the existing Git payload identity excludes it. Git still seals the exact
+  complete tree, including metadata; no manifest or ownership proof is relaxed.
+- `coordination::Snapshot` reads the containing board tree and prerequisite Git
+  journals through the store facade. Deterministic analysis separates dependency
+  waits from overlap assessments and execution blockers. Pair fingerprints bind
+  requirements and declared scope; no missing-metadata or dirty-worktree project
+  fence is introduced. Selection, activation, manual claims, completion and
+  resume acquisition share admission. Waiting consumers cannot block their own
+  prerequisites; workers preserve their session and unsealed journal when
+  returning automated coordination waits to Todo.
+- CLI context and cached TUI annotations expose owners, scope and specific waits.
+  The private app-server worker polls context changes and uses its existing
+  exact-turn steering transport, without replacing threads or taking over manual
+  sessions. Direct sessions cooperate through `context --check` and scope updates.
+- `coordination::finalization` provides a kernel file lock around a participating
+  staging/sealing/commit command. Nested commands authenticate the same owner via
+  an inherited token; only that command inherits the Unix descriptor. Scheduler
+  Git preparation and proof reconciliation use this boundary too. It supplements
+  existing leases, index manifests and retry contracts; it never stages, clears
+  the index, or changes Git routing. File presence is not ownership. Uncoordinated
+  external edits remain outside the shared-checkout guarantee.
 
 - `task` does not depend on agent or TUI code.
 - CLI and TUI call application/store facades; they do not contain SQL.
@@ -166,4 +191,15 @@ The supervisor stop/resume recovery regressions can also be run directly:
 
 ```bash
 cargo test --locked --bin clt supervisor::tests
+```
+
+Coordination regressions cover both board layouts, stable references and edits,
+cycles/missing references, publication-aware prerequisites, parallel manual work,
+semantic overlap across files, reviewed compatible shared files, scope changes,
+worker context refresh and process-lifetime staging ownership. Targeted checks:
+
+```bash
+cargo test --locked --bin clt coordination
+cargo test --locked --test cli coordination
+cargo test --locked --bin clt managed_git::tests
 ```

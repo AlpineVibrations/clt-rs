@@ -1,3 +1,5 @@
+pub(crate) mod coordination;
+
 use anyhow::{Context, Result};
 use std::{
     ffi::OsStr,
@@ -706,7 +708,7 @@ pub(super) fn read_directory_entries(path: &Path) -> Result<Vec<TaskEntry>> {
                 fs::read_to_string(&path)
                     .with_context(|| format!("Failed to read task file {:?}", path))?
             };
-            let summary = first_sentence(&content).unwrap_or(fallback);
+            let summary = first_sentence(&coordination::strip(&content)).unwrap_or(fallback);
             let (description, metadata) = split_description_metadata(&summary);
             let has_subtasks = is_dir && board_has_any_status_store(&path);
 
@@ -727,7 +729,8 @@ pub(super) fn task_entry_from_text(
     content: &str,
     has_subtasks: bool,
 ) -> TaskEntry {
-    let summary = first_sentence(text).unwrap_or_else(|| text.trim().to_string());
+    let text = coordination::strip(text);
+    let summary = first_sentence(&text).unwrap_or_else(|| text.trim().to_string());
     let (description, metadata) = split_description_metadata(&summary);
 
     TaskEntry {
@@ -990,6 +993,8 @@ pub(super) fn task_content_without_recoverable_codex_session(content: &str) -> S
 }
 
 pub(super) fn task_content_for_edit(content: &str) -> String {
+    let content = coordination::strip(content);
+    let content = content.as_str();
     task_content_without_interactive_done_marker(&task_content_without_manual_marker(
         &task_content_without_recoverable_codex_session(task_content_without_stop_marker(content)),
     ))
@@ -1033,6 +1038,8 @@ pub(super) fn normalize_task_text(content: &str) -> String {
 }
 
 pub(super) fn durable_task_identity(content: &str) -> Option<String> {
+    let content = coordination::strip(content);
+    let content = content.as_str();
     let content = task_content_without_interactive_done_marker(
         &task_content_without_recoverable_codex_session(content),
     );
@@ -1098,8 +1105,9 @@ pub(super) fn split_description_metadata(value: &str) -> (&str, Option<&str>) {
 }
 
 pub(super) fn task_display_text(entry: &TaskEntry) -> String {
+    let summary = coordination::strip(&entry.summary);
     let summary = task_content_without_interactive_done_marker(
-        &task_content_without_manual_marker(task_content_without_stop_marker(&entry.summary)),
+        &task_content_without_manual_marker(task_content_without_stop_marker(&summary)),
     );
     match &entry.metadata {
         Some(metadata) => format!("{summary} ({metadata})"),
@@ -1108,8 +1116,9 @@ pub(super) fn task_display_text(entry: &TaskEntry) -> String {
 }
 
 pub(super) fn task_full_display_text(entry: &TaskEntry) -> String {
+    let raw = coordination::strip(&entry.content);
     let content = normalize_task_text(&task_content_without_interactive_done_marker(
-        &task_content_without_manual_marker(task_content_without_stop_marker(&entry.content)),
+        &task_content_without_manual_marker(task_content_without_stop_marker(&raw)),
     ));
     if content.is_empty() {
         task_display_text(entry)

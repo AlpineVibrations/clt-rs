@@ -54,6 +54,38 @@ After moving the task to Doing, review pre-existing staged changes for task scop
 
 A Todo or other task-board edit added after the automated run starts may remain unstaged. Preserve it and continue finalization: CLT's exact staged-tree proof excludes that concurrent board work from the sealed task commit. Stage only the selected task's status transition, its explicit follow-up, or related hunks; never use a whole-board add when it would absorb the concurrent edit.
 
+## Coordinating shared work
+
+Before implementation, read `clt context` and declare planned scope with
+`clt coordinate <status> <index> --scope '<JSON>'`. The scope object accepts
+`intent`, `files`, `modules`, `interfaces`, `resources`, and a `behavior` map.
+This replaces scope, so retain all still-relevant fields. An invocation without
+options assigns a stable task ID without starting work. Use those IDs for
+`--depends-on`, `--remove-dependency`, or an evidence-backed `--compatible` or
+`--conflict` assessment with `--reason`. Never infer ownership from dirty files.
+
+Run `clt context --check doing <index>` before edits and finalization. Update scope
+before expanding work; reassess changed requirements, interfaces and resources,
+including overlap across different files. Context names other owners and their
+intended changes. A CLI claim alone does not prove the session is running.
+Automated workers receive refreshed context in their existing turn; direct
+sessions refresh it explicitly and preserve their claim and conversation.
+
+A coordination wait is recomputed from its exact prerequisite or overlap. Do not
+turn it into a dated BLOCKED note. An unsealed automated task should return to Todo
+with its session and work preserved, then exit; a participating manual task keeps
+its claim while deferring incompatible edits. Unrelated ready work may proceed.
+Explicit stops and provisional Done recovery retain their existing controls.
+
+Use `clt finalize doing <index> -- <command> [args...]` to run the entire reviewed
+staging, sealing/resealing and one-commit sequence under cooperative Git ownership.
+For a provisional Done retry use its current Done index. A script can perform the
+sequence, retaining the same separate `GIT_INDEX_FILE` when needed. Inspect the
+index before each seal and commit, and never include another task's staged work.
+This lock does not reserve editing or planning. Its process lifetime, rather than
+an old lock file, determines ownership; retry after the owning command exits.
+Do not stage through bare Git while another participant owns finalization.
+
 ## Core Workflow
 Queued work follows this state transition pipeline:
 `Todo` → `Doing` → `Done`

@@ -187,10 +187,13 @@ pub(super) fn acquire_agent_job_stage(
     {
         return Ok(AgentJobAcquisitionResult::SessionSuspended);
     }
+    if let Some(session) = resume_session_id.as_deref()
+        && crate::coordination::session_waiting(&project.path, session)?
+    {
+        return Ok(AgentJobAcquisitionResult::SessionSuspended);
+    }
     if task_selection == AgentTaskSelection::NextTodo
-        && !read_task_entries(&board, TaskStatus::Todo)?
-            .iter()
-            .any(crate::task::task_entry_is_ready)
+        && crate::coordination::ready_tasks(&project.path)?.is_empty()
     {
         return Ok(AgentJobAcquisitionResult::SessionSuspended);
     }
@@ -1969,7 +1972,9 @@ pub(super) fn project_has_resumable_doing_task(
                             Some(AGENT_EXTERNAL_COMPLETION_REASON | AGENT_TASK_DELETION_REASON)
                         )
                 });
-            if !cancelled_by_user {
+            if !cancelled_by_user
+                && !crate::coordination::session_waiting(&project.path, session_id)?
+            {
                 return Ok(true);
             }
         }
@@ -2011,7 +2016,9 @@ fn interrupted_codex_session_in_doing(
                             Some(AGENT_EXTERNAL_COMPLETION_REASON | AGENT_TASK_DELETION_REASON)
                         )
                 });
-            if !cancelled_by_user {
+            if !cancelled_by_user
+                && !crate::coordination::session_waiting(&project.path, session_id)?
+            {
                 return Ok(Some(session_id.to_string()));
             }
         }
@@ -2118,7 +2125,10 @@ fn queued_resume_can_wait(
     };
     // A saved Git resume request is not permission to override a later stop.
     // Read through the stop suffix, and yield even when no ready work exists.
-    if status != TaskStatus::Done && task_entry_is_stopped(&task) {
+    if status != TaskStatus::Done
+        && (task_entry_is_stopped(&task)
+            || crate::coordination::session_waiting(&project.path, &control.codex_session_id)?)
+    {
         return Ok(true);
     }
     Ok(status == TaskStatus::Todo
@@ -2391,6 +2401,14 @@ pub(super) fn scan_agent_project(project_root: &Path) -> AgentProjectScan {
         Ok(entries) => entries,
         Err(err) => return AgentProjectScan::unavailable(err),
     };
+    let coordination = match crate::coordination::Snapshot::admission(&board_dir) {
+        Ok(snapshot) => snapshot,
+        Err(error) => return AgentProjectScan::unavailable(error),
+    };
+    let coordination_wait_count = todo_entries
+        .iter()
+        .filter(|entry| crate::task::task_entry_is_ready(entry) && !coordination.ready(entry))
+        .count();
     let total_todo_count = todo_entries.len();
     let total_doing_count = doing_entries.len();
     let todo_entries = todo_entries
@@ -2425,6 +2443,10 @@ pub(super) fn scan_agent_project(project_root: &Path) -> AgentProjectScan {
     );
     // Keep display totals while availability and blocked recovery exclude
     // independently owned manual work.
+    scan.coordination_wait_count = coordination_wait_count;
+    if scan.available_todo_count() == 0 && scan.status == AgentProjectScanStatus::Pending {
+        scan.status = AgentProjectScanStatus::Empty;
+    }
     scan.manual_todo_count = total_todo_count - todo_count;
     scan.todo_count = total_todo_count;
     scan.doing_count = total_doing_count;
@@ -2471,6 +2493,7 @@ impl AgentProjectScan {
             status,
             todo_count,
             manual_todo_count: 0,
+            coordination_wait_count: 0,
             blocked_todo_count,
             stopped_todo_count,
             doing_count,
@@ -2488,6 +2511,7 @@ impl AgentProjectScan {
             status: AgentProjectScanStatus::Missing,
             todo_count: 0,
             manual_todo_count: 0,
+            coordination_wait_count: 0,
             blocked_todo_count: 0,
             stopped_todo_count: 0,
             doing_count: 0,
@@ -2500,6 +2524,7 @@ impl AgentProjectScan {
             status: AgentProjectScanStatus::Uninitialized,
             todo_count: 0,
             manual_todo_count: 0,
+            coordination_wait_count: 0,
             blocked_todo_count: 0,
             stopped_todo_count: 0,
             doing_count: 0,
@@ -2512,6 +2537,7 @@ impl AgentProjectScan {
             status: AgentProjectScanStatus::Unavailable(format!("{err:#}")),
             todo_count: 0,
             manual_todo_count: 0,
+            coordination_wait_count: 0,
             blocked_todo_count: 0,
             stopped_todo_count: 0,
             doing_count: 0,
@@ -2537,6 +2563,7 @@ impl AgentProjectScan {
             .saturating_sub(self.manual_todo_count)
             .saturating_sub(self.blocked_todo_count)
             .saturating_sub(self.stopped_todo_count)
+            .saturating_sub(self.coordination_wait_count)
     }
 
     pub(super) fn blocked_task_count(&self) -> usize {

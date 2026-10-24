@@ -131,6 +131,37 @@ enum Commands {
     },
     /// Lists tasks. Optional status to filter by (backlog, todo, doing, done)
     List { status: Option<String> },
+    /// Shows active owners, intended work, dependencies and overlap decisions
+    Context {
+        /// Check this task's current admission; nonzero while waiting
+        #[arg(long, num_args = 2, value_names = ["STATUS", "INDEX"])]
+        check: Vec<String>,
+    },
+    /// Assigns a stable ID or updates a task's dependencies, scope and pair assessment
+    Coordinate {
+        status: String,
+        task_index: usize,
+        #[arg(long)]
+        depends_on: Vec<String>,
+        #[arg(long)]
+        remove_dependency: Vec<String>,
+        /// Replace the scope with a JSON object (intent, files, modules, interfaces, resources, behavior)
+        #[arg(long)]
+        scope: Option<String>,
+        #[arg(long, conflicts_with = "conflict", requires = "reason")]
+        compatible: Option<String>,
+        #[arg(long, requires = "reason")]
+        conflict: Option<String>,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Owns shared Git staging through a complete sealing/commit command
+    Finalize {
+        status: String,
+        task_index: usize,
+        #[arg(required = true, last = true)]
+        command: Vec<String>,
+    },
     /// Prints shell integration that changes directory after leaving the TUI
     ShellInit {
         /// Shell to generate integration for
@@ -466,11 +497,63 @@ pub(super) fn run() -> Result<()> {
             let msg = add_task(&root, &description, metadata)?;
             println!("{}", msg);
         }
+        Some(Commands::Context { check }) => {
+            let selected = if check.is_empty() {
+                None
+            } else {
+                Some((
+                    TaskStatus::parse_arg(&check[0])?,
+                    check[1].parse::<usize>()?,
+                ))
+            };
+            crate::coordination::print_context(&root, selected)?;
+        }
+        Some(Commands::Coordinate {
+            status,
+            task_index,
+            depends_on,
+            remove_dependency,
+            scope,
+            compatible,
+            conflict,
+            reason,
+        }) => {
+            let review = compatible
+                .map(|id| (id, true))
+                .or_else(|| conflict.map(|id| (id, false)))
+                .map(|(id, allowed)| (id, allowed, reason.unwrap_or_default()));
+            let id = crate::coordination::update(
+                &root,
+                TaskStatus::parse_arg(&status)?,
+                task_index,
+                crate::coordination::Update {
+                    depends_on,
+                    remove_dependency,
+                    scope: scope.map(|json| serde_json::from_str(&json)).transpose()?,
+                    review,
+                },
+            )?;
+            println!("Task ID: {id}");
+            crate::coordination::print_context(&root, None)?;
+        }
+        Some(Commands::Finalize {
+            status,
+            task_index,
+            command,
+        }) => {
+            crate::coordination::finalization::run(
+                &root,
+                TaskStatus::parse_arg(&status)?,
+                task_index,
+                &command,
+            )?;
+        }
         Some(Commands::Start {
             session,
             description,
         }) => {
             start_manual_task(&root, &description, session.as_deref())?;
+            crate::coordination::print_context(&root, None)?;
             println!(
                 "[CLI] Task reserved in Doing. Use clt handoff doing <index> to queue automation."
             );
@@ -486,6 +569,7 @@ pub(super) fn run() -> Result<()> {
                 &task_index,
                 session.as_deref(),
             )?;
+            crate::coordination::print_context(&root, None)?;
             println!(
                 "[CLI] Task reserved in Doing. Use clt handoff doing <index> to queue automation."
             );

@@ -3,6 +3,7 @@ use anyhow::Result;
 mod agent;
 mod application;
 mod cli;
+mod coordination;
 mod managed_git;
 mod manual_sessions;
 mod platform;

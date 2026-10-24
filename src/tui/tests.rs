@@ -660,6 +660,7 @@ fn tui_agent_panel_refresh_worker_does_not_block_the_caller() {
                 daemon_status: "running".to_string(),
             }),
             task_session_states: Ok(TaskAgentSessionStates::default()),
+            coordination: Ok(crate::coordination::Snapshot::default()),
         }
     }));
     started_receiver

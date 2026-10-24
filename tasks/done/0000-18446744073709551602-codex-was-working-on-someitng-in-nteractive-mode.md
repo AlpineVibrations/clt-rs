@@ -64,3 +64,10 @@ Keep useful parallel work moving while making dependencies, potential conflicts,
 Separate Git worktrees per task may provide stronger editing isolation in a later task. They are outside this implementation scope and are not a prerequisite for delivering the coordination above. Worktrees would still need dependency tracking and integration checks.
 
 UNBLOCKED 2026-10-23: CLT recovered after two consecutive resumes failed at startup because the old conversation already has an active writer; the idle attempt was retired automatically. Previous Codex session: 01a16c21-5a61-72d2-aaf7-55e2976e9caa. Review current files and Git history first; preserve existing work and commits, verify what is already complete, and implement only what remains. This is a fresh attempt; follow the project's current Git settings. Do not recreate or duplicate earlier commits.
+
+Completion note:
+COMPLETED 2026-10-23: Added stable task IDs and publication-aware dependencies, scoped overlap assessments, shared owner/scope context in CLI and TUI, live worker context refresh, and cooperative staging/finalization ownership. Preserved explicit stops, task conversations, independent dirty work, unrelated staging, and existing Git completion/recovery safeguards. Updated features.md, ARCHITECTURE.md, Unreleased changelog, and bundled workflow skills.
+
+Checks: `rustfmt --edition 2024 src/lib.rs tests/cli.rs`; `cargo fmt --all -- --check`; `cargo clippy --no-deps --locked --all-targets --all-features -- -D warnings`; `cargo test --locked --all-targets --all-features` (881 passed, one ignored); `cargo test --locked --all-features --bin clt skills::` (3 passed). Coverage includes both board layouts, stable references/cycles/missing prerequisites, provisional Done/publication waits, independent and compatible parallel work, behavior conflicts across files, scope reassessment, context delivery, and finalization owner-exit recovery preserving the shared index.
+
+codex:01a16c2f-5e88-7350-9674-b1480fd9215a

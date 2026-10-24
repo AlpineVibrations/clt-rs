@@ -101,6 +101,7 @@ pub(super) fn start_manual_task(
             "This Codex session already belongs to a task; use clt claim for that task"
         );
         let content = task_content_with_manual_session(description, &session);
+        crate::coordination::ensure_new_manual_admitted(board_dir, &content)?;
         match get_status_store(board_dir, TaskStatus::Doing)? {
             StatusStore::MarkdownFile(path) => insert_content_into_markdown(&path, None, &content),
             StatusStore::Directory(path) => {
@@ -141,6 +142,8 @@ pub(super) fn claim_manual_task(
                     && linked[0].1.content == entry.content),
             "This Codex session already belongs to another task"
         );
+        crate::application::ensure_task_not_stopped(&entry)?;
+        crate::coordination::ensure_admitted(board_dir, status, index)?;
         let content = task_content_with_manual_session(&entry.content, &session);
         // Claim first: a failed or interrupted move remains reserved in place.
         board.write_entry_content(status, &entry, &content)?;

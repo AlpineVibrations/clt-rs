@@ -36,6 +36,47 @@ fn messages(protocol: &Protocol<'_, Vec<u8>>) -> Vec<Value> {
 }
 
 #[test]
+fn coordination_refresh_uses_the_owned_turn_and_deduplicates_unchanged_context() {
+    let f = Fixture::new(false, false);
+    let spec = spec(&f);
+    let (mut protocol, _sender) = active(&spec, &f);
+    protocol.coordination_checked = Instant::now() - Duration::from_secs(4);
+    protocol.refresh_coordination();
+    let sent = messages(&protocol);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["method"], "turn/steer");
+    assert_eq!(sent[0]["params"]["expectedTurnId"], "turn-one");
+    protocol.coordination_checked = Instant::now() - Duration::from_secs(4);
+    protocol.refresh_coordination();
+    assert_eq!(messages(&protocol).len(), 1);
+    protocol
+        .event(json!({"id": sent[0]["id"], "result": {"turnId": "turn-one"}}))
+        .unwrap();
+    crate::task::insert_task(
+        &f.project.path,
+        crate::task::TaskStatus::Doing,
+        None,
+        "Independent UI task clt:manual codex:manual-peer",
+        None,
+    )
+    .unwrap();
+    protocol.coordination_checked = Instant::now() - Duration::from_secs(4);
+    protocol.refresh_coordination();
+    let sent = messages(&protocol);
+    assert_eq!(sent.len(), 2);
+    assert!(
+        sent[1]["params"]["input"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Independent UI task")
+    );
+    protocol.close_mailbox();
+    protocol.coordination_checked = Instant::now() - Duration::from_secs(4);
+    protocol.refresh_coordination();
+    assert_eq!(messages(&protocol).len(), 2);
+}
+
+#[test]
 fn adapter_process_entry() {
     let Ok(spec) = std::env::var("CLT_TEST_APP_SERVER_SPEC") else {
         return;

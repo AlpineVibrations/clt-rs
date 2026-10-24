@@ -8,8 +8,7 @@ use crate::{
         TaskStatus, acquire_board_mutation_lock, get_tasks_dir,
         move_task_without_reordering_after_lock, read_task_entries,
         recoverable_codex_session_id_from_task_content, task_content_is_manual,
-        task_entry_is_blocked, task_entry_is_ready, task_entry_is_stopped,
-        write_task_entry_content,
+        task_entry_is_blocked, task_entry_is_stopped, write_task_entry_content,
     },
 };
 use anyhow::{Context, Result};
@@ -495,11 +494,7 @@ pub(super) fn queued_blockers_can_wait(project: &AgentProject) -> Result<bool> {
     {
         return Ok(false);
     }
-    Ok(
-        read_task_entries(&get_tasks_dir(&project.path), TaskStatus::Todo)?
-            .iter()
-            .any(task_entry_is_ready),
-    )
+    Ok(!crate::coordination::ready_tasks(&project.path)?.is_empty())
 }
 
 fn blocked_candidates(project: &AgentProject) -> Result<Vec<(TaskStatus, crate::task::TaskEntry)>> {

@@ -205,6 +205,9 @@ struct Protocol<'a, W> {
     used_tools: bool,
     final_text: String,
     log: log::EventLog,
+    coordination_context: Option<String>,
+    coordination_pending: Option<(u64, String)>,
+    coordination_checked: Instant,
 }
 
 impl<'a, W: Write> Protocol<'a, W> {
@@ -224,6 +227,9 @@ impl<'a, W: Write> Protocol<'a, W> {
             used_tools: false,
             final_text: String::new(),
             log: log::EventLog::default(),
+            coordination_context: None,
+            coordination_pending: None,
+            coordination_checked: Instant::now(),
         }
     }
 
@@ -319,6 +325,7 @@ impl<'a, W: Write> Protocol<'a, W> {
         }
         let mut goal_wait: Option<Instant> = None;
         loop {
+            self.refresh_coordination();
             self.mailbox()?;
             if let Some(completed) = self.completed_turn.take() {
                 let used_tools = self.used_tools;
@@ -363,6 +370,65 @@ impl<'a, W: Write> Protocol<'a, W> {
         }
     }
 
+    fn refresh_coordination(&mut self) {
+        if self.coordination_checked.elapsed() < Duration::from_secs(3)
+            || self.coordination_pending.is_some()
+        {
+            return;
+        }
+        self.coordination_checked = Instant::now();
+        let Some(target) = self.target.clone() else {
+            return;
+        };
+        let Some(root) = self.spec.params["cwd"].as_str() else {
+            return;
+        };
+        let board = get_tasks_dir(Path::new(root));
+        let snapshot = match crate::coordination::Snapshot::load_at(&board, &self.spec.state_dir) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                eprintln!("CLT coordination refresh: {error:#}");
+                return;
+            }
+        };
+        // Registration/activation may still be in progress. Never deliver into
+        // a different task merely because this private server owns a thread.
+        if !snapshot.tasks.iter().any(|task| {
+            task.status == crate::task::TaskStatus::Doing
+                && crate::task::recoverable_codex_session_id_from_task_content(&task.entry.content)
+                    == Some(&self.session_id)
+        }) {
+            return;
+        }
+        let context = snapshot.context(Some(&self.session_id));
+        if self.coordination_context.as_ref() == Some(&context) {
+            return;
+        }
+        let mut text = format!(
+            "Coordination changed. Reassess before further edits; defer only incompatible work. Preserve this conversation and ownership.\n{context}"
+        );
+        if text.len() > 60_000 {
+            let mut end = 60_000;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.truncate(end);
+            text.push_str("\nContext truncated; run clt context for the full board context.");
+        }
+        let request = SteeringRequest {
+            id: uuid::Uuid::new_v4().to_string(),
+            target,
+            text,
+        };
+        match self.deliver(&request) {
+            Ok(id) => {
+                self.coordination_pending = Some((id, context));
+                self.pending.insert(id, (request, Instant::now()));
+            }
+            Err(error) => eprintln!("CLT coordination update not delivered: {error:#}"),
+        }
+    }
+
     fn start_turn(&mut self, id: &str) -> Result<()> {
         if self.active_turn.as_deref() == Some(id) {
             return Ok(());
@@ -392,6 +458,15 @@ impl<'a, W: Write> Protocol<'a, W> {
         {
             let accepted = event.get("error").is_none()
                 && event["result"]["turnId"].as_str() == Some(&request.target.turn_id);
+            if self
+                .coordination_pending
+                .as_ref()
+                .is_some_and(|(pending, _)| *pending == id)
+                && let Some((_, context)) = self.coordination_pending.take()
+                && accepted
+            {
+                self.coordination_context = Some(context);
+            }
             let message = if accepted {
                 "Sent to the running agent".to_string()
             } else {
@@ -519,6 +594,13 @@ impl<'a, W: Write> Protocol<'a, W> {
             .map(|(id, _)| *id)
             .collect();
         for id in expired {
+            if self
+                .coordination_pending
+                .as_ref()
+                .is_some_and(|(pending, _)| *pending == id)
+            {
+                self.coordination_pending = None;
+            }
             if let Some((request, _)) = self.pending.remove(&id) {
                 self.receipt(&request, false, "Delivery is unconfirmed: Codex did not reply. Check the agent output before retrying".into())?;
             }
@@ -550,6 +632,7 @@ impl<'a, W: Write> Protocol<'a, W> {
 
     fn close_mailbox(&mut self) {
         self.target = None;
+        self.coordination_pending = None;
         let _ = fs::remove_file(self.spec.mailbox.join("active.json"));
         for (_, (request, _)) in self.pending.drain().collect::<Vec<_>>() {
             let _ = self.receipt(&request, false,

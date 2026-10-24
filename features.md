@@ -29,6 +29,7 @@ in [Feature Ideas](docs/FEATURE_IDEAS.md); they are not a list of shipped featur
   - [Background services and workers](#background-services-and-workers)
   - [Database recovery](#database-recovery)
   - [Service environment and state](#service-environment-and-state)
+- [Task coordination](#task-coordination)
 - [Task commands and storage](#task-commands-and-storage)
 
 ## Overview
@@ -742,6 +743,121 @@ Useful runtime tuning variables are:
 - `CLT_AGENT_HEARTBEAT_TAIL`: print a short stderr tail on still-running heartbeats when set to `1`, `true`, `yes`, or `on`; default `false`.
 
 If Codex is installed through a version manager such as NVM, make sure the `PATH` used for `clt agent start` contains a stable bin directory. For example, NVM can maintain `~/.nvm/current`; putting `~/.nvm/current/bin` before version-specific directories lets the service continue finding `codex` after switching Node versions. Run `clt agent start` again after changing the service `PATH`; on Linux this reloads and restarts the existing user service.
+
+## Task coordination
+
+Manual claims and automated runs can share a project. `clt context` shows active
+tasks, conversation owners, intended work, declared scope, current changed paths,
+and specific reasons for waiting. A `[CLI]` claim persists when its session exits;
+“activity unconfirmed” means that CLT has no running-session record for it. A claim
+alone never reserves the project against other work.
+
+### Stable references and prerequisites
+
+Assign a task a stable ID without starting it, then reference that ID:
+
+```bash
+clt list todo
+clt coordinate todo 1
+# Copy the printed Task ID for the prerequisite.
+clt coordinate todo 2 --depends-on <prerequisite-id>
+clt context --check todo 2
+```
+
+IDs and dependencies are stored in a `clt-coordination` HTML comment in the task.
+They survive prose edits through CLT, reordering, status moves, and archiving.
+Do not copy a task's ID to another task. Existing boards need no migration: the
+`coordinate` command adds an ID only to the selected task. An already completed
+task may receive an ID, but its scope and dependencies cannot be changed.
+
+Dependent Todo tasks remain in Todo. `list`, the TUI, and `context` display the
+prerequisite reference. Provisional Done entries still count as unfinished while
+commit proof or required publication is pending; missing managed Git proof is
+also a wait. CLT rejects self-dependencies and cycles. Deleted or missing references
+explain how to restore the prerequisite or remove the dependency:
+
+```bash
+clt coordinate todo 2 --remove-dependency <prerequisite-id>
+```
+
+Eligibility is recomputed when the board or Git proof changes. It needs no dated
+UNBLOCKED note. Explicit stops and conversation ownership retain their usual
+controls. Nested tasks can reference IDs elsewhere in their containing board tree.
+
+### Scope and overlap assessments
+
+Before editing, participating sessions describe the intended scope. `--scope`
+replaces the scope object; omitted fields become empty:
+
+```bash
+clt coordinate doing 1 --scope '{"intent":"Extend the response parser","files":["src/parser.rs"],"modules":["parser"],"interfaces":["Response"],"resources":[],"behavior":{"response.encoding":"json"}}'
+clt context --check doing 1
+```
+
+The scheduler, manual claims, and Todo-to-Doing transitions use the same admission
+rules. Automated checks compare explicit behavior contracts, shared modules,
+interfaces, resources, file/directory paths, and code symbols or paths named in
+backticks in the requirements. They also identify currently changed paths without
+assuming who owns them. Different files may share an interface; one file may
+contain independent changes. Shared paths or symbols request an assessment, and
+incompatible values for a named behavior report the two conflicting requirements.
+This analysis supplies concrete leads, not a claim to infer every dependency.
+Missing scope metadata and unrelated dirty or untracked work alone do not create
+waits.
+
+For compatible overlap, record the reviewed evidence against the other task's ID:
+
+```bash
+clt coordinate todo 2 --compatible <other-id> --reason 'Separate functions; the shared Response type and wire format stay unchanged'
+# Or record a known conflict and its evidence:
+clt coordinate todo 2 --conflict <other-id> --reason 'Both replace the queue ordering algorithm with incompatible behavior'
+```
+
+Assessments are bound to both tasks' requirements, dependencies and declared scope.
+An unchanged assessment is reused; editing either plan invalidates it. Conflicting
+explicit behavior values require aligned scope or a dependency. Completion of the
+related task clears its overlap wait. Only affected tasks wait; other ready tasks
+remain eligible. `context --check STATUS INDEX` returns nonzero while the selected
+task is waiting or explicitly stopped.
+
+Update scope before expanding work and recheck context before further edits and
+completion. The owning automated worker refreshes context in its existing turn
+when tasks start, finish, or change scope. Direct sessions refresh with `clt context`
+and follow the same check protocol; the TUI refreshes annotations and shows scope
+on the selected row. Automated workers return an unsealed waiting task to Todo,
+keeping work, session and Git history; manual sessions keep their claim while
+pausing incompatible edits. Coordination waits do not require a dated BLOCKED
+note. A waiting consumer does not prevent its prerequisite from finishing.
+
+### Shared staging and finalization
+
+Participating sessions use `clt finalize` to own the shared staging/commit phase:
+
+```bash
+clt list doing
+clt finalize doing 1 -- sh /path/to/reviewed-finalization-script.sh
+```
+
+The command runs the supplied script with a process-scoped Git lock. Put the
+entire reviewed sequence in that script: stage only this task, inspect the index,
+run `clt done`, stage the board transition, list Done and reseal its exact index,
+then make the one task commit. Preserve the same `GIT_INDEX_FILE` across the whole
+sequence when unrelated work is already staged. The existing completion notes,
+manifest proof, hooks, signing, publication and recovery rules still apply.
+
+Another finalization command receives the owning session and an actionable retry
+message. `clt done`, scheduler startup Git preparation and Git reconciliation honor
+the same lock. Ordinary editing, planning, context reads and board work continue.
+On Unix the designated command inherits the lock so it remains protected if the
+wrapper exits; unrelated subprocesses do not inherit it. The kernel releases
+ownership when those processes exit, so an old lock file does not create a stale
+hold. Failed hooks still require correction and resealing before retrying the
+single commit; provisional Done tasks continue through their existing recovery.
+
+This is a cooperative protocol in a shared checkout. Bare Git commands and editors
+outside it cannot be isolated or attributed by CLT. Review diffs and use precise
+staging; the lock cannot prove authorship of changes already present in the index.
+Separate per-task worktrees are not part of this feature.
 
 ## Task commands and storage
 

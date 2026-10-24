@@ -815,9 +815,9 @@ fn configure_automated_codex_subcommand_with_direction(
     }
     if task_selection == AgentTaskSelection::NextTodo
         && session_id.is_none()
-        && let Some(selected) = read_task_entries(&get_tasks_dir(&project.path), TaskStatus::Todo)?
+        && let Some(selected) = crate::coordination::ready_tasks(&project.path)?
             .into_iter()
-            .find(task_entry_is_ready)
+            .next()
     {
         if let Some(start) = git_start_state {
             let identity = durable_task_identity(&selected.content)
@@ -835,6 +835,12 @@ fn configure_automated_codex_subcommand_with_direction(
     if let Some(direction) = direction {
         prompt.push_str(&format!("\n\nSupervisor decision for this exact task:\n{direction}\nFollow this next step while preserving the existing task, session, and Git boundary."));
     }
+    prompt.push_str("\n\n");
+    prompt.push_str(
+        &crate::coordination::Snapshot::load(&get_tasks_dir(&project.path))?
+            .context(session_id.as_deref()),
+    );
+    prompt.push_str("\nBefore implementation, use clt coordinate to declare planned scope and dependencies. Recheck clt context --check doing <index> before edits and after scope changes. Use clt finalize doing <index> -- <command> to own staging, sealing and the single commit together; preserve unrelated staged work with the existing separate-index procedure. Coordination waits are task-specific and recomputed, not dated BLOCKED execution notes. If scope changes create a wait, preserve all work and the session marker, return this unsealed automated task to Todo using clt, and exit. It becomes eligible when that exact cause resolves. Participating manual sessions keep their claim while deferring incompatible edits.\n");
     command.arg(prompt);
     Ok(session_id)
 }
@@ -2080,9 +2086,9 @@ impl CodexAgentRunner {
             None
         };
         let selected_task_identity = if task_selection == AgentTaskSelection::NextTodo {
-            read_task_entries(&get_tasks_dir(&project.path), TaskStatus::Todo)?
+            crate::coordination::ready_tasks(&project.path)?
                 .into_iter()
-                .find(task_entry_is_ready)
+                .next()
                 .and_then(|task| durable_task_identity(&task.content))
         } else {
             None

@@ -1322,6 +1322,7 @@ pub(super) struct TuiAgentPanelRefreshResult {
     pub(super) active_root: PathBuf,
     pub(super) panel_snapshot: Result<TuiAgentPanelSnapshot>,
     pub(super) task_session_states: Result<TaskAgentSessionStates>,
+    pub(super) coordination: Result<crate::coordination::Snapshot>,
 }
 
 pub(super) struct TuiAgentPanelRefreshWorker {
@@ -1337,6 +1338,7 @@ impl TuiAgentPanelRefreshWorker {
         self.request_with(active_root, |active_root| TuiAgentPanelRefreshResult {
             panel_snapshot: load_tui_agent_panel_snapshot_with_service_recovery(&active_root),
             task_session_states: try_load_task_agent_session_states(&active_root),
+            coordination: crate::coordination::Snapshot::load(&get_tasks_dir(&active_root)),
             active_root,
         })
     }
@@ -6246,6 +6248,7 @@ pub(super) struct TuiApp {
     pub(super) models_return_pane: TuiPane,
     pub(super) agent_panel: TuiAgentPanel,
     pub(super) task_agent_session_states: TaskAgentSessionStates,
+    pub(super) coordination: crate::coordination::Snapshot,
     pub(super) models_panel: TuiModelsPanel,
     pub(super) model_input: Option<TuiModelInput>,
     pub(super) awaiting_model_provider_choice: bool,
@@ -6291,6 +6294,7 @@ impl TuiApp {
             models_return_pane: tui_models_return_pane(start_state.current_pane),
             agent_panel: TuiAgentPanel::new(root),
             task_agent_session_states: TaskAgentSessionStates::default(),
+            coordination: crate::coordination::Snapshot::default(),
             models_panel: TuiModelsPanel::new(),
             model_input: None,
             awaiting_model_provider_choice: false,
@@ -7100,12 +7104,13 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
                 .iter()
                 .map(|entry| {
                     format!(
-                        "- {}",
+                        "- {}{}",
                         task_display_text_with_agent_flag(
                             entry,
                             status,
                             &app.task_agent_session_states,
-                        )
+                        ),
+                        app.coordination.annotation(entry)
                     )
                 })
                 .collect();
@@ -7114,13 +7119,18 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
                 .enumerate()
                 .map(|(idx, entry)| {
                     format!(
-                        "- {}",
+                        "- {}{}",
                         task_tui_display_text_with_agent_flag(
                             entry,
                             status,
                             Some(idx) == selected_idx,
                             &app.task_agent_session_states,
-                        )
+                        ),
+                        if Some(idx) == selected_idx {
+                            app.coordination.details(entry)
+                        } else {
+                            app.coordination.annotation(entry)
+                        }
                     )
                 })
                 .collect();
@@ -9141,6 +9151,9 @@ pub(super) fn tui_view_with_active_board(
                     selected_row,
                     refresh.panel_snapshot,
                 );
+                if let Ok(coordination) = refresh.coordination {
+                    app.coordination = coordination;
+                }
                 if let Ok(states) = refresh.task_session_states {
                     app.task_agent_session_states = states;
                 }

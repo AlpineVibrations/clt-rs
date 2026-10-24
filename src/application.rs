@@ -180,6 +180,7 @@ pub(super) struct AgentProjectScan {
     pub(super) status: AgentProjectScanStatus,
     pub(super) todo_count: usize,
     pub(super) manual_todo_count: usize,
+    pub(super) coordination_wait_count: usize,
     pub(super) blocked_todo_count: usize,
     pub(super) stopped_todo_count: usize,
     pub(super) doing_count: usize,
@@ -623,6 +624,9 @@ pub(super) fn format_agent_project_summary(
         ),
     ];
 
+    if scan.coordination_wait_count > 0 {
+        lines.push(format!("   coordination  {} Todo waiting; clt context shows prerequisites and overlap evidence", scan.coordination_wait_count));
+    }
     if let AgentProjectScanStatus::Unavailable(err) = &scan.status {
         lines.push(format!("   scan err  {err}"));
     }
@@ -1227,6 +1231,7 @@ pub(super) fn move_task_to_doing_with_agent_session(
     let _mutation_lock = acquire_board_mutation_lock(&board_dir)?;
     let entry = task_entry_at(&board_dir, TaskStatus::Todo, task_index)?;
     ensure_task_not_stopped(&entry)?;
+    crate::coordination::ensure_admitted(&board_dir, TaskStatus::Todo, task_index)?;
     if let Some(previous) = recoverable_codex_session_id_from_task_content(&entry.content)
         && previous != session_id
     {
@@ -1303,6 +1308,7 @@ pub(super) fn move_task_to_doing_with_agent_git_journal(
     let board = TaskBoard::new(&board_dir);
     let entry = board.entry(TaskStatus::Todo, task_index)?;
     ensure_task_not_stopped(&entry)?;
+    crate::coordination::ensure_admitted(&board_dir, TaskStatus::Todo, task_index)?;
     anyhow::ensure!(
         recoverable_codex_session_id_from_task_content(&entry.content)
             .is_none_or(|previous| previous == session_id),
@@ -1448,6 +1454,20 @@ pub(super) fn move_task_to_done(
     from: TaskStatus,
     task_index_str: &str,
 ) -> Result<TaskDoneOutcome> {
+    let board = get_tasks_dir(root);
+    let index = parse_one_based_task_index(task_index_str)?;
+    let selected = TaskBoard::new(&board).entry(from, index)?;
+    let _coordination_guard = if let Some(session) =
+        recoverable_codex_session_id_from_task_content(&selected.content)
+        && root.join(".git").exists()
+    {
+        Some(crate::coordination::finalization::acquire(root, session)?)
+    } else {
+        None
+    };
+    if from != TaskStatus::Done {
+        crate::coordination::ensure_admitted(&board, from, index)?;
+    }
     let Some(context) = automated_completion_context(root)? else {
         return Ok(
             match move_task_in_board(&get_tasks_dir(root), from, TaskStatus::Done, task_index_str)?
@@ -1884,6 +1904,9 @@ pub(super) fn move_task_in_board_after_lock(
 ) -> Result<()> {
     let board = TaskBoard::new(board_dir);
     let entry = board.entry(from, task_index)?;
+    if matches!(to, TaskStatus::Doing | TaskStatus::Done) && from != to {
+        crate::coordination::ensure_admitted(board_dir, from, task_index)?;
+    }
     let manual_session = if to == TaskStatus::Todo && task_content_is_manual(&entry.content) {
         let session = recoverable_codex_session_id_from_task_content(&entry.content)
             .context("Manual task needs its attached Codex conversation before moving to Todo")?;
@@ -2048,6 +2071,8 @@ pub(super) fn update_task_in_board_after_lock(
 ) -> Result<()> {
     let board = TaskBoard::new(board_dir);
     let entry = board.entry(status, task_index)?;
+    let new_description = crate::task::coordination::preserve(&entry.content, new_description)?;
+    let new_description = new_description.as_str();
     let session_id = recoverable_codex_session_id_from_task_content(&entry.content);
     let updated_content = match session_id {
         Some(session_id) if task_content_is_manual(&entry.content) => {
@@ -2095,6 +2120,7 @@ pub(super) fn reorder_task_in_board(
 pub(super) fn list_tasks(root: &Path, filter_status: Option<String>) -> Result<()> {
     let board = TaskBoard::for_project(root);
     let session_states = load_task_agent_session_states(root);
+    let coordination = crate::coordination::Snapshot::load(board.path())?;
 
     if let Some(ref s) = filter_status {
         let status_name = match s.as_str() {
@@ -2109,9 +2135,10 @@ pub(super) fn list_tasks(root: &Path, filter_status: Option<String>) -> Result<(
         let status = TaskStatus::parse(status_name)?;
         for (index, entry) in board.entries(status)?.iter().enumerate() {
             println!(
-                "{}. {}{}",
+                "{}. {}{}{}",
                 index + 1,
                 task_display_text_with_agent_flag(entry, status, &session_states),
+                coordination.annotation(entry),
                 if entry.has_subtasks {
                     " [subtasks]"
                 } else {
@@ -2124,9 +2151,10 @@ pub(super) fn list_tasks(root: &Path, filter_status: Option<String>) -> Result<(
             println!("\n--- {} ---", status.as_str().to_uppercase());
             for (index, entry) in board.entries(status)?.iter().enumerate() {
                 println!(
-                    "{}. {}{}",
+                    "{}. {}{}{}",
                     index + 1,
                     task_display_text_with_agent_flag(entry, status, &session_states),
+                    coordination.annotation(entry),
                     if entry.has_subtasks {
                         " [subtasks]"
                     } else {

@@ -7,6 +7,220 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 static NEXT_WORKSPACE: AtomicU64 = AtomicU64::new(0);
 
+fn coordinated_id(workspace: &TestWorkspace, status: &str, index: &str) -> String {
+    let (stdout, _) = assert_success(&workspace.run(&["coordinate", status, index]));
+    stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("Task ID: "))
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+fn coordination_dependencies_wait_release_and_preserve_stops_in_both_layouts() {
+    for folders in [false, true] {
+        let w = TestWorkspace::new("coordination-dependencies");
+        assert_success(&w.run(if folders {
+            &["init", "--folders"]
+        } else {
+            &["init"]
+        }));
+        assert_success(&w.run(&["add", "Publish API"]));
+        assert_success(&w.run(&["add", "Use unfinished API"]));
+        let api = coordinated_id(&w, "todo", "1");
+        assert_success(&w.run(&["coordinate", "todo", "2", "--depends-on", &api]));
+        let (listing, _) = assert_success(&w.run(&["list", "todo"]));
+        assert!(listing.contains("Waiting for task"));
+        assert!(listing.contains(&api));
+        assert!(!w.run(&["status", "todo", "2", "doing"]).status.success());
+        assert!(
+            !w.run(&["coordinate", "todo", "1", "--depends-on", &api])
+                .status
+                .success()
+        );
+        let client = coordinated_id(&w, "todo", "2");
+        assert!(
+            !w.run(&["coordinate", "todo", "1", "--depends-on", &client])
+                .status
+                .success()
+        );
+        assert_success(&w.run(&["status", "todo", "1", "doing"]));
+        assert_success(&w.run(&["done", "doing", "1"]));
+        assert_success(&w.run(&["context", "--check", "todo", "1"]));
+        assert_success(&w.run(&["status", "todo", "1", "doing"]));
+        let (listing, _) = assert_success(&w.run(&["list", "doing"]));
+        assert!(listing.contains(&client));
+    }
+}
+
+#[test]
+fn coordination_manual_claims_and_automation_use_the_same_overlap_admission() {
+    let w = TestWorkspace::new("coordination-admission");
+    assert_success(&w.run(&["init"]));
+    assert_success(&w.run(&["add", "Update parser"]));
+    let a = coordinated_id(&w, "todo", "1");
+    let scope =
+        r#"{"files":["shared.rs"],"interfaces":["Response"],"intent":"Keep current wire format"}"#;
+    assert_success(&w.run(&["coordinate", "todo", "1", "--scope", scope]));
+    assert_success(&w.run(&[
+        "claim",
+        "todo",
+        "1",
+        "--session",
+        "00000000-0000-4000-8000-000000000011",
+    ]));
+    assert_success(&w.run(&["add", "Update consumer"]));
+    assert_success(&w.run(&["coordinate", "todo", "1", "--scope", scope]));
+    assert!(!w.run(&["status", "todo", "1", "doing"]).status.success());
+    assert!(
+        !w.run(&[
+            "claim",
+            "todo",
+            "1",
+            "--session",
+            "00000000-0000-4000-8000-000000000012"
+        ])
+        .status
+        .success()
+    );
+    assert_success(&w.run(&[
+        "coordinate",
+        "todo",
+        "1",
+        "--compatible",
+        &a,
+        "--reason",
+        "Only separate tests; Response and wire format stay identical",
+    ]));
+    assert_success(&w.run(&[
+        "claim",
+        "todo",
+        "1",
+        "--session",
+        "00000000-0000-4000-8000-000000000012",
+    ]));
+    let (context, _) = assert_success(&w.run(&["context"]));
+    assert!(context.contains("CLI claimed; activity unconfirmed"));
+    assert!(context.contains("Keep current wire format"));
+    assert_success(&w.run(&[
+        "coordinate",
+        "doing",
+        "1",
+        "--scope",
+        r#"{"interfaces":["Response"],"intent":"Change response encoding"}"#,
+    ]));
+    assert!(
+        !w.run(&["context", "--check", "doing", "2"])
+            .status
+            .success()
+    );
+    assert_success(&w.run(&["add", "Write independent documentation"]));
+    assert_success(&w.run(&["context", "--check", "todo", "1"]));
+}
+
+#[cfg(unix)]
+#[test]
+fn coordination_finalization_owner_exit_preserves_child_lock_and_shared_index() {
+    use std::io::Write;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let w = TestWorkspace::new("coordination-finalize");
+    assert_success(&w.run(&["init"]));
+    let session = "00000000-0000-4000-8000-000000000031";
+    assert_success(&w.run(&["start", "Finish isolated work", "--session", session]));
+    assert!(
+        Command::new("git")
+            .current_dir(w.path())
+            .args(["init", "-q"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    fs::write(w.path().join("user.txt"), "unrelated staged work\n").unwrap();
+    assert!(
+        Command::new("git")
+            .current_dir(w.path())
+            .args(["add", "user.txt"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let initial_index = fs::read(w.path().join(".git/index")).unwrap();
+    let ready = w.path().join("lock-ready");
+    let command = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_clt"));
+        command
+            .current_dir(w.path())
+            .args(["--local", "finalize", "doing", "1", "--"])
+            .env("CLT_AGENT_STATE_DIR", w.path().join("agent-state"))
+            .env("CODEX_THREAD_ID", session)
+            .env_remove("CLT_AGENT_PROJECT_ID")
+            .env_remove("CLT_AGENT_RUN_TOKEN")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        command
+    };
+    let mut owner = command()
+        .args([
+            "sh",
+            "-c",
+            "printf ready > \"$1\"; read -r line",
+            "lock-test",
+        ])
+        .arg(&ready)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = owner.stdin.take().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !ready.is_file() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(ready.is_file(), "Finalization command did not start");
+    let contender = command().arg("true").output().unwrap();
+    assert!(!contender.status.success());
+    assert!(String::from_utf8_lossy(&contender.stderr).contains(session));
+    owner.kill().unwrap();
+    owner.wait().unwrap();
+    assert!(
+        !command().arg("true").output().unwrap().status.success(),
+        "Surviving designated child must retain ownership"
+    );
+    input.write_all(b"finish\n").unwrap();
+    drop(input);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if command().arg("true").output().unwrap().status.success() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Exited command left stale ownership"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        fs::read(w.path().join(".git/index")).unwrap(),
+        initial_index
+    );
+    // Nested clt done inherits the same ownership; it can seal without deadlock.
+    let result = command()
+        .arg(env!("CARGO_BIN_EXE_clt"))
+        .args(["--local", "done", "doing", "1"])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        fs::read(w.path().join(".git/index")).unwrap(),
+        initial_index
+    );
+}
+
 struct TestWorkspace {
     root: PathBuf,
 }

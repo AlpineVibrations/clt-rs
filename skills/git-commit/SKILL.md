@@ -47,6 +47,38 @@ Unstaged and untracked work can safely coexist, including outside edits and new 
 
 After moving the task to Doing, review pre-existing staged changes for task scope; their presence alone is not a blocker. Include only verified changes belonging to this task. If unrelated work is already staged, use a separate `GIT_INDEX_FILE` initialized from the current `HEAD` for task staging, every `clt done`/reseal invocation, and the task commit. Keep that index available across retries. After the commit, reconcile only the task changes into the shared index, preserving unrelated staged entries and same-file hunks. Never clear the shared index or commit unrelated staged work just to proceed.
 
+## Coordinating shared work
+
+Before implementation, read `clt context` and declare planned scope with
+`clt coordinate <status> <index> --scope '<JSON>'`. The scope object accepts
+`intent`, `files`, `modules`, `interfaces`, `resources`, and a `behavior` map.
+This replaces scope, so retain all still-relevant fields. An invocation without
+options assigns a stable task ID without starting work. Use those IDs for
+`--depends-on`, `--remove-dependency`, or an evidence-backed `--compatible` or
+`--conflict` assessment with `--reason`. Never infer ownership from dirty files.
+
+Run `clt context --check doing <index>` before edits and finalization. Update scope
+before expanding work; reassess changed requirements, interfaces and resources,
+including overlap across different files. Context names other owners and their
+intended changes. A CLI claim alone does not prove the session is running.
+Automated workers receive refreshed context in their existing turn; direct
+sessions refresh it explicitly and preserve their claim and conversation.
+
+A coordination wait is recomputed from its exact prerequisite or overlap. Do not
+turn it into a dated BLOCKED note. An unsealed automated task should return to Todo
+with its session and work preserved, then exit; a participating manual task keeps
+its claim while deferring incompatible edits. Unrelated ready work may proceed.
+Explicit stops and provisional Done recovery retain their existing controls.
+
+Use `clt finalize doing <index> -- <command> [args...]` to run the entire reviewed
+staging, sealing/resealing and one-commit sequence under cooperative Git ownership.
+For a provisional Done retry use its current Done index. A script can perform the
+sequence, retaining the same separate `GIT_INDEX_FILE` when needed. Inspect the
+index before each seal and commit, and never include another task's staged work.
+This lock does not reserve editing or planning. Its process lifetime, rather than
+an old lock file, determines ownership; retry after the owning command exits.
+Do not stage through bare Git while another participant owns finalization.
+
 ## Default Flow
 
 ```bash
@@ -197,7 +229,7 @@ git commit \
   -m "CLT-Task: codex:019abcde-1234-7890-abcd-0123456789ab"
 ```
 
-Use ordinary `git commit` so repository hooks and signing behavior remain active. Do not use `commit-tree`, an alternate index, amend, a merge commit, or a second board-only commit to simulate finalization. After the command returns, inspect the created commit. CLT will accept only the exact sealed full tree and manifest parent together with the matching task identity, CLT Agent author/committer identity, and one exact trailer.
+Use ordinary `git commit` so repository hooks and signing behavior remain active. Keep the same reviewed index throughout staging, sealing and committing, including when the separate-index procedure is required. Do not use `commit-tree`, amend, a merge commit, or a second board-only commit to simulate finalization. After the command returns, inspect the created commit. CLT will accept only the exact sealed full tree and manifest parent together with the matching task identity, CLT Agent author/committer identity, and one exact trailer.
 
 If a commit hook changes files or fails after sealing, fix and stage the complete corrected payload, run `clt list done` to confirm the current index, then run `clt done done <index>` to reseal that provisional Done entry. Inspect the new staged diff and retry the one commit. If the process stops, CLT resumes this exact session and checks whether the intended commit already exists before creating anything. Never move the provisional Done entry back to Doing merely because acknowledgement was lost, and never duplicate a commit that CLT can prove already succeeded. If completed-task evidence exists but the frozen start journal was lost, stop: CLT deliberately fails closed because it cannot reconstruct the exact-one-commit boundary safely.
 

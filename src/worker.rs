@@ -49,8 +49,7 @@ use crate::{
         TaskEntry, TaskStatus, acquire_board_mutation_lock,
         attach_codex_session_to_task_after_lock, durable_task_identity, get_tasks_dir,
         move_task_without_reordering_after_lock, read_task_entries, task_content_is_manual,
-        task_entry_is_blocked, task_entry_is_ready, task_entry_is_stopped,
-        terminal_task_for_codex_session_in_board,
+        task_entry_is_blocked, task_entry_is_stopped, terminal_task_for_codex_session_in_board,
     },
 };
 
@@ -1284,7 +1283,13 @@ pub(super) fn run_agent_job_inner(
                 });
                 let unbound =
                     finalization.task_identity.is_none() && finalization.commit_oid.is_none();
-                if durably_blocked {
+                if crate::coordination::session_waiting(
+                    &job.project.path,
+                    &finalization.codex_session_id,
+                )? {
+                    status = "blocked";
+                    summary = "The task has a coordination wait; its work and exact Git journal are preserved. CLT reevaluates its prerequisite/overlap automatically; see clt context.".into();
+                } else if durably_blocked {
                     status = "blocked";
                     summary = "The linked task recorded a durable blocker; its pre-run Git journal remains available for a later recovery without finalizing the task.".to_string();
                 } else if linked_task.is_none() && (status == "idle" || unbound) {
@@ -1542,7 +1547,7 @@ pub(super) fn run_agent_job_inner(
     {
         status = "blocked";
         summary = format!(
-            "The blocked task is queued in Todo with its work and session preserved. {summary}"
+            "The waiting task is queued in Todo with its work and session preserved. {summary}"
         );
     }
 
@@ -1612,7 +1617,8 @@ fn defer_blocked_task_after_run(job: &AgentRunJob, session: &str) -> Result<bool
             return Ok(false);
         };
         if !status.is_active()
-            || !task_entry_is_blocked(task)
+            || (!task_entry_is_blocked(task)
+                && !crate::coordination::session_waiting(&job.project.path, session)?)
             || task_entry_is_stopped(task)
             || task_content_is_manual(&task.content)
         {
@@ -1813,9 +1819,9 @@ pub(super) fn automated_codex_session_to_resume(
             if !board.join("todo").try_exists()? && !board.join("todo.md").try_exists()? {
                 return Ok(None);
             }
-            return Ok(read_task_entries(&board, TaskStatus::Todo)?
+            return Ok(crate::coordination::ready_tasks(project_root)?
                 .into_iter()
-                .find(task_entry_is_ready)
+                .next()
                 .as_ref()
                 .and_then(codex_session_for_task));
         }
