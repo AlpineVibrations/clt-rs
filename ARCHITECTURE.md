@@ -46,6 +46,13 @@ used Turso dependency. Application modules import its local API through
 - `task` does not depend on agent or TUI code.
 - CLI and TUI call application/store facades; they do not contain SQL.
 - TUI render functions read cached `TuiApp` state and perform no I/O.
+- Supervisor evidence includes each candidate session's retry eligibility, so
+  an explicit stop/resume invalidates stale ownership decisions without binding
+  heartbeat timestamps or interchangeable idle recovery tokens. Review
+  acquisition accepts stopped and resume-requested controls only when they have
+  no child, interactive holder or pending interactive launch. Regression tests
+  cover the existing task's stop/resume controls through review and exact-session
+  retry in both board layouts, preserving Git history, journal and staged work.
 - Scheduler decision functions are separate from acquisition and worker effects.
 - Direct-session ownership is persisted as `clt:manual` beside the task's terminal conversation marker. Creation publishes directly into Doing; claiming writes ownership before moving; handoff moves into Todo before removing ownership. The project board lock serializes board changes and exact-session selection. Independent manual claims and automated work may coexist; scheduler scans, resume acquisition, blocked recovery and worker result inference exclude manual tasks. Interactive and Git recovery checks protect the selected conversation without fencing unrelated manual work. Creation and status moves preserve neighboring folder paths. Editing and moves to Backlog preserve claims; moves into Todo release the selected claim after publishing its destination. Done and deletion also release it. A conversation with prior automated work keeps its existing journal and controls.
 - Completion can recover absent launch environment from the exact runtime `CODEX_THREAD_ID` and its running session-control record. The project, child liveness, unique token ownership and selected task session are checked before ordinary Git sealing/resealing; journal transactions still recheck the token. Stopped, interactive, missing and ambiguous records cannot supply an automated context. Explicit malformed launch environment remains an error. CLI tests cover recovery without launch variables and rejection of another task's completion.
@@ -153,4 +160,10 @@ The required verification gates are:
 cargo fmt --all -- --check
 cargo clippy --no-deps --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-targets --all-features
+```
+
+The supervisor stop/resume recovery regressions can also be run directly:
+
+```bash
+cargo test --locked --bin clt supervisor::tests
 ```

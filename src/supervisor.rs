@@ -94,14 +94,15 @@ pub(super) enum Gate {
 }
 
 pub(super) fn control_allows_review(control: &crate::agent::AgentSessionControlRecord) -> bool {
-    control.state == AgentSessionControlState::Stopped
-        || control.state == AgentSessionControlState::ResumeRequested
-            && control.child_pid.is_none()
-            && control.interactive_holder.is_none()
-            && control.interactive_launch_token.is_none()
-            && control.run_token.as_deref().is_some_and(|token| {
-                token.starts_with(crate::agent::AGENT_GIT_FINALIZATION_RESUME_TOKEN_PREFIX)
-            })
+    // A read-only reviewer may inspect an idle queued resume, including one
+    // explicitly requested by the user that retains its original run token.
+    // It does not consume the request or authorize implementation while stopped.
+    matches!(
+        control.state,
+        AgentSessionControlState::Stopped | AgentSessionControlState::ResumeRequested
+    ) && control.child_pid.is_none()
+        && control.interactive_holder.is_none()
+        && control.interactive_launch_token.is_none()
 }
 
 pub(super) fn evidence(project: &AgentProject) -> Result<String> {
@@ -136,8 +137,22 @@ fn review_evidence(store: &TursoAgentStore, project: &AgentProject) -> Result<St
         let run = store.latest_run_for_codex_session_blocking(project.id, session)?;
         Ok(json!({"session": session, "run": run.map(|run| json!({"id": run.id, "status": run.status, "summary": run.summary}))}))
     }).collect::<Result<Vec<_>>>()?;
+    // Resume/stop controls can resolve (or introduce) an ownership blocker
+    // without changing the board or a WORKING journal. Bind decisions to that
+    // eligibility, not heartbeat timestamps or replacement recovery tokens.
+    let session_eligibility = review_candidates(store, project)?
+        .iter()
+        .filter_map(|(_, task)| recoverable_codex_session_id_from_task_content(&task.content))
+        .map(|session| {
+            Ok(json!({
+                "session": session,
+                "can_retry": retry_session_is_idle(store, project.id, session)?,
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
     Ok(serde_json::to_string(
-        &json!({"board": evidence(project)?, "finalizations": seals, "repeated_failures": failures}),
+        &json!({"board": evidence(project)?, "finalizations": seals, "repeated_failures": failures,
+            "session_eligibility": session_eligibility}),
     )?)
 }
 

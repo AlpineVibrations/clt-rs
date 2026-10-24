@@ -639,6 +639,15 @@ Retry and dependency-wait deferral are automatic actions. The scheduler handles 
 
 Supervisor settings and decisions survive scheduler restarts and registry recovery. Explicit stops, manual ownership, active leases, and the sealed Git manifest retain their protections. Turning the supervisor off restores ordinary scheduling without deleting its saved decisions or changing task sessions. A review already running when it is switched off cannot apply its decision. Supervisor output remains available with the project's usual `l` log control.
 
+If a Repair decision says an unfinished session is stopped, select that task and
+press `s` to resume the same conversation. Opening an already-stopped session
+interactively and leaving it keeps the stop in place. Explicitly resuming it
+invalidates the old ownership assessment, allowing a fresh read-only review and
+an approved retry with the original Git journal and staged work preserved. You
+do not need a replacement conversation or an additional project retry. Live
+processes and interactive owners still prevent review acquisition; unchanged
+eligibility does not trigger repeated assessments.
+
 ### Background services and workers
 
 Run the scheduler continuously in the foreground:

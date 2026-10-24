@@ -6,6 +6,12 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+### Fixed
+
+- Reassess a supervisor hold after the user resumes a stopped task. Allow a
+  read-only review of its idle queued session with the original run token,
+  preserving the conversation, Git journal, staging and live-owner protections.
+
 ### Changed
 
 - Allow project Git-mode changes during automated runs, interactive sessions,
