@@ -36,6 +36,116 @@ fn messages(protocol: &Protocol<'_, Vec<u8>>) -> Vec<Value> {
 }
 
 #[test]
+fn progress_events_record_updates_without_sending_requests_or_interrupting_the_turn() {
+    let f = Fixture::new(false, false);
+    let spec = spec(&f);
+    let (mut protocol, _sender) = active(&spec, &f);
+    let before = f
+        .store
+        .session_control_blocking(f.project.id, &f.target.session_id)
+        .unwrap();
+    let path = f.target.mailbox.join("progress.json");
+    for (method, item) in [
+        (
+            "item/completed",
+            json!({"type":"agentMessage", "text":"Implementation finished; checking tests."}),
+        ),
+        (
+            "item/started",
+            json!({"type":"commandExecution", "command":"cargo test"}),
+        ),
+        (
+            "item/completed",
+            json!({"type":"commandExecution", "command":"cargo test", "status":"completed"}),
+        ),
+    ] {
+        protocol
+            .event(
+                json!({"method":method, "params":{"threadId":f.target.thread_id,
+            "turnId":f.target.turn_id, "item":item}}),
+            )
+            .unwrap();
+    }
+    let saved: progress::ProgressSnapshot = steering::read_json(&path).unwrap();
+    assert!(chrono::DateTime::parse_from_rfc3339(&saved.recorded_at).is_ok());
+    assert_eq!(
+        saved.update.as_deref(),
+        Some("Implementation finished; checking tests.")
+    );
+    assert_eq!(saved.activity, "Command completed: cargo test");
+    let original = fs::read(&path).unwrap();
+    for (thread, turn) in [
+        ("other-thread", "turn-one"),
+        (&*f.target.thread_id, "old-turn"),
+    ] {
+        protocol
+            .event(
+                json!({"method":"item/completed", "params":{"threadId":thread,
+            "turnId":turn, "item":{"type":"agentMessage", "text":"Wrong task"}}}),
+            )
+            .unwrap();
+        assert_eq!(fs::read(&path).unwrap(), original);
+    }
+    assert!(messages(&protocol).is_empty());
+    assert!(protocol.pending.is_empty());
+    assert_eq!(protocol.active_turn.as_deref(), Some("turn-one"));
+    assert_eq!(
+        f.store
+            .session_control_blocking(f.project.id, &f.target.session_id)
+            .unwrap(),
+        before
+    );
+    protocol
+        .event(
+            json!({"method":"turn/completed", "params":{"threadId":f.target.thread_id,
+        "turn":{"id":"turn-one", "status":"completed"}}}),
+        )
+        .unwrap();
+    assert_eq!(
+        steering::read_json::<progress::ProgressSnapshot>(&path)
+            .unwrap()
+            .activity,
+        "Turn completed"
+    );
+    protocol.start_turn("next-turn").unwrap();
+    let next: progress::ProgressSnapshot = steering::read_json(&path).unwrap();
+    assert_eq!(next.target.turn_id, "next-turn");
+    assert!(next.update.is_none());
+    // Older peers omit turnId on item notifications; the owned active turn still applies.
+    protocol
+        .event(
+            json!({"method":"item/completed", "params":{"threadId":f.target.thread_id,
+        "item":{"type":"agentMessage", "text":"Continuing the goal"}}}),
+        )
+        .unwrap();
+    assert_eq!(
+        steering::read_json::<progress::ProgressSnapshot>(&path)
+            .unwrap()
+            .update
+            .as_deref(),
+        Some("Continuing the goal")
+    );
+}
+
+#[test]
+fn progress_storage_failure_does_not_fail_the_agent() {
+    let f = Fixture::new(false, false);
+    let spec = spec(&f);
+    let (mut protocol, _sender) = active(&spec, &f);
+    let path = f.target.mailbox.join("progress.json");
+    fs::remove_file(&path).unwrap();
+    fs::create_dir(&path).unwrap();
+    protocol
+        .event(
+            json!({"method":"item/completed", "params":{"threadId":f.target.thread_id,
+        "item":{"type":"agentMessage", "text":"Still working"}}}),
+        )
+        .unwrap();
+    assert_eq!(protocol.active_turn.as_deref(), Some("turn-one"));
+    assert!(messages(&protocol).is_empty());
+}
+
+#[test]
 fn coordination_refresh_uses_the_owned_turn_and_deduplicates_unchanged_context() {
     let f = Fixture::new(false, false);
     let spec = spec(&f);

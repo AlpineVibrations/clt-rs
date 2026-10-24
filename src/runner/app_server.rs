@@ -24,6 +24,7 @@ use crate::{
 const RPC_TIMEOUT: Duration = Duration::from_secs(20);
 
 mod log;
+pub(crate) mod progress;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct LaunchSpec {
@@ -205,6 +206,7 @@ struct Protocol<'a, W> {
     used_tools: bool,
     final_text: String,
     log: log::EventLog,
+    progress: Option<progress::ProgressSnapshot>,
     coordination_context: Option<String>,
     coordination_pending: Option<(u64, String)>,
     coordination_checked: Instant,
@@ -227,6 +229,7 @@ impl<'a, W: Write> Protocol<'a, W> {
             used_tools: false,
             final_text: String::new(),
             log: log::EventLog::default(),
+            progress: None,
             coordination_context: None,
             coordination_pending: None,
             coordination_checked: Instant::now(),
@@ -448,6 +451,9 @@ impl<'a, W: Write> Protocol<'a, W> {
             mailbox: self.spec.mailbox.clone(),
         };
         steering::write_json(&target.mailbox.join("active.json"), &target)?;
+        let progress = progress::ProgressSnapshot::new(target.clone());
+        progress.save(&self.spec.mailbox);
+        self.progress = Some(progress);
         self.target = Some(target);
         Ok(())
     }
@@ -490,6 +496,16 @@ impl<'a, W: Write> Protocol<'a, W> {
         let params = &event["params"];
         if params["threadId"].as_str() != Some(&self.thread_id) {
             return Ok(());
+        }
+        if let Some(progress) = self.progress.as_mut()
+            && self.active_turn.as_deref() == Some(progress.target.turn_id.as_str())
+            && params["turnId"]
+                .as_str()
+                .or_else(|| params["turn"]["id"].as_str())
+                .is_none_or(|turn| turn == progress.target.turn_id)
+            && progress.event(event["method"].as_str().unwrap_or_default(), params)
+        {
+            progress.save(&self.spec.mailbox);
         }
         match event["method"].as_str().unwrap_or_default() {
             "turn/started" => {

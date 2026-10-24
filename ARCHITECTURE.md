@@ -139,6 +139,21 @@ omits empty reasoning and opaque protocol metadata. Formatter regressions and th
 private-peer integration test verify readable output without changing final stdout,
 session/settings headers, steering or thread filtering. Historical logs are unchanged.
 
+`runner::app_server::progress` saves bounded progress snapshots atomically beside
+each run's mailbox from existing root-thread events. It records agent updates and
+activity, excludes tool output and reasoning, and never sends a protocol request.
+Snapshot write errors do not fail the worker. `application::progress` reads only
+the selected task's session and run generation, rejecting mismatched snapshots,
+and adds session/Git state. `tui::progress` loads that snapshot off the UI thread
+into a read-only dialog. On the task board, `s` opens or refreshes progress and
+`Shift+S` retains stop/start; Agent Projects keeps its existing controls. Tests
+cover both board layouts, nested tasks, stale or absent snapshots, turn changes,
+non-interruption, storage failures, keyboard routing and small-terminal rendering.
+
+```bash
+cargo test --locked --bin clt progress
+```
+
 `session_control::steering` owns a private mailbox beside each run's logs. The
 TUI and owning worker recheck the unique Doing task and the saved session,
 PID, run token and active turn before publication/delivery. Only the worker

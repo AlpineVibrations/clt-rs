@@ -31,6 +31,8 @@ use ratatui::{
 };
 use tui_input::{Input, InputRequest};
 
+mod progress;
+
 use crate::{
     agent::{
         self, AGENT_CODEX_REASONING_EFFORTS, AGENT_DB_FILE, AGENT_PROVIDER_PRESETS,
@@ -1193,7 +1195,7 @@ impl TuiTaskSnapshot {
 }
 
 pub(super) fn tui_task_board_instructions() -> &'static str {
-    "Arrows navigate boards and tasks, Enter messages running Doing agents or opens subtasks/edits, e edits, n or + creates a subtask under the selected task, and Space creates a task. Press r to reorganize; use Shift+Arrows to move tasks. Tab opens Agent Projects, M opens Models, and h/? opens Help. Task control: s stops/starts tasks, i interrupts for interaction, c plans Todo tasks or opens linked sessions (taking over active runs), and l shows logs."
+    "Arrows navigate boards and tasks, Enter messages running Doing agents or opens subtasks/edits, e edits, n or + creates a subtask under the selected task, and Space creates a task. Press r to reorganize; use Shift+Arrows to move tasks. Tab opens Agent Projects, M opens Models, and h/? opens Help. Task control: s shows a read-only progress summary, S stops/starts tasks, i interrupts for interaction, c plans Todo tasks or opens linked sessions (taking over active runs), and l shows logs."
 }
 
 pub(super) fn tui_start_state(active_board: bool) -> TuiStartState {
@@ -3602,7 +3604,7 @@ pub(super) fn tui_agent_panel_instructions() -> &'static str {
 pub(super) fn tui_agent_log_title(log_view: &TuiAgentLogView) -> String {
     let status = if log_view.is_live { "LIVE" } else { "LATEST" };
     let controls = if log_view.session_target.is_some() {
-        "s/i/c controls; l/Esc closes"
+        "s/S/i/c controls; l/Esc closes"
     } else {
         "l/Esc closes"
     };
@@ -6241,6 +6243,7 @@ pub(super) struct TuiApp {
     pub(super) task_input: TaskInput,
     pub(super) steering_target: Option<SteeringTarget>,
     pub(super) steering_delivery: Option<Receiver<Result<String>>>,
+    task_summary: Option<progress::TaskSummary>,
     pub(super) feedback_buffer: String,
     pub(super) archive_view: bool,
     pub(super) backlog_visible: bool,
@@ -6287,6 +6290,7 @@ impl TuiApp {
             task_input: TaskInput::default(),
             steering_target: None,
             steering_delivery: None,
+            task_summary: None,
             feedback_buffer: start_state.feedback_buffer,
             archive_view: false,
             backlog_visible: false,
@@ -6527,6 +6531,8 @@ pub(super) fn normalize_cached_list_selection(state: &mut ListState, item_count:
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum TuiEffect {
+    RefreshTaskSummary,
+    ToggleTaskStop,
     RefreshAgentPanel,
     RefreshModels,
     RefreshSelectedProviderModels,
@@ -6540,6 +6546,9 @@ pub(super) enum TuiEffect {
 }
 
 pub(super) fn update_tui_pane(app: &mut TuiApp, key: KeyEvent) -> Option<Vec<TuiEffect>> {
+    if app.task_summary.is_some() {
+        return Some(app.task_summary_key(key));
+    }
     if app.pending_git_recovery.is_some() {
         return Some(vec![TuiEffect::PaneKey(key)]);
     }
@@ -6755,6 +6764,15 @@ pub(super) fn update_tui_tasks_pane(app: &mut TuiApp, key: KeyEvent) -> Option<V
         };
     }
 
+    if !key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        && (key.code == KeyCode::Char('S')
+            || (key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::SHIFT)))
+    {
+        return Some(vec![TuiEffect::ToggleTaskStop]);
+    }
+
     if !tui_toggles_models(&key)
         && key
             .modifiers
@@ -6764,6 +6782,7 @@ pub(super) fn update_tui_tasks_pane(app: &mut TuiApp, key: KeyEvent) -> Option<V
     }
 
     match key.code {
+        KeyCode::Char('s') => Some(vec![TuiEffect::RefreshTaskSummary]),
         _ if tui_toggles_models(&key) => {
             app.models_return_pane = tui_models_return_pane(app.current_pane);
             app.current_pane = TuiPane::Models;
@@ -6879,6 +6898,32 @@ pub(super) fn execute_tui_effect(
     last_agent_log_refresh: &mut Instant,
 ) -> bool {
     match effect {
+        TuiEffect::RefreshTaskSummary => app.refresh_task_summary(),
+        TuiEffect::ToggleTaskStop => {
+            let board_dir = app.board_dir();
+            let selected_status = TASK_STATUSES[app.selected_board];
+            let Some((_, task)) = selected_task_entry_in_board(
+                &board_dir,
+                selected_status,
+                &app.board_states[app.selected_board],
+            ) else {
+                app.feedback_buffer = "No task selected".to_string();
+                return false;
+            };
+            app.agent_panel.refresh(&app.active_root);
+            *last_agent_panel_refresh = Instant::now();
+            let project_id = app
+                .agent_panel
+                .select_project_for_path(&app.active_root)
+                .then(|| app.agent_panel.selected_project().map(|p| p.project.id))
+                .flatten();
+            app.feedback_buffer = match agent_state_dir().and_then(|state_dir| {
+                toggle_tui_task_stop_at(&state_dir, project_id, &board_dir, selected_status, &task)
+            }) {
+                Ok(message) => message,
+                Err(error) => format!("Unable to stop or start the task: {error}"),
+            };
+        }
         TuiEffect::RefreshAgentPanel => {
             if agent_panel_refresh.request(&app.active_root) {
                 *last_agent_panel_refresh = Instant::now();
@@ -7395,6 +7440,10 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
     // The feedback area is always the last element of main_layout
     f.render_widget(feedback_paragraph, feedback_area);
 
+    if let Some(summary) = &app.task_summary {
+        summary.render(f);
+    }
+
     if let Some(plan) = app.pending_git_recovery.as_ref() {
         let area = Rect::new(
             size.x + 1,
@@ -7421,7 +7470,8 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
                                  [Enter]        - Message running Doing agent; otherwise open subtasks/edit task/project\n\
                                  [e]            - Edit selected task\n\
                                  [g]            - Cycle selected project's Git mode: off/commit/push\n\
-                                 [s]            - Stop/start task or stop/resume displayed Agent Output session\n\
+                                 [s]            - Task progress summary (Agent Projects: stop/resume)\n\
+                                 [S]            - Stop/start selected task\n\
                                  [i]            - Take over linked/displayed live session, then auto-restart exec\n\
                                  [c]            - Plan a Todo / open linked session; take over if active\n\
                                  [l]            - Toggle active/selected project's live/current agent output\n\
@@ -7591,6 +7641,7 @@ pub(super) fn execute_tui_key_effect(
         return Ok(false);
     }
     if app.current_mode == Mode::View
+        && app.task_summary.is_none()
         && key.code == KeyCode::Esc
         && app.agent_log_view.take().is_some()
     {
@@ -8079,7 +8130,7 @@ pub(super) fn execute_tui_key_effect(
                         };
                         *last_agent_panel_refresh = Instant::now();
                     }
-                    KeyCode::Char('s') => {
+                    KeyCode::Char('s' | 'S') => {
                         let target_result = if app.agent_log_view.is_some() {
                             viewed_tui_codex_session_target(app.agent_log_view.as_ref())
                         } else {
@@ -8434,36 +8485,6 @@ pub(super) fn execute_tui_key_effect(
                         );
                         app.feedback_buffer =
                             "Archive view. Press A again to leave archive view.".to_string();
-                    }
-                    KeyCode::Char('s') => {
-                        let selected_status = statuses[app.selected_board];
-                        let Some((_, task)) = selected_task_entry_in_board(
-                            &board_dir,
-                            selected_status,
-                            &app.board_states[app.selected_board],
-                        ) else {
-                            app.feedback_buffer = "No task selected".to_string();
-                            return Ok(false);
-                        };
-                        app.agent_panel.refresh(&app.active_root);
-                        *last_agent_panel_refresh = Instant::now();
-                        let project_id = app
-                            .agent_panel
-                            .select_project_for_path(&app.active_root)
-                            .then(|| app.agent_panel.selected_project().map(|p| p.project.id))
-                            .flatten();
-                        app.feedback_buffer = match agent_state_dir().and_then(|state_dir| {
-                            toggle_tui_task_stop_at(
-                                &state_dir,
-                                project_id,
-                                &board_dir,
-                                selected_status,
-                                &task,
-                            )
-                        }) {
-                            Ok(message) => message,
-                            Err(error) => format!("Unable to stop or start the task: {error}"),
-                        };
                     }
                     KeyCode::Char('i') => {
                         let selected_status = statuses[app.selected_board];
@@ -9203,6 +9224,7 @@ pub(super) fn tui_view_with_active_board(
         }
 
         app.poll_steering_delivery();
+        app.poll_task_summary();
         terminal_session.set_text_input(
             matches!(app.current_mode, Mode::Input | Mode::Edit | Mode::Steer)
                 || app.model_input.is_some(),

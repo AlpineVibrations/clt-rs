@@ -1393,7 +1393,7 @@ fn running_agent_log_view_streams_the_current_output_file() {
         .unwrap();
     assert!(log_view.is_live);
     assert!(tui_agent_log_title(&log_view).contains("[LIVE]"));
-    assert!(tui_agent_log_title(&log_view).contains("s/i/c controls"));
+    assert!(tui_agent_log_title(&log_view).contains("s/S/i/c controls"));
     assert_eq!(log_view.content, header);
     assert_eq!(
         log_view.settings_label(),
@@ -1828,7 +1828,7 @@ fn fenced_agent_log_view_keeps_the_orphaned_session_controllable() {
     assert!(log_view.content.contains("work survived its supervisor"));
     let target = viewed_tui_codex_session_target(Some(&log_view)).unwrap();
     assert_eq!(target.session_id, "session-fenced");
-    assert!(tui_agent_log_title(&log_view).contains("s/i/c controls"));
+    assert!(tui_agent_log_title(&log_view).contains("s/S/i/c controls"));
 
     let message =
         toggle_tui_codex_session_stop_at(&state_dir, target.project_id, &target.session_id)
@@ -3066,7 +3066,7 @@ fn tui_task_board_instructions_only_describe_task_page_controls() {
     assert!(instructions.contains("Space creates a task"));
     assert!(instructions.contains("n or + creates a subtask under the selected task"));
     assert!(instructions.contains("e edits"));
-    assert!(instructions.contains("Task control: s stops/starts tasks"));
+    assert!(instructions.contains("s shows a read-only progress summary, S stops/starts tasks"));
     assert!(instructions.contains("i interrupts for interaction"));
     assert!(
         instructions

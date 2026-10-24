@@ -1645,7 +1645,7 @@ pub(super) fn toggle_tui_task_stop_at(
     }
     Ok(
         if toggle_task_stop_marker_in_board(board_dir, status, task)? {
-            "Task stopped. CLT will skip it until you press s again.".to_string()
+            "Task stopped. CLT will skip it until you press Shift+S on the task again.".to_string()
         } else {
             "Task started. CLT may pick it up when it is ready.".to_string()
         },
@@ -1687,7 +1687,7 @@ pub(super) fn toggle_tui_codex_session_stop_at(
                     ));
                 }
                 Ok(
-                    "Stopping this Codex task session; press s again once stopped to resume it."
+                    "Stopping this Codex task session; use Shift+S on the task board or s in Agent Projects once stopped to resume it."
                         .to_string(),
                 )
             } else {

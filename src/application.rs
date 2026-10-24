@@ -15,6 +15,7 @@ use anyhow::{Context, Result};
 
 pub(super) mod activity;
 pub(super) mod git_recovery;
+pub(crate) mod progress;
 
 use crate::{
     agent::{
@@ -2009,7 +2010,7 @@ pub(super) fn move_task_to_archive_in_board(
 pub(super) fn ensure_task_not_stopped(entry: &TaskEntry) -> Result<()> {
     anyhow::ensure!(
         !task_entry_is_stopped(entry),
-        "This task is stopped; press s on it to allow it to start again"
+        "This task is stopped; press Shift+S on it to allow it to start again"
     );
     Ok(())
 }

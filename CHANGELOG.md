@@ -14,6 +14,9 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ### Added
 
+- Show a short task progress summary with `s` on the Kanban board without
+  interrupting the agent. Display its latest recorded update, activity and
+  session/Git state; use `Shift+S` to stop or start a task.
 - Coordinate manual and automated tasks with stable dependency references,
   prerequisite completion/publication waits, declared scope and evidence-bound
   overlap assessments. Show owners and actionable waits in context, CLI and TUI;
