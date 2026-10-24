@@ -1,0 +1,1 @@
+codex was working on someitng in nteractive mode and made a task with CLI label.  then clt started a new task. so 2 are running. this sounds good but how do we know about dependencies and one might impact the other.
