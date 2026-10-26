@@ -7,6 +7,33 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 static NEXT_WORKSPACE: AtomicU64 = AtomicU64::new(0);
 
+#[test]
+fn task_thinking_is_listed_and_preserved_across_status_moves() {
+    for folders in [false, true] {
+        let w = TestWorkspace::new("task-thinking");
+        assert_success(&w.run(if folders {
+            &["init", "--folders"]
+        } else {
+            &["init"]
+        }));
+        assert_success(&w.run(&["add", "Fix parser.\n\nUse /think max in the details."]));
+        assert_success(&w.run(&["add", "Ordinary task"]));
+        let (todo, _) = assert_success(&w.run(&["list", "todo"]));
+        assert!(todo.contains("[think: max] Fix parser."));
+        assert!(!todo.contains("/think"));
+        assert!(!todo.contains("[think: max] Ordinary task"));
+        assert_success(&w.run(&["status", "todo", "1", "doing"]));
+        let (doing, _) = assert_success(&w.run(&["list", "doing"]));
+        assert!(doing.contains("[think: max] Fix parser."));
+        assert_success(&w.run(&["done", "doing", "1"]));
+        let (done, _) = assert_success(&w.run(&["list", "done"]));
+        assert!(done.contains("[think: max] Fix parser."));
+        let (todo, _) = assert_success(&w.run(&["list", "todo"]));
+        assert!(todo.contains("Ordinary task"));
+        assert!(!todo.contains("[think:"));
+    }
+}
+
 fn coordinated_id(workspace: &TestWorkspace, status: &str, index: &str) -> String {
     let (stdout, _) = assert_success(&workspace.run(&["coordinate", status, index]));
     stdout

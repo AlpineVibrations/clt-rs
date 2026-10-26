@@ -11,6 +11,7 @@ in [Feature Ideas](docs/FEATURE_IDEAS.md); they are not a list of shipped featur
 - [Kanban view](#kanban-view)
   - [Agent Projects](#agent-projects)
   - [Task sessions and controls](#task-sessions-and-controls)
+  - [Per-task thinking levels](#per-task-thinking-levels)
   - [Task progress summaries](#task-progress-summaries)
   - [Messaging a running agent](#messaging-a-running-agent)
   - [Direct Codex sessions](#direct-codex-sessions)
@@ -121,7 +122,7 @@ clt
 ```
 Selected tasks expand to show their text; other tasks occupy one line. When a task collapses or the viewport grows, the list brings earlier tasks back into view to fill available space while keeping the selection visible. In normal navigation, `Esc` clears the task selection.
 
-Press `Enter` to message the agent on a running Doing task; otherwise it opens a folder task's subtasks or edits the selected task. Use `n` or `+` to create a subtask under the selected task, `e` to edit the selected task, `Space` to create a task, `Backspace` to return to the parent board, and `q` to quit. Creating a subtask automatically expands a Markdown-backed parent status to folder-backed storage, preserving the original status file as a `.bak`, converts the selected task into a nested board, and opens that board after the subtask is saved. Cancelling the prompt leaves storage unchanged.
+Press `Enter` to message the agent on a running Doing task; otherwise it opens a folder task's subtasks or edits the selected task. Use `n` or `+` to create a subtask under the selected task, `e` to edit the selected task, `Space` to create a task, `t` to cycle a Todo task's thinking level, `Backspace` to return to the parent board, and `q` to quit. Creating a subtask automatically expands a Markdown-backed parent status to folder-backed storage, preserving the original status file as a `.bak`, converts the selected task into a nested board, and opens that board after the subtask is saved. Cancelling the prompt leaves storage unchanged.
 
 Press `r` to enter sticky Reorganize mode, then use the arrow keys as many times as needed: Up/Down changes the selected task's position and Left/Right moves it between columns. The task-board borders turn yellow and the selected column shows `REORGANIZE MODE` while the mode is active. Press `r` again or `Esc` to return to normal navigation.
 
@@ -194,6 +195,38 @@ Done once their interactive owner is gone. An idle failed attempt that never
 started work cannot keep a completed task or the project's next Todo blocked.
 Todo planning and interactive takeover of unfinished automated work retain their
 existing controls.
+
+### Per-task thinking levels
+
+Add `/think <level>` anywhere in a task's text, including its detail paragraphs,
+when creating or editing it in the CLI, TUI, or task file. Supported levels are
+`low`, `medium`, `high`, `xhigh`, `max`, and `ultra`. Separate the directive and its
+level from surrounding text with whitespace. For example:
+
+```bash
+clt add "Investigate the parser /think max and cover the edge cases"
+clt add "/think high Fix the export error"
+clt add "Update the docs /think low"
+```
+
+The task shows a bracketed label such as `[think: max]` in CLI listings and both
+collapsed and expanded TUI cards. The editor retains the `/think` directive so
+you can change or remove it. If several directives are present, the last valid
+one wins. `/think default` clears the override; tasks without an override follow
+their usual project, model, and Codex defaults.
+
+Select a **Todo** task and press `t` to cycle through default → low → medium →
+high → xhigh → max → ultra → default. This also works in nested boards and on
+stopped Todo tasks. Returning to default removes the custom label. The setting
+stays with the task when it moves between statuses and when its session resumes.
+Agent Projects and Models keep their existing `t` controls.
+
+A task override takes precedence over project and model thinking settings for
+its next automated launch and when creating its planning conversation. It does
+not modify those defaults or change an already running turn. `/goal` can be
+combined with `/think`; thinking directives are excluded when interpreting the
+goal objective. Each level is passed to the selected model as written, so that
+model/provider must support it.
 
 ### Task progress summaries
 
@@ -301,7 +334,7 @@ the scheduler after upgrading and refresh the bundled skills with
 
 ### Models and providers
 
-Press uppercase `M` from either the task board or Agent Projects to open the Models page; uppercase `M`, `Tab`, or `Esc` returns to the pane you came from. The Models page keeps a catalog of providers and model targets with aligned, labeled columns. `USE` shows live availability, `FAV` marks favorites, and the separate `CLT` and `CODEX` columns identify the effective CLT-wide default and the user's Codex config default; `YES` is shown when a row has that role. `THINK` shows each model's default reasoning level: press `t` to cycle through system, low, medium, high, extra-high, max, and ultra. A model setting is used for agent runs unless the selected project has its own reasoning override. Changing `THINK` on the `CODEX=YES` model also updates Codex's top-level reasoning default immediately; choosing system removes that override. Pressing `c` to choose a new Codex default writes both its model and reasoning setting. When no explicit CLT override exists, CLT follows the Codex default and both columns mark the same model. The provider pane always shows the available presets: press `1` through `4` to add or enable OpenAI, OpenRouter, Ollama, or LM Studio. Ollama and LM Studio query their standard local URLs for models immediately. To remove a provider, select it in the left pane and press `x` or `Delete`; its models and affected CLT/project selections are removed, along with its custom Codex provider configuration. Built-in OpenAI cannot be removed, but `Space` can disable it.
+Press uppercase `M` from either the task board or Agent Projects to open the Models page; uppercase `M`, `Tab`, or `Esc` returns to the pane you came from. The Models page keeps a catalog of providers and model targets with aligned, labeled columns. `USE` shows live availability, `FAV` marks favorites, and the separate `CLT` and `CODEX` columns identify the effective CLT-wide default and the user's Codex config default; `YES` is shown when a row has that role. `THINK` shows each model's default reasoning level: press `t` to cycle through system, low, medium, high, extra-high, max, and ultra. A model setting is used for agent runs unless the selected task or project has its own reasoning override. Changing `THINK` on the `CODEX=YES` model also updates Codex's top-level reasoning default immediately; choosing system removes that override. Pressing `c` to choose a new Codex default writes both its model and reasoning setting. When no explicit CLT override exists, CLT follows the Codex default and both columns mark the same model. The provider pane always shows the available presets: press `1` through `4` to add or enable OpenAI, OpenRouter, Ollama, or LM Studio. Ollama and LM Studio query their standard local URLs for models immediately. To remove a provider, select it in the left pane and press `x` or `Delete`; its models and affected CLT/project selections are removed, along with its custom Codex provider configuration. Built-in OpenAI cannot be removed, but `Space` can disable it.
 
 Press `n` to add another local or custom OpenAI-compatible endpoint. CLT asks for a friendly name, the API base URL, and an optional API-key environment-variable name; it creates the internal provider ID automatically. Enter the API root, for example `http://127.0.0.1:9090/v1`. Include `/v1` when that is where the server exposes its compatible API, or omit it when the server exposes endpoints directly at the host root. Do not paste a complete operation URL ending in `/chat`, `/chat/completions`, `/models`, or `/responses`. After saving, CLT requests `<base URL>/models` and shows every returned model in the Models pane. Newly discovered models start `OFF`, so use Right, Up/Down, and `Space` to choose exactly which models appear in project selection. Press `r` to discover again later, or `a` to enter a model ID manually when an endpoint does not expose `/models`. `Space` also enables or hides the selected provider, and `f` toggles model favorite status. Favorites sort first. Use `k` on an endpoint that names no environment variable to store its key in CLT; CLT then records `OPENAI_API_KEY` as that provider's `env_key` so Codex sends the stored credential to the endpoint.
 

@@ -170,8 +170,7 @@ pub(super) fn resolve_agent_state_dir(
     }
 }
 pub(super) const CODEX_HOME_ENV: &str = "CODEX_HOME";
-pub(super) const AGENT_CODEX_REASONING_EFFORTS: [&str; 7] =
-    ["", "low", "medium", "high", "xhigh", "max", "ultra"];
+pub(super) const AGENT_CODEX_REASONING_EFFORTS: [&str; 7] = crate::task::thinking::LEVELS;
 pub(super) const AGENT_STATE_DIR_ENV: &str = "CLT_AGENT_STATE_DIR";
 pub(super) const AGENT_GIT_FINALIZATION_RESUME_TOKEN_PREFIX: &str = "clt-git-finalization:";
 pub(super) const AGENT_EXTERNAL_COMPLETION_REASON: &str = "Managed Git proof was cancelled because a user explicitly moved the task to Done as an external completion";

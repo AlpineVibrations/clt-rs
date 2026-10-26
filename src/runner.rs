@@ -292,6 +292,57 @@ pub(super) fn classify_agent_supervision_stage(
     }
 }
 
+fn selected_task_thinking(
+    root: &Path,
+    selection: AgentTaskSelection,
+    resume_session: Option<&str>,
+) -> Result<Option<&'static str>> {
+    if selection == AgentTaskSelection::SupervisorReview {
+        return Ok(None);
+    }
+    let session = match resume_session {
+        Some(session) => Some(session.to_string()),
+        None => automated_codex_session_to_resume(root, selection)?,
+    };
+    let task = if let Some(session) = session {
+        let mut linked = Vec::new();
+        crate::session_control::collect_codex_session_tasks_in_board(
+            &get_tasks_dir(root),
+            &session,
+            &mut linked,
+        )?;
+        anyhow::ensure!(
+            linked.len() <= 1,
+            "Task thinking requires an unambiguous session link"
+        );
+        linked.pop().map(|(_, task)| task)
+    } else {
+        match selection {
+            AgentTaskSelection::NextTodo => {
+                crate::coordination::ready_tasks(root)?.into_iter().next()
+            }
+            AgentTaskSelection::ResumeDoing | AgentTaskSelection::RecoverBlocked => {
+                let mut tasks = if selection == AgentTaskSelection::ResumeDoing {
+                    read_task_entries(&get_tasks_dir(root), TaskStatus::Doing)?
+                        .into_iter()
+                        .filter(|task| !crate::task::task_content_is_manual(&task.content))
+                        .collect::<Vec<_>>()
+                } else {
+                    crate::worker::blocked_tasks(root)?
+                        .into_iter()
+                        .map(|(_, task)| task)
+                        .collect()
+                };
+                if tasks.len() == 1 { tasks.pop() } else { None }
+            }
+            _ => None,
+        }
+    };
+    Ok(task
+        .as_ref()
+        .and_then(|task| crate::task::thinking::read(&task.content)))
+}
+
 pub(super) fn launch_agent_runner_stage(
     request: AgentRunnerLaunchRequest<'_>,
 ) -> Result<AgentRunnerLaunchResult> {
@@ -361,7 +412,11 @@ pub(super) fn launch_agent_runner_stage(
     if let Some(provider) = store.resolve_credential_provider_blocking(project)? {
         configure_agent_provider_credential(&mut command, store, &provider)?;
     }
-    let model_reasoning_effort = if project.codex_reasoning_effort.is_none() {
+    let task_reasoning_effort =
+        selected_task_thinking(&project.path, task_selection, resume_session_id)?;
+    let model_reasoning_effort = if task_reasoning_effort.is_none()
+        && project.codex_reasoning_effort.is_none()
+    {
         match (
             model_target.provider_id.as_deref(),
             model_target.model_id.as_deref(),
@@ -374,9 +429,8 @@ pub(super) fn launch_agent_runner_stage(
     } else {
         None
     };
-    if let Some(reasoning_effort) = project
-        .codex_reasoning_effort
-        .as_deref()
+    if let Some(reasoning_effort) = task_reasoning_effort
+        .or(project.codex_reasoning_effort.as_deref())
         .or(model_reasoning_effort.as_deref())
     {
         command
@@ -593,6 +647,7 @@ Your job for this run:
    - inspect its full content and applicable repository instructions before starting work
    - follow the applicable mode-specific pre-task Git boundary; when a Git appendix says CLT already prepared and froze the checkout, do not sync or switch it yourself
    - move it to doing only after that preparation
+   - CLT already applies any `/think <level>` directive as this task's launch setting; preserve it in the stored task, but exclude it when interpreting task prose or checking for a leading `/goal`; do not change project, model, or global thinking settings
    - if the first non-whitespace token is exactly `/goal`, treat that as an explicit Goal mode request: remove that token, trim the remaining task content, create a persistent goal from the result without including `/goal` in the goal objective, and then work toward it
    - if `/goal` has no non-empty objective after it, add a concise `BLOCKED YYYY-MM-DD:` note explaining that the goal objective is missing and stop
    - do not create a goal when `/goal` appears anywhere except at the start of the task content
@@ -803,7 +858,10 @@ fn configure_automated_codex_subcommand_with_direction(
         )?;
         prompt.push_str(&format!("\n\nExact task session for this run: codex:{session}. Work only on the task carrying this marker. If its link is missing or ambiguous, stop without selecting or blocking another task.\n"));
         if let [(status, task)] = linked.as_slice() {
-            prompt.push_str(&format!("Linked task ({status}):\n{}\n", task.content));
+            prompt.push_str(&format!(
+                "Linked task ({status}):\n{}\n",
+                crate::task::thinking::strip(&task.content)
+            ));
         }
     }
     if task_selection == AgentTaskSelection::NextTodo
@@ -829,7 +887,7 @@ fn configure_automated_codex_subcommand_with_direction(
         }
         prompt.push_str(&format!(
             "\n\nSelected task for this run:\n{}\n\nCLT selected the Todo above before launch. This selection supersedes the instruction to pick the next ready task. Re-read the board and use this task's current index; do not substitute a Todo added or reordered after launch. If this task is removed, claimed by another conversation, stopped, or no longer ready, exit without starting or blocking another task.\n",
-            selected.content
+            crate::task::thinking::strip(&selected.content)
         ));
     }
     if let Some(direction) = direction {

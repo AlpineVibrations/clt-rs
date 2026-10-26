@@ -6,6 +6,9 @@ use crate::worker::tests::reserve_test_inline_worker;
 #[path = "tests/planning.rs"]
 mod planning;
 
+#[path = "tests/thinking.rs"]
+mod thinking;
+
 #[test]
 fn enabling_project_git_records_the_unmanaged_session_before_resumption() {
     for by_path in [false, true] {

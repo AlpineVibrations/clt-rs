@@ -2,6 +2,77 @@ use crate::test_support::prelude::*;
 use crate::test_support::*;
 
 #[test]
+fn task_thinking_key_cycles_todo_and_renders_the_override() {
+    let root = temp_root("tui-task-thinking");
+    init_tasks(&root, false).unwrap();
+    add_task(&root, "Fix parser. More detail /think high", None).unwrap();
+    let mut app = TuiApp::new(&root, true);
+    app.refresh_task_snapshot();
+    app.selected_board = TODO_BOARD_INDEX;
+    app.board_states[TODO_BOARD_INDEX].select(Some(0));
+    let key = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE);
+    assert_eq!(
+        update_tui_pane(&mut app, key),
+        Some(vec![TuiEffect::CycleTaskThinking])
+    );
+    let mut worker = TuiAgentPanelRefreshWorker::new();
+    let mut panel_refresh = Instant::now();
+    let mut log_refresh = Instant::now();
+    execute_tui_effect(
+        &mut app,
+        TuiEffect::CycleTaskThinking,
+        &mut worker,
+        &mut panel_refresh,
+        &mut log_refresh,
+    );
+    assert_eq!(app.feedback_buffer, "Task thinking: xhigh");
+    let task = &app.task_snapshot.board_entries[TODO_BOARD_INDEX][0];
+    assert_eq!(
+        task_tui_display_text(task, false),
+        "[think: xhigh] Fix parser."
+    );
+    assert_eq!(
+        task_tui_display_text(task, true),
+        "[think: xhigh] Fix parser. More detail"
+    );
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+    terminal.draw(|frame| render_tui(frame, &app)).unwrap();
+    let rendered: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(rendered.contains("[think: xhigh]"));
+
+    app.current_mode = Mode::Edit;
+    assert_eq!(
+        update_tui_pane(&mut app, key),
+        Some(vec![TuiEffect::PaneKey(key)])
+    );
+    app.current_mode = Mode::View;
+    for pane in [TuiPane::AgentProjects, TuiPane::Models] {
+        app.current_pane = pane;
+        assert_eq!(
+            update_tui_pane(&mut app, key),
+            Some(vec![TuiEffect::PaneKey(key)])
+        );
+    }
+    app.current_pane = TuiPane::Tasks;
+    app.board_states[TODO_BOARD_INDEX].select(None);
+    execute_tui_effect(
+        &mut app,
+        TuiEffect::CycleTaskThinking,
+        &mut worker,
+        &mut panel_refresh,
+        &mut log_refresh,
+    );
+    assert_eq!(app.feedback_buffer, "No task selected");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn worker_task_activity_stays_visible_on_board_projects_and_logs() {
     use crate::application::activity::{WorkerActivity, WorkerActivityPhase};
     let root = temp_root("visible-worker-task");

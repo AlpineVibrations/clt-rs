@@ -69,6 +69,17 @@ used Turso dependency. Application modules import its local API through
   external edits remain outside the shared-checkout guarantee.
 
 - `task` does not depend on agent or TUI code.
+- `task::thinking` parses portable `/think` directives throughout task prose and
+  owns the reasoning-level cycle shared with project/model controls. Display
+  replaces directives with one bracketed label; editors retain the directives.
+  Thinking settings are excluded from durable task payload identity, while Git
+  still seals the complete tree. The Todo cycle uses the board lock, checks the
+  cached task's source and contents, and preserves coordination/session markers
+  through the existing guarded editor. Runner selection resolves the ready Todo
+  or exact linked session under the launch lock; its override precedes project
+  and model defaults and never writes those defaults. Supervisor reviews remain
+  independent. Regression tests cover both board layouts, nested tasks, stale
+  selections, full-content labels, launch arguments and resumed selection.
 - CLI and TUI call application/store facades; they do not contain SQL.
 - TUI render functions read cached `TuiApp` state and perform no I/O.
 - Supervisor evidence includes each candidate session's retry eligibility, so
@@ -211,6 +222,13 @@ The required verification gates are:
 cargo fmt --all -- --check
 cargo clippy --no-deps --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-targets --all-features
+```
+
+Task thinking regressions can also be run directly:
+
+```bash
+cargo test --locked --bin clt thinking
+cargo test --locked --test cli task_thinking
 ```
 
 The supervisor stop/resume recovery regressions can also be run directly:

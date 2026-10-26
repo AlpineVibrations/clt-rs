@@ -2051,6 +2051,27 @@ pub(super) fn update_task_in_board(
     update_task_in_board_after_lock(board_dir, status, task_index, new_description)
 }
 
+pub(crate) fn cycle_task_thinking_in_board(
+    board_dir: &Path,
+    status: TaskStatus,
+    selected: &TaskEntry,
+) -> Result<Option<&'static str>> {
+    anyhow::ensure!(
+        status == TaskStatus::Todo,
+        "Thinking can only be cycled on Todo tasks"
+    );
+    let _mutation_lock = acquire_board_mutation_lock(board_dir)?;
+    let index = TaskBoard::new(board_dir)
+        .entries(status)?
+        .iter()
+        .position(|entry| entry.source == selected.source && entry.content == selected.content)
+        .context("The selected task changed; select it again before changing its thinking")?;
+    let (content, level) =
+        crate::task::thinking::cycle(&crate::task::task_content_for_edit(&selected.content));
+    update_task_in_board_after_lock(board_dir, status, index + 1, &content)?;
+    Ok(level)
+}
+
 #[cfg(test)]
 pub(super) fn update_task_in_board_with_contention_callback(
     board_dir: &Path,

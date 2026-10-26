@@ -6,6 +6,8 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+## [0.9.4] - 2026-10-25
+
 ### Fixed
 
 - Reassess a supervisor hold after the user resumes a stopped task. Allow a
@@ -14,6 +16,10 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ### Added
 
+- Set thinking for one task with `/think low|medium|high|xhigh|max|ultra`
+  anywhere in its text. Press `t` on a Todo to cycle levels or return to default;
+  custom levels appear as `[think: high]` in task lists and cards. Task overrides
+  apply to fresh and resumed launches without changing project or model defaults.
 - Show a short task progress summary with `s` on the Kanban board without
   interrupting the agent. Display its latest recorded update, activity and
   session/Git state; use `Shift+S` to stop or start a task.

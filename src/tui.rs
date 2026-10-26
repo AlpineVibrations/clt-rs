@@ -1195,7 +1195,7 @@ impl TuiTaskSnapshot {
 }
 
 pub(super) fn tui_task_board_instructions() -> &'static str {
-    "Arrows navigate boards and tasks, Enter messages running Doing agents or opens subtasks/edits, e edits, n or + creates a subtask under the selected task, and Space creates a task. Press r to reorganize; use Shift+Arrows to move tasks. Tab opens Agent Projects, M opens Models, and h/? opens Help. Task control: s shows a read-only progress summary, S stops/starts tasks, i interrupts for interaction, c plans Todo tasks or opens linked sessions (taking over active runs), and l shows logs."
+    "Arrows navigate boards and tasks, Enter messages running Doing agents or opens subtasks/edits, e edits, n or + creates a subtask under the selected task, and Space creates a task. Press r to reorganize; use Shift+Arrows to move tasks. Tab opens Agent Projects, M opens Models, and h/? opens Help. Task control: t cycles Todo thinking, s shows a read-only progress summary, S stops/starts tasks, i interrupts for interaction, c plans Todo tasks or opens linked sessions (taking over active runs), and l shows logs."
 }
 
 pub(super) fn tui_start_state(active_board: bool) -> TuiStartState {
@@ -6533,6 +6533,7 @@ pub(super) fn normalize_cached_list_selection(state: &mut ListState, item_count:
 pub(super) enum TuiEffect {
     RefreshTaskSummary,
     ToggleTaskStop,
+    CycleTaskThinking,
     RefreshAgentPanel,
     RefreshModels,
     RefreshSelectedProviderModels,
@@ -6783,6 +6784,7 @@ pub(super) fn update_tui_tasks_pane(app: &mut TuiApp, key: KeyEvent) -> Option<V
 
     match key.code {
         KeyCode::Char('s') => Some(vec![TuiEffect::RefreshTaskSummary]),
+        KeyCode::Char('t') => Some(vec![TuiEffect::CycleTaskThinking]),
         _ if tui_toggles_models(&key) => {
             app.models_return_pane = tui_models_return_pane(app.current_pane);
             app.current_pane = TuiPane::Models;
@@ -6899,6 +6901,24 @@ pub(super) fn execute_tui_effect(
 ) -> bool {
     match effect {
         TuiEffect::RefreshTaskSummary => app.refresh_task_summary(),
+        TuiEffect::CycleTaskThinking => {
+            let status = TASK_STATUSES[app.selected_board];
+            let selected = app.board_states[app.selected_board]
+                .selected()
+                .and_then(|index| app.task_snapshot.board_entries[app.selected_board].get(index));
+            app.feedback_buffer = match selected {
+                Some(task) => match crate::application::cycle_task_thinking_in_board(
+                    &app.board_dir(),
+                    status,
+                    task,
+                ) {
+                    Ok(level) => format!("Task thinking: {}", level.unwrap_or("default")),
+                    Err(error) => format!("Unable to change task thinking: {error}"),
+                },
+                None => "No task selected".to_string(),
+            };
+            app.refresh_task_snapshot();
+        }
         TuiEffect::ToggleTaskStop => {
             let board_dir = app.board_dir();
             let selected_status = TASK_STATUSES[app.selected_board];
@@ -7469,6 +7489,7 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
                                  [n/+]          - Create subtask under selected task\n\
                                  [Enter]        - Message running Doing agent; otherwise open subtasks/edit task/project\n\
                                  [e]            - Edit selected task\n\
+                                 [t]            - Cycle selected Todo's thinking level\n\
                                  [g]            - Cycle selected project's Git mode: off/commit/push\n\
                                  [s]            - Task progress summary (Agent Projects: stop/resume)\n\
                                  [S]            - Stop/start selected task\n\

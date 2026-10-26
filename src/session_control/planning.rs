@@ -36,7 +36,9 @@ pub(crate) fn prepare_todo_planning_session(
     prepare_todo_planning_session_with(state_dir, project, board_dir, selected, |store| {
         let target = store.resolve_model_target_blocking(project)?;
         let reasoning = match (
-            project.codex_reasoning_effort.clone(),
+            crate::task::thinking::read(&selected.content)
+                .map(str::to_string)
+                .or_else(|| project.codex_reasoning_effort.clone()),
             target.provider_id.as_deref(),
             target.model_id.as_deref(),
         ) {

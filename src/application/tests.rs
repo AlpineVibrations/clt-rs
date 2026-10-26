@@ -2,6 +2,9 @@ use crate::test_support::prelude::*;
 use crate::test_support::*;
 use crate::tui::tests::tui_agent_project_for_test;
 
+#[path = "tests/thinking.rs"]
+mod thinking;
+
 #[test]
 fn markdown_move_does_not_convert_or_reject_a_managed_destination_task() {
     for folder_source in [false, true] {
