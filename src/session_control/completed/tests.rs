@@ -3,6 +3,122 @@ use crate::test_support::temp_root;
 
 use super::{prepare_completed_task_context, restore_completed_task_for_guardian};
 
+#[test]
+fn scheduler_retires_completed_resume_and_starts_next_todo() {
+    for folders in [false, true] {
+        let root = temp_root("completed-resume-scheduling");
+        let project_root = root.join("project");
+        let state = root.join("state");
+        init_tasks(&project_root, folders).unwrap();
+        let content = "Finished feature — COMPLETED: verified codex:session-completed";
+        insert_task(&project_root, TaskStatus::Done, None, content, None).unwrap();
+        let done_before = read_task_entries(&get_tasks_dir(&project_root), TaskStatus::Done)
+            .unwrap()[0]
+            .content
+            .clone();
+        add_task(&project_root, "Next feature", None).unwrap();
+        let store = agent::TursoAgentStore::open_blocking(&state).unwrap();
+        store
+            .register_project_blocking(&project_root, "project")
+            .unwrap();
+        let id = store.list_projects_blocking().unwrap().remove(0).id;
+        store
+            .set_session_control_recovery_token_blocking(id, "session-completed", "original-run")
+            .unwrap();
+        let before = store
+            .session_control_blocking(id, "session-completed")
+            .unwrap()
+            .unwrap();
+        drop(store);
+
+        let scheduled = run_agent_scheduler_pass(&state, false, &[]).unwrap();
+        assert_eq!(scheduled.jobs.len(), 1);
+        assert_eq!(
+            scheduled.jobs[0].task_selection,
+            AgentTaskSelection::NextTodo
+        );
+        assert!(scheduled.jobs[0].resume_session_id.is_none());
+        let store = agent::TursoAgentStore::open_blocking(&state).unwrap();
+        let after = store
+            .session_control_blocking(id, "session-completed")
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.state, AgentSessionControlState::Stopped);
+        assert_eq!(after.run_token, before.run_token);
+        assert_eq!(
+            read_task_entries(&get_tasks_dir(&project_root), TaskStatus::Done).unwrap()[0].content,
+            done_before
+        );
+        assert!(store.list_recent_runs_blocking(10).unwrap().is_empty());
+        assert!(
+            store
+                .release_lease_blocking(id, &scheduled.jobs[0].holder)
+                .unwrap()
+        );
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn completed_resume_cleanup_requires_one_done_task_including_nested_boards() {
+    for scenario in ["nested-done", "doing", "duplicate", "missing"] {
+        let root = temp_root("completed-resume-task-proof");
+        init_tasks(&root, true).unwrap();
+        let epic = root.join("tasks/doing/0001-epic");
+        fs::create_dir_all(&epic).unwrap();
+        fs::write(epic.join("task.md"), "Parent epic.").unwrap();
+        let status = if scenario == "doing" { "doing" } else { "done" };
+        let content = if scenario == "missing" {
+            ""
+        } else {
+            "- Finished child codex:session-completed\n"
+        };
+        fs::write(epic.join(format!("{status}.md")), content).unwrap();
+        if scenario == "duplicate" {
+            insert_task(
+                &root,
+                TaskStatus::Done,
+                None,
+                "Other task codex:session-completed",
+                None,
+            )
+            .unwrap();
+        }
+        let store = agent::TursoAgentStore::open_blocking(&root.join("state")).unwrap();
+        store.register_project_blocking(&root, "project").unwrap();
+        let id = store.list_projects_blocking().unwrap().remove(0).id;
+        store
+            .set_session_control_recovery_token_blocking(id, "session-completed", "original-run")
+            .unwrap();
+        let before = store
+            .session_control_blocking(id, "session-completed")
+            .unwrap();
+        let retired = super::retire_completed_resume_request(
+            &store,
+            id,
+            "session-completed",
+            agent_timestamp_seconds(),
+        )
+        .unwrap();
+        assert_eq!(retired, scenario == "nested-done", "{scenario}");
+        if !retired {
+            assert_eq!(
+                store
+                    .session_control_blocking(id, "session-completed")
+                    .unwrap(),
+                before
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(epic.join(format!("{status}.md"))).unwrap(),
+            content
+        );
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
 fn completed_session(
     root: &Path,
     folders: bool,

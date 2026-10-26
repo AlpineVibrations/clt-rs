@@ -55,7 +55,7 @@ use crate::{
     },
 };
 
-mod completed;
+pub(super) mod completed;
 pub(super) mod planning;
 pub(crate) mod steering;
 
@@ -882,6 +882,15 @@ pub(super) fn run_agent_session_resume_worker(project_id: i64, session_id: &str)
                 continue;
             }
             Some(_) | None => return Ok(()),
+        }
+
+        if completed::retire_completed_resume_request(
+            &store,
+            project_id,
+            session_id,
+            agent_timestamp_seconds(),
+        )? {
+            return Ok(());
         }
 
         let acquired_at = agent_timestamp();

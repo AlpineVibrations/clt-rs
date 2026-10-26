@@ -51,8 +51,8 @@ use crate::{
         agent_timestamp_seconds, format_agent_timestamp,
     },
     session_control::{
-        InteractiveGuardianDisposition, recover_stale_interactive_guardian_with_task,
-        restore_idle_completed_interactive_tasks,
+        InteractiveGuardianDisposition, completed::retire_completed_resume_request,
+        recover_stale_interactive_guardian_with_task, restore_idle_completed_interactive_tasks,
     },
     session_recovery::{ensure_orphaned_session_supervision, recovered_supervisor_pid},
     task::{
@@ -1708,6 +1708,13 @@ pub(super) fn reconcile_stale_agent_session_controls(
         restore_idle_completed_interactive_tasks(store, project_id)
     })?;
     for control in controls {
+        if control.state == AgentSessionControlState::ResumeRequested
+            && with_agent_store_at(state_dir, |store| {
+                retire_completed_resume_request(store, project_id, &control.codex_session_id, now)
+            })?
+        {
+            continue;
+        }
         if control.state == AgentSessionControlState::ReadyInteractive
             && let Some(holder) = control.interactive_holder.as_deref()
             && (holder.starts_with("clt-idle-interactive-")
@@ -2044,6 +2051,11 @@ pub(super) fn resumable_codex_session_for_project(
             continue;
         }
         let session_id = control.codex_session_id;
+        if with_agent_store_at(state_dir, |store| {
+            retire_completed_resume_request(store, project.id, &session_id, now)
+        })? {
+            continue;
+        }
         let git_finalization = with_agent_store_at(state_dir, |store| {
             store.git_finalization_blocking(project.id, &session_id)
         })?;

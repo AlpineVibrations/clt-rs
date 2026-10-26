@@ -6,6 +6,15 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+## [0.9.5] - 2026-10-25
+
+### Fixed
+
+- Release an idle session reservation when its linked task is already Done,
+  including completion during an interactive handoff. Scheduling and exact-session
+  retry workers stop obsolete resumes instead of leaving the project FENCED.
+  Preserve conversation history, active owners, and unfinished Git proof.
+
 ## [0.9.4] - 2026-10-25
 
 ### Fixed

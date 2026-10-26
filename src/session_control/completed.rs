@@ -161,6 +161,49 @@ pub(super) fn restore_completed_task_for_guardian(
     Ok(())
 }
 
+pub(crate) fn retire_completed_resume_request(
+    store: &TursoAgentStore,
+    project_id: i64,
+    session: &str,
+    now: u64,
+) -> Result<bool> {
+    let (board, _lock) = lock_project_board(store, project_id)?;
+    let Some(control) = store.session_control_blocking(project_id, session)? else {
+        return Ok(false);
+    };
+    if control.state != AgentSessionControlState::ResumeRequested
+        || control.child_pid.is_some()
+        || control.interactive_holder.is_some()
+        || control.interactive_launch_token.is_some()
+        // Git proof acknowledgement has its own completion path.
+        || control.run_token.as_deref().is_some_and(|token| {
+            token.starts_with(crate::agent::AGENT_GIT_FINALIZATION_RESUME_TOKEN_PREFIX)
+        })
+    {
+        return Ok(false);
+    }
+    if !crate::task::TASK_STATUSES
+        .into_iter()
+        .any(|status| crate::task::status_store_exists(&board, status))
+    {
+        return Ok(false);
+    }
+    let mut tasks = Vec::new();
+    collect_linked_tasks(&board, Some(session), &mut tasks)?;
+    if tasks.len() != 1 || tasks[0].1 != TaskStatus::Done {
+        return Ok(false);
+    }
+    // A Done entry can still be provisional. Recheck Git state and ownership
+    // atomically with the exact request while the board remains locked.
+    let retired = store.retire_completed_resume_request_blocking(&control, now)?;
+    if retired {
+        eprintln!(
+            "Project {project_id}: action=completed_session_resume_retired session={session} reason=task_done"
+        );
+    }
+    Ok(retired)
+}
+
 pub(super) fn restore_idle_completed_tasks(store: &TursoAgentStore, project_id: i64) -> Result<()> {
     let (board, _lock) = lock_project_board(store, project_id)?;
     // Reconciliation also runs for paused/missing projects. Do not initialize

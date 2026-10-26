@@ -5,6 +5,54 @@ use crate::tui::tests::tui_agent_project_for_test;
 use clt_database::turso;
 
 #[test]
+fn exact_session_resume_worker_retires_completed_task_without_launching_codex() {
+    let root = temp_root("completed-exec-handback");
+    init_tasks(&root, false).unwrap();
+    insert_task(
+        &root,
+        TaskStatus::Done,
+        None,
+        "Finished task codex:session-completed",
+        None,
+    )
+    .unwrap();
+    let store = open_agent_store().unwrap();
+    store.register_project_blocking(&root, "project").unwrap();
+    let project = store.list_projects_blocking().unwrap().remove(0);
+    store
+        .set_session_control_recovery_token_blocking(
+            project.id,
+            "session-completed",
+            "original-run",
+        )
+        .unwrap();
+
+    super::run_agent_session_resume_worker(project.id, "session-completed").unwrap();
+
+    assert_eq!(
+        store
+            .session_control_blocking(project.id, "session-completed")
+            .unwrap()
+            .unwrap()
+            .state,
+        AgentSessionControlState::Stopped
+    );
+    assert!(
+        store
+            .lease_for_project_blocking(project.id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(store.list_recent_runs_blocking(10).unwrap().is_empty());
+    assert_eq!(
+        task_status_for_codex_session(&root, "session-completed").unwrap(),
+        Some(TaskStatus::Done)
+    );
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn interactive_exec_handback_waits_while_the_project_is_paused() {
     let root = temp_root("paused-exec-handback");
     init_tasks(&root, false).unwrap();
@@ -1146,15 +1194,25 @@ fn stopped_sessions_remain_persisted_without_stranding_markerless_projects() {
     );
     drop(store);
     toggle_tui_codex_session_stop_at(&state_dir, project_id, "session-123").unwrap();
-    let exact_resume = run_agent_scheduler_pass(&state_dir, false, &[]).unwrap();
-    assert_eq!(exact_resume.jobs.len(), 1);
+    // Even a newly queued resume cannot turn a terminal Done task back into
+    // automated work. Its conversation remains available through `c`.
+    let after_resume_request = run_agent_scheduler_pass(&state_dir, false, &[]).unwrap();
+    assert_eq!(after_resume_request.jobs.len(), 1);
     assert_eq!(
-        exact_resume.jobs[0].task_selection,
-        AgentTaskSelection::ResumeSession
+        after_resume_request.jobs[0].task_selection,
+        AgentTaskSelection::NextTodo
     );
     let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
+    assert_eq!(
+        store
+            .session_control_blocking(project_id, "session-123")
+            .unwrap()
+            .unwrap()
+            .state,
+        AgentSessionControlState::Stopped
+    );
     store
-        .release_lease_blocking(project_id, &exact_resume.jobs[0].holder)
+        .release_lease_blocking(project_id, &after_resume_request.jobs[0].holder)
         .unwrap();
     drop(store);
     fs::remove_dir_all(root).unwrap();

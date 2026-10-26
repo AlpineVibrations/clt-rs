@@ -2635,6 +2635,62 @@ impl TursoAgentStore {
             })
     }
 
+    /// The caller holds the board lock and has proved one linked task in Done.
+    /// Keep its history, and retire only the observed idle request with no
+    /// unfinished Git contract or concurrent project owner.
+    pub(crate) fn retire_completed_resume_request_blocking(
+        &self,
+        expected: &AgentSessionControlRecord,
+        now: u64,
+    ) -> Result<bool> {
+        if expected.state != AgentSessionControlState::ResumeRequested
+            || expected.child_pid.is_some()
+            || expected.interactive_holder.is_some()
+            || expected.interactive_launch_token.is_some()
+        {
+            return Ok(false);
+        }
+        self.blocking.block_on_persist(async {
+            let conn = self.repositories.sessions_runs.connect().await?;
+            let changed = conn.execute(
+                "UPDATE session_controls SET state = 'stopped', updated_at = ?5
+                  WHERE project_id = ?1 AND codex_session_id = ?2
+                    AND state = 'resume_requested' AND child_pid IS NULL
+                    AND interactive_holder IS NULL AND interactive_launch_token IS NULL
+                    AND run_token IS ?3 AND updated_at = ?4
+                    AND NOT EXISTS (
+                        SELECT 1 FROM agent_workers WHERE project_id = ?1
+                          AND state IN ('dispatching', 'running', 'finalizing'))
+                    AND NOT EXISTS (
+                        SELECT 1 FROM leases WHERE project_id = ?1
+                          AND CAST(expires_at AS INTEGER) > CAST(?5 AS INTEGER))
+                    AND NOT EXISTS (
+                        SELECT 1 FROM agent_git_launch_states WHERE project_id = ?1)
+                    AND NOT EXISTS (
+                        SELECT 1 FROM git_finalizations
+                         WHERE project_id = ?1 AND codex_session_id = ?2
+                           AND state NOT IN ('completed', 'cancelled'))
+                    AND (EXISTS (
+                        SELECT 1 FROM git_finalizations
+                         WHERE project_id = ?1 AND codex_session_id = ?2)
+                        OR COALESCE(
+                            (SELECT git_mode FROM session_git_modes
+                              WHERE project_id = ?1 AND codex_session_id = ?2),
+                            (SELECT git_mode FROM projects WHERE id = ?1)) = 'off')",
+                params![
+                    expected.project_id,
+                    expected.codex_session_id.as_str(),
+                    expected.run_token.as_deref(),
+                    expected.updated_at.as_str(),
+                    now.to_string(),
+                ],
+            ).await.with_context(|| {
+                format!("Failed to retire completed task resume request for Codex session {}", expected.codex_session_id)
+            })?;
+            Ok(changed == 1)
+        })
+    }
+
     pub(crate) fn clear_orphaned_resume_requested_session_blocking(
         &self,
         project_id: i64,

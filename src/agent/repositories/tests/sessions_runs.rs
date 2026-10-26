@@ -147,6 +147,124 @@ fn current_control(
 }
 
 #[test]
+fn completed_resume_retirement_preserves_history_and_rechecks_ownership_and_git() {
+    for scenario in [
+        "idle",
+        "completed",
+        "cancelled",
+        "working",
+        "tracking",
+        "commit_pending",
+        "push_pending",
+        "child",
+        "holder",
+        "launch-token",
+        "new-run",
+        "new-timestamp",
+        "running",
+        "lease",
+        "worker",
+        "git-launch",
+        "missing-git-proof",
+        "missing-project-git-proof",
+    ] {
+        let (root, _, store, running) = supervision_fixture("completed-resume-fences");
+        let id = running.project_id;
+        let session = running.codex_session_id.as_str();
+        store
+            .set_session_control_recovery_token_blocking(id, session, "original-run")
+            .unwrap();
+        let expected = current_control(&store, &running);
+        match scenario {
+            "lease" | "worker" => {
+                assert!(
+                    store
+                        .try_acquire_lease_blocking(id, "other-owner", "100", "9999999999")
+                        .unwrap()
+                );
+                if scenario == "worker" {
+                    assert!(reserve_test_worker(
+                        &store,
+                        id,
+                        "other-worker",
+                        "other-owner",
+                        "100",
+                        2
+                    ));
+                    assert!(
+                        store
+                            .release_lease_blocking(id, "clt-worker-other-worker")
+                            .unwrap()
+                    );
+                }
+            }
+            "working" | "tracking" | "commit_pending" | "push_pending" | "completed"
+            | "cancelled" => {
+                store.blocking.block_on_persist(async {
+                    let conn = store.repositories.sessions_runs.connect().await?;
+                    conn.execute(
+                        "INSERT INTO git_finalizations (project_id, codex_session_id, state, git_mode, worktree_baseline, created_at, updated_at)
+                         VALUES (?1, ?2, ?3, 'commit', '{}', '100', '100')",
+                        params![id, session, scenario],
+                    ).await?;
+                    Ok(())
+                }).unwrap();
+            }
+            "idle" => {}
+            _ => {
+                store.blocking.block_on_persist(async {
+                    let conn = store.repositories.sessions_runs.connect().await?;
+                    let sql = match scenario {
+                        "child" => "UPDATE session_controls SET child_pid = 999 WHERE project_id = ?1 AND codex_session_id = ?2",
+                        "holder" => "UPDATE session_controls SET interactive_holder = 'other' WHERE project_id = ?1 AND codex_session_id = ?2",
+                        "launch-token" => "UPDATE session_controls SET interactive_launch_token = 'other' WHERE project_id = ?1 AND codex_session_id = ?2",
+                        "new-run" => "UPDATE session_controls SET run_token = 'new-run' WHERE project_id = ?1 AND codex_session_id = ?2",
+                        "new-timestamp" => "UPDATE session_controls SET updated_at = '101' WHERE project_id = ?1 AND codex_session_id = ?2",
+                        "running" => "UPDATE session_controls SET state = 'running' WHERE project_id = ?1 AND codex_session_id = ?2",
+                        "git-launch" => "INSERT INTO agent_git_launch_states (project_id, run_token, git_mode, starting_head, worktree_baseline, created_at) VALUES (?1, ?2, 'commit', 'head', '{}', '100')",
+                        "missing-git-proof" => "INSERT INTO session_git_modes (project_id, codex_session_id, git_mode) VALUES (?1, ?2, 'commit')",
+                        "missing-project-git-proof" => "UPDATE projects SET git_mode = 'commit' WHERE id = ?1 AND ?2 IS NOT NULL",
+                        _ => unreachable!(),
+                    };
+                    conn.execute(sql, params![id, session]).await?;
+                    Ok(())
+                }).unwrap();
+            }
+        }
+        let before = current_control(&store, &expected);
+        let journal_before = store.git_finalization_blocking(id, session).unwrap();
+        let retired = store
+            .retire_completed_resume_request_blocking(&expected, 200)
+            .unwrap();
+        assert_eq!(
+            retired,
+            matches!(scenario, "idle" | "completed" | "cancelled"),
+            "{scenario}"
+        );
+        let after = current_control(&store, &expected);
+        if retired {
+            assert_eq!(after.state, AgentSessionControlState::Stopped);
+            assert_eq!(after.run_token, before.run_token);
+            assert_eq!(after.stdout_path, before.stdout_path);
+            assert_eq!(after.stderr_path, before.stderr_path);
+            assert!(
+                !store
+                    .retire_completed_resume_request_blocking(&expected, 201)
+                    .unwrap()
+            );
+        } else {
+            assert_eq!(after, before, "{scenario}");
+        }
+        assert_eq!(
+            store.git_finalization_blocking(id, session).unwrap(),
+            journal_before
+        );
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
 fn planning_reservations_reject_live_owners_and_unfinished_workers() {
     for blocker in [
         "running",
