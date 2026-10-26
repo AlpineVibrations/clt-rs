@@ -476,8 +476,17 @@ fn registry_open_repairs_a_crash_after_commit_without_reverting_to_the_snapshot(
             })
             .unwrap()
     );
+    store
+        .mark_session_running_blocking(
+            project.id,
+            "surviving-worker",
+            std::process::id(),
+            "surviving-run",
+            &root.join("out"),
+            &root.join("err"),
+        )
+        .unwrap();
     let old_snapshot = fs::read(state_dir.join(SNAPSHOT_FILE)).unwrap();
-    drop(store);
     let child = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -521,15 +530,18 @@ fn registry_open_repairs_a_crash_after_commit_without_reverting_to_the_snapshot(
     assert_eq!(current["tables"]["git_finalizations"][0]["generation"], 3);
     assert!(!state_dir.join(DIRTY_FILE).exists());
     assert!(!state_dir.join(REQUIRED_FILE).exists());
-    let archive = fs::read_dir(state_dir.join("quarantine"))
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
-    assert_eq!(fs::read(archive.join(SNAPSHOT_FILE)).unwrap(), old_snapshot);
-    assert!(archive.join(DIRTY_FILE).exists());
+    // Snapshot-only repair leaves the original DB/WAL and coordination intact.
+    assert!(!state_dir.join("quarantine").exists());
+    assert!(!store.list_projects_blocking().unwrap()[0].enabled);
+    assert_eq!(
+        store
+            .session_controls_for_project_blocking(project.id)
+            .unwrap()[0]
+            .child_pid,
+        Some(std::process::id())
+    );
     drop(reopened);
+    drop(store);
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -555,7 +567,7 @@ fn registry_dirty_commit_crash_child() {
 }
 
 #[test]
-fn dirty_auto_recovery_checks_processes_missing_from_the_old_snapshot() {
+fn dirty_auto_recovery_preserves_processes_missing_from_the_old_snapshot() {
     let (root, state_dir, store, project) = registered_store("registry-dirty-live-process");
     let old_snapshot = fs::read(state_dir.join(SNAPSHOT_FILE)).unwrap();
     store
@@ -571,15 +583,20 @@ fn dirty_auto_recovery_checks_processes_missing_from_the_old_snapshot() {
     drop(store);
     fs::write(state_dir.join(SNAPSHOT_FILE), &old_snapshot).unwrap();
     fs::write(state_dir.join(DIRTY_FILE), "snapshot export interrupted").unwrap();
-    let original = bundle_contents(&state_dir);
-    let error = crate::agent::open_agent_store_at(&state_dir).err().unwrap();
-    assert!(format!("{error:#}").contains("waiting for worker/session process"));
-    assert_eq!(bundle_contents(&state_dir), original);
+    let reopened = crate::agent::open_agent_store_at(&state_dir).unwrap();
+    let controls = reopened
+        .session_controls_for_project_blocking(project.id)
+        .unwrap();
+    assert_eq!(controls.len(), 1);
+    assert_eq!(controls[0].codex_session_id, "unexported-session");
+    assert_eq!(controls[0].child_pid, Some(std::process::id()));
     assert_eq!(
-        fs::read(state_dir.join(SNAPSHOT_FILE)).unwrap(),
-        old_snapshot
+        read_snapshot(&state_dir).unwrap().unwrap()["tables"]["session_controls"][0]["child_pid"],
+        std::process::id()
     );
-    assert!(state_dir.join(DIRTY_FILE).exists());
+    assert!(!state_dir.join(DIRTY_FILE).exists());
+    assert!(!state_dir.join(REQUIRED_FILE).exists());
+    drop(reopened);
     fs::remove_dir_all(root).unwrap();
 }
 

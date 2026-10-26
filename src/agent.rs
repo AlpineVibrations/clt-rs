@@ -1442,6 +1442,21 @@ pub(super) struct AgentDaemonCheckin {
 }
 
 impl TursoAgentStore {
+    /// Keep durable updates out of the final heartbeat check and service restart.
+    /// Busy writers defer the restart; callers must drop this store before invoking
+    /// the service manager, while retaining the returned guard through that call.
+    pub(crate) fn try_service_restart_guard(&self) -> Result<Option<recovery::RegistryWriteLock>> {
+        let state_dir = self
+            .db_path
+            .parent()
+            .context("Agent database has no state directory")?;
+        let Some(guard) = recovery::try_write_lock(state_dir)? else {
+            return Ok(None);
+        };
+        recovery::check_clean(state_dir)?;
+        Ok(Some(guard))
+    }
+
     pub(crate) fn check_recovery_required(&self) -> Result<()> {
         recovery::check_required(
             self.db_path

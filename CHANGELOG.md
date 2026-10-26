@@ -6,6 +6,17 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+## [0.9.6] - 2026-10-26
+
+### Fixed
+
+- Defer automatic service restarts while a registry update is in progress, and
+  recheck the heartbeat under the write lock before restarting.
+- Recover an interrupted registry snapshot from verified committed rows while
+  other workers continue. Preserve live sessions and Git journals without
+  replacing the database or its coordination files; storage damage still uses
+  exclusive recovery.
+
 ## [0.9.5] - 2026-10-25
 
 ### Fixed
@@ -569,7 +580,10 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 - Fixed task moves so destination write failures do not remove the source task.
 - Fixed TUI navigation on empty boards.
 
-[Unreleased]: https://github.com/AlpineVibrations/clt-rs/compare/v0.9.3...HEAD
+[Unreleased]: https://github.com/AlpineVibrations/clt-rs/compare/v0.9.6...HEAD
+[0.9.6]: https://github.com/AlpineVibrations/clt-rs/compare/v0.9.5...v0.9.6
+[0.9.5]: https://github.com/AlpineVibrations/clt-rs/compare/v0.9.4...v0.9.5
+[0.9.4]: https://github.com/AlpineVibrations/clt-rs/compare/v0.9.3...v0.9.4
 [0.9.3]: https://github.com/AlpineVibrations/clt-rs/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/AlpineVibrations/clt-rs/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/AlpineVibrations/clt-rs/compare/v0.9.0...v0.9.1

@@ -2,6 +2,98 @@ use crate::test_support::prelude::*;
 use crate::test_support::*;
 
 #[test]
+fn stale_service_restart_defers_while_a_registry_writer_is_active() {
+    let root = temp_root("restart-busy-registry");
+    let store = open_agent_store_at(&root).unwrap();
+    let writer = store.try_service_restart_guard().unwrap().unwrap();
+    assert!(
+        !super::restart_stale_service_after_updates(
+            store,
+            || panic!("a busy registry must not inspect the service"),
+            || panic!("a busy registry must not restart the service"),
+        )
+        .unwrap()
+    );
+    drop(writer);
+    assert!(!root.join("registry-dirty").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn stale_service_restart_rechecks_heartbeat_and_preserves_explicit_stops() {
+    for stopped in [false, true] {
+        let root = temp_root("restart-heartbeat-recheck");
+        let store = open_agent_store_at(&root).unwrap();
+        let now = agent_timestamp_seconds();
+        store
+            .record_daemon_checkin_blocking("scheduler", "service", "1", "1", "2")
+            .unwrap();
+        assert!(agent_service_needs_restart(
+            "running",
+            &store.list_daemon_checkins_blocking().unwrap(),
+            now
+        ));
+        if !stopped {
+            store
+                .record_daemon_checkin_blocking(
+                    "scheduler",
+                    "service",
+                    "1",
+                    &now.to_string(),
+                    &(now + 45).to_string(),
+                )
+                .unwrap();
+        }
+        assert!(
+            !super::restart_stale_service_after_updates(
+                store,
+                || if stopped { "installed" } else { "running" }.to_string(),
+                || panic!("fresh or explicitly stopped service must stay untouched"),
+            )
+            .unwrap()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn stale_service_restart_holds_writer_fence_after_dropping_database_handles() {
+    let root = temp_root("restart-write-boundary");
+    let store = open_agent_store_at(&root).unwrap();
+    store
+        .record_daemon_checkin_blocking("scheduler", "service", "1", "1", "2")
+        .unwrap();
+    let writer = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(root.join("agent-write.lock"))
+        .unwrap();
+    assert!(
+        super::restart_stale_service_after_updates(
+            store,
+            || "running".to_string(),
+            || {
+                assert!(matches!(
+                    writer.try_lock(),
+                    Err(fs::TryLockError::WouldBlock)
+                ));
+                let access = fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(root.join("agent-access.lock"))?;
+                access.try_lock().unwrap();
+                assert!(!root.join("registry-dirty").exists());
+                Ok(())
+            },
+        )
+        .unwrap()
+    );
+    writer.try_lock().unwrap();
+    drop(writer);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn task_thinking_key_cycles_todo_and_renders_the_override() {
     let root = temp_root("tui-task-thinking");
     init_tasks(&root, false).unwrap();

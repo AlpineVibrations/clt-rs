@@ -113,7 +113,8 @@ used Turso dependency. Application modules import its local API through
 - Scheduler passes persist missing/uninitialized/unreadable board scans and skip those projects before recovery reads, so unavailable storage cannot initialize a replacement board or block unrelated jobs. Platform startup bounds launchd unload/bootstrap retries and retains permanent failure diagnostics.
 - Project and existing-board probes preserve metadata errors; only not-found errors indicate missing storage. TUI snapshots distinguish local readability from the daemon's saved scan, without overwriting its access evidence. Reconnection tests restore the same registered path and verify scheduling resumes with the original board.
 - Persistent agent commands use the store blocking adapter's durable update boundary. A writer lock and dirty marker cover the DB-to-snapshot interval; live stores hold shared access until every Turso handle is dropped. Recovery takes exclusive access, preserves DB and WAL together, and refuses ambiguous reconstruction.
-- An interrupted snapshot export may be repaired automatically from the original DB/WAL under exclusive access. Automatic dirty recovery rechecks process ownership from committed database rows before checkpointing and publishing a fresh snapshot; it never reconstructs from the stale external snapshot. Scheduler recovery runs on a blocking worker after failed pass handles are dropped and only without active inline runs. Interrupted repairs resume from the same validated quarantine under exclusive access, recheck committed process ownership, and retain dirty-snapshot evidence. Failed retries retain that original quarantine and progress marker without creating duplicate backups or reconstructing automatically. Snapshot loading and platform recovery share the supported-version check.
+- `agent::recovery::interrupted_snapshot` handles only an interrupted-export marker with no exclusive repair in progress. It holds shared access and the registry writer lock, opens fresh handles without migrations, verifies integrity and foreign keys, and exports committed rows without checkpointing, reindexing or replacing coordination files. Live readers and workers remain valid. Marker publication and conditional clearing share a separate lock so a concurrent storage failure cannot be erased. Snapshot publication precedes marker removal, and failures retain evidence. Storage/index failures retain exclusive recovery, quarantine and committed-process checks. Scheduler recovery runs on a blocking worker after failed pass handles are dropped and only without active inline runs. Interrupted exclusive repairs resume from the same validated quarantine, preserving their original evidence. Snapshot loading and platform recovery share the supported-version check.
+- TUI service recovery takes a nonblocking registry writer guard before its final heartbeat/service check. A busy writer or a renewed heartbeat defers the restart. Database handles are dropped before calling the service manager, while the write guard remains held; the existing cross-window restart claim and cooldown also apply. Tests prove write exclusion at the restart callback, reader-handle teardown, fresh-heartbeat cancellation and explicit-stop preservation.
 - Snapshot lock conflicts retry only the snapshot transaction, with fresh connections and bounded attempts, while preserving that writer boundary. Completed mutations are never replayed by snapshot retries.
 - Registry writer-lock acquisition is bounded. Ordinary store operations retain checkpoint pins only while their futures run, explicitly rolling back on completion; idle handles do not pin old WAL generations. Under the writer lock, opens before migrations and durable updates before mutation/dirty marking attempt engine-managed WAL truncation at 64 MiB. Real readers may defer it; the 128 MiB admission guard remains a fallback for legacy clients and long reads. Recovery retains its lifetime pin until integrity verification, releases only that pin, truncates through the engine, and verifies integrity again before publishing a snapshot. Idle opens also retain exclusive maintenance; live stores and worker/session processes defer that path. Successful routine exclusive maintenance deletes only its own backup after verified teardown and durable snapshot publication; manual and failed recovery bundles remain quarantined. Recovery bypasses the admission guard to permit checkpointing.
 - Turso rows are mapped to agent-domain records inside `agent::repositories`.
@@ -223,6 +224,16 @@ The required verification gates are:
 cargo fmt --all -- --check
 cargo clippy --no-deps --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-targets --all-features
+```
+
+Registry recovery regressions include a subprocess exiting after commit while a
+different worker and reader remain alive, newer Git proof and session ownership,
+publication failures and storage-damage refusal. Run these and the service restart
+boundary checks directly with:
+
+```bash
+cargo test --locked --bin clt agent::recovery
+cargo test --locked --bin clt stale_service_restart
 ```
 
 Task thinking regressions can also be run directly:

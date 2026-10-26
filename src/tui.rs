@@ -2787,21 +2787,17 @@ pub(super) fn load_tui_agent_panel_snapshot_inner(
     let mut store = open_agent_store_at(&state_dir)?;
     let mut checkins = store.list_daemon_checkins_blocking()?;
     let now = agent_timestamp_seconds();
-    let service_restarted =
-        recover_stale_service && agent_service_needs_restart(&service_status, &checkins, now);
-    if service_restarted {
+    let mut service_restarted = false;
+    if recover_stale_service && agent_service_needs_restart(&service_status, &checkins, now) {
         // Never hold a database reader while waiting for a service restart.
         // Another TUI may already have restarted it since our first snapshot.
         drop(store);
         if let Some(_claim) = crate::platform::claim_agent_service_restart(&state_dir, now)? {
-            let current = open_agent_store_at(&state_dir)?.list_daemon_checkins_blocking()?;
-            if agent_service_needs_restart(
-                &agent_service_status(&state_dir),
-                &current,
-                agent_timestamp_seconds(),
-            ) {
-                restart_running_agent_service().context("Failed to restart stale agent service")?;
-            }
+            service_restarted = restart_stale_service_after_updates(
+                open_agent_store_at(&state_dir)?,
+                || agent_service_status(&state_dir),
+                restart_running_agent_service,
+            )?;
         }
         store = open_agent_store_at(&state_dir)?;
         checkins = store.list_daemon_checkins_blocking()?;
@@ -3099,6 +3095,27 @@ pub(super) fn tui_agent_failure_problem(
     Some(format!(
         "Last agent run failed: {summary}\n{retry} {correction} Press r to clear the cooldown and retry now."
     ))
+}
+
+fn restart_stale_service_after_updates(
+    store: agent::TursoAgentStore,
+    service_status: impl FnOnce() -> String,
+    restart: impl FnOnce() -> Result<()>,
+) -> Result<bool> {
+    let Some(_writer) = store.try_service_restart_guard()? else {
+        return Ok(false);
+    };
+    let current = store.list_daemon_checkins_blocking()?;
+    let needs_restart =
+        agent_service_needs_restart(&service_status(), &current, agent_timestamp_seconds());
+    // Keep the writer fence, but release every Turso handle before stopping the
+    // old process. A heartbeat that finished while we waited cancels the restart.
+    drop(store);
+    if !needs_restart {
+        return Ok(false);
+    }
+    restart().context("Failed to restart stale agent service")?;
+    Ok(true)
 }
 
 pub(super) fn agent_service_needs_restart(

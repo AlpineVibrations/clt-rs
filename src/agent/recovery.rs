@@ -15,11 +15,14 @@ use serde_json::{Map, Value as Json, json};
 use super::{TursoAgentStore, configure_agent_connection};
 
 pub(super) mod health;
+mod interrupted_snapshot;
 
 pub(crate) const SNAPSHOT_FILE: &str = "registry.json";
 const DIRTY_FILE: &str = "registry-dirty";
 const REQUIRED_FILE: &str = "recovery-required";
 const RECOVERING_REASON: &str = "Exclusive registry recovery in progress";
+const INTERRUPTED_UPDATE_REASON: &str =
+    "An agent registry update was interrupted before its external snapshot was durable";
 const BUNDLE_FILES: [&str; 4] = ["agent.db", "agent.db-wal", "agent.db-tshm", "agent.db-shm"];
 const WAL_MAINTENANCE_BYTES: u64 = 64 * 1024 * 1024;
 const WAL_WRITE_LIMIT_BYTES: u64 = 128 * 1024 * 1024;
@@ -54,7 +57,7 @@ impl Drop for RegistryAccess {
     }
 }
 
-pub(super) struct RegistryWriteLock(File);
+pub(crate) struct RegistryWriteLock(File);
 
 impl Drop for RegistryWriteLock {
     fn drop(&mut self) {
@@ -107,6 +110,30 @@ pub(super) fn write_lock(state_dir: &Path) -> Result<RegistryWriteLock> {
     }
 }
 
+pub(super) fn try_write_lock(state_dir: &Path) -> Result<Option<RegistryWriteLock>> {
+    let file = lock_file(state_dir, "agent-write.lock")?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(RegistryWriteLock(file))),
+        Err(fs::TryLockError::WouldBlock) => Ok(None),
+        Err(fs::TryLockError::Error(error)) => Err(error.into()),
+    }
+}
+
+struct RecoveryMarkerLock(File);
+
+impl Drop for RecoveryMarkerLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
+fn marker_lock(state_dir: &Path) -> Result<RecoveryMarkerLock> {
+    let file = lock_file(state_dir, "recovery-marker.lock")?;
+    file.lock()
+        .context("Failed to lock the registry recovery marker")?;
+    Ok(RecoveryMarkerLock(file))
+}
+
 pub(crate) fn check_required(state_dir: &Path) -> Result<()> {
     if state_dir.join(REQUIRED_FILE).exists()
         || state_dir.join("recovery-in-progress.json").exists()
@@ -122,9 +149,12 @@ pub(crate) fn check_required(state_dir: &Path) -> Result<()> {
 pub(super) fn check_clean(state_dir: &Path) -> Result<()> {
     check_required(state_dir)?;
     if state_dir.join(DIRTY_FILE).exists() {
-        mark_required(
-            state_dir,
-            "An agent registry update was interrupted before its external snapshot was durable",
+        let _marker = marker_lock(state_dir)?;
+        // Do not replace a storage failure discovered by a concurrent reader.
+        check_required(state_dir)?;
+        atomic_write(
+            &state_dir.join(REQUIRED_FILE),
+            INTERRUPTED_UPDATE_REASON.as_bytes(),
         )?;
         check_required(state_dir)?;
     }
@@ -132,6 +162,7 @@ pub(super) fn check_clean(state_dir: &Path) -> Result<()> {
 }
 
 pub(super) fn mark_required(state_dir: &Path, reason: &str) -> Result<()> {
+    let _marker = marker_lock(state_dir)?;
     atomic_write(&state_dir.join(REQUIRED_FILE), reason.as_bytes())
 }
 
@@ -634,6 +665,16 @@ pub(crate) fn recover_registry_automatically(state_dir: &Path) -> Result<()> {
     if check_required(state_dir).is_ok() {
         return Ok(());
     }
+    let snapshot_error = match interrupted_snapshot::try_repair(state_dir) {
+        Ok(true) => {
+            eprintln!(
+                "Automatically refreshed the interrupted registry snapshot from the verified database; active workers continue."
+            );
+            return Ok(());
+        }
+        Ok(false) => None,
+        Err(error) => Some(error),
+    };
     let result = recover_registry_with_policy(
         state_dir,
         |manifest| {
@@ -652,7 +693,12 @@ pub(crate) fn recover_registry_automatically(state_dir: &Path) -> Result<()> {
         }
         // Another opener may have finished recovery before we acquired access.
         Err(_) if check_required(state_dir).is_ok() => Ok(()),
-        Err(error) => Err(error),
+        Err(error) => match snapshot_error {
+            Some(snapshot_error) => Err(error).context(format!(
+                "Could not refresh the interrupted registry snapshot: {snapshot_error:#}"
+            )),
+            None => Err(error),
+        },
     }
 }
 
