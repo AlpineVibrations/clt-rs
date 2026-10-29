@@ -769,6 +769,13 @@ Transient database lock errors while saving a snapshot retry the snapshot with a
 
 CLT keeps its database write-ahead log (WAL) small during normal use. Before a database update or migrations on open, a WAL at or above 64 MiB is checkpointed and truncated through the database engine. This works while CLT windows and workers remain open: checkpoint pins last only for individual database operations. Committed settings, run history, leases, and Git journals are preserved. Active readers can defer a checkpoint until a later update. Recovery also verifies and checkpoints the WAL while holding exclusive access, retaining its original DB/WAL bundle in quarantine. Idle registry opens retain this exclusive maintenance fallback. Successful routine maintenance removes its own temporary backup after integrity checks and durable snapshot publication, so repeated cleanup does not accumulate archived WALs. Manual recovery and failed maintenance retain their backups.
 
+An upgrade can encounter an older WAL that already exceeds the engine's shared
+frame-index capacity. Exclusive recovery retains the verified disk-scan coverage
+through migration transactions and rollbacks, allowing fresh connections to read
+and checkpoint that WAL. A subsequent registry open also resumes a previously
+failed automatic repair from its original quarantine; no manual reconstruction
+is needed when the original database passes integrity checks.
+
 If an older CLT process or an unusually long database read still prevents checkpointing at 128 MiB, the safety guard refuses updates and migrations before starting a mutation or dirty-snapshot interval. Both new opens and already-open stores attempt cleanup before applying this guard. An operation already in progress may cross the threshold; the next update attempts cleanup. Restart older CLT processes after upgrading so they release their lifetime checkpoint pins. If cleanup remains blocked, close other CLT windows and foreground sessions, run `clt agent recover`, then `clt agent start`. The size guard itself does not mark the registry corrupt or discard project settings.
 
 Registry writer-lock waits are bounded to five seconds and report contention instead of hanging indefinitely. A failed interactive Codex handoff keeps its terminal output visible until you press Enter, and planning-server startup errors are retained in the CLT console.

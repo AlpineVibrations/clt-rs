@@ -6,6 +6,15 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+## [0.9.7] - 2026-10-29
+
+### Fixed
+
+- Automatically recover oversized agent WALs left by older versions without
+  failing with a spurious `database is locked` error during recovery. Preserve
+  verified frame-cache coverage through empty migration transactions, rollbacks,
+  and commits that write multiple frames.
+
 ## [0.9.6] - 2026-10-26
 
 ### Fixed

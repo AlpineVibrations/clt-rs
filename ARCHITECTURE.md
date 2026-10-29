@@ -119,6 +119,12 @@ used Turso dependency. Application modules import its local API through
 - Registry writer-lock acquisition is bounded. Ordinary store operations retain checkpoint pins only while their futures run, explicitly rolling back on completion; idle handles do not pin old WAL generations. Under the writer lock, opens before migrations and durable updates before mutation/dirty marking attempt engine-managed WAL truncation at 64 MiB. Real readers may defer it; the 128 MiB admission guard remains a fallback for legacy clients and long reads. Recovery retains its lifetime pin until integrity verification, releases only that pin, truncates through the engine, and verifies integrity again before publishing a snapshot. Idle opens also retain exclusive maintenance; live stores and worker/session processes defer that path. Successful routine exclusive maintenance deletes only its own backup after verified teardown and durable snapshot publication; manual and failed recovery bundles remain quarantined. Recovery bypasses the admission guard to permit checkpointing.
 - Turso rows are mapped to agent-domain records inside `agent::repositories`.
 - The pinned Turso core carries a local reader-ownership fix under `vendor/`; its provenance and patch are documented there. Keep operation checkpoint pins and the partial-checkpoint, overlapping-store, live cross-process WAL truncation, and interrupted-WAL regressions when updating the dependency.
+- Shared-WAL overflow recovery preserves verified local frame coverage when a
+  rollback removes only newer frames and extends it across contiguous locally
+  cached writes, including uncommitted spills. Coverage remains bound to the WAL
+  generation and cannot bridge unseen peer commits. Engine regressions cover
+  overflow transactions and generation changes so migration checks cannot strand
+  an oversized legacy WAL before recovery opens its checkpoint pin.
 - Production modules use explicit imports. There is no crate-root prelude or transitional
   re-export layer.
 
@@ -234,6 +240,7 @@ boundary checks directly with:
 ```bash
 cargo test --locked --bin clt agent::recovery
 cargo test --locked --bin clt stale_service_restart
+cargo test --locked --lib storage::wal::overflow_tests
 ```
 
 Task thinking regressions can also be run directly:

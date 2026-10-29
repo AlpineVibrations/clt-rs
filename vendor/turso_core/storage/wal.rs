@@ -1415,15 +1415,6 @@ impl ShmWalCoordination {
             .covers(snapshot, max_frame)
     }
 
-    fn clear_overflow_fallback_coverage(&self) {
-        self.shared
-            .read()
-            .runtime
-            .overflow_fallback_coverage
-            .lock()
-            .clear();
-    }
-
     fn local_authority_snapshot_from_shared(
         shared: &WalFileShared,
         authority_snapshot: SharedWalCoordinationHeader,
@@ -1927,14 +1918,6 @@ impl WalCoordination for ShmWalCoordination {
             commit.last_checksum.1,
             commit.transaction_count,
         );
-        if self.authority.frame_index_overflowed() {
-            let snapshot = self.authority.snapshot();
-            let shared = self.shared.read();
-            let mut coverage = shared.runtime.overflow_fallback_coverage.lock();
-            if coverage.covers(snapshot, commit.max_frame.saturating_sub(1)) {
-                coverage.record_snapshot(snapshot, commit.max_frame);
-            }
-        }
     }
 
     fn publish_backfill(&self, max_frame: u64) {
@@ -2362,13 +2345,37 @@ impl WalCoordination for ShmWalCoordination {
 
     fn cache_frame(&self, page_id: u64, frame_id: u64) {
         self.fallback.cache_frame(page_id, frame_id);
+        {
+            let snapshot = self.authority.snapshot();
+            let shared = self.shared.read();
+            let mut coverage = shared.runtime.overflow_fallback_coverage.lock();
+            // A disk scan proves a complete prefix. Locally appended frames
+            // extend that prefix one at a time, including uncommitted spills
+            // needed by the writer. Never bridge a gap left by a peer or adopt
+            // proof from another WAL generation. Reused slots also truncate
+            // the proof, matching fallback.cache_frame's suffix removal.
+            if frame_id > 0 && coverage.covers(snapshot, frame_id - 1) {
+                coverage.record_snapshot(snapshot, frame_id);
+            }
+        }
         self.authority.record_frame(page_id, frame_id);
     }
 
     fn rollback_cache(&self, max_frame: u64) {
         self.fallback.rollback_cache(max_frame);
         self.authority.rollback_frames(max_frame);
-        self.clear_overflow_fallback_coverage();
+        let snapshot = self.authority.snapshot();
+        let shared = self.shared.read();
+        let mut coverage = shared.runtime.overflow_fallback_coverage.lock();
+        // Removing an uncommitted suffix cannot invalidate a scanned prefix.
+        // Keep only the previously proven range; a rollback must never create
+        // coverage of frames written by another process.
+        if coverage.same_generation(snapshot) {
+            let retained = coverage.max_frame.min(max_frame);
+            coverage.record_snapshot(snapshot, retained);
+        } else {
+            coverage.clear();
+        }
     }
 
     fn should_checkpoint_on_close(&self) -> bool {
@@ -5821,6 +5828,10 @@ impl WalFileShared {
         self.runtime.overflow_fallback_coverage = restored.runtime.overflow_fallback_coverage;
     }
 }
+
+#[cfg(all(test, host_shared_wal))]
+#[path = "wal_overflow_tests.rs"]
+mod overflow_tests;
 
 #[cfg(clt_turso_tests)]
 pub mod test {

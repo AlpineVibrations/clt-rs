@@ -121,3 +121,17 @@ CLT's operation checkpoint pins and retained WAL data when making that transitio
 Idle stores no longer retain a read transaction: CLT checkpoints growing WALs
 between operations. Cross-process regressions cover idle handles observing reads
 and writes after repeated truncation, including WALs above the safety threshold.
+
+Overflow fallback coverage now follows each locally cached frame instead of
+assuming that a commit appends only one frame. Rollbacks retain the previously
+verified prefix while dropping its discarded suffix. This lets exclusive
+recovery migrate and checkpoint a scanned WAL larger than the shared index's
+capacity without reporting a permanent database lock. Missing peer frames and
+different WAL generations still require a fresh scan. The normal library test
+suite covers multi-page commits, spilled-page reads, rollback, fresh connections,
+integrity checks and truncation with a small WAL and a forced overflow flag;
+separate checks retain the gap, salt, generation and frame-reuse boundaries.
+
+```bash
+cargo test --locked --lib overflow_tests
+```
