@@ -6,6 +6,12 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+### Fixed
+
+- Complete the `h` TUI help reference for every screen and modal, including
+  supervisor, project and model controls. Wrap and scroll help so commands remain
+  reachable on small terminals, with line/page scrolling and Home/End navigation.
+
 ## [0.9.7] - 2026-10-29
 
 ### Fixed

@@ -224,6 +224,16 @@ user home from `HOME` on Unix or `USERPROFILE` (with a drive/path fallback) on
 Windows. Unit tests cover overwrite decisions; the CLI suite checks that the
 command works without a task board.
 
+`tui::help` owns the keyboard reference, viewport preparation, bounded scrolling
+and pure dialog rendering. Help input is consumed before pane actions, preserving
+the underlying selection and settings. Update the reference alongside key
+handlers. Tests render and traverse the full reference at multiple terminal sizes
+and cover modal isolation, reopening and resize clamping:
+
+```bash
+cargo test --locked --bin clt tui::help
+```
+
 The required verification gates are:
 
 ```bash

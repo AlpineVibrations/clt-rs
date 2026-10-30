@@ -9,6 +9,7 @@ in [Feature Ideas](docs/FEATURE_IDEAS.md); they are not a list of shipped featur
 - [Installation, shell integration, and skills](#installation)
 - [Basic usage](#usage)
 - [Kanban view](#kanban-view)
+  - [Keyboard help](#keyboard-help)
   - [Agent Projects](#agent-projects)
   - [Task sessions and controls](#task-sessions-and-controls)
   - [Per-task thinking levels](#per-task-thinking-levels)
@@ -142,6 +143,21 @@ To remove an accidentally started managed Git task, stop its worker with `Shift+
 Backlog is a fourth column for captured work that is not ready to be acted on. It is hidden by default; the task-board console title shows its current task count. Press `b` to move the selected task to Backlog, `B` to show or hide the Backlog column, or `0` to show and focus it. When visible, Backlog appears to the left of To Do and works with the normal Left/Right focus and task-movement controls. Keys `1`, `2`, and `3` continue to focus To Do, Doing, and Done.
 
 When the current project is registered, the Kanban console title appends its agent `ON`/`OFF` setting, current runtime status, and configured Codex settings, such as `clt Console | Agent: ON RUNNING | Model: openrouter/gpt-6-astra | Thinking: xhigh | Fast: on`. `Model` uses the project's provider and model and `Thinking` shows the reasoning effort; when the project has no explicit setting, the resolved CLT default is named in parentheses, such as `Model: default (gpt-5.6-sol)` or `Thinking: default (high)`. `Fast: on` appears only when fast mode is enabled. The runtime status follows the same labels as the Agent Projects pane and remains visible when the project's agent is `OFF`. The whole suffix is omitted only when the project is unregistered.
+
+### Keyboard help
+
+Press `h`, `H`, or `?` from the task board, archive, Agent Projects, or Models
+to open the complete keyboard reference. Commands are grouped by screen,
+including Reorganize mode, supervisor settings, task progress, text input and
+confirmation prompts. The reference includes project Fast/Thinking/retry keys,
+model enable/favorite/API-key controls, and the task board's `4`–`9` position
+shortcuts.
+
+Help wraps to the terminal width. Use Up/Down to scroll a line, PageUp/PageDown
+to scroll a page, and Home/End to reach the beginning or end. The border shows
+the current line and navigation hints. Press `h`, `H`, `?`, `Enter`, or `Esc` to
+close help and return to the same screen; other commands are inactive while it
+is open. Reopening help starts at the top.
 
 ### Agent Projects
 

@@ -31,6 +31,7 @@ use ratatui::{
 };
 use tui_input::{Input, InputRequest};
 
+mod help;
 mod progress;
 
 use crate::{
@@ -6257,6 +6258,7 @@ pub(super) struct TuiApp {
     pub(super) board_stack: Vec<PathBuf>,
     pub(super) active_board: bool,
     pub(super) current_mode: Mode,
+    help: help::Help,
     pub(super) task_input: TaskInput,
     pub(super) steering_target: Option<SteeringTarget>,
     pub(super) steering_delivery: Option<Receiver<Result<String>>>,
@@ -6304,6 +6306,7 @@ impl TuiApp {
             board_stack,
             active_board: start_state.active_board,
             current_mode: Mode::View,
+            help: help::Help::default(),
             task_input: TaskInput::default(),
             steering_target: None,
             steering_delivery: None,
@@ -6458,6 +6461,9 @@ impl TuiApp {
     }
 
     pub(super) fn prepare_render(&mut self, size: Rect) {
+        if self.current_mode == Mode::Help {
+            self.help.prepare(size);
+        }
         let input_height = tui_input_height(self, size.width);
         let (console_content, _) = tui_console_content(
             self.current_pane == TuiPane::AgentProjects,
@@ -6571,10 +6577,7 @@ pub(super) fn update_tui_pane(app: &mut TuiApp, key: KeyEvent) -> Option<Vec<Tui
         return Some(vec![TuiEffect::PaneKey(key)]);
     }
     if app.current_mode == Mode::Help {
-        if matches!(
-            key.code,
-            KeyCode::Enter | KeyCode::Esc | KeyCode::Char('h' | 'H' | '?')
-        ) {
+        if app.help.key(key.code) {
             app.current_mode = Mode::View;
         }
         return Some(Vec::new());
@@ -6607,6 +6610,7 @@ pub(super) fn update_tui_pane(app: &mut TuiApp, key: KeyEvent) -> Option<Vec<Tui
     }
 
     if matches!(key.code, KeyCode::Char('h' | 'H' | '?')) {
+        app.help = help::Help::default();
         app.current_mode = Mode::Help;
         return Some(Vec::new());
     }
@@ -7501,67 +7505,7 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
     }
 
     if matches!(app.current_mode, Mode::Help) {
-        let help_text = "TUI Commands:\n\n\
-                                 [Space]        - Create new task / toggle selected agent project\n\
-                                 [n/+]          - Create subtask under selected task\n\
-                                 [Enter]        - Message running Doing agent; otherwise open subtasks/edit task/project\n\
-                                 [e]            - Edit selected task\n\
-                                 [t]            - Cycle selected Todo's thinking level\n\
-                                 [g]            - Cycle selected project's Git mode: off/commit/push\n\
-                                 [s]            - Task progress summary (Agent Projects: stop/resume)\n\
-                                 [S]            - Stop/start selected task\n\
-                                 [i]            - Take over linked/displayed live session, then auto-restart exec\n\
-                                 [c]            - Plan a Todo / open linked session; take over if active\n\
-                                 [l]            - Toggle active/selected project's live/current agent output\n\
-                                 [a]            - Move selected task to archive\n\
-                                 [A]            - Toggle archive view\n\
-                                 [b]            - Move selected task to backlog\n\
-                                 [B]            - Show/hide backlog column\n\
-                                 [Backspace]    - Return to parent board\n\
-                                 [Del]          - Delete selected task\n\
-                                 [Agent Del]    - Remove selected project after confirmation\n\
-                                 [Tab]          - Toggle task board and agent projects\n\
-                                 [Agent m]      - Cycle selected target\n\
-                                 [M]            - Open Models from Tasks or Agent Projects\n\
-                                 [Models n/r/a] - Add provider / discover models / manually add ID\n\
-                                 [Models /]     - Search model names and IDs\n\
-                                 [Models x/Del] - Remove selected non-built-in provider\n\
-                                 [Models d/c]   - Set CLT default / explicitly set Codex default\n\
-                                 [Arrows]       - Navigate boards, tasks, providers, and models\n\
-                                 [PgUp/Dn Home/End] - Jump through Models lists\n\
-                                 [r]            - Toggle sticky Reorganize mode (r/Esc exits)\n\
-                                 [Shift+Arrows] - Reorder/Move tasks\n\
-                                 [Ctrl-P/N]     - Reorder task Up/Down\n\
-                                 [0, 1, 2, 3]   - Focus Backlog/To Do/Doing/Done\n\
-                                 [Input Arrows]         - Move cursor in wrapped input\n\
-                                 [Ctrl/Alt+Left/Right]  - Jump input cursor by word\n\
-                                 [Ctrl+A/E/W/U/K]       - Edit input line\n\
-                                 [h / ?]        - Toggle Help\n\
-                                 [q]            - Quit";
-
-        let area = f.area();
-        let popover_width = area.width.min(70);
-        let popover_height = area.height.min(27);
-        let x = area.width.saturating_sub(popover_width) / 2;
-        let y = area.height.saturating_sub(popover_height) / 2;
-
-        let popover_area = ratatui::layout::Rect {
-            x,
-            y,
-            width: popover_width,
-            height: popover_height,
-        };
-
-        let help_paragraph = Paragraph::new(help_text)
-            .block(
-                Block::default()
-                    .title(" Help ")
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Yellow)),
-            )
-            .style(Style::default().fg(Color::White));
-
-        f.render_widget(help_paragraph, popover_area);
+        app.help.render(f);
     }
 }
 
@@ -9053,16 +8997,11 @@ pub(super) fn execute_tui_key_effect(
                         .to_string();
             }
         },
-        Mode::Help => match key.code {
-            KeyCode::Enter
-            | KeyCode::Esc
-            | KeyCode::Char('h')
-            | KeyCode::Char('H')
-            | KeyCode::Char('?') => {
+        Mode::Help => {
+            if app.help.key(key.code) {
                 app.current_mode = Mode::View;
             }
-            _ => {}
-        },
+        }
         Mode::Steer => app.steering_key(key, input_available_width),
         Mode::Input if tui_cancels_task_prompt(&key) => {
             app.current_mode = Mode::View;
