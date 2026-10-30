@@ -3,6 +3,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+pub(crate) mod references;
+
 const PREFIX: &str = "<!-- clt-coordination: ";
 const SUFFIX: &str = " -->";
 

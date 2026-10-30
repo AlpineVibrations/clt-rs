@@ -21,6 +21,7 @@ fn task(id: u128, status: TaskStatus, description: &str, scope: Scope) -> Task {
             false,
         ),
         meta,
+        prose: metadata::references::References::read(description).unwrap(),
         error: None,
         completion_wait: None,
         owner: "CLI claimed; activity unconfirmed".into(),
@@ -32,6 +33,144 @@ fn snapshot(tasks: Vec<Task>) -> Snapshot {
         tasks,
         ..Default::default()
     }
+}
+
+#[test]
+fn prose_dependencies_skip_stopped_prerequisites_without_launching_codex() {
+    for folders in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let state = root.path().join("state");
+        init_tasks(&project, folders).unwrap();
+        add_task(&project, "MM-019 Finish MVP. clt:stopped", None).unwrap();
+        add_task(&project, "MM-020 Add stamps. Dependencies: MM-019.", None).unwrap();
+        add_task(&project, "MM-021 Add brushes. Dependencies: MM-020.", None).unwrap();
+        let board = TaskBoard::for_project(&project);
+        let contents = || {
+            board
+                .entries(TaskStatus::Todo)
+                .unwrap()
+                .into_iter()
+                .map(|entry| (entry.source, entry.content))
+                .collect::<Vec<_>>()
+        };
+        let before = contents();
+        let store = agent::TursoAgentStore::open_blocking(&state).unwrap();
+        store
+            .register_project_blocking(&project, "magimap")
+            .unwrap();
+        drop(store);
+        let runner = crate::runner::tests::FakeAgentRunner::new(&state, "success");
+        let pass = run_agent_once_with_runner(&state, &runner).unwrap();
+        assert_eq!(pass.runs_started, 0);
+        assert_eq!(runner.ran_project_count(), 0);
+        assert_eq!(contents(), before);
+        let scan = scan_agent_project(&project);
+        assert_eq!(scan.coordination_wait_count, 2);
+        assert_eq!(scan.available_todo_count(), 0);
+        let view = Snapshot::admission(board.path()).unwrap();
+        assert!(view.context(None).contains("prerequisite is stopped"));
+
+        add_task(&project, "Independent work", None).unwrap();
+        assert_eq!(
+            ready_tasks(&project).unwrap()[0].summary,
+            "Independent work"
+        );
+        let stopped = board.entry(TaskStatus::Todo, 1).unwrap();
+        board
+            .write_entry_content(TaskStatus::Todo, &stopped, "MM-019 Finish MVP.")
+            .unwrap();
+        move_task(&project, TaskStatus::Todo, TaskStatus::Doing, "1").unwrap();
+        move_task(&project, TaskStatus::Doing, TaskStatus::Done, "1").unwrap();
+        let ready = ready_tasks(&project).unwrap();
+        assert_eq!(ready.len(), 2);
+        assert_eq!(
+            ready[0].content.trim_end(),
+            "MM-020 Add stamps. Dependencies: MM-019."
+        );
+        assert!(!ready[0].content.contains("codex:"));
+    }
+}
+
+#[test]
+fn prose_dependencies_reject_missing_duplicate_and_cyclic_references() {
+    for descriptions in [
+        vec!["MM-020 Add stamps. Dependencies: MM-019."],
+        vec![
+            "MM-019 MVP",
+            "MM-019 Another MVP",
+            "MM-020 Add stamps. Dependencies: MM-019.",
+        ],
+        vec![
+            "MM-019 MVP. Dependencies: MM-020.",
+            "MM-020 Add stamps. Dependencies: MM-019.",
+        ],
+        vec!["MM-020 Add stamps. Dependencies: MM-020."],
+        vec!["MM-020 Add stamps. Dependencies: MM-019 or MM-021."],
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        init_tasks(root.path(), false).unwrap();
+        for description in &descriptions {
+            add_task(root.path(), description, None).unwrap();
+        }
+        let board = get_tasks_dir(root.path());
+        let view = Snapshot::admission(&board).unwrap();
+        let selected = view
+            .selected(&board, TaskStatus::Todo, descriptions.len())
+            .unwrap();
+        assert!(!view.waits(selected).is_empty(), "{descriptions:?}");
+        assert!(ensure_admitted(&board, TaskStatus::Todo, descriptions.len()).is_err());
+    }
+}
+
+#[test]
+fn prose_dependencies_share_cycle_detection_with_stable_metadata() {
+    let root = tempfile::tempdir().unwrap();
+    init_tasks(root.path(), false).unwrap();
+    add_task(root.path(), "MM-019 MVP", None).unwrap();
+    add_task(root.path(), "MM-020 Stamps. Dependencies: MM-019.", None).unwrap();
+    let id = update(root.path(), TaskStatus::Todo, 2, Update::default()).unwrap();
+    let error = update(
+        root.path(),
+        TaskStatus::Todo,
+        1,
+        Update {
+            depends_on: vec![id],
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("cycle"));
+}
+
+#[test]
+fn prose_dependencies_resolve_archived_and_nested_prerequisites_without_rewriting() {
+    let root = tempfile::tempdir().unwrap();
+    let board = root.path().join("tasks");
+    fs::create_dir_all(board.join("todo/group")).unwrap();
+    fs::write(
+        board.join("todo/group/todo.md"),
+        "# Todo\n- MM-020 Stamps. Dependencies: MM-001 through MM-002.\n",
+    )
+    .unwrap();
+    fs::write(board.join("todo.md"), "# Todo\n").unwrap();
+    fs::write(board.join("done.md"), "# Done\n- MM-002 API.\n").unwrap();
+    fs::write(
+        board.join("archived.md"),
+        "# Archived\n- MM-001 Foundation.\n",
+    )
+    .unwrap();
+    let view = Snapshot::admission(&board).unwrap();
+    let selected = view
+        .tasks
+        .iter()
+        .find(|task| task.prose.code.as_deref() == Some("MM-020"))
+        .unwrap();
+    assert!(view.waits(selected).is_empty());
+    assert_eq!(
+        selected.entry.content,
+        "MM-020 Stamps. Dependencies: MM-001 through MM-002."
+    );
 }
 
 #[test]
@@ -203,11 +342,16 @@ fn unfinished_git_proof_keeps_prerequisite_waiting_until_publication() {
     let mut api = task(
         1,
         TaskStatus::Done,
-        "Publish API codex:api-session",
+        "MM-001 Publish API codex:api-session",
         Scope::default(),
     );
     api.board = get_tasks_dir(&project_root);
-    let mut client = task(2, TaskStatus::Todo, "Use API", Scope::default());
+    let mut client = task(
+        2,
+        TaskStatus::Todo,
+        "MM-002 Use API. Dependencies: MM-001.",
+        Scope::default(),
+    );
     client.meta.depends_on = vec![api.meta.id.clone()];
     store
         .create_git_finalization_blocking(agent::NewGitFinalization {
@@ -250,15 +394,23 @@ fn unfinished_git_proof_keeps_prerequisite_waiting_until_publication() {
                     .unwrap()
             );
         }
-        let mut view = snapshot(vec![api.clone(), client.clone()]);
-        view.load_runtime_from_store(&get_tasks_dir(&project_root), &store)
-            .unwrap();
-        assert_eq!(
-            view.waits(&client).is_empty(),
-            state == GitFinalizationState::Completed
-        );
-        if state == GitFinalizationState::PushPending {
-            assert!(view.waits(&client)[0].contains("PUSH-PENDING"));
+        for prose_only in [false, true] {
+            let mut api = api.clone();
+            let mut client = client.clone();
+            if prose_only {
+                api.meta = Metadata::default();
+                client.meta = Metadata::default();
+            }
+            let mut view = snapshot(vec![api, client.clone()]);
+            view.load_runtime_from_store(&get_tasks_dir(&project_root), &store)
+                .unwrap();
+            assert_eq!(
+                view.waits(&client).is_empty(),
+                state == GitFinalizationState::Completed
+            );
+            if state == GitFinalizationState::PushPending {
+                assert!(view.waits(&client)[0].contains("PUSH-PENDING"));
+            }
         }
     }
 }

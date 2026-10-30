@@ -81,6 +81,38 @@ fn coordination_dependencies_wait_release_and_preserve_stops_in_both_layouts() {
 }
 
 #[test]
+fn coordination_prose_dependencies_wait_without_creating_sessions_or_blocker_notes() {
+    for folders in [false, true] {
+        let w = TestWorkspace::new("coordination-prose-dependencies");
+        assert_success(&w.run(if folders {
+            &["init", "--folders"]
+        } else {
+            &["init"]
+        }));
+        assert_success(&w.run(&["add", "MM-019 Finish MVP. clt:stopped"]));
+        assert_success(&w.run(&["add", "MM-020 Add stamps. Dependencies: MM-019."]));
+        assert_success(&w.run(&["add", "Independent task"]));
+        let (listing, _) = assert_success(&w.run(&["list", "todo"]));
+        assert!(listing.contains("prerequisite is stopped"));
+        let check = w.run(&["context", "--check", "todo", "2"]);
+        assert!(!check.status.success());
+        assert!(String::from_utf8_lossy(&check.stderr).contains("MM-019"));
+        assert!(!w.run(&["status", "todo", "2", "doing"]).status.success());
+        assert_success(&w.run(&["context", "--check", "todo", "3"]));
+        let (unchanged, _) = assert_success(&w.run(&["list", "todo"]));
+        assert_eq!(listing, unchanged);
+        assert!(!unchanged.contains("BLOCKED"));
+        assert!(!unchanged.contains("codex:"));
+        // External completion releases the consumer without a metadata migration.
+        assert_success(&w.run(&["done", "todo", "1"]));
+        assert_success(&w.run(&["context", "--check", "todo", "1"]));
+        assert_success(&w.run(&["status", "todo", "1", "doing"]));
+        let (doing, _) = assert_success(&w.run(&["list", "doing"]));
+        assert!(doing.contains("MM-020"));
+    }
+}
+
+#[test]
 fn coordination_manual_claims_and_automation_use_the_same_overlap_admission() {
     let w = TestWorkspace::new("coordination-admission");
     assert_success(&w.run(&["init"]));

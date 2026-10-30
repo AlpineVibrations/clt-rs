@@ -269,7 +269,16 @@ cargo test --locked --bin clt supervisor::tests
 Coordination regressions cover both board layouts, stable references and edits,
 cycles/missing references, publication-aware prerequisites, parallel manual work,
 semantic overlap across files, reviewed compatible shared files, scope changes,
-worker context refresh and process-lifetime staging ownership. Targeted checks:
+worker context refresh and process-lifetime staging ownership.
+
+`task::coordination::references` parses explicit leading project codes and
+`Dependencies:` lists/ranges without rewriting task files. `coordination` merges
+those edges with metadata dependencies for admission, cycle/ambiguity checks and
+completion proof, including nested and archived tasks. Scheduler regressions
+verify a stopped prerequisite prevents a Codex launch, independent work stays
+eligible and completion releases the consumer without a session-marker repair.
+
+Targeted checks:
 
 ```bash
 cargo test --locked --bin clt coordination

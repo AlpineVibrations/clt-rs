@@ -6,11 +6,16 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+## [0.9.8] - 2026-10-30
+
 ### Fixed
 
 - Complete the `h` TUI help reference for every screen and modal, including
   supervisor, project and model controls. Wrap and scroll help so commands remain
   reachable on small terminals, with line/page scrolling and Home/End navigation.
+- Honor explicit task-code prerequisites such as `Dependencies: MM-019` before
+  launching Codex. Dependent tasks wait for completion instead of repeatedly
+  starting runs that exit without a task and report a session-marker error.
 
 ## [0.9.7] - 2026-10-29
 
@@ -595,7 +600,9 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 - Fixed task moves so destination write failures do not remove the source task.
 - Fixed TUI navigation on empty boards.
 
-[Unreleased]: https://github.com/AlpineVibrations/clt-rs/compare/v0.9.6...HEAD
+[Unreleased]: https://github.com/AlpineVibrations/clt-rs/compare/v0.9.8...HEAD
+[0.9.8]: https://github.com/AlpineVibrations/clt-rs/compare/v0.9.7...v0.9.8
+[0.9.7]: https://github.com/AlpineVibrations/clt-rs/compare/v0.9.6...v0.9.7
 [0.9.6]: https://github.com/AlpineVibrations/clt-rs/compare/v0.9.5...v0.9.6
 [0.9.5]: https://github.com/AlpineVibrations/clt-rs/compare/v0.9.4...v0.9.5
 [0.9.4]: https://github.com/AlpineVibrations/clt-rs/compare/v0.9.3...v0.9.4

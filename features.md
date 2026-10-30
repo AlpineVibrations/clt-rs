@@ -872,6 +872,29 @@ Eligibility is recomputed when the board or Git proof changes. It needs no dated
 UNBLOCKED note. Explicit stops and conversation ownership retain their usual
 controls. Nested tasks can reference IDs elsewhere in their containing board tree.
 
+Existing boards can also use explicit task codes without a metadata migration:
+
+```markdown
+- MM-019 Complete browser MVP acceptance. clt:stopped
+- MM-020 Add stamp assets. Dependencies: MM-019.
+- MM-021 Add brushes. Dependencies: MM-019, MM-020.
+```
+
+A code begins the task title and uses an uppercase prefix and numeric suffix.
+CLT reads a `Dependencies:` sentence or line containing comma-separated codes;
+`MM-001 through MM-018` includes every code in that range (same prefix and numeric
+width, at most 1000 tasks). These references use the same admission and Git-proof
+checks as stored dependencies, including nested and archived tasks. Missing or
+duplicate codes, cycles and malformed code lists produce a wait. Package names,
+ordinary mentions and document anchors do not declare task prerequisites.
+
+Stopped or unfinished prerequisites keep their consumers in Todo, with a visible
+waiting reason. CLT skips them before launching Codex and can run independent
+ready work. It rechecks them automatically when the board changes, preserving
+explicit stops and existing conversation links. Edit the `Dependencies:` clause
+to remove a prose prerequisite; `coordinate --remove-dependency` only removes
+metadata references. UUID references remain preferable when task titles may change.
+
 ### Scope and overlap assessments
 
 Before editing, participating sessions describe the intended scope. `--scope`

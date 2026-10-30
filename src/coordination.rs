@@ -29,12 +29,30 @@ pub(crate) struct Task {
     pub index: usize,
     pub entry: TaskEntry,
     pub meta: Metadata,
+    pub prose: metadata::references::References,
     pub error: Option<String>,
     pub completion_wait: Option<String>,
     pub owner: String,
 }
 
 impl Task {
+    fn key(&self) -> Option<&str> {
+        if self.meta.id.is_empty() {
+            self.prose.code.as_deref()
+        } else {
+            Some(&self.meta.id)
+        }
+    }
+
+    fn dependencies(&self) -> BTreeSet<&str> {
+        self.meta
+            .depends_on
+            .iter()
+            .chain(&self.prose.depends_on)
+            .map(String::as_str)
+            .collect()
+    }
+
     fn label(&self) -> String {
         if self.meta.id.is_empty() {
             format!(
@@ -70,9 +88,16 @@ fn collect(board: &Path, tasks: &mut Vec<Task>) -> Result<()> {
             {
                 collect(path, tasks)?;
             }
-            let (meta, error) = match metadata::read(&entry.content) {
+            let (meta, mut error) = match metadata::read(&entry.content) {
                 Ok(meta) => (meta, None),
                 Err(error) => (Metadata::default(), Some(format!("{error:#}"))),
+            };
+            let prose = match metadata::references::References::read(&entry.content) {
+                Ok(prose) => prose,
+                Err(problem) => {
+                    error.get_or_insert_with(|| format!("{problem:#}"));
+                    metadata::references::References::default()
+                }
             };
             let owner = if task_content_is_manual(&entry.content) {
                 "CLI claimed; activity unconfirmed"
@@ -88,6 +113,7 @@ fn collect(board: &Path, tasks: &mut Vec<Task>) -> Result<()> {
                 index: offset + 1,
                 entry,
                 meta,
+                prose,
                 error,
                 completion_wait: None,
                 owner,
@@ -96,13 +122,15 @@ fn collect(board: &Path, tasks: &mut Vec<Task>) -> Result<()> {
     }
     for entry in read_archived_task_entries(board)? {
         let meta = metadata::read(&entry.content).unwrap_or_default();
-        if !meta.id.is_empty() {
+        let prose = metadata::references::References::read(&entry.content).unwrap_or_default();
+        if !meta.id.is_empty() || prose.code.is_some() {
             tasks.push(Task {
                 board: board.to_path_buf(),
                 status: TaskStatus::Done,
                 index: 0,
                 entry,
                 meta,
+                prose,
                 error: None,
                 completion_wait: None,
                 owner: "archived".into(),
@@ -138,10 +166,11 @@ impl Snapshot {
         collect(outer, &mut snapshot.tasks)?;
         // Old boards without links remain cheap and do not need an agent registry.
         let needs_proof = owners
-            || snapshot
-                .tasks
-                .iter()
-                .any(|task| !task.meta.id.is_empty() || !inferred_symbols(task).is_empty());
+            || snapshot.tasks.iter().any(|task| {
+                task.key().is_some()
+                    || !task.prose.depends_on.is_empty()
+                    || !inferred_symbols(task).is_empty()
+            });
         if needs_proof
             && snapshot.tasks.iter().any(|task| {
                 recoverable_codex_session_id_from_task_content(&task.entry.content).is_some()
@@ -226,7 +255,7 @@ impl Snapshot {
                 );
             }
             if task.status == TaskStatus::Done
-                && (!task.meta.id.is_empty()
+                && (task.key().is_some()
                     || pending
                         .iter()
                         .any(|journal| journal.codex_session_id == session))
@@ -262,11 +291,10 @@ impl Snapshot {
     }
 
     fn referenced(&self, id: &str) -> Result<&Task> {
-        let mut matches = self
-            .tasks
-            .iter()
-            .filter(|task| task.meta.id == id && !id.is_empty());
-        let task = matches.next().with_context(|| format!("Missing prerequisite {id}; restore the task or remove this dependency with clt coordinate --remove-dependency"))?;
+        let mut matches = self.tasks.iter().filter(|task| {
+            !id.is_empty() && (task.meta.id == id || task.prose.code.as_deref() == Some(id))
+        });
+        let task = matches.next().with_context(|| format!("Missing prerequisite {id}; restore the task or correct its Dependencies clause / clt coordinate --remove-dependency reference"))?;
         anyhow::ensure!(
             matches.next().is_none(),
             "Duplicate task ID {id}; repair the duplicate before using this reference"
@@ -280,25 +308,28 @@ impl Snapshot {
         path: &mut Vec<String>,
         done: &mut BTreeSet<String>,
     ) -> Result<()> {
-        if !task.meta.id.is_empty() {
-            self.referenced(&task.meta.id)?;
+        if let Some(error) = &task.error {
+            anyhow::bail!("Coordination metadata: {error}");
+        }
+        if let Some(key) = task.key() {
+            self.referenced(key)?;
             anyhow::ensure!(
-                !path.contains(&task.meta.id),
+                !path.iter().any(|id| id == key),
                 "Dependency cycle: {} -> {}",
                 path.join(" -> "),
-                task.meta.id
+                key
             );
-            if done.contains(&task.meta.id) {
+            if done.contains(key) || task.complete() {
                 return Ok(());
             }
-            path.push(task.meta.id.clone());
+            path.push(key.to_string());
         }
-        for id in &task.meta.depends_on {
+        for id in task.dependencies() {
             self.visit(self.referenced(id)?, path, done)?;
         }
-        if !task.meta.id.is_empty() {
+        if let Some(key) = task.key() {
             path.pop();
-            done.insert(task.meta.id.clone());
+            done.insert(key.to_string());
         }
         Ok(())
     }
@@ -314,17 +345,20 @@ impl Snapshot {
             return vec![format!("Dependency wait: {error:#}")];
         }
         let mut waits = Vec::new();
-        for id in &task.meta.depends_on {
+        for id in task.dependencies() {
             if let Ok(other) = self.referenced(id)
                 && !other.complete()
             {
                 waits.push(format!(
                     "Waiting for task {}: {}",
                     other.label(),
-                    other
-                        .completion_wait
-                        .as_deref()
-                        .unwrap_or("prerequisite is unfinished")
+                    other.completion_wait.as_deref().unwrap_or(
+                        if task_entry_is_stopped(&other.entry) {
+                            "prerequisite is stopped"
+                        } else {
+                            "prerequisite is unfinished"
+                        }
+                    )
                 ));
             }
         }
@@ -335,8 +369,8 @@ impl Snapshot {
         {
             // An explicitly waiting consumer must not prevent its prerequisite
             // from finishing. Its own admission/check remains deferred.
-            if !task.meta.id.is_empty()
-                && self.depends_on(other, &task.meta.id, &mut BTreeSet::new())
+            if let Some(key) = task.key()
+                && self.depends_on(other, key, &mut BTreeSet::new())
             {
                 continue;
             }
@@ -348,12 +382,12 @@ impl Snapshot {
     }
 
     fn depends_on(&self, task: &Task, id: &str, seen: &mut BTreeSet<String>) -> bool {
-        task.meta.depends_on.iter().any(|dependency| {
+        task.dependencies().into_iter().any(|dependency| {
             dependency == id
-                || (seen.insert(dependency.clone())
-                    && self
-                        .referenced(dependency)
-                        .is_ok_and(|other| self.depends_on(other, id, seen)))
+                || (seen.insert(dependency.to_string())
+                    && self.referenced(dependency).is_ok_and(|other| {
+                        other.key() == Some(id) || self.depends_on(other, id, seen)
+                    }))
         })
     }
 
@@ -651,6 +685,7 @@ pub(crate) fn ensure_new_manual_admitted(board: &Path, content: &str) -> Result<
             false,
         ),
         meta: metadata::read(content)?,
+        prose: metadata::references::References::read(content)?,
         error: None,
         completion_wait: None,
         owner: "CLI claimed".into(),
@@ -692,6 +727,13 @@ pub(crate) fn update(
         "Completed tasks can only receive a stable ID"
     );
     let mut meta = metadata::read(&selected.entry.content)?;
+    anyhow::ensure!(
+        !update
+            .remove_dependency
+            .iter()
+            .any(|id| selected.prose.depends_on.contains(id)),
+        "Edit the task's Dependencies clause to remove a prose prerequisite; clt coordinate --remove-dependency only removes stored metadata references"
+    );
     if meta.id.is_empty() {
         meta.id = uuid::Uuid::new_v4().to_string();
     }
