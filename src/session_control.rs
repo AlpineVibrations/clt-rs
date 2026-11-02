@@ -1580,11 +1580,11 @@ pub(super) fn stop_interactive_child_until_reaped(
 }
 
 pub(super) fn task_supports_interactive_codex_resume(status: TaskStatus, task: &TaskEntry) -> bool {
-    (status == TaskStatus::Done || !crate::task::task_content_is_manual(&task.content))
-        && matches!(
-            status,
-            TaskStatus::Todo | TaskStatus::Doing | TaskStatus::Done
-        )
+    matches!(
+        status,
+        TaskStatus::Todo | TaskStatus::Doing | TaskStatus::Done
+    ) && (!crate::task::task_content_is_manual(&task.content)
+        || codex_session_for_task(task).is_some())
 }
 
 pub(super) fn codex_session_task_supports_interactive_resume(
@@ -1634,7 +1634,7 @@ pub(super) fn toggle_tui_task_stop_at(
     task: &TaskEntry,
 ) -> Result<String> {
     if status != TaskStatus::Done && crate::task::task_content_is_manual(&task.content) {
-        return Ok("This task is owned by a directly opened Codex session. Use clt handoff to release it to automation.".to_string());
+        return Ok("This task is CLI-owned. Press c to reopen its conversation; use clt handoff to move it to Todo for automation.".to_string());
     }
     if !task_entry_is_stopped(task)
         && let (Some(project_id), Some(session_id)) = (project_id, codex_session_for_task(task))
@@ -1827,6 +1827,11 @@ pub(super) fn prepare_tui_codex_session_interrupt_at(
                 lease_timeout_seconds,
             )?
             .context("The project became busy before the stopped Codex session could open")?;
+            let (board, _lock) = lock_project_board(&store, project_id)?;
+            anyhow::ensure!(
+                !crate::task::board_has_manual_session(&board, session_id)?,
+                "This task is CLI-owned. Press c to reopen its conversation; clt handoff queues automation"
+            );
             if !store.begin_stopped_session_interactive_blocking(
                 project_id,
                 session_id,
@@ -1963,7 +1968,7 @@ fn reserve_idle_codex_session_interactive(
     let (board, _lock) = lock_project_board(store, project_id)?;
     anyhow::ensure!(
         !crate::task::board_has_manual_session(&board, session_id)?,
-        "This Codex session owns a manual task; continue it in its directly opened session"
+        "This task's ownership changed; press c again to reopen its saved conversation"
     );
     let control = store.session_control_blocking(project_id, session_id)?;
     let mut tasks = Vec::new();
@@ -2043,15 +2048,13 @@ fn reserve_tui_shared_codex_session_interactive_at(
         let mut linked = Vec::new();
         collect_codex_session_tasks_in_board(&board, session_id, &mut linked)?;
         anyhow::ensure!(
-            !linked
-                .iter()
-                .any(|(status, task)| *status != TaskStatus::Done
-                    && crate::task::task_content_is_manual(&task.content)),
-            "This Codex session owns a manual task; continue it in its directly opened session"
+            linked.len() <= 1,
+            "This Codex session belongs to multiple tasks; resolve duplicate links before continuing"
         );
-        // Manual owners have no CLT lease or session control. Hold the board
-        // lock through reservation so their claim can authorize shared access
-        // without transferring project ownership or resuming the owner itself.
+        // A manual claim reserves work from automation, not from its user's c
+        // action. Reopen that exact conversation with shared controls so leaving
+        // it preserves the claim and never queues an automated handback. The
+        // reservation CAS still excludes an already-open CLT session.
         let has_manual_owner = crate::task::board_has_manual_task(&board)?;
         store.reserve_shared_session_interactive_blocking(
             project_id,

@@ -148,7 +148,11 @@ fn task_thinking_key_cycles_todo_and_renders_the_override() {
         app.current_pane = pane;
         assert_eq!(
             update_tui_pane(&mut app, key),
-            Some(vec![TuiEffect::PaneKey(key)])
+            Some(if pane == TuiPane::AgentProjects {
+                Vec::new() // Project settings now reduce from the cache without blocking effects.
+            } else {
+                vec![TuiEffect::PaneKey(key)]
+            })
         );
     }
     app.current_pane = TuiPane::Tasks;
@@ -753,6 +757,7 @@ fn tui_agent_panel_only_offers_registration_after_a_successful_refresh() {
             active_root,
             None,
             Ok(TuiAgentPanelSnapshot {
+                enabled_models: Vec::new(),
                 supervisor_settings: Default::default(),
                 projects: Vec::new(),
                 daemon_status: "stopped".to_string(),
@@ -818,6 +823,7 @@ fn tui_agent_panel_refresh_worker_does_not_block_the_caller() {
         TuiAgentPanelRefreshResult {
             active_root,
             panel_snapshot: Ok(TuiAgentPanelSnapshot {
+                enabled_models: Vec::new(),
                 supervisor_settings: Default::default(),
                 projects: Vec::new(),
                 daemon_status: "running".to_string(),
@@ -849,6 +855,7 @@ fn tui_agent_panel_refresh_worker_does_not_block_the_caller() {
 #[test]
 fn tui_agent_panel_restore_keeps_scroll_offset_when_selection_still_exists() {
     let mut panel = TuiAgentPanel {
+        enabled_models: Vec::new(),
         supervisor_settings: Default::default(),
         supervisor_selected: false,
         projects: vec![
@@ -874,6 +881,7 @@ fn tui_agent_panel_restore_keeps_scroll_offset_when_selection_still_exists() {
 #[test]
 fn tui_agent_panel_selects_nearest_row_after_removal() {
     let mut panel = TuiAgentPanel {
+        enabled_models: Vec::new(),
         supervisor_settings: Default::default(),
         supervisor_selected: false,
         projects: vec![
@@ -898,6 +906,7 @@ fn tui_agent_panel_selects_nearest_row_after_removal() {
 fn tui_agent_panel_refresh_selects_a_newly_registered_current_project() {
     let active_root = PathBuf::from("/tmp/beta");
     let mut panel = TuiAgentPanel {
+        enabled_models: Vec::new(),
         supervisor_settings: Default::default(),
         supervisor_selected: false,
         projects: vec![
@@ -916,6 +925,7 @@ fn tui_agent_panel_refresh_selects_a_newly_registered_current_project() {
     panel.state.select(Some(0));
     let selected_row = panel.selected_row_identity();
     let snapshot = TuiAgentPanelSnapshot {
+        enabled_models: Vec::new(),
         supervisor_settings: Default::default(),
         projects: vec![
             tui_agent_project_for_test(1, "alpha"),
@@ -935,6 +945,7 @@ fn tui_agent_panel_refresh_selects_a_newly_registered_current_project() {
 #[test]
 fn tui_agent_panel_refresh_error_preserves_the_last_snapshot() {
     let mut panel = TuiAgentPanel {
+        enabled_models: Vec::new(),
         supervisor_settings: Default::default(),
         supervisor_selected: false,
         projects: vec![
@@ -967,6 +978,7 @@ fn tui_agent_panel_refresh_error_preserves_the_last_snapshot() {
 #[test]
 fn tui_agent_panel_refresh_error_uses_the_red_console() {
     let panel = TuiAgentPanel {
+        enabled_models: Vec::new(),
         supervisor_settings: Default::default(),
         supervisor_selected: false,
         projects: vec![tui_agent_project_for_test(1, "alpha")],
@@ -985,6 +997,7 @@ fn tui_agent_panel_refresh_error_uses_the_red_console() {
 #[test]
 fn tui_kanban_console_displays_an_open_agent_log() {
     let panel = TuiAgentPanel {
+        enabled_models: Vec::new(),
         supervisor_settings: Default::default(),
         supervisor_selected: false,
         projects: Vec::new(),
@@ -1059,6 +1072,7 @@ fn opening_agent_log_clears_previous_console_text_and_shows_log_mode() {
 #[test]
 fn tui_agent_panel_selects_the_active_project_by_path() {
     let mut panel = TuiAgentPanel {
+        enabled_models: Vec::new(),
         supervisor_settings: Default::default(),
         supervisor_selected: false,
         projects: vec![
@@ -1085,6 +1099,7 @@ fn tui_agent_panel_selects_the_active_project_by_path() {
 fn tui_agent_panel_selects_the_current_project_registration_by_path() {
     let active_path = PathBuf::from("/tmp/current");
     let mut panel = TuiAgentPanel {
+        enabled_models: Vec::new(),
         supervisor_settings: Default::default(),
         supervisor_selected: false,
         projects: vec![tui_agent_project_for_test(1, "alpha")],
@@ -1136,6 +1151,7 @@ fn tui_agent_project_removal_requires_confirmation_and_only_unregisters() {
         .unwrap();
     let project = store.list_projects_blocking().unwrap().remove(0);
     let mut panel = TuiAgentPanel {
+        enabled_models: Vec::new(),
         supervisor_settings: Default::default(),
         supervisor_selected: false,
         projects: vec![TuiAgentProject {
@@ -1244,6 +1260,7 @@ fn tui_working_project_removal_fixture(protection: &str) -> TuiWorkingProjectRem
         .unwrap()
         .unwrap();
     let mut panel = TuiAgentPanel {
+        enabled_models: Vec::new(),
         supervisor_settings: Default::default(),
         supervisor_selected: false,
         projects: vec![TuiAgentProject {
@@ -1540,6 +1557,7 @@ fn running_agent_log_view_streams_the_current_output_file() {
     fs::write(&stderr_path, header).unwrap();
 
     let mut panel = TuiAgentPanel {
+        enabled_models: Vec::new(),
         supervisor_settings: Default::default(),
         supervisor_selected: false,
         projects: vec![project],
@@ -1634,6 +1652,7 @@ fn reaped_session_logs_are_latest_while_project_runtime_still_looks_active() {
                 .unwrap()
         );
         let mut panel = TuiAgentPanel {
+            enabled_models: Vec::new(),
             supervisor_settings: Default::default(),
             supervisor_selected: false,
             projects: vec![TuiAgentProject {
@@ -1748,6 +1767,7 @@ fn git_recovery_without_logs_keeps_exact_completed_session_output() {
     );
     assert!(latest.stdout_path.is_none());
     let mut panel = TuiAgentPanel {
+        enabled_models: Vec::new(),
         supervisor_settings: Default::default(),
         supervisor_selected: false,
         projects: vec![TuiAgentProject {
@@ -1863,6 +1883,7 @@ fn completed_log_is_latest_but_a_newer_attempt_of_the_same_session_is_live() {
         })
         .unwrap();
     let mut panel = TuiAgentPanel {
+        enabled_models: Vec::new(),
         supervisor_settings: Default::default(),
         supervisor_selected: false,
         projects: vec![TuiAgentProject {
@@ -1965,6 +1986,7 @@ fn fenced_agent_log_view_keeps_the_orphaned_session_controllable() {
         HashSet::from([project.id])
     );
     let mut panel = TuiAgentPanel {
+        enabled_models: Vec::new(),
         supervisor_settings: Default::default(),
         supervisor_selected: false,
         projects: vec![TuiAgentProject {
@@ -2045,6 +2067,7 @@ fn completed_task_keeps_reaped_session_output_without_run_history() {
             .unwrap()
     );
     let mut panel = TuiAgentPanel {
+        enabled_models: Vec::new(),
         supervisor_settings: Default::default(),
         supervisor_selected: false,
         projects: vec![TuiAgentProject {
@@ -2171,6 +2194,18 @@ fn manual_owner_allows_shared_resume_without_hiding_selected_session_or_project(
         TuiCodexSessionAvailability::ProjectBusy
     );
     assert_eq!(panel.selected_project().unwrap().project.id, project.id);
+    // The selected CLI claim also opens via shared controls, even with no
+    // automated owner. Opening it must not acquire the project's scheduler lease.
+    assert_eq!(
+        tui_codex_session_availability_for_path_at(
+            &mut panel,
+            &project_root,
+            "manual-owner",
+            &state_dir,
+        )
+        .unwrap(),
+        TuiCodexSessionAvailability::ProjectBusy
+    );
     // Already-open shared sessions must retain their own busy/handoff routing.
     store
         .set_session_control_state_blocking(
@@ -2226,6 +2261,7 @@ fn kanban_agent_log_view_uses_the_active_project_for_selected_doing_task() {
     .unwrap();
 
     let mut panel = TuiAgentPanel {
+        enabled_models: Vec::new(),
         supervisor_settings: Default::default(),
         supervisor_selected: false,
         projects: vec![alpha, tui_agent_project_for_test(2, "beta")],
@@ -2356,6 +2392,7 @@ fn open_kanban_agent_log_follows_the_selected_task() {
     }
 
     let mut panel = TuiAgentPanel {
+        enabled_models: Vec::new(),
         supervisor_settings: Default::default(),
         supervisor_selected: false,
         projects: vec![TuiAgentProject {
@@ -2534,6 +2571,7 @@ fn open_agent_log_follows_the_highlighted_project() {
     }
 
     let mut panel = TuiAgentPanel {
+        enabled_models: Vec::new(),
         supervisor_settings: Default::default(),
         supervisor_selected: false,
         projects: projects
@@ -2716,6 +2754,7 @@ fn agent_project_table_surfaces_external_daemon_scan_errors() {
         agent_project_column_width(std::slice::from_ref(&item), None, 160, codex_width);
     let row = format_agent_project_table_row(0, &item, 160, project_width, codex_width, false);
     let mut panel = TuiAgentPanel {
+        enabled_models: Vec::new(),
         supervisor_settings: Default::default(),
         supervisor_selected: false,
         projects: vec![item],
@@ -2795,6 +2834,7 @@ fn agent_project_table_surfaces_failed_run_reason_and_retry_guidance() {
         agent_project_column_width(std::slice::from_ref(&item), None, 180, codex_width);
     let row = format_agent_project_table_row(0, &item, 180, project_width, codex_width, false);
     let mut panel = TuiAgentPanel {
+        enabled_models: Vec::new(),
         supervisor_settings: Default::default(),
         supervisor_selected: false,
         projects: vec![item],
@@ -2911,6 +2951,7 @@ fn missing_git_start_output_keeps_the_saved_failure_and_exact_session() {
     item.project = project;
     item.runtime_state = TuiAgentRuntimeState::Error;
     let mut panel = TuiAgentPanel {
+        enabled_models: Vec::new(),
         supervisor_settings: Default::default(),
         supervisor_selected: false,
         projects: vec![item],
@@ -2986,6 +3027,7 @@ fn current_project_registration_is_present_only_when_active_project_is_unregiste
 #[test]
 fn tui_agent_panel_selects_current_project_registration_before_projects() {
     let mut panel = TuiAgentPanel {
+        enabled_models: Vec::new(),
         supervisor_settings: Default::default(),
         supervisor_selected: false,
         projects: vec![
@@ -3096,6 +3138,7 @@ fn agent_project_table_shows_full_interactive_status_and_wait_reason() {
     }
 
     let mut panel = TuiAgentPanel {
+        enabled_models: Vec::new(),
         supervisor_settings: Default::default(),
         supervisor_selected: false,
         projects: vec![project],
@@ -3365,7 +3408,11 @@ fn tui_models_shortcut_preserves_lowercase_m_and_task_input() {
 
         assert_eq!(
             update_tui_pane(&mut app, key).unwrap(),
-            vec![TuiEffect::PaneKey(key)]
+            if pane == TuiPane::AgentProjects {
+                Vec::new()
+            } else {
+                vec![TuiEffect::PaneKey(key)]
+            }
         );
         assert_eq!(app.current_pane, pane);
     }

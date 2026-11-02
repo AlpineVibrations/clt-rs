@@ -37,7 +37,7 @@ t: Cycle the selected Todo's thinking override, including default.
 s: Open a read-only task progress summary.
 Shift+S: Stop/start the selected task.
 i: Take over a linked live/stopped session interactively; resume automation on return.
-c: Plan a Todo or open its linked session; take over an active run.
+c: Plan a Todo or open its linked session (including CLI tasks); take over an active run.
 l / L: Toggle the selected task's output (project output if none selected).
 a: Move the selected task to the archive.
 A: Open the read-only archive.

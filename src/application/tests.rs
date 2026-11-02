@@ -285,6 +285,7 @@ fn git_off_activation_links_the_exact_task_and_exposes_its_live_log() {
         selected.project = project;
         selected.runtime_state = TuiAgentRuntimeState::Running;
         let mut panel = TuiAgentPanel {
+            enabled_models: Vec::new(),
             supervisor_settings: Default::default(),
             supervisor_selected: false,
             projects: vec![selected],

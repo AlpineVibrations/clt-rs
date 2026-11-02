@@ -3349,6 +3349,19 @@ fn interactive_codex_resume_accepts_doing_done_and_all_todo_tasks() {
         "ready again — BLOCKED 2026-08-12: waiting — UNBLOCKED 2026-08-13: restored",
         false,
     );
+    let manual = task_entry_from_text(
+        TaskSource::MarkdownLine { line_index: 1 },
+        "manual task",
+        "manual task clt:manual codex:manual-session",
+        false,
+    );
+    for status in [TaskStatus::Todo, TaskStatus::Doing, TaskStatus::Done] {
+        assert!(task_supports_interactive_codex_resume(status, &manual));
+    }
+    assert!(!task_supports_interactive_codex_resume(
+        TaskStatus::Backlog,
+        &manual
+    ));
 
     assert!(task_supports_interactive_codex_resume(
         TaskStatus::Done,
@@ -3434,6 +3447,7 @@ fn interactive_c_busy_check_honors_persisted_session_fences_without_a_live_log()
         )
         .unwrap();
     let mut panel = TuiAgentPanel {
+        enabled_models: Vec::new(),
         supervisor_settings: Default::default(),
         supervisor_selected: false,
         projects: vec![TuiAgentProject {
@@ -3596,6 +3610,7 @@ fn writable_shared_interactive_reservation_coexists_with_another_active_session(
         std::process::id()
     ));
     let mut panel = TuiAgentPanel {
+        enabled_models: Vec::new(),
         supervisor_settings: Default::default(),
         supervisor_selected: false,
         projects: vec![TuiAgentProject {
@@ -3909,6 +3924,194 @@ fn writable_shared_interactive_preserves_active_git_work_through_exit_and_reopen
 }
 
 #[test]
+fn manual_conversation_reopens_after_exit_and_crash_without_handoff() {
+    for folders in [false, true] {
+        for other_owner in [false, true] {
+            let root = temp_root("manual-conversation-reopen");
+            let state_dir = root.join("state");
+            let project_root = root.join("project");
+            init_tasks(&project_root, folders).unwrap();
+            let board = get_tasks_dir(&project_root);
+            insert_task(
+                &project_root,
+                TaskStatus::Doing,
+                None,
+                "Interrupted manual work clt:manual codex:manual-owner",
+                None,
+            )
+            .unwrap();
+            let before = task_entry_at(&board, TaskStatus::Doing, 1).unwrap();
+            let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
+            store
+                .register_project_blocking(&project_root, "project")
+                .unwrap();
+            let project_id = store.list_projects_blocking().unwrap().remove(0).id;
+            if other_owner {
+                assert!(
+                    store
+                        .try_acquire_lease_blocking(project_id, "other-owner", "100", "9999999999")
+                        .unwrap()
+                );
+            }
+
+            // First open, reopen after an ordinary exit, and reopen after a
+            // guardian interrupted by shutdown. The durable CLI claim survives.
+            for attempt in 0..3 {
+                assert!(
+                    codex_session_task_supports_interactive_resume(&project_root, "manual-owner")
+                        .unwrap()
+                );
+                let holder = InteractiveAgentLease::holder_for_shared_session(attempt > 0);
+                assert!(
+                    super::reserve_tui_shared_codex_session_interactive_at(
+                        &state_dir,
+                        project_id,
+                        "manual-owner",
+                        &holder,
+                        None,
+                    )
+                    .unwrap()
+                );
+                assert!(
+                    !super::reserve_tui_shared_codex_session_interactive_at(
+                        &state_dir,
+                        project_id,
+                        "manual-owner",
+                        &holder,
+                        None,
+                    )
+                    .unwrap()
+                );
+                let disposition = InteractiveGuardianDisposition::from_handoff(
+                    InteractiveCodexResumeMode::WritableShared,
+                    &holder,
+                );
+                assert!(!disposition.holds_project_lease());
+                let guardian = interactive_guardian_holder(disposition);
+                assert!(
+                    store
+                        .adopt_interactive_guardian_blocking(
+                            project_id,
+                            Some("manual-owner"),
+                            &holder,
+                            &guardian,
+                            60,
+                        )
+                        .unwrap()
+                );
+                assert!(
+                    !super::completed::prepare_completed_task_context(
+                        &store,
+                        project_id,
+                        "manual-owner",
+                        &guardian,
+                    )
+                    .unwrap()
+                );
+                assert!(
+                    !super::reserve_tui_shared_codex_session_interactive_at(
+                        &state_dir,
+                        project_id,
+                        "manual-owner",
+                        &holder,
+                        None,
+                    )
+                    .unwrap()
+                );
+                if attempt == 1 {
+                    assert!(
+                        super::recover_stale_interactive_guardian_with_task(
+                            &store,
+                            project_id,
+                            "manual-owner",
+                            &guardian,
+                            None,
+                            disposition,
+                        )
+                        .unwrap()
+                    );
+                } else {
+                    assert!(
+                        store
+                            .register_interactive_guardian_child_blocking(
+                                project_id,
+                                "manual-owner",
+                                &guardian,
+                                std::process::id(),
+                                60,
+                            )
+                            .unwrap()
+                    );
+                    assert!(
+                        !finish_interactive_guardian_after_reap(
+                            &store,
+                            project_id,
+                            "manual-owner",
+                            &guardian,
+                            Duration::from_secs(60),
+                            disposition,
+                        )
+                        .unwrap()
+                    );
+                }
+                let control = store
+                    .session_control_blocking(project_id, "manual-owner")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(control.state, AgentSessionControlState::Stopped);
+                assert!(control.run_token.is_none());
+                assert!(control.child_pid.is_none());
+                assert!(control.interactive_holder.is_none());
+                assert!(
+                    store
+                        .planning_session_can_start_blocking(project_id, "manual-owner")
+                        .unwrap()
+                );
+                let after = task_entry_at(&board, TaskStatus::Doing, 1).unwrap();
+                assert_eq!(after.content, before.content);
+                assert_eq!(after.source, before.source);
+                assert!(
+                    read_task_entries(&board, TaskStatus::Todo)
+                        .unwrap()
+                        .is_empty()
+                );
+                assert!(!scan_agent_project(&project_root).has_schedulable_work());
+                let lease = store.lease_for_project_blocking(project_id).unwrap();
+                assert_eq!(
+                    lease.as_ref().map(|lease| lease.holder.as_str()),
+                    other_owner.then_some("other-owner")
+                );
+                if let Some(lease) = lease {
+                    assert_eq!(lease.acquired_at, "100");
+                    assert_eq!(lease.expires_at, "9999999999");
+                }
+            }
+            // The automation handback path must not bypass the surviving claim.
+            assert!(
+                prepare_tui_codex_session_interrupt_at(
+                    &state_dir,
+                    project_id,
+                    "manual-owner",
+                    60,
+                    Duration::from_millis(1),
+                )
+                .is_err()
+            );
+            assert_eq!(
+                store
+                    .session_control_blocking(project_id, "manual-owner")
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                AgentSessionControlState::Stopped
+            );
+            drop(store);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+}
+
+#[test]
 fn shared_interactive_resume_preserves_manual_owner_through_exit_and_reopen() {
     for folders in [false, true] {
         let root = temp_root("shared-manual-owner");
@@ -3959,19 +4162,6 @@ fn shared_interactive_resume_preserves_manual_owner_through_exit_and_reopen() {
                 )
                 .unwrap()
             );
-            assert!(
-                super::reserve_tui_shared_codex_session_interactive_at(
-                    &state_dir,
-                    project_id,
-                    "manual-owner",
-                    &requester,
-                    None,
-                )
-                .unwrap_err()
-                .to_string()
-                .contains("owns a manual task")
-            );
-
             let disposition = InteractiveGuardianDisposition::from_handoff(
                 InteractiveCodexResumeMode::WritableShared,
                 &requester,

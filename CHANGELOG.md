@@ -6,6 +6,17 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+## [0.9.9] - 2026-11-02
+
+### Fixed
+
+- Keep Agent Projects settings responsive while saving enabled state, Git mode,
+  model, thinking, Fast mode, and supervisor settings. Show changes immediately,
+  combine rapid edits, and prevent stale refreshes from undoing the display.
+- Let `c` reopen the saved conversation of a `[CLI]` task after a crash or closed
+  Codex window. Preserve its manual claim and task status instead of requiring
+  a handoff to automation; prevent duplicate CLT opens of the same session.
+
 ## [0.9.8] - 2026-10-30
 
 ### Fixed

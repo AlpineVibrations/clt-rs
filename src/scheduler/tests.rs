@@ -127,10 +127,11 @@ fn manual_marker_survives_editing_and_reserves_nested_boards() {
     );
     assert!(display.starts_with("[CLI]"));
     assert!(!display.contains("STOPPED") && !display.contains("clt:manual"));
-    assert!(!task_supports_interactive_codex_resume(
+    assert!(task_supports_interactive_codex_resume(
         TaskStatus::Todo,
         &entry
     ));
+    assert!(codex_session_task_supports_interactive_resume(&root, "direct-session").unwrap());
     move_task_in_board(&nested, TaskStatus::Todo, TaskStatus::Done, "1").unwrap();
     assert!(!board_has_manual_task(&board).unwrap());
     fs::remove_dir_all(root).unwrap();

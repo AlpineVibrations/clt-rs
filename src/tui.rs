@@ -33,6 +33,7 @@ use tui_input::{Input, InputRequest};
 
 mod help;
 mod progress;
+mod settings;
 
 use crate::{
     agent::{
@@ -1316,6 +1317,7 @@ impl TuiAgentRuntimeState {
 }
 
 pub(super) struct TuiAgentPanelSnapshot {
+    pub(super) enabled_models: Vec<agent::AgentModelTarget>,
     pub(super) supervisor_settings: crate::supervisor::SupervisorSettings,
     pub(super) projects: Vec<TuiAgentProject>,
     pub(super) daemon_status: String,
@@ -1329,15 +1331,23 @@ pub(super) struct TuiAgentPanelRefreshResult {
 }
 
 pub(super) struct TuiAgentPanelRefreshWorker {
+    pub(super) revision: u64,
     pub(super) receiver: Option<Receiver<TuiAgentPanelRefreshResult>>,
 }
 
 impl TuiAgentPanelRefreshWorker {
     pub(super) fn new() -> Self {
-        Self { receiver: None }
+        Self {
+            receiver: None,
+            revision: 0,
+        }
     }
 
-    pub(super) fn request(&mut self, active_root: &Path) -> bool {
+    pub(super) fn request(&mut self, active_root: &Path, revision: u64) -> bool {
+        if self.receiver.is_some() {
+            return false;
+        }
+        self.revision = revision;
         self.request_with(active_root, |active_root| TuiAgentPanelRefreshResult {
             panel_snapshot: load_tui_agent_panel_snapshot_with_service_recovery(&active_root),
             task_session_states: try_load_task_agent_session_states(&active_root),
@@ -1397,6 +1407,7 @@ pub(super) enum TuiAgentPanelRow<'a> {
 }
 
 pub(super) struct TuiAgentPanel {
+    pub(super) enabled_models: Vec<agent::AgentModelTarget>,
     pub(super) supervisor_settings: crate::supervisor::SupervisorSettings,
     pub(super) supervisor_selected: bool,
     pub(super) projects: Vec<TuiAgentProject>,
@@ -1641,6 +1652,7 @@ impl TuiAgentLogView {
 impl TuiAgentPanel {
     pub(super) fn new(_active_root: &Path) -> Self {
         let mut panel = Self {
+            enabled_models: Vec::new(),
             supervisor_settings: Default::default(),
             supervisor_selected: false,
             projects: Vec::new(),
@@ -1671,6 +1683,7 @@ impl TuiAgentPanel {
     ) {
         match result {
             Ok(snapshot) => {
+                self.enabled_models = snapshot.enabled_models;
                 self.supervisor_settings = snapshot.supervisor_settings;
                 self.projects = snapshot.projects;
                 self.daemon_status = snapshot.daemon_status;
@@ -2912,6 +2925,7 @@ pub(super) fn load_tui_agent_panel_snapshot_inner(
         .collect::<Result<Vec<_>>>()?;
 
     Ok(TuiAgentPanelSnapshot {
+        enabled_models: store.list_enabled_model_targets_blocking()?,
         supervisor_settings: store.supervisor_settings_blocking()?,
         projects,
         daemon_status,
@@ -3340,30 +3354,6 @@ pub(super) fn remove_tui_agent_project_with_store(
     }
 }
 
-pub(super) fn toggle_selected_tui_agent_project(
-    panel: &mut TuiAgentPanel,
-    active_root: &Path,
-) -> Result<String> {
-    let Some(project) = panel.selected_project().map(|entry| entry.project.clone()) else {
-        return Ok("No registered project selected".to_string());
-    };
-
-    let enabled = !project.enabled;
-    let store = open_agent_store()?;
-    let changed = store.set_project_enabled_blocking(project.id, enabled)?;
-    panel.refresh(active_root);
-
-    if changed {
-        let action = if enabled { "Turned on" } else { "Turned off" };
-        Ok(format!("{} agent project: {}", action, project.name))
-    } else {
-        Ok(format!(
-            "Project is no longer registered: {}",
-            project.path.display()
-        ))
-    }
-}
-
 pub(super) fn retry_selected_tui_agent_project(
     panel: &mut TuiAgentPanel,
     active_root: &Path,
@@ -3390,33 +3380,6 @@ pub(super) fn retry_selected_tui_agent_project(
     }
 }
 
-pub(super) fn cycle_selected_tui_agent_project_git_mode(
-    panel: &mut TuiAgentPanel,
-    active_root: &Path,
-) -> Result<String> {
-    let Some(project) = panel.selected_project().map(|entry| entry.project.clone()) else {
-        return Ok("No registered project selected".to_string());
-    };
-
-    let mode = project.git_mode.next();
-    let store = open_agent_store()?;
-    let changed = store.set_project_git_mode_blocking(project.id, mode)?;
-    panel.refresh(active_root);
-
-    if changed {
-        Ok(format!(
-            "Git mode for {}: {} for subsequent runs; active runs keep their current mode",
-            project.name,
-            mode.label()
-        ))
-    } else {
-        Ok(format!(
-            "Project is no longer registered: {}",
-            project.path.display()
-        ))
-    }
-}
-
 pub(super) fn next_agent_codex_setting(current: Option<&str>, choices: &[&str]) -> Option<String> {
     let current_idx = choices
         .iter()
@@ -3424,30 +3387,6 @@ pub(super) fn next_agent_codex_setting(current: Option<&str>, choices: &[&str]) 
         .unwrap_or(0);
     let next = choices[(current_idx + 1) % choices.len()];
     (!next.is_empty()).then(|| next.to_string())
-}
-
-pub(super) fn update_selected_tui_agent_codex_settings(
-    panel: &mut TuiAgentPanel,
-    active_root: &Path,
-    provider: Option<String>,
-    model: Option<String>,
-    reasoning_effort: Option<String>,
-    fast_enabled: bool,
-) -> Result<bool> {
-    let Some(project_id) = panel.selected_project().map(|entry| entry.project.id) else {
-        return Ok(false);
-    };
-
-    let store = open_agent_store()?;
-    let changed = store.set_project_codex_settings_blocking(
-        project_id,
-        provider.as_deref(),
-        model.as_deref(),
-        reasoning_effort.as_deref(),
-        fast_enabled,
-    )?;
-    panel.refresh(active_root);
-    Ok(changed)
 }
 
 pub(super) fn edit_supervisor_settings(
@@ -3481,130 +3420,6 @@ pub(super) fn edit_supervisor_settings(
         _ => return false,
     }
     true
-}
-
-fn update_tui_supervisor_settings(panel: &mut TuiAgentPanel, key: KeyEvent) -> Result<String> {
-    let store = open_agent_store()?;
-    let mut settings = store.supervisor_settings_blocking()?;
-    let targets = store.list_enabled_model_targets_blocking()?;
-    if edit_supervisor_settings(&mut settings, &targets, key) {
-        store.set_supervisor_settings_blocking(&settings)?;
-        panel.supervisor_settings = settings;
-        Ok("Supervisor settings saved. Space on/off; m model; t thinking; f fast; Esc/Down returns to projects.".into())
-    } else {
-        Ok(
-            "Supervisor: Space on/off; m model; t thinking; f fast; Esc/Down returns to projects."
-                .into(),
-        )
-    }
-}
-
-pub(super) fn cycle_selected_tui_agent_codex_model(
-    panel: &mut TuiAgentPanel,
-    active_root: &Path,
-) -> Result<String> {
-    let Some(project) = panel.selected_project().map(|entry| entry.project.clone()) else {
-        return Ok("No registered project selected".to_string());
-    };
-    let store = open_agent_store()?;
-    let targets = store.list_enabled_model_targets_blocking()?;
-    let current_idx = project.codex_model.as_ref().and_then(|model| {
-        let provider = project.codex_provider.as_deref().unwrap_or("openai");
-        targets
-            .iter()
-            .position(|target| target.provider_id == provider && target.model_id == *model)
-            .map(|index| index + 1)
-    });
-    let next_idx = (current_idx.unwrap_or(0) + 1) % (targets.len() + 1);
-    let (provider, model, label) = if next_idx == 0 {
-        (None, None, "CLT default".to_string())
-    } else {
-        let target = &targets[next_idx - 1];
-        (
-            Some(target.provider_id.clone()),
-            Some(target.model_id.clone()),
-            format!("{}/{}", target.provider_id, target.model_id),
-        )
-    };
-    let changed = update_selected_tui_agent_codex_settings(
-        panel,
-        active_root,
-        provider,
-        model,
-        project.codex_reasoning_effort,
-        project.codex_fast_enabled,
-    )?;
-
-    if changed {
-        Ok(format!("Codex model for {}: {}", project.name, label))
-    } else {
-        Ok(format!(
-            "Project is no longer registered: {}",
-            project.path.display()
-        ))
-    }
-}
-
-pub(super) fn cycle_selected_tui_agent_codex_reasoning(
-    panel: &mut TuiAgentPanel,
-    active_root: &Path,
-) -> Result<String> {
-    let Some(project) = panel.selected_project().map(|entry| entry.project.clone()) else {
-        return Ok("No registered project selected".to_string());
-    };
-    let reasoning = next_agent_codex_setting(
-        project.codex_reasoning_effort.as_deref(),
-        &AGENT_CODEX_REASONING_EFFORTS,
-    );
-    let label = reasoning.as_deref().unwrap_or("default").to_string();
-    let changed = update_selected_tui_agent_codex_settings(
-        panel,
-        active_root,
-        project.codex_provider,
-        project.codex_model,
-        reasoning,
-        project.codex_fast_enabled,
-    )?;
-
-    if changed {
-        Ok(format!("Codex thinking for {}: {}", project.name, label))
-    } else {
-        Ok(format!(
-            "Project is no longer registered: {}",
-            project.path.display()
-        ))
-    }
-}
-
-pub(super) fn toggle_selected_tui_agent_codex_fast(
-    panel: &mut TuiAgentPanel,
-    active_root: &Path,
-) -> Result<String> {
-    let Some(project) = panel.selected_project().map(|entry| entry.project.clone()) else {
-        return Ok("No registered project selected".to_string());
-    };
-    let fast_enabled = !project.codex_fast_enabled;
-    let changed = update_selected_tui_agent_codex_settings(
-        panel,
-        active_root,
-        project.codex_provider,
-        project.codex_model,
-        project.codex_reasoning_effort,
-        fast_enabled,
-    )?;
-
-    if changed {
-        Ok(format!(
-            "Codex fast mode for {}: {}",
-            project.name,
-            if fast_enabled { "ON" } else { "OFF" }
-        ))
-    } else {
-        Ok(format!(
-            "Project is no longer registered: {}",
-            project.path.display()
-        ))
-    }
 }
 
 pub(super) fn tui_agent_panel_refresh_interval() -> Duration {
@@ -6269,6 +6084,7 @@ pub(super) struct TuiApp {
     pub(super) current_pane: TuiPane,
     pub(super) models_return_pane: TuiPane,
     pub(super) agent_panel: TuiAgentPanel,
+    agent_settings: settings::Settings,
     pub(super) task_agent_session_states: TaskAgentSessionStates,
     pub(super) coordination: crate::coordination::Snapshot,
     pub(super) models_panel: TuiModelsPanel,
@@ -6317,6 +6133,7 @@ impl TuiApp {
             current_pane: start_state.current_pane,
             models_return_pane: tui_models_return_pane(start_state.current_pane),
             agent_panel: TuiAgentPanel::new(root),
+            agent_settings: settings::Settings::default(),
             task_agent_session_states: TaskAgentSessionStates::default(),
             coordination: crate::coordination::Snapshot::default(),
             models_panel: TuiModelsPanel::new(),
@@ -6728,6 +6545,9 @@ pub(super) fn update_tui_agent_projects_pane(
         } else { tui_agent_panel_instructions() }.into();
         return Some(Vec::new());
     }
+    if app.edit_agent_setting(key) {
+        return Some(Vec::new());
+    }
     if app.agent_panel.supervisor_selected {
         if matches!(key.code, KeyCode::Esc | KeyCode::Down | KeyCode::Enter) {
             app.agent_panel.supervisor_selected = false;
@@ -6966,7 +6786,9 @@ pub(super) fn execute_tui_effect(
             };
         }
         TuiEffect::RefreshAgentPanel => {
-            if agent_panel_refresh.request(&app.active_root) {
+            if !app.agent_settings.is_pending()
+                && agent_panel_refresh.request(&app.active_root, app.agent_settings.revision)
+            {
                 *last_agent_panel_refresh = Instant::now();
             }
         }
@@ -6979,6 +6801,12 @@ pub(super) fn execute_tui_effect(
             *last_agent_log_refresh = Instant::now();
         }
         TuiEffect::SyncTaskLog => {
+            if app.agent_log_view.is_some() {
+                // Other panes do not scan the board. Refresh before choosing a
+                // log when returning so it follows the current task selection.
+                app.refresh_task_snapshot();
+                app.normalize_cached_task_selections();
+            }
             let selected_task = app.board_states[app.selected_board]
                 .selected()
                 .and_then(|idx| app.task_snapshot.board_entries[app.selected_board].get(idx));
@@ -7002,7 +6830,14 @@ pub(super) fn execute_tui_effect(
         TuiEffect::RefreshTaskSnapshot => app.refresh_task_snapshot(),
         TuiEffect::RefreshClock => app.current_time = Local::now().format("%H:%M").to_string(),
         TuiEffect::PaneKey(_) => unreachable!("pane keys require the terminal effect executor"),
-        TuiEffect::Quit => return true,
+        TuiEffect::Quit => {
+            if app.agent_settings.is_pending() {
+                app.agent_settings.quit_requested = true;
+                app.feedback_buffer = "Saving settings before quitting…".into();
+            } else {
+                return true;
+            }
+        }
     }
     false
 }
@@ -7467,6 +7302,25 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
     {
         console_block = console_block.title_bottom(log_view.settings_label());
     }
+    if app.agent_settings.is_pending() {
+        console_block = console_block.title(
+            Line::from(if app.agent_settings.quit_requested {
+                " Saving settings before quitting… "
+            } else {
+                " Saving settings… "
+            })
+            .alignment(Alignment::Right),
+        );
+    }
+    if let Some(error) = &app.agent_settings.error {
+        console_block = console_block.title_bottom(
+            Line::from(truncate_to_width(
+                error,
+                feedback_area.width.saturating_sub(2) as usize,
+            ))
+            .style(Style::default().fg(Color::Red)),
+        );
+    }
     let feedback_paragraph = Paragraph::new(wrapped_console_content.as_str())
         .block(console_block)
         .style(Style::default().fg(console_color))
@@ -7663,7 +7517,10 @@ pub(super) fn execute_tui_key_effect(
                         app.agent_panel.select_project_for_path(&app.active_root);
                     }
                     sync_open_tui_agent_log_view(&app.agent_panel, &mut app.agent_log_view);
-                    if agent_panel_refresh.request(&app.active_root) {
+                    if !app.agent_settings.is_pending()
+                        && agent_panel_refresh
+                            .request(&app.active_root, app.agent_settings.revision)
+                    {
                         *last_agent_panel_refresh = Instant::now();
                     }
                 } else if app.current_pane == TuiPane::Tasks {
@@ -7823,11 +7680,7 @@ pub(super) fn execute_tui_key_effect(
                     && !matches!(key.code, KeyCode::Char('q' | 'h' | 'H' | '?'))
                     && !tui_toggles_models(&key)
                 {
-                    app.feedback_buffer =
-                        match update_tui_supervisor_settings(&mut app.agent_panel, key) {
-                            Ok(message) => message,
-                            Err(error) => format!("Supervisor settings: {error:#}"),
-                        };
+                    app.feedback_buffer = "Supervisor: Space on/off; m model; t thinking; f fast; Esc/Down returns to projects.".into();
                     return Ok(false);
                 }
                 match key.code {
@@ -7905,7 +7758,10 @@ pub(super) fn execute_tui_key_effect(
                             Ok(_) => {
                                 app.active_root = project.path.clone();
                                 app.task_agent_session_states.clear();
-                                if agent_panel_refresh.request(&app.active_root) {
+                                if !app.agent_settings.is_pending()
+                                    && agent_panel_refresh
+                                        .request(&app.active_root, app.agent_settings.revision)
+                                {
                                     *last_agent_panel_refresh = Instant::now();
                                 } else {
                                     *last_agent_panel_refresh = Instant::now()
@@ -7971,114 +7827,12 @@ pub(super) fn execute_tui_key_effect(
                             }
                             return Ok(false);
                         }
-
-                        match toggle_selected_tui_agent_project(
-                            &mut app.agent_panel,
-                            &app.active_root,
-                        ) {
-                            Ok(message) => {
-                                *last_agent_panel_refresh = Instant::now();
-                                app.feedback_buffer = message;
-                            }
-                            Err(e) => app.feedback_buffer = format!("Error: {}", e),
-                        }
-                    }
-                    KeyCode::Char('g') | KeyCode::Char('G') => {
-                        if app
-                            .agent_panel
-                            .selected_current_project_registration()
-                            .is_some()
-                        {
-                            app.feedback_buffer =
-                                "Register current project before changing its Git mode".to_string();
-                            return Ok(false);
-                        }
-
-                        match cycle_selected_tui_agent_project_git_mode(
-                            &mut app.agent_panel,
-                            &app.active_root,
-                        ) {
-                            Ok(message) => {
-                                *last_agent_panel_refresh = Instant::now();
-                                app.feedback_buffer = message;
-                            }
-                            Err(e) => app.feedback_buffer = format!("Error: {}", e),
-                        }
                     }
                     _ if tui_toggles_models(&key) => {
                         app.models_return_pane = tui_models_return_pane(app.current_pane);
                         app.models_panel.refresh();
                         app.current_pane = TuiPane::Models;
                         app.feedback_buffer = tui_models_instructions().to_string();
-                    }
-                    KeyCode::Char('m') => {
-                        if app
-                            .agent_panel
-                            .selected_current_project_registration()
-                            .is_some()
-                        {
-                            app.feedback_buffer =
-                                "Register current project before changing its Codex model"
-                                    .to_string();
-                            return Ok(false);
-                        }
-
-                        match cycle_selected_tui_agent_codex_model(
-                            &mut app.agent_panel,
-                            &app.active_root,
-                        ) {
-                            Ok(message) => {
-                                *last_agent_panel_refresh = Instant::now();
-                                app.feedback_buffer = message;
-                            }
-                            Err(e) => app.feedback_buffer = format!("Error: {}", e),
-                        }
-                    }
-                    KeyCode::Char('f') | KeyCode::Char('F') => {
-                        if app
-                            .agent_panel
-                            .selected_current_project_registration()
-                            .is_some()
-                        {
-                            app.feedback_buffer =
-                                "Register current project before changing Codex fast mode"
-                                    .to_string();
-                            return Ok(false);
-                        }
-
-                        match toggle_selected_tui_agent_codex_fast(
-                            &mut app.agent_panel,
-                            &app.active_root,
-                        ) {
-                            Ok(message) => {
-                                *last_agent_panel_refresh = Instant::now();
-                                app.feedback_buffer = message;
-                            }
-                            Err(e) => app.feedback_buffer = format!("Error: {}", e),
-                        }
-                    }
-                    KeyCode::Char('t') | KeyCode::Char('T') => {
-                        if app
-                            .agent_panel
-                            .selected_current_project_registration()
-                            .is_some()
-                        {
-                            app.feedback_buffer =
-                                "Register current project before changing Codex thinking"
-                                    .to_string();
-                            return Ok(false);
-                        }
-
-                        match cycle_selected_tui_agent_codex_reasoning(
-                            &mut app.agent_panel,
-                            &app.active_root,
-                        ) {
-                            Ok(message) => {
-                                *last_agent_panel_refresh = Instant::now();
-                                app.feedback_buffer = message;
-                            }
-                            Err(e) => app.feedback_buffer = format!("Error: {}", e),
-                        }
                     }
                     KeyCode::Char('r') | KeyCode::Char('R') => {
                         if let Some(project) = app.agent_panel.selected_project()
@@ -8545,14 +8299,16 @@ pub(super) fn execute_tui_key_effect(
                         };
 
                         if !task_supports_interactive_codex_resume(selected_status, &task) {
-                            app.feedback_buffer = if crate::task::task_content_is_manual(
-                                &task.content,
-                            ) {
-                                "This conversation is reserved by a directly opened Codex session. Use clt handoff to release it.".to_string()
-                            } else {
-                                "Codex sessions are available from Todo, Doing, or Done tasks."
-                                    .to_string()
-                            };
+                            app.feedback_buffer =
+                                if crate::task::task_content_is_manual(&task.content)
+                                    && codex_session_for_task(&task).is_none()
+                                {
+                                    "This CLI task has no saved Codex conversation to reopen."
+                                        .to_string()
+                                } else {
+                                    "Codex sessions are available from Todo, Doing, or Done tasks."
+                                        .to_string()
+                                };
                             return Ok(false);
                         }
 
@@ -9130,7 +8886,16 @@ pub(super) fn tui_view_with_active_board(
             app.archive_view = false;
         }
 
+        if app.poll_agent_settings() {
+            last_agent_panel_refresh = Instant::now() - tui_agent_panel_refresh_interval();
+        }
+        if app.agent_settings.quit_requested && !app.agent_settings.is_pending() {
+            break;
+        }
         for effect in [TuiEffect::RefreshTaskSnapshot, TuiEffect::RefreshClock] {
+            if effect == TuiEffect::RefreshTaskSnapshot && app.current_pane != TuiPane::Tasks {
+                continue;
+            }
             execute_tui_effect(
                 &mut app,
                 effect,
@@ -9142,7 +8907,11 @@ pub(super) fn tui_view_with_active_board(
         app.normalize_cached_task_selections();
 
         if let Some(refresh) = agent_panel_refresh.try_result() {
-            if refresh.active_root == app.active_root {
+            if refresh.active_root == app.active_root
+                && app
+                    .agent_settings
+                    .accepts_refresh(agent_panel_refresh.revision)
+            {
                 let selected_row = app.agent_panel.selected_row_identity();
                 app.agent_panel.apply_refresh_result(
                     &app.active_root,
