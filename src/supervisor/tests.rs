@@ -1070,3 +1070,97 @@ fn repeated_exact_session_failures_are_reviewed_without_a_blocked_note() {
         fs::remove_dir_all(root).unwrap();
     }
 }
+
+#[test]
+fn supervisor_rechecks_failed_resume_boundary_and_keeps_latest_error() {
+    let (root, _, store, mut project) = fixture("supervisor-resume-check");
+    initialize_test_git_repository(&project.path);
+    project.git_mode = AgentGitMode::Commit;
+    let start = capture_agent_git_start_state(&project.path, project.git_mode).unwrap();
+    store
+        .create_git_finalization_blocking(agent::NewGitFinalization {
+            project_id: project.id,
+            codex_session_id: "original-session",
+            git_mode: project.git_mode,
+            starting_head: Some(&start.starting_head),
+            branch_ref: start.branch_ref.as_deref(),
+            upstream_ref: start.upstream_ref.as_deref(),
+            worktree_baseline: &start.worktree_baseline,
+            task_identity: durable_task_identity("Fix renderer.").as_deref(),
+            owner_run_token: None,
+            created_at: "100",
+        })
+        .unwrap();
+    store
+        .ensure_pending_git_finalization_resume_requested_blocking(project.id, "original-session")
+        .unwrap();
+    store
+        .record_run_outcome_blocking(agent::AgentRunOutcome {
+            project_id: project.id,
+            status: "failure",
+            started_at: "101",
+            finished_at: Some("102"),
+            exit_code: None,
+            log_dir: None,
+            stdout_path: None,
+            stderr_path: None,
+            summary: Some("Launch failed: selected task was not committed exactly once"),
+            codex_session_id: Some("original-session"),
+        })
+        .unwrap();
+    let original = store
+        .git_finalization_blocking(project.id, "original-session")
+        .unwrap();
+    let board = evidence(&project).unwrap();
+    enable(&store);
+    begin_review(&store, &project).unwrap();
+    finish_review(&store, &project, &result(&root, json!({
+        "decision":"repair", "task":1, "reason":"Historical launch failed", "next_action":"Inspect handoff"
+    }))).unwrap();
+    assert!(matches!(
+        gate(&store, &project, true).unwrap(),
+        Gate::Hold(_)
+    ));
+    // An older saved hold lacks the current launch checks. Upgrade its evidence
+    // once, without clearing a resume control, task note or journal.
+    let mut old = store
+        .supervisor_review_blocking(project.id)
+        .unwrap()
+        .unwrap();
+    let mut old_evidence: serde_json::Value = serde_json::from_str(&old.evidence).unwrap();
+    for eligibility in old_evidence["session_eligibility"].as_array_mut().unwrap() {
+        eligibility
+            .as_object_mut()
+            .unwrap()
+            .remove("resume_git_check");
+    }
+    old.evidence = serde_json::to_string(&old_evidence).unwrap();
+    store
+        .save_supervisor_review_blocking(project.id, &old)
+        .unwrap();
+    assert!(matches!(
+        gate(&store, &project, true).unwrap(),
+        Gate::Review
+    ));
+    begin_review(&store, &project).unwrap();
+    let mut command = Command::new("codex");
+    configure_command(&mut command, &store, &project, &root.join("review.err")).unwrap();
+    let prompt = command.get_args().last().unwrap().to_string_lossy();
+    assert!(prompt.contains("Launch failed: selected task was not committed exactly once"));
+    assert!(prompt.contains("resume_git_check"));
+    assert!(prompt.contains("verified"));
+    assert!(prompt.contains("normal queued state"));
+    assert_eq!(
+        store
+            .git_finalization_blocking(project.id, "original-session")
+            .unwrap(),
+        original
+    );
+    assert_eq!(evidence(&project).unwrap(), board);
+    let mismatch =
+        resume_git_check(&store, &project, "original-session", "A different task.").unwrap();
+    assert_eq!(mismatch["status"], "blocked");
+    assert!(mismatch["error"].as_str().unwrap().contains("found 0"));
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}

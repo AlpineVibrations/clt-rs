@@ -1227,6 +1227,7 @@ pub(super) fn run_agent_job_inner(
         ),
     };
 
+    let execution_failure = matches!(status, "failure" | "timeout").then(|| summary.clone());
     let mut git_finalization_pending = false;
     let mut autonomous_git_push_pending = false;
     if control_action.is_none()
@@ -1368,6 +1369,15 @@ pub(super) fn run_agent_job_inner(
         status = "failure";
         summary = error;
         git_finalization_pending = true;
+    }
+
+    // Git reconciliation describes pending proof, not why execution failed.
+    // Keep the actual diagnostic available to both operators and the reviewer.
+    if status != "success"
+        && let Some(failure) = execution_failure
+        && summary != failure
+    {
+        summary = format!("{failure} {summary}");
     }
 
     let control_resolution_result: Result<()> = (|| {

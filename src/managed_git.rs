@@ -2892,6 +2892,29 @@ pub(super) fn ensure_agent_git_working_record(
     Ok(())
 }
 
+/// Read the same frozen task boundary used by launch, without changing its owner.
+pub(super) fn verify_agent_git_resume_task(
+    project_root: &Path,
+    finalization: &agent::GitFinalizationRecord,
+    content: &str,
+) -> Result<String> {
+    let task_identity = durable_task_identity(content)
+        .context("CLT could not derive a durable identity for the session-linked task")?;
+    let starting_head = finalization
+        .starting_head
+        .as_deref()
+        .context("The Git finalization has no frozen starting commit")?;
+    require_agent_git_start_task_identity(project_root, starting_head, &task_identity)?;
+    if let Some(bound_identity) = finalization.task_identity.as_deref() {
+        anyhow::ensure!(
+            bound_identity == task_identity,
+            "Codex session {} is attached to task content that no longer matches its frozen Git journal",
+            finalization.codex_session_id
+        );
+    }
+    Ok(task_identity)
+}
+
 pub(super) fn bind_agent_git_working_task_identity(
     store: &agent::TursoAgentStore,
     project: &agent::AgentProject,
@@ -2906,19 +2929,8 @@ pub(super) fn bind_agent_git_working_task_identity(
     else {
         return Ok(false);
     };
-    let task_identity = durable_task_identity(&task.content)
-        .context("CLT could not derive a durable identity for the session-linked task")?;
-    let starting_head = finalization
-        .starting_head
-        .as_deref()
-        .context("The Git finalization has no frozen starting commit")?;
-    require_agent_git_start_task_identity(&project.path, starting_head, &task_identity)?;
-    if let Some(bound_identity) = finalization.task_identity.as_deref() {
-        if bound_identity != task_identity {
-            anyhow::bail!(
-                "Codex session {session_id} is attached to task content that no longer matches its frozen Git journal"
-            );
-        }
+    let task_identity = verify_agent_git_resume_task(&project.path, &finalization, &task.content)?;
+    if finalization.task_identity.is_some() {
         if finalization.state == GitFinalizationState::Working
             && finalization.owner_run_token.as_deref() != Some(run_token)
             && !store.compare_and_set_git_finalization_with_identity_blocking(

@@ -1053,7 +1053,7 @@ pub(super) fn durable_task_identity(content: &str) -> Option<String> {
         let normalized_heading = heading.trim_end_matches(':').to_ascii_lowercase();
         let outcome_heading = matches!(
             normalized_heading.as_str(),
-            "completion note" | "blocked note" | "unblocked note"
+            "completion note" | "blocked note" | "unblocked note" | "deferred note"
         );
         if outcome_heading {
             skipping_outcome_section = true;
@@ -1069,7 +1069,7 @@ pub(super) fn durable_task_identity(content: &str) -> Option<String> {
 
         let uppercase = trimmed.to_ascii_uppercase();
         let mut note_start = None;
-        for marker in ["COMPLETED ", "BLOCKED ", "UNBLOCKED "] {
+        for marker in ["COMPLETED ", "BLOCKED ", "UNBLOCKED ", "DEFERRED "] {
             for (index, matched) in uppercase.match_indices(marker) {
                 let has_word_boundary = uppercase[..index]
                     .chars()

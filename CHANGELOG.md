@@ -6,6 +6,16 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+## [0.9.11] - 2026-11-05
+
+### Fixed
+
+- Resume deferred tasks without treating dated `DEFERRED` notes as changes to
+  their frozen task identity. Preserve the original session and Git journal.
+- Preserve launch errors and log paths through Git reconciliation, and reap
+  gated children when resume preparation fails. Give supervisor reviews current
+  resume checks and terminal-worker evidence so stale repair holds can be reassessed.
+
 ## [0.9.10] - 2026-11-05
 
 ### Fixed
@@ -623,7 +633,8 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 - Fixed task moves so destination write failures do not remove the source task.
 - Fixed TUI navigation on empty boards.
 
-[Unreleased]: https://github.com/AlpineVibrations/clt-rs/compare/v0.9.8...HEAD
+[Unreleased]: https://github.com/AlpineVibrations/clt-rs/compare/v0.9.11...HEAD
+[0.9.11]: https://github.com/AlpineVibrations/clt-rs/compare/v0.9.10...v0.9.11
 [0.9.8]: https://github.com/AlpineVibrations/clt-rs/compare/v0.9.7...v0.9.8
 [0.9.7]: https://github.com/AlpineVibrations/clt-rs/compare/v0.9.6...v0.9.7
 [0.9.6]: https://github.com/AlpineVibrations/clt-rs/compare/v0.9.5...v0.9.6

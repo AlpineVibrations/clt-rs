@@ -310,7 +310,10 @@ fn planning_runner_process_entry() {
         .unwrap();
     let state = PathBuf::from(std::env::var_os(AGENT_STATE_DIR_ENV).unwrap());
     let context = AutomatedAgentChildContext {
-        project_id: std::env::var(AGENT_PROJECT_ID_ENV).unwrap().parse().unwrap(),
+        project_id: std::env::var(AGENT_PROJECT_ID_ENV)
+            .unwrap()
+            .parse()
+            .unwrap(),
         run_token: std::env::var(AGENT_RUN_TOKEN_ENV).unwrap(),
     };
     let store = agent::TursoAgentStore::open_blocking(&state).unwrap();
@@ -326,7 +329,10 @@ fn planning_runner_process_entry() {
         .unwrap()
         .unwrap();
     assert_eq!(control.state, AgentSessionControlState::Running);
-    assert_eq!(control.run_token.as_deref(), Some(context.run_token.as_str()));
+    assert_eq!(
+        control.run_token.as_deref(),
+        Some(context.run_token.as_str())
+    );
     assert_eq!(control.child_pid, Some(std::process::id()));
     if resumed {
         let doing = read_task_entries(&get_tasks_dir(&project.path), TaskStatus::Doing).unwrap();
@@ -339,7 +345,13 @@ fn planning_runner_process_entry() {
         let wrong_task = if mode == AgentGitMode::Off {
             move_task_to_doing_with_agent_session(&project.path, "2", &context, &project, &store)
         } else {
-            move_task_to_doing_with_agent_git_journal(&project.path, "2", &context, &project, &store)
+            move_task_to_doing_with_agent_git_journal(
+                &project.path,
+                "2",
+                &context,
+                &project,
+                &store,
+            )
         };
         assert!(
             wrong_task
@@ -360,8 +372,14 @@ fn planning_runner_process_entry() {
                 journal.owner_run_token.as_deref(),
                 Some(context.run_token.as_str())
             );
-            move_task_to_doing_with_agent_git_journal(&project.path, "1", &context, &project, &store)
-                .unwrap();
+            move_task_to_doing_with_agent_git_journal(
+                &project.path,
+                "1",
+                &context,
+                &project,
+                &store,
+            )
+            .unwrap();
         }
     }
     println!("activated");
@@ -464,7 +482,7 @@ fn todo_runner_starts_plans_and_resumes_prior_work_with_each_git_mode() {
             let board = TaskBoard::new(get_tasks_dir(&project_root));
             let task = board.entry(TaskStatus::Todo, 1).unwrap();
             board.write_entry_content(TaskStatus::Todo, &task,
-                "Implement the agreed plan. BLOCKED 2026-10-05: Waiting. UNBLOCKED 2026-10-06: Prerequisite restored. codex:planning-session").unwrap();
+                "Implement the agreed plan. DEFERRED 2026-10-04: Waiting for a prerequisite commit. BLOCKED 2026-10-05: Waiting. UNBLOCKED 2026-10-06: Prerequisite restored. codex:planning-session").unwrap();
             store
                 .git_finalization_blocking(project.id, "planning-session")
                 .unwrap()

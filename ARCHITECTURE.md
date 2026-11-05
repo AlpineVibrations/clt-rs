@@ -284,6 +284,15 @@ The existing reservation compare-and-swap still fences intervening stops. Explic
 resume uses the same provenance to distinguish a tokenless stopped automated task
 from a planning conversation; neither path invents a new Git boundary.
 
+Supervisor evidence includes read-only branch and task identity validation shared
+with managed Git launch binding. It invalidates stale holds without changing
+controls or journals; worker acquisition and gated registration remain the
+authority for resumption. Dated DEFERRED outcomes are excluded from durable task
+identity. Post-spawn preparation errors close the launch gate, prove child reaping,
+and return the exact session's log paths and diagnostic. Worker reconciliation
+retains that diagnostic alongside unfinished Git proof. Planning and worker
+regressions cover deferred resumes and rejected scope changes before release.
+
 The supervisor and interactive stop/resume recovery regressions can also be run directly:
 
 ```bash

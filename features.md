@@ -691,6 +691,19 @@ Automated runs configure Codex with `danger-full-access`, approval policy `never
 
 ### Task supervisor
 
+Reviews include the latest attempt's error even when it has no log paths, the
+matching terminal worker's cleanup state, and current branch/task checks against
+the preserved Git journal. An idle `resume_requested` control is a queued request;
+empty historical logs alone do not establish a broken handoff. Changed launch
+checks trigger a fresh assessment of a saved hold. Actual launch still requires
+the existing lease, session, and child ownership checks.
+
+Dated `DEFERRED YYYY-MM-DD:` notes and Deferred note sections preserve the task's
+identity, like completion and blocked notes. Returning work to Todo does not
+replace its original conversation or `WORKING` journal. Real changes to its
+implementation requirements remain fenced. If launch preparation fails, CLT
+reaps the gated child and retains the concrete error and log paths for recovery.
+
 Two consecutive failed or timed-out attempts in the same task session trigger
 supervisor assessment even when the worker did not write a BLOCKED note. A
 successful attempt breaks that sequence; manual and stopped tasks remain excluded.

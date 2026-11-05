@@ -414,21 +414,20 @@ pub(super) fn launch_agent_runner_stage(
     }
     let task_reasoning_effort =
         selected_task_thinking(&project.path, task_selection, resume_session_id)?;
-    let model_reasoning_effort = if task_reasoning_effort.is_none()
-        && project.codex_reasoning_effort.is_none()
-    {
-        match (
-            model_target.provider_id.as_deref(),
-            model_target.model_id.as_deref(),
-        ) {
-            (Some(provider), Some(model)) => {
-                store.model_target_reasoning_blocking(provider, model)?
+    let model_reasoning_effort =
+        if task_reasoning_effort.is_none() && project.codex_reasoning_effort.is_none() {
+            match (
+                model_target.provider_id.as_deref(),
+                model_target.model_id.as_deref(),
+            ) {
+                (Some(provider), Some(model)) => {
+                    store.model_target_reasoning_blocking(provider, model)?
+                }
+                _ => None,
             }
-            _ => None,
-        }
-    } else {
-        None
-    };
+        } else {
+            None
+        };
     if let Some(reasoning_effort) = task_reasoning_effort
         .or(project.codex_reasoning_effort.as_deref())
         .or(model_reasoning_effort.as_deref())
@@ -2218,93 +2217,111 @@ impl CodexAgentRunner {
         let mut last_session_control_poll: Option<Instant> = None;
         let mut last_lease_renewal = Instant::now();
         let requested_control_cell = Cell::new(None);
-        if let Some(session_id) = observed_session_id.as_deref() {
-            let registration_result = store.register_known_session_with_child_blocking(
-                agent::AgentKnownSessionRegistration {
-                    project_id: project.id,
-                    codex_session_id: session_id,
-                    child_pid,
-                    run_token: &run_file_stem,
-                    stdout_path: &stdout_path,
-                    stderr_path: &stderr_path,
-                    lease_holder,
-                    lease_timeout_seconds: runner.lease_timeout.as_secs(),
-                    claim_requested_resume: resume_session_id == Some(session_id)
-                        && (task_selection == AgentTaskSelection::ResumeSession
-                            || task_selection == AgentTaskSelection::SupervisorRetry
-                                && store
-                                    .session_control_blocking(project.id, session_id)?
-                                    .is_some_and(|control| {
-                                        control.state
-                                            == agent::AgentSessionControlState::ResumeRequested
-                                    })),
-                    claim_planning_session: starting_planning_session,
-                },
-            );
-            let registration_error = match registration_result {
-                Ok(true) => None,
-                Ok(false) => Some(anyhow::anyhow!(
-                    "Known-session control or its live project lease changed before Codex launch"
-                )),
-                Err(error) => Some(error),
-            };
-            if let Some(error) = registration_error {
-                #[cfg(unix)]
-                {
-                    cancel_automated_supervisor_launch(
-                        &mut child,
-                        supervisor_control.take().expect("Unix automated supervisor has a control pipe"),
-                        &mut supervisor_proof,
-                    )
-                    .with_context(|| {
-                        format!(
-                            "Known-session registration failed ({error:#}), and its supervisor could not prove Codex stopped"
-                        )
-                    })?;
+        let registration_result: Result<()> = (|| {
+            if let Some(session_id) = observed_session_id.as_deref() {
+                let registration_result = store.register_known_session_with_child_blocking(
+                    agent::AgentKnownSessionRegistration {
+                        project_id: project.id,
+                        codex_session_id: session_id,
+                        child_pid,
+                        run_token: &run_file_stem,
+                        stdout_path: &stdout_path,
+                        stderr_path: &stderr_path,
+                        lease_holder,
+                        lease_timeout_seconds: runner.lease_timeout.as_secs(),
+                        claim_requested_resume: resume_session_id == Some(session_id)
+                            && (task_selection == AgentTaskSelection::ResumeSession
+                                || task_selection == AgentTaskSelection::SupervisorRetry
+                                    && store
+                                        .session_control_blocking(project.id, session_id)?
+                                        .is_some_and(|control| {
+                                            control.state
+                                                == agent::AgentSessionControlState::ResumeRequested
+                                        })),
+                        claim_planning_session: starting_planning_session,
+                    },
+                );
+                let registration_error = match registration_result {
+                    Ok(true) => None,
+                    Ok(false) => Some(anyhow::anyhow!(
+                        "Known-session control or its live project lease changed before Codex launch"
+                    )),
+                    Err(error) => Some(error),
+                };
+                if let Some(error) = registration_error {
+                    return Err(error)
+                        .context("Failed to register known Codex child before launch");
                 }
-                #[cfg(not(unix))]
-                stop_agent_child_process(&mut child).with_context(|| {
-                    format!(
-                        "Known-session registration failed ({error:#}), and CLT could not prove its spawned Codex process stopped"
-                    )
-                })?;
-                return Err(error).context("Failed to register known Codex child before launch");
-            }
-            session_registered = true;
-            if starting_planning_session {
-                // Consume the frozen launch record before releasing the child,
-                // just as a new conversation does when its ID is announced.
-                store.mark_session_running_with_git_mode_blocking(
-                    project.id,
-                    session_id,
-                    child_pid,
-                    &run_file_stem,
-                    &stdout_path,
-                    &stderr_path,
-                    project.git_mode,
-                )?;
-            }
-            ensure_agent_git_working_record(
-                &store,
-                project,
-                session_id,
-                &run_file_stem,
-                git_start_state.as_ref(),
-            )?;
-            let _ =
-                bind_agent_git_working_task_identity(&store, project, session_id, &run_file_stem)?;
-            if let Some(index) = resumed_todo_index {
-                // This task already has an automated boundary. Reactivate it
-                // only after registering the exact child and binding its saved
-                // journal, before releasing the child. Do not apply the fresh
-                // Todo activation check against an older starting checkout.
-                TaskBoard::new(get_tasks_dir(&project.path))
-                    .move_task_without_reordering_after_lock(
-                        TaskStatus::Todo,
-                        TaskStatus::Doing,
-                        index,
+                session_registered = true;
+                if starting_planning_session {
+                    // Consume the frozen launch record before releasing the child,
+                    // just as a new conversation does when its ID is announced.
+                    store.mark_session_running_with_git_mode_blocking(
+                        project.id,
+                        session_id,
+                        child_pid,
+                        &run_file_stem,
+                        &stdout_path,
+                        &stderr_path,
+                        project.git_mode,
                     )?;
+                }
+                ensure_agent_git_working_record(
+                    &store,
+                    project,
+                    session_id,
+                    &run_file_stem,
+                    git_start_state.as_ref(),
+                )?;
+                let _ = bind_agent_git_working_task_identity(
+                    &store,
+                    project,
+                    session_id,
+                    &run_file_stem,
+                )?;
+                if let Some(index) = resumed_todo_index {
+                    // This task already has an automated boundary. Reactivate it
+                    // only after registering the exact child and binding its saved
+                    // journal, before releasing the child. Do not apply the fresh
+                    // Todo activation check against an older starting checkout.
+                    TaskBoard::new(get_tasks_dir(&project.path))
+                        .move_task_without_reordering_after_lock(
+                            TaskStatus::Todo,
+                            TaskStatus::Doing,
+                            index,
+                        )?;
+                }
             }
+            Ok(())
+        })();
+        if let Err(error) = registration_result {
+            // Every post-spawn preparation error must close the gate and prove
+            // the child reaped before returning a resumable, logged failure.
+            #[cfg(unix)]
+            cancel_automated_supervisor_launch(
+                &mut child,
+                supervisor_control.take().expect("Unix automated supervisor has a control pipe"),
+                &mut supervisor_proof,
+            ).with_context(|| format!("Launch preparation failed ({error:#}), and its supervisor could not prove Codex stopped"))?;
+            #[cfg(not(unix))]
+            stop_agent_child_process(&mut child).with_context(|| {
+                format!(
+                    "Launch preparation failed ({error:#}), and CLT could not prove Codex stopped"
+                )
+            })?;
+            let summary = format!("Failed to prepare known Codex session before launch: {error:#}");
+            append_agent_log_line(&stderr_path, &summary)?;
+            return Ok(AgentRunResult {
+                status: "failure",
+                exit_code: None,
+                log_dir,
+                stdout_path,
+                stderr_path,
+                summary,
+                codex_session_id: observed_session_id,
+                session_run_token: session_registered.then_some(run_file_stem),
+                control_action: None,
+            });
         }
         #[cfg(unix)]
         if let Err(error) = supervisor_control

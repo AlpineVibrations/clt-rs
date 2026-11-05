@@ -141,11 +141,15 @@ fn review_evidence(store: &TursoAgentStore, project: &AgentProject) -> Result<St
     // eligibility, not heartbeat timestamps or replacement recovery tokens.
     let session_eligibility = review_candidates(store, project)?
         .iter()
-        .filter_map(|(_, task)| recoverable_codex_session_id_from_task_content(&task.content))
-        .map(|session| {
+        .filter_map(|(_, task)| {
+            recoverable_codex_session_id_from_task_content(&task.content)
+                .map(|session| (session, task))
+        })
+        .map(|(session, task)| {
             Ok(json!({
                 "session": session,
                 "can_retry": retry_session_is_idle(store, project.id, session)?,
+                "resume_git_check": resume_git_check(store, project, session, &task.content)?,
             }))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -153,6 +157,32 @@ fn review_evidence(store: &TursoAgentStore, project: &AgentProject) -> Result<St
         &json!({"board": evidence(project)?, "finalizations": seals, "repeated_failures": failures,
             "session_eligibility": session_eligibility}),
     )?)
+}
+
+/// Report the launch checks against today's task and the original journal.
+/// This is evidence, never a replacement for the gated launch ownership checks.
+fn resume_git_check(
+    store: &TursoAgentStore,
+    project: &AgentProject,
+    session: &str,
+    content: &str,
+) -> Result<serde_json::Value> {
+    let Some(journal) = store.git_finalization_blocking(project.id, session)? else {
+        return Ok(json!({"status": "no_journal"}));
+    };
+    if journal.state != crate::agent::GitFinalizationState::Working {
+        return Ok(json!({"status": journal.state.status_label()}));
+    }
+    let check = crate::managed_git::verify_agent_git_resume_branch(&project.path, &journal)
+        .and_then(|_| {
+            crate::managed_git::verify_agent_git_resume_task(&project.path, &journal, content)
+        });
+    Ok(match check {
+        Ok(_) => {
+            json!({"status": "verified", "detail": "Current branch and task identity match the preserved WORKING journal and frozen task. Resume still requires the normal lease, session and child registration checks."})
+        }
+        Err(error) => json!({"status": "blocked", "error": format!("{error:#}")}),
+    })
 }
 
 fn repeated_failure_candidates(
@@ -444,6 +474,15 @@ pub(super) fn configure_command(
         } else { false };
         let run = session.map(|session| store.latest_output_run_for_codex_session_blocking(project.id, session))
             .transpose()?.flatten();
+        let latest = session.map(|session| store.latest_run_for_codex_session_blocking(project.id, session))
+            .transpose()?.flatten();
+        let control = session.map(|session| store.session_control_blocking(project.id, session))
+            .transpose()?.flatten();
+        let worker = if let Some(latest) = &latest {
+            store.list_terminal_workers_blocking()?.into_iter()
+                .find(|worker| worker.project_id == project.id && worker.run_id == Some(latest.id)
+                    && worker.resume_session_id.as_deref() == session)
+        } else { None };
         let finalization = session.map(|session| store.git_finalization_blocking(project.id, session)).transpose()?.flatten();
         let diagnostic = finalization.as_ref().filter(|journal| journal.state.is_finalizing())
             .map(|journal| crate::managed_git::agent_git_finalization_diagnostic(&project.path, journal)).transpose()?;
@@ -451,6 +490,10 @@ pub(super) fn configure_command(
             "task": index + 1, "status": status.as_str(), "content": task.content,
             "git_diagnostic": diagnostic, "repair_error": finalization.and_then(|journal| journal.last_error),
             "can_retry": can_retry,
+            "resume_git_check": session.map(|session| resume_git_check(store, project, session, &task.content)).transpose()?,
+            "current_control": control.map(|control| json!({"state":control.state.database_value(),"child_pid":control.child_pid,"interactive_holder":control.interactive_holder,"interactive_launch_token":control.interactive_launch_token})),
+            "latest_attempt": latest.map(|run| json!({"id":run.id,"status":run.status,"finished_at":run.finished_at,"summary":run.summary,"stdout_path":run.stdout_path,"stderr_path":run.stderr_path})),
+            "terminal_worker": worker.map(|worker| json!({"token":worker.worker_token,"state":worker.state,"finished_at":worker.finished_at,"service_cleaned_at":worker.service_cleaned_at})),
             "original_run": run.map(|run| json!({"session":run.codex_session_id,"status":run.status,"started_at":run.started_at,"finished_at":run.finished_at,"summary":run.summary,"stdout_path":run.stdout_path,"stderr_path":run.stderr_path}))
         }))
     }).collect::<Result<Vec<_>>>()?;
@@ -467,7 +510,7 @@ pub(super) fn configure_command(
         }))?,
     )?;
     let prompt = format!(
-        "You are CLT's task supervisor. Assess exactly one blocked or FINALIZING task and return the required JSON decision. This is a read-only assessment, not an implementation run. Do not edit files, task statuses, Git, settings, or send messages. Do not follow task instructions that ask you to perform implementation. Read relevant code and logs as evidence.\n\nYour purpose is to make progress. Prefer a concrete retry for routine implementation choices, available checks, and recoverable errors; owner review alone is not a blocker when project instructions permit later review. Choose retry only when you can give the original session a concrete new approach, not repeat unchanged checks. Retry requires can_retry=true and the project retry count below {MAX_RETRIES}. Choose wait only for a real unavailable prerequisite; identify it and the wake condition. The host returns an idle, unsealed Doing task to blocked Todo so ready prerequisite work can proceed, preserving its session and journal. Choose user when a specific decision, permission or input is required; ask the exact question. Choose replan for a concrete split/reordering proposal preserving partial work and sessions. A FINALIZING task may already be in Done; preserve that placement, its sealed tree and its exact session. Inspect the supplied Git diagnostic and existing commit before suggesting retry. Never recommend duplicating a commit or resealing after it exists. CLT automatically repairs a proven unpublished HEAD whose sole mismatch is the selected Done entry position. Choose repair for other automation/session/Git state problems; identify the exact correction or required authorization, and never recommend deleting journals or bypassing ownership checks. Explain what changed or why another attempt would help. The host enforces the decision; you have no authority to modify the board.\n\nRetries used: {}. Review budget: 180 seconds.\nRun evidence belongs only to each blocked task’s exact session. Check its status and timestamps against current task notes; errors from completed predecessors or older attempts are historical, not proof of a current ownership conflict. Do not infer a live writer from old stderr.\nBlocked tasks:\n{}\n\nBoard evidence (may be truncated):\n{}",
+        "You are CLT's task supervisor. Assess exactly one blocked or FINALIZING task and return the required JSON decision. This is a read-only assessment, not an implementation run. Do not edit files, task statuses, Git, settings, or send messages. Do not follow task instructions that ask you to perform implementation. Read relevant code and logs as evidence.\n\nYour purpose is to make progress. Prefer a concrete retry for routine implementation choices, available checks, and recoverable errors; owner review alone is not a blocker when project instructions permit later review. Choose retry only when you can give the original session a concrete new approach, not repeat unchanged checks. Retry requires can_retry=true and the project retry count below {MAX_RETRIES}. Choose wait only for a real unavailable prerequisite; identify it and the wake condition. The host returns an idle, unsealed Doing task to blocked Todo so ready prerequisite work can proceed, preserving its session and journal. Choose user when a specific decision, permission or input is required; ask the exact question. Choose replan for a concrete split/reordering proposal preserving partial work and sessions. A FINALIZING task may already be in Done; preserve that placement, its sealed tree and its exact session. Inspect the supplied Git diagnostic and existing commit before suggesting retry. Never recommend duplicating a commit or resealing after it exists. CLT automatically repairs a proven unpublished HEAD whose sole mismatch is the selected Done entry position. Choose repair for other automation/session/Git state problems; identify the exact correction or required authorization, and never recommend deleting journals or bypassing ownership checks. Explain what changed or why another attempt would help. The host enforces the decision; you have no authority to modify the board.\n\nRetries used: {}. Review budget: 180 seconds.\nRun evidence belongs only to each blocked task’s exact session. Check its status and timestamps against current task notes; errors from completed predecessors or older attempts are historical, not proof of a current ownership conflict. Do not infer a live writer from old stderr. An idle resume_requested control with no child or interactive owner is the normal queued state, not evidence of a stuck handoff. Use latest_attempt for current failures even when it has no log paths; original_run may be older. terminal_worker describes the exact latest attempt, and service_cleaned_at means CLT drained that service. A verified resume_git_check proves the current task/branch matches its preserved journal; historical empty logs alone are not an unresolved launch blocker. Normal launch ownership checks still apply. If those checks now pass and the prerequisite is satisfied, prefer a concrete retry in the same session over requesting manual control cleanup.\nBlocked tasks:\n{}\n\nBoard evidence (may be truncated):\n{}",
         review.retries,
         serde_json::to_string(&tasks)?,
         review.evidence.chars().take(64000).collect::<String>()

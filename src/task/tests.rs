@@ -2,6 +2,25 @@ use crate::test_support::prelude::*;
 use crate::test_support::*;
 
 #[test]
+fn deferred_outcome_notes_preserve_identity_without_hiding_task_edits() {
+    let identity = durable_task_identity("Retry worker uploads.");
+    for content in [
+        "Retry worker uploads. DEFERRED 2026-11-05: Wait for WEB-09. codex:session",
+        "Retry worker uploads.\n\n## Deferred note\nWait for WEB-09.\ncodex:session",
+        "Retry worker uploads. deferred 2026-11-05: Wait. UNBLOCKED 2026-11-06: Ready. codex:session",
+    ] {
+        assert_eq!(durable_task_identity(content), identity);
+    }
+    for content in [
+        "Retry different jobs. DEFERRED 2026-11-05: Wait.",
+        "Retry worker uploads. DEFERRED until the server is ready.",
+        "Retry worker uploads.\n## Deferred note\nWait.\n## Acceptance\nCreate a new paid job.",
+    ] {
+        assert_ne!(durable_task_identity(content), identity);
+    }
+}
+
+#[test]
 fn add_task_creates_missing_task_store() {
     let root = temp_root("auto-init");
 

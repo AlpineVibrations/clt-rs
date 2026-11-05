@@ -3134,3 +3134,122 @@ fn automation_selection_and_results_ignore_parallel_manual_work() {
         fs::remove_dir_all(root).unwrap();
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn rejected_resume_keeps_launch_error_logs_and_reaps_gated_child() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = temp_root("rejected-resume-diagnostics");
+    let (state, mut job) = prepare_inline_git_job(&root);
+    initialize_test_git_repository(&job.project.path);
+    let start = capture_agent_git_start_state(&job.project.path, AgentGitMode::Commit).unwrap();
+    let store = agent::TursoAgentStore::open_blocking(&state).unwrap();
+    let session = "rejected-resume";
+    store
+        .create_git_finalization_blocking(agent::NewGitFinalization {
+            project_id: job.project.id,
+            codex_session_id: session,
+            git_mode: AgentGitMode::Commit,
+            starting_head: Some(&start.starting_head),
+            branch_ref: start.branch_ref.as_deref(),
+            upstream_ref: start.upstream_ref.as_deref(),
+            worktree_baseline: &start.worktree_baseline,
+            task_identity: durable_task_identity("inline Git task").as_deref(),
+            owner_run_token: None,
+            created_at: "100",
+        })
+        .unwrap();
+    store
+        .ensure_pending_git_finalization_resume_requested_blocking(job.project.id, session)
+        .unwrap();
+    let board = TaskBoard::new(get_tasks_dir(&job.project.path));
+    let task = board.entry(TaskStatus::Todo, 1).unwrap();
+    board
+        .write_entry_content(
+            TaskStatus::Todo,
+            &task,
+            "Different implementation scope. codex:rejected-resume",
+        )
+        .unwrap();
+    let before = board.entry(TaskStatus::Todo, 1).unwrap().content;
+    let original = store
+        .git_finalization_blocking(job.project.id, session)
+        .unwrap();
+    let launched = root.join("must-not-launch");
+    let fake = root.join("codex");
+    fs::write(
+        &fake,
+        format!("#!/bin/sh\ntouch '{}'\n", launched.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    let runner = CodexAgentRunner::with_command(state.clone(), Duration::from_secs(20), fake);
+    job.task_selection = AgentTaskSelection::ResumeSession;
+    job.resume_session_id = Some(session.into());
+    let project_id = job.project.id;
+    drop(store);
+    let completed = run_agent_job(job, &runner, &new_agent_shutdown_signal()).unwrap();
+    assert_eq!(completed.status, "failure");
+    assert!(!launched.exists());
+    let store = agent::TursoAgentStore::open_blocking(&state).unwrap();
+    let run = store
+        .latest_run_for_codex_session_blocking(project_id, session)
+        .unwrap()
+        .unwrap();
+    let summary = run.summary.unwrap();
+    assert!(
+        summary.contains("Failed to prepare known Codex session before launch"),
+        "{summary}"
+    );
+    assert!(summary.contains("committed exactly once"), "{summary}");
+    assert!(
+        fs::read_to_string(run.stderr_path.unwrap())
+            .unwrap()
+            .contains("committed exactly once")
+    );
+    assert!(
+        fs::read_to_string(run.stdout_path.unwrap())
+            .unwrap()
+            .is_empty()
+    );
+    let control = store
+        .session_control_blocking(project_id, session)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        crate::platform::automated_agent_process_group_is_running(control.child_pid.unwrap()),
+        Some(false)
+    );
+    // The scheduler consumes the preserved generation only after checking that
+    // its exact child group and project lease are gone.
+    crate::scheduler::reconcile_stale_agent_session_controls(
+        &state,
+        project_id,
+        None,
+        false,
+        agent_timestamp_seconds(),
+    )
+    .unwrap();
+    let control = store
+        .session_control_blocking(project_id, session)
+        .unwrap()
+        .unwrap();
+    assert_eq!(control.state, AgentSessionControlState::ResumeRequested);
+    assert!(control.child_pid.is_none());
+    assert!(store.list_active_workers_blocking().unwrap().is_empty());
+    assert!(
+        store
+            .lease_for_project_blocking(project_id)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .git_finalization_blocking(project_id, session)
+            .unwrap(),
+        original
+    );
+    assert_eq!(board.entry(TaskStatus::Todo, 1).unwrap().content, before);
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}

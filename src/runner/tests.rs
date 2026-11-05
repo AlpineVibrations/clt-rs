@@ -1991,7 +1991,18 @@ fn exact_resume_runner_releases_gate_only_after_live_lease_registration() {
         None,
         &new_agent_shutdown_signal(),
     );
-    assert!(wrong_holder_result.is_err());
+    let failure = wrong_holder_result.unwrap();
+    assert_eq!(failure.status, "failure");
+    assert!(
+        failure
+            .summary
+            .contains("Failed to register known Codex child")
+    );
+    assert!(
+        fs::read_to_string(&failure.stderr_path)
+            .unwrap()
+            .contains(&failure.summary)
+    );
     assert!(!launched_marker.exists());
     let unclaimed = store
         .session_control_blocking(project.id, "session-123")
@@ -2327,7 +2338,7 @@ fn codex_runner_registers_a_marker_derived_resume_without_a_session_banner() {
 
     let runner =
         CodexAgentRunner::with_command(state_dir.clone(), Duration::from_secs(5), fake_codex);
-    assert!(
+    assert_eq!(
         runner
             .run_project(
                 &project,
@@ -2337,7 +2348,9 @@ fn codex_runner_registers_a_marker_derived_resume_without_a_session_banner() {
                 None,
                 &new_agent_shutdown_signal(),
             )
-            .is_err()
+            .unwrap()
+            .status,
+        "failure"
     );
     assert!(!launched_marker.exists());
     assert!(
