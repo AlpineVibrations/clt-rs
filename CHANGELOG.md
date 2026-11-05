@@ -6,6 +6,18 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+## [0.9.10] - 2026-11-05
+
+### Fixed
+
+- Resume unfinished automated tasks returned to Todo after an interactive Codex
+  visit, preserving their original conversation and Git journal. Allow an explicit
+  resume when an older interactive visit cleared the saved run token; planning
+  conversations and explicit stops retain their controls.
+- Show supervisor waits, requests for input, replanning, repairs and approved retries
+  separately from actual errors in Agent Projects, with the next action visible
+  in the console.
+
 ## [0.9.9] - 2026-11-02
 
 ### Fixed

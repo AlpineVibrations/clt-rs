@@ -82,6 +82,10 @@ used Turso dependency. Application modules import its local API through
   selections, full-content labels, launch arguments and resumed selection.
 - CLI and TUI call application/store facades; they do not contain SQL.
 - TUI render functions read cached `TuiApp` state and perform no I/O.
+- Agent Projects keeps typed supervisor notices separate from scan, execution
+  and assessment failures. Runtime status and console styling preserve active
+  worker and interactive ownership while showing ordinary holds as attention
+  states. Rendering uses the cached decision without registry reads.
 - `tui::settings` previews project and supervisor edits from cached settings and
   enabled model targets. One background writer uses the existing durable store
   facades; queued edits coalesce by project and setting group without changing
@@ -273,10 +277,18 @@ cargo test --locked --bin clt thinking
 cargo test --locked --test cli task_thinking
 ```
 
-The supervisor stop/resume recovery regressions can also be run directly:
+`session_control::reserve_idle_codex_session_interactive` recognizes unfinished
+automated work in Todo as well as Doing using its unfinished journal or saved
+Git-off automation mode.
+The existing reservation compare-and-swap still fences intervening stops. Explicit
+resume uses the same provenance to distinguish a tokenless stopped automated task
+from a planning conversation; neither path invents a new Git boundary.
+
+The supervisor and interactive stop/resume recovery regressions can also be run directly:
 
 ```bash
 cargo test --locked --bin clt supervisor::tests
+cargo test --locked --bin clt session_control::tests
 ```
 
 Coordination regressions cover both board layouts, stable references and edits,

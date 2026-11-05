@@ -722,6 +722,7 @@ pub(crate) fn tui_agent_project_for_test(id: i64, name: &str) -> TuiAgentProject
         runtime_state: TuiAgentRuntimeState::Idle,
         daemon_scan_problem: None,
         failure_problem: None,
+        supervisor_notice: None,
         activity: None,
         resolved_codex: TuiAgentResolvedCodexTarget::default(),
     }
@@ -1160,6 +1161,7 @@ fn tui_agent_project_removal_requires_confirmation_and_only_unregisters() {
             runtime_state: TuiAgentRuntimeState::Idle,
             daemon_scan_problem: None,
             failure_problem: None,
+            supervisor_notice: None,
             activity: None,
             resolved_codex: TuiAgentResolvedCodexTarget::default(),
         }],
@@ -1269,6 +1271,7 @@ fn tui_working_project_removal_fixture(protection: &str) -> TuiWorkingProjectRem
             runtime_state: TuiAgentRuntimeState::Finalizing,
             daemon_scan_problem: None,
             failure_problem: None,
+            supervisor_notice: None,
             activity: None,
             resolved_codex: TuiAgentResolvedCodexTarget::default(),
         }],
@@ -1661,6 +1664,7 @@ fn reaped_session_logs_are_latest_while_project_runtime_still_looks_active() {
                 runtime_state: TuiAgentRuntimeState::Running,
                 daemon_scan_problem: None,
                 failure_problem: None,
+                supervisor_notice: None,
                 activity: None,
                 resolved_codex: TuiAgentResolvedCodexTarget::default(),
             }],
@@ -1776,6 +1780,7 @@ fn git_recovery_without_logs_keeps_exact_completed_session_output() {
             runtime_state: TuiAgentRuntimeState::Idle,
             daemon_scan_problem: None,
             failure_problem: None,
+            supervisor_notice: None,
             activity: None,
             resolved_codex: TuiAgentResolvedCodexTarget::default(),
         }],
@@ -1892,6 +1897,7 @@ fn completed_log_is_latest_but_a_newer_attempt_of_the_same_session_is_live() {
             runtime_state: TuiAgentRuntimeState::Running,
             daemon_scan_problem: None,
             failure_problem: None,
+            supervisor_notice: None,
             activity: None,
             resolved_codex: TuiAgentResolvedCodexTarget::default(),
         }],
@@ -1995,6 +2001,7 @@ fn fenced_agent_log_view_keeps_the_orphaned_session_controllable() {
             runtime_state: TuiAgentRuntimeState::Fenced,
             daemon_scan_problem: None,
             failure_problem: None,
+            supervisor_notice: None,
             activity: None,
             resolved_codex: TuiAgentResolvedCodexTarget::default(),
         }],
@@ -2076,6 +2083,7 @@ fn completed_task_keeps_reaped_session_output_without_run_history() {
             runtime_state: TuiAgentRuntimeState::Idle,
             daemon_scan_problem: None,
             failure_problem: None,
+            supervisor_notice: None,
             activity: None,
             resolved_codex: TuiAgentResolvedCodexTarget::default(),
         }],
@@ -2401,6 +2409,7 @@ fn open_kanban_agent_log_follows_the_selected_task() {
             runtime_state: TuiAgentRuntimeState::Idle,
             daemon_scan_problem: None,
             failure_problem: None,
+            supervisor_notice: None,
             activity: None,
             resolved_codex: TuiAgentResolvedCodexTarget::default(),
         }],
@@ -2582,6 +2591,7 @@ fn open_agent_log_follows_the_highlighted_project() {
                 runtime_state: TuiAgentRuntimeState::Idle,
                 daemon_scan_problem: None,
                 failure_problem: None,
+                supervisor_notice: None,
                 activity: None,
                 resolved_codex: TuiAgentResolvedCodexTarget::default(),
             })
@@ -2681,6 +2691,7 @@ fn tui_agent_runtime_state_surfaces_failed_recovery_over_pending_finalization() 
                     false,
                     Some(finalization),
                     true,
+                    None,
                 ),
                 TuiAgentRuntimeState::Error
             );
@@ -2693,6 +2704,7 @@ fn tui_agent_runtime_state_surfaces_failed_recovery_over_pending_finalization() 
             true,
             Some(GitFinalizationState::Working),
             true,
+            None,
         ),
         TuiAgentRuntimeState::Error
     );
@@ -2703,6 +2715,7 @@ fn tui_agent_runtime_state_surfaces_failed_recovery_over_pending_finalization() 
             true,
             Some(GitFinalizationState::Working),
             false,
+            None,
         ),
         TuiAgentRuntimeState::Fenced
     );
@@ -2713,6 +2726,7 @@ fn tui_agent_runtime_state_surfaces_failed_recovery_over_pending_finalization() 
             false,
             Some(GitFinalizationState::Working),
             false,
+            None,
         ),
         TuiAgentRuntimeState::Waiting
     );
@@ -2723,6 +2737,7 @@ fn tui_agent_runtime_state_surfaces_failed_recovery_over_pending_finalization() 
             false,
             Some(GitFinalizationState::PushPending),
             false,
+            None,
         ),
         TuiAgentRuntimeState::PushPending
     );
@@ -2733,9 +2748,192 @@ fn tui_agent_runtime_state_surfaces_failed_recovery_over_pending_finalization() 
             false,
             Some(GitFinalizationState::Working),
             true,
+            None,
         ),
         TuiAgentRuntimeState::Running
     );
+}
+
+#[test]
+fn supervisor_decisions_show_actionable_status_without_error_styling() {
+    use crate::supervisor::{Decision, DecisionKind, SupervisorReview};
+
+    for (decision, expected_state) in [
+        (None, TuiAgentRuntimeState::Waiting),
+        (Some(DecisionKind::Wait), TuiAgentRuntimeState::Waiting),
+        (Some(DecisionKind::User), TuiAgentRuntimeState::NeedsInput),
+        (Some(DecisionKind::Replan), TuiAgentRuntimeState::Replan),
+        (Some(DecisionKind::Repair), TuiAgentRuntimeState::Repair),
+        (Some(DecisionKind::Retry), TuiAgentRuntimeState::RetryApproved),
+    ] {
+        let review = SupervisorReview {
+            evidence: "current evidence".into(),
+            state: "held".into(),
+            attempts: 1,
+            retries: 0,
+            decision: decision.map(|decision| Decision {
+                decision,
+                task: 1,
+                reason: "Task needs attention".into(),
+                next_action: "Restore the required database".into(),
+            }),
+            retry_session: None,
+            error: None,
+        };
+        let mut item = tui_agent_project_for_test(1, "demo");
+        item.supervisor_notice = TuiAgentSupervisorNotice::from_review(&review);
+        item.runtime_state = resolve_tui_agent_runtime_state(
+            TuiAgentRuntimeState::Idle,
+            false,
+            false,
+            Some(GitFinalizationState::Working),
+            false,
+            item.supervisor_notice.as_ref(),
+        );
+        assert_eq!(item.runtime_state, expected_state);
+        assert!(item.displayed_problem().is_none());
+
+        let mut panel = TuiAgentPanel {
+            enabled_models: Vec::new(),
+            supervisor_settings: Default::default(),
+            supervisor_selected: false,
+            projects: vec![item],
+            current_project_registration: None,
+            daemon_status: "service active".into(),
+            state: ListState::default(),
+            scroll_offset: 0,
+            last_error: None,
+        };
+        for width in [80, 200] {
+            let mut terminal =
+                Terminal::new(ratatui::backend::TestBackend::new(width, 12)).unwrap();
+            terminal
+                .draw(|frame| {
+                    render_tui_agent_panel(
+                        frame,
+                        frame.area(),
+                        &panel,
+                        Path::new("/other-project"),
+                        Color::White,
+                        Color::Cyan,
+                        "12:00",
+                    )
+                })
+                .unwrap();
+            let row = terminal
+                .backend()
+                .buffer()
+                .content
+                .chunks(usize::from(width))
+                .find(|row| {
+                    row.iter()
+                        .map(|cell| cell.symbol())
+                        .collect::<String>()
+                        .contains("demo")
+                })
+                .unwrap();
+            let row_text = row.iter().map(|cell| cell.symbol()).collect::<String>();
+            assert!(row_text.contains(expected_state.label()), "{row_text}");
+            assert!(!row_text.contains("ERROR"), "{row_text}");
+            assert!(row.iter().any(|cell| cell.fg == Color::LightYellow));
+            assert!(!row.iter().any(|cell| cell.fg == Color::LightRed));
+        }
+
+        panel.state.select(Some(0));
+        let (console, color) = tui_console_content(true, &panel, None, "instructions");
+        assert_eq!(console, review.message());
+        assert_eq!(color, Color::LightYellow);
+        if review.decision.is_some() {
+            assert!(console.contains("Next: Restore the required database"));
+        }
+    }
+}
+
+#[test]
+fn supervisor_notices_preserve_errors_and_live_session_activity() {
+    use crate::supervisor::{Decision, DecisionKind, SupervisorReview};
+
+    let mut review = SupervisorReview {
+        evidence: "current evidence".into(),
+        state: "held".into(),
+        attempts: 1,
+        retries: 0,
+        decision: Some(Decision {
+            decision: DecisionKind::Wait,
+            task: 1,
+            reason: "Database unavailable".into(),
+            next_action: "Restore the database".into(),
+        }),
+        retry_session: None,
+        error: None,
+    };
+    let mut item = tui_agent_project_for_test(1, "project");
+    item.supervisor_notice = TuiAgentSupervisorNotice::from_review(&review);
+    for (initial, interactive, expected) in [
+        (
+            TuiAgentRuntimeState::Starting,
+            false,
+            TuiAgentRuntimeState::Starting,
+        ),
+        (
+            TuiAgentRuntimeState::Running,
+            false,
+            TuiAgentRuntimeState::Running,
+        ),
+        (
+            TuiAgentRuntimeState::Resuming,
+            false,
+            TuiAgentRuntimeState::Resuming,
+        ),
+        (
+            TuiAgentRuntimeState::Reviewing,
+            false,
+            TuiAgentRuntimeState::Reviewing,
+        ),
+        (
+            TuiAgentRuntimeState::Settling,
+            false,
+            TuiAgentRuntimeState::Settling,
+        ),
+        (
+            TuiAgentRuntimeState::Stale,
+            false,
+            TuiAgentRuntimeState::Stale,
+        ),
+        (
+            TuiAgentRuntimeState::Idle,
+            true,
+            TuiAgentRuntimeState::Interactive,
+        ),
+    ] {
+        item.runtime_state = resolve_tui_agent_runtime_state(
+            initial,
+            interactive,
+            false,
+            Some(GitFinalizationState::Working),
+            false,
+            item.supervisor_notice.as_ref(),
+        );
+        assert_eq!(item.runtime_state, expected);
+        assert!(item.displayed_supervisor_notice().is_none());
+    }
+
+    item.daemon_scan_problem = Some("Task board unavailable".into());
+    item.runtime_state = resolve_tui_agent_runtime_state(
+        TuiAgentRuntimeState::Idle,
+        false,
+        false,
+        Some(GitFinalizationState::Working),
+        true,
+        item.supervisor_notice.as_ref(),
+    );
+    assert_eq!(item.runtime_state, TuiAgentRuntimeState::Error);
+    assert_eq!(item.displayed_problem(), Some("Task board unavailable"));
+    assert!(item.displayed_supervisor_notice().is_none());
+    assert_eq!(item.row_color(Color::White), Color::LightRed);
+
+    review.error = Some("Supervisor did not return a valid decision".into());
+    assert!(TuiAgentSupervisorNotice::from_review(&review).is_none());
 }
 
 #[test]
@@ -2827,6 +3025,7 @@ fn agent_project_table_surfaces_failed_run_reason_and_retry_guidance() {
         true,
         Some(GitFinalizationState::Working),
         item.failure_problem.is_some(),
+        None,
     );
 
     let codex_width = agent_codex_column_width(std::slice::from_ref(&item), false);

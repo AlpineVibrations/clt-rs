@@ -95,8 +95,18 @@ fn idle_interactive_handback_resumes_unfinished_automation_and_preserves_stops()
         "task-stopped",
         "done",
         "planning",
+        "planning-with-output",
         "queued-todo-unbound",
         "stopped-todo-unbound",
+        "idle-todo-bound",
+        "queued-todo-bound",
+        "blocked-todo-bound",
+        "stopped-todo-bound",
+        "stop-during-todo-bound",
+        "task-stopped-todo-bound",
+        "terminal-todo-bound",
+        "manual-todo-bound",
+        "todo-git-off",
         "external",
     ] {
         for stale in [false, true] {
@@ -106,11 +116,16 @@ fn idle_interactive_handback_resumes_unfinished_automation_and_preserves_stops()
             init_tasks(&project_root, false).unwrap();
             let status = match scenario {
                 "done" => TaskStatus::Done,
-                "planning" | "queued-todo-unbound" | "stopped-todo-unbound" => TaskStatus::Todo,
+                "planning" | "planning-with-output" | "todo-git-off" => TaskStatus::Todo,
+                _ if scenario.contains("-todo-") => TaskStatus::Todo,
                 _ => TaskStatus::Doing,
             };
-            let content = if scenario == "task-stopped" {
+            let content = if scenario.starts_with("task-stopped") {
                 "Unfinished task codex:session-handback clt:stopped"
+            } else if scenario == "blocked-todo-bound" {
+                "Unfinished task BLOCKED 2026-11-05: Needs input codex:session-handback"
+            } else if scenario == "manual-todo-bound" {
+                "Unfinished task clt:manual codex:session-handback"
             } else {
                 "Unfinished task codex:session-handback"
             };
@@ -120,7 +135,10 @@ fn idle_interactive_handback_resumes_unfinished_automation_and_preserves_stops()
                 .register_project_blocking(&project_root, "project")
                 .unwrap();
             let project = store.list_projects_blocking().unwrap().remove(0);
-            if !matches!(scenario, "planning" | "external") {
+            if !matches!(
+                scenario,
+                "planning" | "planning-with-output" | "external" | "todo-git-off"
+            ) {
                 if scenario.ends_with("todo-unbound") {
                     store
                         .mark_session_running_blocking(
@@ -154,9 +172,64 @@ fn idle_interactive_handback_resumes_unfinished_automation_and_preserves_stops()
                         .unwrap()
                 );
             }
+            if scenario == "planning-with-output" {
+                store
+                    .record_run_outcome_blocking(agent::AgentRunOutcome {
+                        project_id: project.id,
+                        status: "success",
+                        started_at: "100",
+                        finished_at: Some("101"),
+                        exit_code: Some(0),
+                        log_dir: None,
+                        stdout_path: Some("planning.out"),
+                        stderr_path: Some("planning.err"),
+                        summary: Some("Planning conversation finished"),
+                        codex_session_id: Some("session-handback"),
+                    })
+                    .unwrap();
+            }
+            if scenario == "terminal-todo-bound" {
+                let journal = store
+                    .git_finalization_blocking(project.id, "session-handback")
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    store
+                        .compare_and_set_git_finalization_blocking(
+                            project.id,
+                            "session-handback",
+                            journal.generation,
+                            GitFinalizationState::Cancelled,
+                            None,
+                            None,
+                            None,
+                            "101",
+                        )
+                        .unwrap()
+                );
+            }
+            if scenario == "todo-git-off" {
+                store
+                    .mark_session_running_with_git_mode_blocking(
+                        project.id,
+                        "session-handback",
+                        12345,
+                        "original-run",
+                        &root.join("run.out"),
+                        &root.join("run.err"),
+                        AgentGitMode::Off,
+                    )
+                    .unwrap();
+            }
             let has_control = matches!(
                 scenario,
-                "queued" | "stopped" | "queued-todo-unbound" | "stopped-todo-unbound"
+                "queued"
+                    | "stopped"
+                    | "queued-todo-unbound"
+                    | "stopped-todo-unbound"
+                    | "queued-todo-bound"
+                    | "stopped-todo-bound"
+                    | "todo-git-off"
             );
             if has_control {
                 store
@@ -166,7 +239,7 @@ fn idle_interactive_handback_resumes_unfinished_automation_and_preserves_stops()
                         "original-run",
                     )
                     .unwrap();
-                if matches!(scenario, "stopped" | "stopped-todo-unbound") {
+                if scenario.starts_with("stopped") {
                     store
                         .set_session_control_state_blocking(
                             project.id,
@@ -188,18 +261,49 @@ fn idle_interactive_handback_resumes_unfinished_automation_and_preserves_stops()
             let before = store
                 .git_finalization_blocking(project.id, "session-handback")
                 .unwrap();
-            let mode = super::reserve_idle_codex_session_interactive(
+            let reservation = super::reserve_idle_codex_session_interactive(
                 &store,
                 project.id,
                 "session-handback",
                 &holder,
                 has_control.then_some("original-run"),
-            )
-            .unwrap()
-            .unwrap();
+            );
+            if scenario == "manual-todo-bound" {
+                assert!(
+                    reservation
+                        .unwrap_err()
+                        .to_string()
+                        .contains("ownership changed")
+                );
+                assert!(
+                    store
+                        .session_control_blocking(project.id, "session-handback")
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(
+                    store
+                        .git_finalization_blocking(project.id, "session-handback")
+                        .unwrap(),
+                    before
+                );
+                lease.release().unwrap();
+                drop(store);
+                fs::remove_dir_all(root).unwrap();
+                continue;
+            }
+            let mode = reservation.unwrap().unwrap();
             let resume = matches!(
                 scenario,
-                "idle" | "queued" | "stop-during" | "queued-todo-unbound"
+                "idle"
+                    | "queued"
+                    | "stop-during"
+                    | "queued-todo-unbound"
+                    | "idle-todo-bound"
+                    | "queued-todo-bound"
+                    | "blocked-todo-bound"
+                    | "stop-during-todo-bound"
+                    | "todo-git-off"
             );
             assert_eq!(mode.resumes_exec(), resume, "{scenario}");
             let disposition = InteractiveGuardianDisposition::from_handoff(mode, &holder);
@@ -215,7 +319,7 @@ fn idle_interactive_handback_resumes_unfinished_automation_and_preserves_stops()
                     )
                     .unwrap()
             );
-            if scenario == "stop-during" {
+            if scenario.starts_with("stop-during") {
                 store
                     .set_session_control_state_blocking(
                         project.id,
@@ -224,7 +328,7 @@ fn idle_interactive_handback_resumes_unfinished_automation_and_preserves_stops()
                     )
                     .unwrap();
             }
-            let expected_resume = resume && scenario != "stop-during";
+            let expected_resume = resume && !scenario.starts_with("stop-during");
             if stale {
                 assert!(
                     recover_stale_interactive_guardian_with_task(
@@ -285,6 +389,137 @@ fn idle_interactive_handback_resumes_unfinished_automation_and_preserves_stops()
                 content
             );
             lease.release().unwrap();
+            drop(store);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+}
+
+#[test]
+fn explicit_resume_recognizes_automated_todo_without_a_run_token() {
+    for folders in [false, true] {
+        for contract in ["working", "git-off", "planning", "terminal"] {
+            let root = temp_root("tokenless-todo-resume");
+            let state = root.join("state");
+            let path = root.join("project");
+            init_tasks(&path, folders).unwrap();
+            let content = "Finish upload. BLOCKED 2026-11-05: Implementation complete; resume for finalization. codex:original-session";
+            insert_task(&path, TaskStatus::Todo, None, content, None).unwrap();
+            let store = agent::TursoAgentStore::open_blocking(&state).unwrap();
+            store.register_project_blocking(&path, "project").unwrap();
+            let project = store.list_projects_blocking().unwrap().remove(0);
+            if matches!(contract, "working" | "terminal") {
+                store
+                    .create_git_finalization_blocking(agent::NewGitFinalization {
+                        project_id: project.id,
+                        codex_session_id: "original-session",
+                        git_mode: AgentGitMode::Commit,
+                        starting_head: Some("1111111111111111111111111111111111111111"),
+                        branch_ref: Some("refs/heads/main"),
+                        upstream_ref: None,
+                        worktree_baseline: "{}",
+                        task_identity: durable_task_identity(content).as_deref(),
+                        owner_run_token: None,
+                        created_at: "100",
+                    })
+                    .unwrap();
+                if contract == "terminal" {
+                    let journal = store
+                        .git_finalization_blocking(project.id, "original-session")
+                        .unwrap()
+                        .unwrap();
+                    assert!(
+                        store
+                            .compare_and_set_git_finalization_blocking(
+                                project.id,
+                                "original-session",
+                                journal.generation,
+                                GitFinalizationState::Cancelled,
+                                None,
+                                None,
+                                None,
+                                "101",
+                            )
+                            .unwrap()
+                    );
+                }
+            } else if contract == "git-off" {
+                store
+                    .mark_session_running_with_git_mode_blocking(
+                        project.id,
+                        "original-session",
+                        12345,
+                        "original-run",
+                        &root.join("run.out"),
+                        &root.join("run.err"),
+                        AgentGitMode::Off,
+                    )
+                    .unwrap();
+                assert!(
+                    store
+                        .clear_running_session_control_blocking(
+                            project.id,
+                            "original-session",
+                            Some("original-run"),
+                        )
+                        .unwrap()
+                );
+            }
+            store
+                .set_session_control_state_blocking(
+                    project.id,
+                    "original-session",
+                    AgentSessionControlState::Stopped,
+                )
+                .unwrap();
+            let before = store
+                .session_control_blocking(project.id, "original-session")
+                .unwrap()
+                .unwrap();
+            assert!(before.run_token.is_none());
+            let journal = store
+                .git_finalization_blocking(project.id, "original-session")
+                .unwrap();
+            let automated = matches!(contract, "working" | "git-off");
+            if !automated {
+                let message =
+                    toggle_tui_codex_session_stop_at(&state, project.id, "original-session")
+                        .unwrap();
+                assert!(message.contains("no automated run to resume"), "{message}");
+            }
+            let board = get_tasks_dir(&path);
+            let task = read_task_entries(&board, TaskStatus::Todo)
+                .unwrap()
+                .remove(0);
+            let message =
+                toggle_tui_task_stop_at(&state, Some(project.id), &board, TaskStatus::Todo, &task)
+                    .unwrap();
+            let after = store
+                .session_control_blocking(project.id, "original-session")
+                .unwrap()
+                .unwrap();
+            if automated {
+                assert!(message.starts_with("Resuming this stopped"), "{message}");
+                assert_eq!(after.state, AgentSessionControlState::ResumeRequested);
+            } else {
+                assert!(message.starts_with("Task stopped."), "{message}");
+                assert_eq!(after, before);
+            }
+            assert!(after.run_token.is_none());
+            assert_eq!(
+                store
+                    .git_finalization_blocking(project.id, "original-session")
+                    .unwrap(),
+                journal
+            );
+            let after_task = read_task_entries(&board, TaskStatus::Todo)
+                .unwrap()
+                .remove(0);
+            if automated {
+                assert_eq!(after_task.content.trim(), content);
+            } else {
+                assert!(task_entry_is_stopped(&after_task));
+            }
             drop(store);
             fs::remove_dir_all(root).unwrap();
         }
@@ -3456,6 +3691,7 @@ fn interactive_c_busy_check_honors_persisted_session_fences_without_a_live_log()
             runtime_state: TuiAgentRuntimeState::Idle,
             daemon_scan_problem: None,
             failure_problem: None,
+            supervisor_notice: None,
             activity: None,
             resolved_codex: TuiAgentResolvedCodexTarget::default(),
         }],
@@ -3619,6 +3855,7 @@ fn writable_shared_interactive_reservation_coexists_with_another_active_session(
             runtime_state: TuiAgentRuntimeState::Interactive,
             daemon_scan_problem: None,
             failure_problem: None,
+            supervisor_notice: None,
             activity: None,
             resolved_codex: TuiAgentResolvedCodexTarget::default(),
         }],

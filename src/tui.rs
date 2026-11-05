@@ -1230,6 +1230,7 @@ pub(super) struct TuiAgentProject {
     pub(super) activity: Option<WorkerActivity>,
     pub(super) daemon_scan_problem: Option<String>,
     pub(super) failure_problem: Option<String>,
+    pub(super) supervisor_notice: Option<TuiAgentSupervisorNotice>,
     /// What Codex runs for this project when its own settings are unset.
     pub(super) resolved_codex: TuiAgentResolvedCodexTarget,
 }
@@ -1240,6 +1241,49 @@ impl TuiAgentProject {
             (self.runtime_state == TuiAgentRuntimeState::Error)
                 .then_some(self.failure_problem.as_deref())
                 .flatten()
+        })
+    }
+
+    fn displayed_supervisor_notice(&self) -> Option<&TuiAgentSupervisorNotice> {
+        self.supervisor_notice.as_ref().filter(|notice| {
+            self.displayed_problem().is_none() && self.runtime_state == notice.runtime_state
+        })
+    }
+
+    fn row_color(&self, text_color: Color) -> Color {
+        if self.displayed_problem().is_some() {
+            Color::LightRed
+        } else if self.displayed_supervisor_notice().is_some() {
+            Color::LightYellow
+        } else if self.project.enabled {
+            text_color
+        } else {
+            Color::Indexed(244)
+        }
+    }
+}
+
+pub(super) struct TuiAgentSupervisorNotice {
+    runtime_state: TuiAgentRuntimeState,
+    message: String,
+}
+
+impl TuiAgentSupervisorNotice {
+    fn from_review(review: &crate::supervisor::SupervisorReview) -> Option<Self> {
+        use crate::supervisor::DecisionKind;
+        if review.error.is_some() {
+            return None;
+        }
+        let runtime_state = match review.decision.as_ref().map(|decision| &decision.decision) {
+            Some(DecisionKind::Retry) => TuiAgentRuntimeState::RetryApproved,
+            Some(DecisionKind::Wait) | None => TuiAgentRuntimeState::Waiting,
+            Some(DecisionKind::User) => TuiAgentRuntimeState::NeedsInput,
+            Some(DecisionKind::Replan) => TuiAgentRuntimeState::Replan,
+            Some(DecisionKind::Repair) => TuiAgentRuntimeState::Repair,
+        };
+        Some(Self {
+            runtime_state,
+            message: review.message(),
         })
     }
 }
@@ -1253,6 +1297,10 @@ pub(super) enum TuiAgentRuntimeState {
     Reviewing,
     Settling,
     Waiting,
+    RetryApproved,
+    NeedsInput,
+    Replan,
+    Repair,
     Finalizing,
     PushPending,
     Interactive,
@@ -1271,6 +1319,10 @@ impl TuiAgentRuntimeState {
             Self::Reviewing => "REVIEWING",
             Self::Settling => "SETTLING",
             Self::Waiting => "WAITING",
+            Self::RetryApproved => "RETRY",
+            Self::NeedsInput => "INPUT",
+            Self::Replan => "REPLAN",
+            Self::Repair => "REPAIR",
             Self::Finalizing => "FINAL",
             Self::PushPending => "PUSH",
             Self::Interactive => "INTERACTIVE",
@@ -2845,6 +2897,7 @@ pub(super) fn load_tui_agent_panel_snapshot_inner(
     };
     let suspending_session_projects = store.suspending_session_project_ids_blocking()?;
     let failure_backoff = agent_failure_backoff()?;
+    let supervisor_settings = store.supervisor_settings_blocking()?;
     let mut interactive_session_projects = HashSet::new();
     for project_id in &suspending_session_projects {
         if store
@@ -2880,14 +2933,18 @@ pub(super) fn load_tui_agent_panel_snapshot_inner(
                     || pending_git_finalizations.contains_key(&project.id)
                     || run.summary.as_deref().is_some_and(failure_has_git_recovery)
             });
-            let failure_problem = store
-                .supervisor_review_blocking(project.id)?
-                .filter(|_| {
-                    store
-                        .supervisor_settings_blocking()
-                        .is_ok_and(|settings| settings.enabled)
-                })
-                .map(|review| review.message())
+            let supervisor_review = if supervisor_settings.enabled {
+                store.supervisor_review_blocking(project.id)?
+            } else {
+                None
+            };
+            let supervisor_notice = supervisor_review
+                .as_ref()
+                .and_then(TuiAgentSupervisorNotice::from_review);
+            let failure_problem = supervisor_review
+                .as_ref()
+                .filter(|review| review.error.is_some())
+                .map(crate::supervisor::SupervisorReview::message)
                 .or_else(|| {
                     tui_agent_failure_problem(&project, relevant_failure, now, failure_backoff)
                 });
@@ -2910,6 +2967,7 @@ pub(super) fn load_tui_agent_panel_snapshot_inner(
                 suspending_session_projects.contains(&project.id),
                 pending_git_finalizations.get(&project.id).copied(),
                 daemon_scan_problem.is_some() || failure_problem.is_some(),
+                supervisor_notice.as_ref(),
             );
             let resolved_codex = resolve_tui_agent_codex_target(&store, &project)?;
             Ok(TuiAgentProject {
@@ -2919,6 +2977,7 @@ pub(super) fn load_tui_agent_panel_snapshot_inner(
                 activity,
                 daemon_scan_problem,
                 failure_problem,
+                supervisor_notice,
                 resolved_codex,
             })
         })
@@ -2926,7 +2985,7 @@ pub(super) fn load_tui_agent_panel_snapshot_inner(
 
     Ok(TuiAgentPanelSnapshot {
         enabled_models: store.list_enabled_model_targets_blocking()?,
-        supervisor_settings: store.supervisor_settings_blocking()?,
+        supervisor_settings,
         projects,
         daemon_status,
     })
@@ -2963,6 +3022,7 @@ pub(super) fn resolve_tui_agent_runtime_state(
     has_suspending_session: bool,
     pending_git_finalization: Option<GitFinalizationState>,
     has_problem: bool,
+    supervisor_notice: Option<&TuiAgentSupervisorNotice>,
 ) -> TuiAgentRuntimeState {
     if matches!(
         runtime_state,
@@ -2980,6 +3040,13 @@ pub(super) fn resolve_tui_agent_runtime_state(
     ) && has_problem
     {
         return TuiAgentRuntimeState::Error;
+    }
+    if matches!(
+        runtime_state,
+        TuiAgentRuntimeState::Idle | TuiAgentRuntimeState::Fenced
+    ) && let Some(notice) = supervisor_notice
+    {
+        return notice.runtime_state;
     }
     if matches!(
         runtime_state,
@@ -4282,6 +4349,10 @@ pub(super) fn format_agent_project_table_row(
     let last_run = format_agent_table_last_run(&item.project);
     let path_or_error = item
         .displayed_problem()
+        .or_else(|| {
+            item.displayed_supervisor_notice()
+                .map(|notice| notice.message.as_str())
+        })
         .and_then(|problem| problem.lines().next())
         .or_else(|| {
             item.activity
@@ -4658,13 +4729,7 @@ pub(super) fn render_tui_agent_panel(
                         codex_width,
                         item.project.path == active_root,
                     ),
-                    if item.displayed_problem().is_some() {
-                        Style::default().fg(Color::LightRed)
-                    } else if item.project.enabled {
-                        Style::default().fg(text_color)
-                    } else {
-                        Style::default().fg(Color::Indexed(244))
-                    },
+                    Style::default().fg(item.row_color(text_color)),
                 )
             }
         } else {
@@ -4679,13 +4744,7 @@ pub(super) fn render_tui_agent_panel(
                     codex_width,
                     item.project.path == active_root,
                 ),
-                if item.displayed_problem().is_some() {
-                    Style::default().fg(Color::LightRed)
-                } else if item.project.enabled {
-                    Style::default().fg(text_color)
-                } else {
-                    Style::default().fg(Color::Indexed(244))
-                },
+                Style::default().fg(item.row_color(text_color)),
             )
         };
         let style = if Some(idx) == selected_idx {
@@ -5149,6 +5208,13 @@ pub(super) fn tui_console_content<'a>(
             .and_then(TuiAgentProject::displayed_problem)
     {
         return (problem, Color::LightRed);
+    }
+    if agent_pane
+        && let Some(notice) = panel
+            .selected_project()
+            .and_then(TuiAgentProject::displayed_supervisor_notice)
+    {
+        return (&notice.message, Color::LightYellow);
     }
     if agent_pane
         && (feedback.is_empty()

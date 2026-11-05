@@ -1646,7 +1646,8 @@ pub(super) fn toggle_tui_task_stop_at(
                 && control.run_token.is_none()
                 && control.child_pid.is_none()
                 && control.interactive_holder.is_none()
-                && control.interactive_launch_token.is_none();
+                && control.interactive_launch_token.is_none()
+                && !session_has_unfinished_automated_contract(&store, project_id, &session_id)?;
             if !idle_planning {
                 return toggle_tui_codex_session_stop_at(state_dir, project_id, &session_id);
             }
@@ -1664,6 +1665,25 @@ pub(super) fn toggle_tui_task_stop_at(
 pub(super) fn toggle_tui_codex_session_stop(project_id: i64, session_id: &str) -> Result<String> {
     let state_dir = ensure_agent_state_dir()?;
     toggle_tui_codex_session_stop_at(&state_dir, project_id, session_id)
+}
+
+fn session_has_unfinished_automated_contract(
+    store: &agent::TursoAgentStore,
+    project_id: i64,
+    session_id: &str,
+) -> Result<bool> {
+    // Older idle interactive visits could clear the run token of returned
+    // automated Todo work. The durable contract still distinguishes it from
+    // a planning-only conversation, including at the task-board control seam.
+    Ok(
+        match store.git_finalization_blocking(project_id, session_id)? {
+            Some(journal) => !journal.state.is_terminal(),
+            None => {
+                store.session_git_mode_blocking(project_id, session_id)?
+                    == Some(agent::AgentGitMode::Off)
+            }
+        },
+    )
 }
 
 pub(super) fn toggle_tui_codex_session_stop_at(
@@ -1715,6 +1735,7 @@ pub(super) fn toggle_tui_codex_session_stop_at(
                     .find(|project| project.id == project_id)
                 && task_status_for_codex_session(&project.path, session_id)?
                     == Some(TaskStatus::Todo)
+                && !session_has_unfinished_automated_contract(&store, project_id, session_id)?
             {
                 return Ok("This planning session has no automated run to resume; press c to continue the conversation. Todo automation can start the task normally.".to_string());
             }
@@ -1977,20 +1998,22 @@ fn reserve_idle_codex_session_interactive(
         if !task_entry_is_stopped(task)
             && !crate::task::task_content_is_interactive_done(&task.content));
     let journal = store.git_finalization_blocking(project_id, session_id)?;
-    // A failed activation can leave a queued, unbound Git attempt linked in
-    // Todo. An interactive visit must not turn that queued recovery into an
-    // explicit stop merely because the task has not reached Doing yet.
-    let queued_unbound_recovery = matches!(tasks.as_slice(), [(TaskStatus::Todo, task)]
+    let session_git_mode = store.session_git_mode_blocking(project_id, session_id)?;
+    // Blocked automated work returns to Todo with its original Git contract.
+    // Opening that conversation to resolve its blocker must retain automatic
+    // handback, just as Doing does. A planning conversation has no such contract.
+    // Keep the narrower queued-owner proof for an unbound activation failure.
+    let queued_automation = matches!(tasks.as_slice(), [(TaskStatus::Todo, task)]
         if !task_entry_is_stopped(task))
-        && control
-            .as_ref()
-            .is_some_and(|control| control.state == AgentSessionControlState::ResumeRequested)
-        && journal.as_ref().is_some_and(|journal| {
+        && (journal.as_ref().is_some_and(|journal| {
             journal.state == agent::GitFinalizationState::Working
-                && journal.task_identity.is_none()
-                && journal.owner_run_token.is_some()
-        });
-    let resumes_exec = (unfinished || queued_unbound_recovery)
+                && (journal.task_identity.is_some()
+                    || journal.owner_run_token.is_some()
+                        && control.as_ref().is_some_and(|control| {
+                            control.state == AgentSessionControlState::ResumeRequested
+                        }))
+        }) || journal.is_none() && session_git_mode == Some(agent::AgentGitMode::Off));
+    let resumes_exec = (unfinished || queued_automation)
         && control
             .as_ref()
             .is_none_or(|control| control.state == AgentSessionControlState::ResumeRequested)
@@ -1998,9 +2021,7 @@ fn reserve_idle_codex_session_interactive(
             .as_ref()
             .is_none_or(|journal| !journal.state.is_terminal())
         && (journal.is_some()
-            || store
-                .session_git_mode_blocking(project_id, session_id)?
-                .is_some()
+            || session_git_mode.is_some()
             || store
                 .latest_output_run_for_codex_session_blocking(project_id, session_id)?
                 .is_some());
