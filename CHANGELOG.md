@@ -6,6 +6,14 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+## [0.9.12] - 2026-11-06
+
+### Fixed
+
+- Retire abandoned idle resume requests before supervisor and Git recovery
+  checks, so a closed conversation cannot leave a project `FENCED` or prevent
+  ready Todo work. Preserve session history, unfinished journals and active owners.
+
 ## [0.9.11] - 2026-11-05
 
 ### Fixed

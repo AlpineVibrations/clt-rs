@@ -147,6 +147,15 @@ used Turso dependency. Application modules import its local API through
 
 ## Tests
 
+Idle resume reconciliation runs before supervisor gating and Git finalization
+lease acquisition. Under the board lock it proves either one Done task or no
+linked task across the nested board. The repository retires only the observed
+control generation, with no child, interactive owner, active worker, live lease,
+launch boundary or unfinished Git journal; missing required Git proof remains
+fenced. A stopped control retains its session and log history. Regressions cover
+an abandoned Git-off conversation alongside a blocked WORKING journal and ready
+Todo work, both board layouts, ownership races and unchanged concurrent edits.
+
 `application::activity` resolves worker activity using the exact worker token,
 registered session and task marker, including nested boards. It never selects a
 task from queue position alone. TUI refresh snapshots and CLI status share this

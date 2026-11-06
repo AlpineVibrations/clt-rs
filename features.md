@@ -229,6 +229,13 @@ continue its conversation, or move the task to Todo to queue further work.
 Active owners and provisional Done entries awaiting commit or push proof keep
 their reservations until that work finishes.
 
+The scheduler also retires an idle resume request whose task link no longer
+exists, before checking supervisor and Git recovery reservations. It verifies
+the whole board, including nested tasks, and requires no active owner, pending
+launch or unfinished Git contract. The stopped control keeps its session and log
+history. Other blocked Todo tasks keep their placement and Git journals while
+ready work proceeds.
+
 ### Per-task thinking levels
 
 Add `/think <level>` anywhere in a task's text, including its detail paragraphs,

@@ -61,14 +61,17 @@ fn scheduler_retires_completed_resume_and_starts_next_todo() {
 }
 
 #[test]
-fn completed_resume_cleanup_requires_one_done_task_including_nested_boards() {
-    for scenario in ["nested-done", "doing", "duplicate", "missing"] {
+fn idle_resume_cleanup_checks_links_including_nested_boards() {
+    for scenario in ["nested-done", "doing", "todo", "duplicate", "missing"] {
         let root = temp_root("completed-resume-task-proof");
         init_tasks(&root, true).unwrap();
         let epic = root.join("tasks/doing/0001-epic");
         fs::create_dir_all(&epic).unwrap();
         fs::write(epic.join("task.md"), "Parent epic.").unwrap();
-        let status = if scenario == "doing" { "doing" } else { "done" };
+        let status = match scenario {
+            "doing" | "todo" => scenario,
+            _ => "done",
+        };
         let content = if scenario == "missing" {
             ""
         } else {
@@ -94,14 +97,18 @@ fn completed_resume_cleanup_requires_one_done_task_including_nested_boards() {
         let before = store
             .session_control_blocking(id, "session-completed")
             .unwrap();
-        let retired = super::retire_completed_resume_request(
+        let retired = super::retire_idle_resume_request(
             &store,
             id,
             "session-completed",
             agent_timestamp_seconds(),
         )
         .unwrap();
-        assert_eq!(retired, scenario == "nested-done", "{scenario}");
+        assert_eq!(
+            retired,
+            matches!(scenario, "nested-done" | "missing"),
+            "{scenario}"
+        );
         if !retired {
             assert_eq!(
                 store

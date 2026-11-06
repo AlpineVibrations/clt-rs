@@ -234,7 +234,7 @@ fn completed_resume_retirement_preserves_history_and_rechecks_ownership_and_git(
         let before = current_control(&store, &expected);
         let journal_before = store.git_finalization_blocking(id, session).unwrap();
         let retired = store
-            .retire_completed_resume_request_blocking(&expected, 200)
+            .retire_idle_resume_request_blocking(&expected, 200)
             .unwrap();
         assert_eq!(
             retired,
@@ -249,7 +249,7 @@ fn completed_resume_retirement_preserves_history_and_rechecks_ownership_and_git(
             assert_eq!(after.stderr_path, before.stderr_path);
             assert!(
                 !store
-                    .retire_completed_resume_request_blocking(&expected, 201)
+                    .retire_idle_resume_request_blocking(&expected, 201)
                     .unwrap()
             );
         } else {

@@ -161,7 +161,9 @@ pub(super) fn restore_completed_task_for_guardian(
     Ok(())
 }
 
-pub(crate) fn retire_completed_resume_request(
+/// Retire requests that cannot select unfinished work. This runs before
+/// supervisor and Git lease acquisition, so an orphan cannot fence recovery.
+pub(crate) fn retire_idle_resume_request(
     store: &TursoAgentStore,
     project_id: i64,
     session: &str,
@@ -190,15 +192,18 @@ pub(crate) fn retire_completed_resume_request(
     }
     let mut tasks = Vec::new();
     collect_linked_tasks(&board, Some(session), &mut tasks)?;
-    if tasks.len() != 1 || tasks[0].1 != TaskStatus::Done {
-        return Ok(false);
-    }
-    // A Done entry can still be provisional. Recheck Git state and ownership
-    // atomically with the exact request while the board remains locked.
-    let retired = store.retire_completed_resume_request_blocking(&control, now)?;
+    let reason = match tasks.as_slice() {
+        [] => "task_marker_missing",
+        [(_, TaskStatus::Done, _, _)] => "task_done",
+        _ => return Ok(false),
+    };
+    // A missing or Done task can still have an unfinished Git contract.
+    // Recheck it and ownership atomically against the observed request while
+    // the board remains locked. Keep the stopped control and its log history.
+    let retired = store.retire_idle_resume_request_blocking(&control, now)?;
     if retired {
         eprintln!(
-            "Project {project_id}: action=completed_session_resume_retired session={session} reason=task_done"
+            "Project {project_id}: action=idle_session_resume_retired session={session} reason={reason}"
         );
     }
     Ok(retired)

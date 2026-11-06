@@ -883,6 +883,36 @@ fn supervisor_wait_defers_work_and_runs_ready_prerequisite_with_journal_preserve
         );
         // Several scans must not repair the waiting task back into Doing or
         // let its saved Git resume request steal the next ready task's slot.
+        // A closed Git-off conversation lost its board link, but its resume
+        // control survived. Retire it before the other session's Git lease.
+        store
+            .mark_session_running_with_git_mode_blocking(
+                project.id,
+                "abandoned-conversation",
+                12345,
+                "old-run",
+                &root.join("old.out"),
+                &root.join("old.err"),
+                AgentGitMode::Off,
+            )
+            .unwrap();
+        store
+            .set_session_control_recovery_token_blocking(
+                project.id,
+                "abandoned-conversation",
+                "old-run",
+            )
+            .unwrap();
+        let todo_contents = || {
+            board
+                .entries(TaskStatus::Todo)
+                .unwrap()
+                .into_iter()
+                .map(|task| task.content)
+                .collect::<Vec<_>>()
+        };
+        let todo_before = todo_contents();
+        fs::write(path.join("concurrent.txt"), "uncommitted user work\n").unwrap();
         for _ in 0..2 {
             let pass = run_agent_scheduler_pass(&state, false, &[]).unwrap();
             assert_eq!(pass.jobs.len(), 1);
@@ -892,6 +922,17 @@ fn supervisor_wait_defers_work_and_runs_ready_prerequisite_with_journal_preserve
                 .release_lease_blocking(project.id, &pass.jobs[0].holder)
                 .unwrap();
             assert!(board.entries(TaskStatus::Doing).unwrap().is_empty());
+            assert_eq!(todo_contents(), todo_before);
+            assert_eq!(
+                fs::read_to_string(path.join("concurrent.txt")).unwrap(),
+                "uncommitted user work\n"
+            );
+            let retired = store
+                .session_control_blocking(project.id, "abandoned-conversation")
+                .unwrap()
+                .unwrap();
+            assert_eq!(retired.state, AgentSessionControlState::Stopped);
+            assert_eq!(retired.run_token.as_deref(), Some("old-run"));
             assert_eq!(
                 store
                     .git_finalization_blocking(project.id, "downstream")

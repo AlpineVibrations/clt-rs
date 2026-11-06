@@ -2635,10 +2635,11 @@ impl TursoAgentStore {
             })
     }
 
-    /// The caller holds the board lock and has proved one linked task in Done.
+    /// The caller holds the board lock and proved either one task in Done or
+    /// no task linked to this session anywhere in an available board.
     /// Keep its history, and retire only the observed idle request with no
     /// unfinished Git contract or concurrent project owner.
-    pub(crate) fn retire_completed_resume_request_blocking(
+    pub(crate) fn retire_idle_resume_request_blocking(
         &self,
         expected: &AgentSessionControlRecord,
         now: u64,
@@ -2685,13 +2686,16 @@ impl TursoAgentStore {
                     now.to_string(),
                 ],
             ).await.with_context(|| {
-                format!("Failed to retire completed task resume request for Codex session {}", expected.codex_session_id)
+                format!("Failed to retire idle resume request for Codex session {}", expected.codex_session_id)
             })?;
             Ok(changed == 1)
         })
     }
 
-    pub(crate) fn clear_orphaned_resume_requested_session_blocking(
+    /// Simulate a missing control alongside an existing activation journal.
+    /// Production reconciliation must use the guarded idle retirement above.
+    #[cfg(test)]
+    pub(crate) fn remove_idle_session_control_for_test(
         &self,
         project_id: i64,
         codex_session_id: &str,

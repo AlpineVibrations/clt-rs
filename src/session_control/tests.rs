@@ -1925,7 +1925,7 @@ fn interrupt_handoff_atomically_transfers_lease_then_schedules_exact_resume() {
 }
 
 #[test]
-fn scheduler_clears_orphaned_resume_session_and_runs_next_todo() {
+fn scheduler_retires_orphaned_resume_session_and_runs_next_todo() {
     let root = temp_root("scheduler-orphaned-resume-session");
     let state_dir = root.join("state/clt");
     let project_root = root.join("project");
@@ -1956,11 +1956,13 @@ fn scheduler_clears_orphaned_resume_session_and_runs_next_todo() {
     );
     assert!(scheduled.jobs[0].resume_session_id.is_none());
     let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
-    assert!(
+    assert_eq!(
         store
             .session_control_blocking(project_id, "session-without-task-marker")
             .unwrap()
-            .is_none()
+            .unwrap()
+            .state,
+        AgentSessionControlState::Stopped
     );
     assert!(
         store

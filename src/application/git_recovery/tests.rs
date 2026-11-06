@@ -1766,7 +1766,7 @@ fn scheduler_recovers_a_blocked_missing_todo_with_unchanged_head() {
                 if missing_control {
                     assert!(
                         store
-                            .clear_orphaned_resume_requested_session_blocking(
+                            .remove_idle_session_control_for_test(
                                 project.id,
                                 SESSION,
                                 u64::MAX,
@@ -2110,7 +2110,7 @@ fn scheduler_repairs_stale_unbound_activation_before_saved_supervisor_hold() {
             if missing_control {
                 assert!(
                     store
-                        .clear_orphaned_resume_requested_session_blocking(
+                        .remove_idle_session_control_for_test(
                             project.id,
                             SESSION,
                             u64::MAX

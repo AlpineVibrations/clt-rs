@@ -884,7 +884,7 @@ pub(super) fn run_agent_session_resume_worker(project_id: i64, session_id: &str)
             Some(_) | None => return Ok(()),
         }
 
-        if completed::retire_completed_resume_request(
+        if completed::retire_idle_resume_request(
             &store,
             project_id,
             session_id,

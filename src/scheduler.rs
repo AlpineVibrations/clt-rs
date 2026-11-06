@@ -51,7 +51,7 @@ use crate::{
         agent_timestamp_seconds, format_agent_timestamp,
     },
     session_control::{
-        InteractiveGuardianDisposition, completed::retire_completed_resume_request,
+        InteractiveGuardianDisposition, completed::retire_idle_resume_request,
         recover_stale_interactive_guardian_with_task, restore_idle_completed_interactive_tasks,
     },
     session_recovery::{ensure_orphaned_session_supervision, recovered_supervisor_pid},
@@ -1703,14 +1703,15 @@ pub(super) fn reconcile_stale_agent_session_controls(
     });
 
     // Retry legacy board cleanup even when its idle control was already removed
-    // or mistakenly queued for automated recovery.
+    // or mistakenly queued for automated recovery. Retire task-less requests
+    // here too, before they can fence supervisor or Git lease acquisition.
     with_agent_store_at(state_dir, |store| {
         restore_idle_completed_interactive_tasks(store, project_id)
     })?;
     for control in controls {
         if control.state == AgentSessionControlState::ResumeRequested
             && with_agent_store_at(state_dir, |store| {
-                retire_completed_resume_request(store, project_id, &control.codex_session_id, now)
+                retire_idle_resume_request(store, project_id, &control.codex_session_id, now)
             })?
         {
             continue;
@@ -2052,7 +2053,7 @@ pub(super) fn resumable_codex_session_for_project(
         }
         let session_id = control.codex_session_id;
         if with_agent_store_at(state_dir, |store| {
-            retire_completed_resume_request(store, project.id, &session_id, now)
+            retire_idle_resume_request(store, project.id, &session_id, now)
         })? {
             continue;
         }
@@ -2100,21 +2101,9 @@ pub(super) fn resumable_codex_session_for_project(
             return Ok(Some(session_id));
         }
 
-        let cleared = with_agent_store_at(state_dir, |store| {
-            store.clear_orphaned_resume_requested_session_blocking(project.id, &session_id, now)
-        })?;
-        if !cleared {
-            // Another scheduler or worker may have claimed the project after this
-            // pass took its initial snapshot. Keep the session fenced and let the
-            // normal lease checks settle that race instead of deleting live state.
-            return Ok(Some(session_id));
-        }
-        eprintln!(
-            "Project {}: action=orphaned_session_cleared session={} reason=task_marker_missing path={}",
-            project.name,
-            session_id,
-            project.path.display()
-        );
+        // Idle retirement above could not prove this orphan safe: a concurrent
+        // owner or missing Git proof still requires the existing fence.
+        return Ok(Some(session_id));
     }
     Ok(None)
 }
