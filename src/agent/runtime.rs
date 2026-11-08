@@ -97,7 +97,28 @@ impl AgentStoreBlockingAdapter {
     }
 
     pub(super) fn block_on_persist<T>(&self, future: impl Future<Output = Result<T>>) -> Result<T> {
-        let _writer = recovery::write_lock(&self.state_dir)?;
+        let writer = recovery::write_lock(&self.state_dir)?;
+        self.persist_with_writer(writer, future)
+    }
+
+    /// A busy writer has not polled the mutation or started a dirty interval.
+    /// Callers can retry later without blocking process supervision on the lock.
+    pub(super) fn try_block_on_persist<T>(
+        &self,
+        future: impl Future<Output = Result<T>>,
+    ) -> Result<Option<T>> {
+        recovery::check_required(&self.state_dir)?;
+        let Some(writer) = recovery::try_write_lock(&self.state_dir)? else {
+            return Ok(None);
+        };
+        self.persist_with_writer(writer, future).map(Some)
+    }
+
+    fn persist_with_writer<T>(
+        &self,
+        _writer: recovery::RegistryWriteLock,
+        future: impl Future<Output = Result<T>>,
+    ) -> Result<T> {
         recovery::check_clean(&self.state_dir)?;
         if let Some(db) = &self.database {
             self.block_on_recovery(recovery::checkpoint_live_registry(db, &self.state_dir))?;

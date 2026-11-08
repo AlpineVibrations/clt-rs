@@ -6,6 +6,16 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+## [0.9.14] - 2026-11-08
+
+### Fixed
+
+- Keep interactive Codex sessions running through temporary registry writer
+  contention, including during service restarts. Retry lease renewal within the
+  confirmed reservation and retain the cause if renewal fails permanently.
+- Recover failed registry snapshot-file publication after space or permissions
+  are restored without closing live sessions, after verifying the original database.
+
 ## [0.9.13] - 2026-11-08
 
 ### Fixed

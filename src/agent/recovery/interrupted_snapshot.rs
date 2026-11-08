@@ -1,4 +1,4 @@
-//! Refresh only the external snapshot after a writer exited between commit and export.
+//! Refresh only the external snapshot after an interrupted export or publication failure.
 //! Unlike coordination/index repair, this keeps the live database and its readers intact.
 use std::{fs, path::Path};
 
@@ -13,22 +13,34 @@ use super::{
 use crate::agent::{AGENT_DB_FILE, open_checkpoint_pin, runtime::AgentStoreBlockingAdapter};
 use clt_database::turso::Builder;
 
-fn eligible(state_dir: &Path) -> bool {
-    state_dir.join(DIRTY_FILE).is_file()
-        && !state_dir.join("recovery-in-progress.json").exists()
-        && fs::read(state_dir.join(REQUIRED_FILE)).ok().as_deref()
-            == Some(INTERRUPTED_UPDATE_REASON.as_bytes())
+fn eligible_reason(state_dir: &Path) -> Option<Vec<u8>> {
+    if !state_dir.join(DIRTY_FILE).is_file() || state_dir.join("recovery-in-progress.json").exists()
+    {
+        return None;
+    }
+    let reason = fs::read(state_dir.join(REQUIRED_FILE)).ok()?;
+    // atomic_write adds this context only after the database export succeeded.
+    // Disk-full and permission failures publishing this exact external file do
+    // not imply damaged database handles. Database/query failures still require
+    // exclusive recovery, and verification below must pass before publication.
+    let publication_failure = format!(
+        "External registry snapshot failed: Failed to durably publish {}: ",
+        state_dir.join(SNAPSHOT_FILE).display()
+    );
+    (reason == INTERRUPTED_UPDATE_REASON.as_bytes()
+        || reason.starts_with(publication_failure.as_bytes()))
+    .then_some(reason)
 }
 
 pub(super) fn try_repair(state_dir: &Path) -> Result<bool> {
-    if !eligible(state_dir) {
+    if eligible_reason(state_dir).is_none() {
         return Ok(false);
     }
     let _access = RegistryAccess::shared(state_dir)?;
     let _writer = write_lock(state_dir)?;
-    if !eligible(state_dir) {
+    let Some(reason) = eligible_reason(state_dir) else {
         return Ok(false);
-    }
+    };
     anyhow::ensure!(
         read_snapshot(state_dir)?.is_some(),
         "Registry snapshot is missing"
@@ -55,16 +67,20 @@ pub(super) fn try_repair(state_dir: &Path) -> Result<bool> {
         Ok(snapshot)
     })?;
 
-    publish_verified_snapshot(state_dir, &snapshot)?;
+    publish_verified_snapshot(state_dir, &snapshot, &reason)?;
     Ok(true)
 }
 
-fn publish_verified_snapshot(state_dir: &Path, snapshot: &Json) -> Result<()> {
+fn publish_verified_snapshot(
+    state_dir: &Path,
+    snapshot: &Json,
+    expected_reason: &[u8],
+) -> Result<()> {
     // A concurrent reader may have discovered an actual storage failure. Its
     // marker must win over this snapshot-only repair, including during teardown.
     let _marker = marker_lock(state_dir)?;
     anyhow::ensure!(
-        eligible(state_dir),
+        eligible_reason(state_dir).as_deref() == Some(expected_reason),
         "Registry recovery reason changed during snapshot verification"
     );
     atomic_write(

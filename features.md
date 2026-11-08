@@ -827,9 +827,24 @@ If the registry is unavailable, project registration cannot be determined. The T
 
 Registry opens (including TUI refreshes and scheduler heartbeats) check database integrity at most once per minute. Readable but damaged indexes trigger recovery instead of leaving stale worker, failure, or heartbeat rows in circulation. A busy database is retried without being classified as corruption.
 
+Interactive Codex guardians retry lease renewal when another CLT process holds
+the registry writer lock, including during a service restart after an update.
+Temporary contention does not terminate Codex or write warnings over its screen.
+The guardian continues watching the child and parent window between attempts.
+Retries cannot extend the last confirmed lease: expiry, loss of ownership, or a
+database recovery error still stops the child and preserves the failure reason.
+New guardian behavior takes effect when an interactive session is reopened with
+the updated CLT executable; already-running guardians keep their original code.
+
 Idle registry clients preserve commits made by other processes when opening new connections. A local WAL scan is used for initial reconciliation only, preventing an older client from restoring stale leases or settings after another client updates them. Recognized Turso index-page panics preserve their original cause in the recovery marker and stop further database operations.
 
 If a process exits between a database update and its snapshot export, the next registry open first verifies the original database and refreshes the snapshot from committed rows under the writer lock. Other workers and CLT windows can stay open. This repair retains newer settings, session ownership and Git journals, and leaves the database, WAL and coordination files in place. It does not replay the interrupted operation. A new storage-failure marker or an unfinished exclusive repair prevents this shortcut; failed verification or snapshot publication retains recovery evidence.
+
+The same verified snapshot refresh handles failures writing `registry.json`,
+such as a full disk, once space or file access is restored. An already-open
+session can remain open. Errors reading the database still require the normal
+storage-recovery path, and a changed recovery reason prevents snapshot repair
+from clearing newer failure evidence.
 
 For coordination or index damage, CLT automatically repairs coordination files when it can acquire exclusive database access and prove that recorded workers and session processes have exited. If integrity errors identify only worker indexes, it rebuilds those indexes from the existing table rows and verifies full database integrity and foreign keys. This preserves run history, settings, and Git journals. The original DB/WAL bundle is quarantined before repair. Automatic repair never stops another process or rebuilds the database from a snapshot; while a live worker or client holds the registry, it waits for that owner to exit. An unfinished repair resumes automatically from its saved original DB/WAL quarantine under the same exclusive-access and process checks. Retries reuse that backup, preserve any interrupted-update evidence, and never reconstruct from a stale snapshot. An original database that cannot pass the supported integrity repair still requires explicit recovery. Close other CLT TUIs and foreground sessions, then run:
 

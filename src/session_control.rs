@@ -56,8 +56,11 @@ use crate::{
 };
 
 pub(super) mod completed;
+mod guardian_lease;
 pub(super) mod planning;
 pub(crate) mod steering;
+
+use guardian_lease::InteractiveGuardianLease;
 
 #[cfg(all(unix, test))]
 use crate::application::TEST_INTERACTIVE_EXEC_GATE_ENV;
@@ -1030,7 +1033,13 @@ pub(super) fn run_agent_interactive_session_worker(
         &guardian_holder,
         lease_timeout,
         disposition,
-    )?;
+    )
+    .with_context(|| match interaction_failure.as_ref() {
+        Some(error) => format!(
+            "Interactive Codex session {session_id} failed: {error:#}; guardian finalization also failed"
+        ),
+        None => format!("Failed to finalize interactive Codex session {session_id}"),
+    })?;
     if resume_exec {
         spawn_agent_session_resume_worker(&project.path, project_id, session_id)?;
     }
@@ -1218,6 +1227,9 @@ pub(super) fn run_guarded_interactive_codex(
         }
     };
     let child_pid = child.id();
+    let lease_renewal = disposition
+        .holds_project_lease()
+        .then(|| InteractiveGuardianLease::new(lease_timeout));
     let registered = store.register_interactive_guardian_child_blocking(
         project.id,
         session_id,
@@ -1294,17 +1306,44 @@ pub(super) fn run_guarded_interactive_codex(
         return Err(error);
     }
 
-    let renew_interval = agent_lease_renew_interval(lease_timeout);
-    let mut last_renewal = Instant::now();
+    let interaction_result = wait_for_interactive_codex(
+        &mut child,
+        store,
+        project.id,
+        guardian_holder,
+        lease_timeout,
+        lease_renewal,
+        parent_connected,
+    );
 
-    let interaction_result = loop {
+    restore_interactive_terminal_before_handoff(
+        &mut terminal_foreground,
+        store,
+        project.id,
+        guardian_holder,
+        lease_timeout,
+        parent_connected,
+    );
+    interaction_result
+}
+
+fn wait_for_interactive_codex(
+    child: &mut Child,
+    store: &agent::TursoAgentStore,
+    project_id: i64,
+    guardian_holder: &str,
+    lease_timeout: Duration,
+    mut lease_renewal: Option<InteractiveGuardianLease>,
+    parent_connected: &AtomicBool,
+) -> Result<Option<ExitStatus>> {
+    loop {
         #[cfg(unix)]
-        match interactive_child_exited_without_reaping(&child) {
+        match interactive_child_exited_without_reaping(child) {
             Ok(true) => {
                 let status = stop_interactive_child_until_reaped(
-                    &mut child,
+                    child,
                     store,
-                    project.id,
+                    project_id,
                     guardian_holder,
                     lease_timeout,
                     "the interactive Codex leader exited",
@@ -1315,9 +1354,9 @@ pub(super) fn run_guarded_interactive_codex(
             Err(error) => {
                 eprintln!("Interactive Codex polling failed: {error:#}");
                 let status = stop_interactive_child_until_reaped(
-                    &mut child,
+                    child,
                     store,
-                    project.id,
+                    project_id,
                     guardian_holder,
                     lease_timeout,
                     "polling the interactive Codex child failed",
@@ -1334,9 +1373,9 @@ pub(super) fn run_guarded_interactive_codex(
             Err(error) => {
                 eprintln!("Interactive Codex polling failed: {error}");
                 let status = stop_interactive_child_until_reaped(
-                    &mut child,
+                    child,
                     store,
-                    project.id,
+                    project_id,
                     guardian_holder,
                     lease_timeout,
                     "polling the interactive Codex child failed",
@@ -1346,57 +1385,30 @@ pub(super) fn run_guarded_interactive_codex(
         }
         if !parent_connected.load(Ordering::SeqCst) {
             let status = stop_interactive_child_until_reaped(
-                &mut child,
+                child,
                 store,
-                project.id,
+                project_id,
                 guardian_holder,
                 lease_timeout,
                 "the CLT parent disconnected",
             );
             break Ok(status);
         }
-        if disposition.holds_project_lease() && last_renewal.elapsed() >= renew_interval {
-            let expires_at = agent_timestamp_after(lease_timeout.as_secs().max(60));
-            match store.renew_lease_blocking(project.id, guardian_holder, &expires_at) {
-                Ok(true) => last_renewal = Instant::now(),
-                Ok(false) => {
-                    eprintln!("Interactive guardian no longer holds its project lease");
-                    let status = stop_interactive_child_until_reaped(
-                        &mut child,
-                        store,
-                        project.id,
-                        guardian_holder,
-                        lease_timeout,
-                        "the interactive guardian lost its project lease",
-                    );
-                    break Ok(status);
-                }
-                Err(error) => {
-                    eprintln!("Failed to renew interactive guardian lease: {error:#}");
-                    let status = stop_interactive_child_until_reaped(
-                        &mut child,
-                        store,
-                        project.id,
-                        guardian_holder,
-                        lease_timeout,
-                        "renewing the interactive guardian lease failed",
-                    );
-                    break Ok(status);
-                }
-            }
+        if let Some(lease) = lease_renewal.as_mut()
+            && let Err(error) = lease.renew_if_due(store, project_id, guardian_holder)
+        {
+            let _ = stop_interactive_child_until_reaped(
+                child,
+                store,
+                project_id,
+                guardian_holder,
+                lease_timeout,
+                &format!("{error:#}"),
+            );
+            break Err(error);
         }
         thread::sleep(Duration::from_millis(250));
-    };
-
-    restore_interactive_terminal_before_handoff(
-        &mut terminal_foreground,
-        store,
-        project.id,
-        guardian_holder,
-        lease_timeout,
-        parent_connected,
-    );
-    interaction_result
+    }
 }
 
 #[cfg(unix)]

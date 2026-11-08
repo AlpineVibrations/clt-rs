@@ -421,6 +421,17 @@ impl TursoAgentStore {
             .block_on_persist(self.renew_lease(project_id, holder, expires_at))
     }
 
+    /// None means another registry writer is busy; no renewal was attempted.
+    pub(crate) fn try_renew_lease_blocking(
+        &self,
+        project_id: i64,
+        holder: &str,
+        expires_at: &str,
+    ) -> Result<Option<bool>> {
+        self.blocking
+            .try_block_on_persist(self.renew_lease(project_id, holder, expires_at))
+    }
+
     async fn renew_lease(&self, project_id: i64, holder: &str, expires_at: &str) -> Result<bool> {
         let conn = self.repositories.workers_leases.connect().await?;
         let changed = conn
