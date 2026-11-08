@@ -34,6 +34,7 @@ use tui_input::{Input, InputRequest};
 mod help;
 mod progress;
 mod settings;
+mod task_details;
 
 use crate::{
     agent::{
@@ -1197,7 +1198,7 @@ impl TuiTaskSnapshot {
 }
 
 pub(super) fn tui_task_board_instructions() -> &'static str {
-    "Arrows navigate boards and tasks, Enter messages running Doing agents or opens subtasks/edits, e edits, n or + creates a subtask under the selected task, and Space creates a task. Press r to reorganize; use Shift+Arrows to move tasks. Tab opens Agent Projects, M opens Models, and h/? opens Help. Task control: t cycles Todo thinking, s shows a read-only progress summary, S stops/starts tasks, i interrupts for interaction, c plans Todo tasks or opens linked sessions (taking over active runs), and l shows logs."
+    "Arrows navigate boards and tasks, Enter messages running Doing agents or opens subtasks/edits, e edits, n or + creates a subtask under the selected task, and Space creates a task. Press v for task details and metadata. Press r to reorganize; use Shift+Arrows to move tasks. Tab opens Agent Projects, M opens Models, and h/? opens Help. Task control: t cycles Todo thinking, s shows a read-only progress summary, S stops/starts tasks, i interrupts for interaction, c plans Todo tasks or opens linked sessions (taking over active runs), and l shows logs."
 }
 
 pub(super) fn tui_start_state(active_board: bool) -> TuiStartState {
@@ -6144,6 +6145,7 @@ pub(super) struct TuiApp {
     pub(super) steering_target: Option<SteeringTarget>,
     pub(super) steering_delivery: Option<Receiver<Result<String>>>,
     task_summary: Option<progress::TaskSummary>,
+    task_details: Option<task_details::Details>,
     pub(super) feedback_buffer: String,
     pub(super) archive_view: bool,
     pub(super) backlog_visible: bool,
@@ -6193,6 +6195,7 @@ impl TuiApp {
             steering_target: None,
             steering_delivery: None,
             task_summary: None,
+            task_details: None,
             feedback_buffer: start_state.feedback_buffer,
             archive_view: false,
             backlog_visible: false,
@@ -6344,6 +6347,9 @@ impl TuiApp {
     }
 
     pub(super) fn prepare_render(&mut self, size: Rect) {
+        if let Some(details) = &mut self.task_details {
+            details.prepare(size);
+        }
         if self.current_mode == Mode::Help {
             self.help.prepare(size);
         }
@@ -6402,13 +6408,14 @@ impl TuiApp {
                     .enumerate()
                     .map(|(idx, entry)| {
                         format!(
-                            "- {}",
+                            "- {}{}",
                             task_tui_display_text_with_agent_flag(
                                 entry,
                                 TASK_STATUSES[*board_index],
                                 Some(idx) == selected,
                                 &self.task_agent_session_states,
-                            )
+                            ),
+                            self.coordination.board_annotation(entry)
                         )
                     })
                     .collect::<Vec<_>>();
@@ -6453,6 +6460,12 @@ pub(super) enum TuiEffect {
 }
 
 pub(super) fn update_tui_pane(app: &mut TuiApp, key: KeyEvent) -> Option<Vec<TuiEffect>> {
+    if let Some(details) = &mut app.task_details {
+        if details.key(key.code) {
+            app.task_details = None;
+        }
+        return Some(Vec::new());
+    }
     if app.task_summary.is_some() {
         return Some(app.task_summary_key(key));
     }
@@ -6651,6 +6664,14 @@ pub(super) fn update_tui_agent_projects_pane(
 }
 
 pub(super) fn update_tui_tasks_pane(app: &mut TuiApp, key: KeyEvent) -> Option<Vec<TuiEffect>> {
+    if matches!(key.code, KeyCode::Char('v' | 'V'))
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        app.open_task_details();
+        return Some(Vec::new());
+    }
     if app.archive_view {
         return match key.code {
             KeyCode::Char('A') => {
@@ -7097,7 +7118,7 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
                             status,
                             &app.task_agent_session_states,
                         ),
-                        app.coordination.annotation(entry)
+                        app.coordination.board_annotation(entry)
                     )
                 })
                 .collect();
@@ -7113,11 +7134,7 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
                             Some(idx) == selected_idx,
                             &app.task_agent_session_states,
                         ),
-                        if Some(idx) == selected_idx {
-                            app.coordination.details(entry)
-                        } else {
-                            app.coordination.annotation(entry)
-                        }
+                        app.coordination.board_annotation(entry)
                     )
                 })
                 .collect();
@@ -7403,6 +7420,9 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
 
     if let Some(summary) = &app.task_summary {
         summary.render(f);
+    }
+    if let Some(details) = &app.task_details {
+        details.render(f);
     }
 
     if let Some(plan) = app.pending_git_recovery.as_ref() {

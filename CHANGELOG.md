@@ -6,6 +6,13 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+## [0.9.13] - 2026-11-08
+
+### Fixed
+
+- Keep generated IDs and scope metadata out of selected Kanban cards. Press `v`
+  on a task to inspect its metadata and coordination waits in a scrollable view.
+
 ## [0.9.12] - 2026-11-06
 
 ### Fixed

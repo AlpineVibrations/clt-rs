@@ -486,17 +486,97 @@ impl Snapshot {
         }
     }
 
-    pub(crate) fn details(&self, entry: &TaskEntry) -> String {
-        let mut text = self.annotation(entry);
-        if let Ok(meta) = metadata::read(&entry.content)
-            && meta.scope != Scope::default()
-        {
-            text.push_str(&format!(
-                " Scope: {}",
-                serde_json::to_string(&meta.scope).unwrap_or_default()
-            ));
+    pub(crate) fn board_annotation(&self, entry: &TaskEntry) -> &'static str {
+        if self.tasks.iter().any(|task| {
+            task.entry.source == entry.source
+                && task.entry.content == entry.content
+                && !self.waits(task).is_empty()
+        }) {
+            " [WAITING]"
+        } else {
+            ""
         }
-        text
+    }
+
+    pub(crate) fn details(&self, entry: &TaskEntry) -> String {
+        let mut lines = Vec::new();
+        if let Some(task) = self
+            .tasks
+            .iter()
+            .find(|task| task.entry.source == entry.source && task.entry.content == entry.content)
+        {
+            lines.push(format!("Owner: {}", task.owner));
+            let waits = self.waits(task);
+            if !waits.is_empty() {
+                lines.push("\nCoordination waits:".into());
+                lines.extend(waits.into_iter().map(|wait| format!("- {wait}")));
+            }
+        }
+        if let Some(session) = recoverable_codex_session_id_from_task_content(&entry.content) {
+            lines.push(format!("Conversation: codex:{session}"));
+        }
+        let meta = match metadata::read(&entry.content) {
+            Ok(meta) => meta,
+            Err(error) => {
+                lines.push(format!("Coordination metadata: {error:#}"));
+                return lines.join("\n");
+            }
+        };
+        if !meta.id.is_empty() {
+            lines.push(format!("Task ID: {}", meta.id));
+        }
+        let mut dependencies: BTreeSet<_> = meta.depends_on.into_iter().collect();
+        match metadata::references::References::read(&entry.content) {
+            Ok(references) => dependencies.extend(references.depends_on),
+            Err(error) => lines.push(format!("Dependency metadata: {error:#}")),
+        }
+        if !dependencies.is_empty() {
+            lines.push("\nDependencies:".into());
+            lines.extend(dependencies.into_iter().map(|id| format!("- {id}")));
+        }
+        if meta.scope != Scope::default() {
+            lines.push("\nScope:".into());
+            if !meta.scope.intent.is_empty() {
+                lines.push(format!("Intent: {}", meta.scope.intent));
+            }
+            for (label, values) in [
+                ("Files", &meta.scope.files),
+                ("Modules", &meta.scope.modules),
+                ("Interfaces", &meta.scope.interfaces),
+                ("Resources", &meta.scope.resources),
+            ] {
+                if !values.is_empty() {
+                    lines.push(format!("{label}:"));
+                    lines.extend(values.iter().map(|value| format!("- {value}")));
+                }
+            }
+            if !meta.scope.behavior.is_empty() {
+                lines.push("Behavior:".into());
+                lines.extend(
+                    meta.scope
+                        .behavior
+                        .iter()
+                        .map(|(key, value)| format!("- {key}: {value}")),
+                );
+            }
+        }
+        if !meta.reviews.is_empty() {
+            lines.push("\nOverlap reviews:".into());
+            for review in meta.reviews {
+                let verdict = if review.compatible {
+                    "Compatible"
+                } else {
+                    "Conflict"
+                };
+                lines.push(format!("- {verdict} with {}: {}", review.other, review.reason));
+                lines.push(format!("  Evidence: {}", review.evidence));
+            }
+        }
+        if lines.is_empty() {
+            "No coordination metadata recorded.".into()
+        } else {
+            lines.join("\n")
+        }
     }
 }
 

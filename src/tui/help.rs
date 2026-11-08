@@ -35,6 +35,7 @@ Backspace: Return to the parent board.
 Esc: Close an open log; otherwise unselect the task.
 t: Cycle the selected Todo's thinking override, including default.
 s: Open a read-only task progress summary.
+v / V: Inspect task details, scope, dependencies and other metadata.
 Shift+S: Stop/start the selected task.
 i: Take over a linked live/stopped session interactively; resume automation on return.
 c: Plan a Todo or open its linked session (including CLI tasks); take over an active run.
@@ -57,6 +58,7 @@ r / R / Esc: Exit Reorganize mode.
 ARCHIVE
 Up/Down: Select previous/next archived task (wraps).
 A: Return to the task board. The archive is read-only.
+v / V: Inspect the selected archived task's details and metadata.
 
 AGENT PROJECTS
 Up/Down: Select a project.
@@ -98,6 +100,10 @@ M / Tab / Shift+Tab / Esc: Return to the previous pane (Esc closes a log first).
 TASK PROGRESS DIALOG
 s: Refresh the snapshot. Up/Down: Scroll.
 Esc / Enter: Close the summary. q: Quit CLT.
+
+TASK DETAILS (after v on a task)
+Up/Down: Scroll. PageUp/PageDown: Scroll a page. Home/End: First/last page.
+v / V / Enter / Esc: Close. Reopen to see the latest cached metadata.
 
 TEXT INPUT (tasks, agent messages, models and providers)
 Enter: Submit the task, message, search or current provider/model field.

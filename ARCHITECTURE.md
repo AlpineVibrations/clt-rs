@@ -82,6 +82,13 @@ used Turso dependency. Application modules import its local API through
   selections, full-content labels, launch arguments and resumed selection.
 - CLI and TUI call application/store facades; they do not contain SQL.
 - TUI render functions read cached `TuiApp` state and perform no I/O.
+- `tui::task_details` presents a read-only snapshot of the selected task's metadata
+  behind `v`, including archived and nested tasks. Cards use compact coordination
+  wait indicators; full IDs, ownership, scope, dependencies and reviews stay in
+  the dialog. Viewport preparation and rendering use the same compact card text.
+  Dialog input is consumed before pane actions, and inspecting metadata never
+  changes the task or its stored coordination data. Verify with
+  `cargo test --locked --bin clt tui::task_details`.
 - Agent Projects keeps typed supervisor notices separate from scan, execution
   and assessment failures. Runtime status and console styling preserve active
   worker and interactive ownership while showing ordinary holds as attention

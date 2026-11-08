@@ -10,6 +10,7 @@ in [Feature Ideas](docs/FEATURE_IDEAS.md); they are not a list of shipped featur
 - [Basic usage](#usage)
 - [Kanban view](#kanban-view)
   - [Keyboard help](#keyboard-help)
+  - [Task details and metadata](#task-details-and-metadata)
   - [Agent Projects](#agent-projects)
   - [Task sessions and controls](#task-sessions-and-controls)
   - [Per-task thinking levels](#per-task-thinking-levels)
@@ -121,7 +122,7 @@ Open the interactive TUI Kanban board:
 ```bash
 clt
 ```
-Selected tasks expand to show their text; other tasks occupy one line. When a task collapses or the viewport grows, the list brings earlier tasks back into view to fill available space while keeping the selection visible. In normal navigation, `Esc` clears the task selection.
+Selected tasks expand to show their text; other tasks occupy one line. Generated task IDs, scope, ownership and coordination explanations stay in the `v` details view. Cards keep compact status labels, including `WAITING` for coordination waits. When a task collapses or the viewport grows, the list brings earlier tasks back into view to fill available space while keeping the selection visible. In normal navigation, `Esc` clears the task selection.
 
 Press `Enter` to message the agent on a running Doing task; otherwise it opens a folder task's subtasks or edits the selected task. Use `n` or `+` to create a subtask under the selected task, `e` to edit the selected task, `Space` to create a task, `t` to cycle a Todo task's thinking level, `Backspace` to return to the parent board, and `q` to quit. Creating a subtask automatically expands a Markdown-backed parent status to folder-backed storage, preserving the original status file as a `.bak`, converts the selected task into a nested board, and opens that board after the subtask is saved. Cancelling the prompt leaves storage unchanged.
 
@@ -158,6 +159,19 @@ to scroll a page, and Home/End to reach the beginning or end. The border shows
 the current line and navigation hints. Press `h`, `H`, `?`, `Enter`, or `Esc` to
 close help and return to the same screen; other commands are inactive while it
 is open. Reopening help starts at the top.
+
+### Task details and metadata
+
+Select a task and press `v` or `V` to inspect its full text, task ID, conversation,
+owner, dependencies, coordination waits, declared scope and overlap reviews.
+Scope fields appear as labeled lists, so long file lists stay out of the card.
+This also works in nested boards and the archive, and does not require an agent
+session or log. Existing task text, tags and saved metadata are preserved.
+
+Use Up/Down to scroll a line, PageUp/PageDown to scroll a page, and Home/End to
+reach the beginning or end. Press `v`, `V`, `Enter` or `Esc` to close and return
+to the same selection. Other task commands are inactive while details are open.
+The view is a snapshot; close and reopen it to see the latest cached information.
 
 ### Agent Projects
 
@@ -980,8 +994,9 @@ task is waiting or explicitly stopped.
 Update scope before expanding work and recheck context before further edits and
 completion. The owning automated worker refreshes context in its existing turn
 when tasks start, finish, or change scope. Direct sessions refresh with `clt context`
-and follow the same check protocol; the TUI refreshes annotations and shows scope
-on the selected row. Automated workers return an unsealed waiting task to Todo,
+and follow the same check protocol; the TUI refreshes compact wait indicators and
+shows full coordination information in the `v` task details view. Automated
+workers return an unsealed waiting task to Todo,
 keeping work, session and Git history; manual sessions keep their claim while
 pausing incompatible edits. Coordination waits do not require a dated BLOCKED
 note. A waiting consumer does not prevent its prerequisite from finishing.
