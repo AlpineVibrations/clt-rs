@@ -25,6 +25,7 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(20);
 
 mod log;
 pub(crate) mod progress;
+mod writer_conflict;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct LaunchSpec {
@@ -259,6 +260,12 @@ impl<'a, W: Write> Protocol<'a, W> {
                 .recv_timeout(deadline.saturating_duration_since(Instant::now()))
                 .with_context(|| format!("Codex {method} timed out or disconnected"))??;
             if event["id"].as_u64() == Some(id) {
+                if method == "thread/resume"
+                    && let Some(diagnostic) =
+                        writer_conflict::diagnostic(self.spec, &event["error"])
+                {
+                    eprintln!("{diagnostic}");
+                }
                 anyhow::ensure!(
                     event.get("error").is_none(),
                     "Codex {method}: {}",

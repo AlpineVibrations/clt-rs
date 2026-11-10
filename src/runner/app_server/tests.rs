@@ -667,3 +667,43 @@ done
         }
     }
 }
+
+#[test]
+fn writer_conflict_diagnostics_preserve_original_rpc_error_and_ownership() {
+    let f = Fixture::new(false, false);
+    let spec = spec(&f);
+    let before = f
+        .store
+        .session_control_blocking(f.project.id, &f.target.session_id)
+        .unwrap();
+    let error = json!({"code":-32600,"message":format!("thread {} already has an active writer", f.target.session_id)});
+    let diagnostic = writer_conflict::diagnostic(&spec, &error).unwrap();
+    assert!(diagnostic.contains("attempting_adapter_pid="));
+    assert!(diagnostic.contains("child_pid="));
+    assert!(diagnostic.contains("same_attempt=true"));
+    assert!(diagnostic.contains("does not prove lock ownership"));
+    assert_eq!(
+        before,
+        f.store
+            .session_control_blocking(f.project.id, &f.target.session_id)
+            .unwrap()
+    );
+    assert!(
+        writer_conflict::diagnostic(
+            &spec,
+            &json!({"code":-32600,"message":"thread another already has an active writer"})
+        )
+        .is_none()
+    );
+    assert!(
+        writer_conflict::diagnostic(&spec, &json!({"code":-32000,"message":error["message"]}))
+            .is_none()
+    );
+    let (sender, receiver) = mpsc::channel();
+    let mut protocol = Protocol::new(&spec, Vec::new(), receiver);
+    sender.send(Ok(json!({"id":1,"error":error}))).unwrap();
+    let failure = protocol
+        .rpc("thread/resume", json!({"threadId":f.target.session_id}))
+        .unwrap_err();
+    assert_eq!(failure.to_string(), format!("Codex thread/resume: {error}"));
+}

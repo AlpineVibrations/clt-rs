@@ -6,6 +6,17 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+## [0.9.15] - 2026-11-10
+
+### Fixed
+
+- Show scheduler retry countdowns and paused/ready states on eligible tasks and
+  project rows, with the latest failure time and reason kept visible.
+- Identify saved log attempts by time and outcome, and prefer newer retained
+  session output when an interrupted worker has not recorded its result.
+- Record known CLT process/session evidence for Codex writer conflicts without
+  claiming that the registered child necessarily owns Codex’s lock.
+
 ## [0.9.14] - 2026-11-08
 
 ### Fixed

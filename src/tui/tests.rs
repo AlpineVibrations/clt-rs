@@ -722,6 +722,7 @@ pub(crate) fn tui_agent_project_for_test(id: i64, name: &str) -> TuiAgentProject
         runtime_state: TuiAgentRuntimeState::Idle,
         daemon_scan_problem: None,
         failure_problem: None,
+        retry_status: None,
         supervisor_notice: None,
         activity: None,
         resolved_codex: TuiAgentResolvedCodexTarget::default(),
@@ -1044,8 +1045,8 @@ fn opening_agent_log_clears_previous_console_text_and_shows_log_mode() {
                 .iter()
                 .map(|cell| cell.symbol())
                 .collect::<String>();
-            let status = if is_live { "LIVE" } else { "LATEST" };
-            assert!(rendered.contains(&format!("Log View [{status}]: alpha")));
+            let status = if is_live { "LIVE" } else { "SAVED" };
+            assert!(rendered.contains(&format!("Log View [{status}")));
             assert!(rendered.contains("l/Esc closes"));
             assert!(rendered.contains("Current agent output"));
             assert!(!rendered.contains("Previous console feedback"));
@@ -1161,6 +1162,7 @@ fn tui_agent_project_removal_requires_confirmation_and_only_unregisters() {
             runtime_state: TuiAgentRuntimeState::Idle,
             daemon_scan_problem: None,
             failure_problem: None,
+            retry_status: None,
             supervisor_notice: None,
             activity: None,
             resolved_codex: TuiAgentResolvedCodexTarget::default(),
@@ -1271,6 +1273,7 @@ fn tui_working_project_removal_fixture(protection: &str) -> TuiWorkingProjectRem
             runtime_state: TuiAgentRuntimeState::Finalizing,
             daemon_scan_problem: None,
             failure_problem: None,
+            retry_status: None,
             supervisor_notice: None,
             activity: None,
             resolved_codex: TuiAgentResolvedCodexTarget::default(),
@@ -1576,7 +1579,7 @@ fn running_agent_log_view_streams_the_current_output_file() {
         .unwrap()
         .unwrap();
     assert!(log_view.is_live);
-    assert!(tui_agent_log_title(&log_view).contains("[LIVE]"));
+    assert!(tui_agent_log_title(&log_view).contains("[LIVE ·"));
     assert!(tui_agent_log_title(&log_view).contains("s/S/i/c controls"));
     assert_eq!(log_view.content, header);
     assert_eq!(
@@ -1664,6 +1667,7 @@ fn reaped_session_logs_are_latest_while_project_runtime_still_looks_active() {
                 runtime_state: TuiAgentRuntimeState::Running,
                 daemon_scan_problem: None,
                 failure_problem: None,
+                retry_status: None,
                 supervisor_notice: None,
                 activity: None,
                 resolved_codex: TuiAgentResolvedCodexTarget::default(),
@@ -1683,7 +1687,7 @@ fn reaped_session_logs_are_latest_while_project_runtime_still_looks_active() {
             .unwrap();
         assert!(!view.is_live);
         assert!(view.content.contains("Codex exited"));
-        assert!(tui_agent_log_title(&view).contains("[LATEST]"));
+        assert!(tui_agent_log_title(&view).contains("[SAVED ·"));
         store
             .record_run_outcome_blocking(agent::AgentRunOutcome {
                 project_id: panel.projects[0].project.id,
@@ -1780,6 +1784,7 @@ fn git_recovery_without_logs_keeps_exact_completed_session_output() {
             runtime_state: TuiAgentRuntimeState::Idle,
             daemon_scan_problem: None,
             failure_problem: None,
+            retry_status: None,
             supervisor_notice: None,
             activity: None,
             resolved_codex: TuiAgentResolvedCodexTarget::default(),
@@ -1828,11 +1833,20 @@ fn git_recovery_without_logs_keeps_exact_completed_session_output() {
             codex_session_id: Some("session-other"),
         })
         .unwrap();
+    let failure = selected_tui_agent_log_view_at(&panel, &state_dir)
+        .unwrap()
+        .unwrap();
     assert!(
-        selected_tui_agent_log_view_at(&panel, &state_dir)
-            .unwrap()
-            .is_none()
+        failure
+            .content
+            .contains("Different session failed before logging")
     );
+    assert!(
+        !failure
+            .content
+            .contains("Completed the deep-folder scan task")
+    );
+    assert_eq!(failure.session_target.unwrap().session_id, "session-other");
     let task_view = selected_tui_task_log_view_at(&panel, TaskStatus::Done, &task, &state_dir)
         .unwrap()
         .unwrap();
@@ -1897,6 +1911,7 @@ fn completed_log_is_latest_but_a_newer_attempt_of_the_same_session_is_live() {
             runtime_state: TuiAgentRuntimeState::Running,
             daemon_scan_problem: None,
             failure_problem: None,
+            retry_status: None,
             supervisor_notice: None,
             activity: None,
             resolved_codex: TuiAgentResolvedCodexTarget::default(),
@@ -2001,6 +2016,7 @@ fn fenced_agent_log_view_keeps_the_orphaned_session_controllable() {
             runtime_state: TuiAgentRuntimeState::Fenced,
             daemon_scan_problem: None,
             failure_problem: None,
+            retry_status: None,
             supervisor_notice: None,
             activity: None,
             resolved_codex: TuiAgentResolvedCodexTarget::default(),
@@ -2083,6 +2099,7 @@ fn completed_task_keeps_reaped_session_output_without_run_history() {
             runtime_state: TuiAgentRuntimeState::Idle,
             daemon_scan_problem: None,
             failure_problem: None,
+            retry_status: None,
             supervisor_notice: None,
             activity: None,
             resolved_codex: TuiAgentResolvedCodexTarget::default(),
@@ -2409,6 +2426,7 @@ fn open_kanban_agent_log_follows_the_selected_task() {
             runtime_state: TuiAgentRuntimeState::Idle,
             daemon_scan_problem: None,
             failure_problem: None,
+            retry_status: None,
             supervisor_notice: None,
             activity: None,
             resolved_codex: TuiAgentResolvedCodexTarget::default(),
@@ -2591,6 +2609,7 @@ fn open_agent_log_follows_the_highlighted_project() {
                 runtime_state: TuiAgentRuntimeState::Idle,
                 daemon_scan_problem: None,
                 failure_problem: None,
+                retry_status: None,
                 supervisor_notice: None,
                 activity: None,
                 resolved_codex: TuiAgentResolvedCodexTarget::default(),
@@ -3013,12 +3032,7 @@ fn agent_project_table_surfaces_failed_run_reason_and_retry_guidance() {
             ),
             codex_session_id: None,
         };
-    item.failure_problem = tui_agent_failure_problem(
-        &item.project,
-        Some(&latest_run),
-        250,
-        Duration::from_secs(300),
-    );
+    item.failure_problem = tui_agent_failure_problem(&item.project, Some(&latest_run));
     item.runtime_state = resolve_tui_agent_runtime_state(
         TuiAgentRuntimeState::Idle,
         false,
@@ -3048,7 +3062,7 @@ fn agent_project_table_surfaces_failed_run_reason_and_retry_guidance() {
 
     assert!(row.contains("ERROR"));
     assert!(row.contains("Last agent run failed"));
-    assert!(console.contains("Automatic retry in 150s"));
+    assert!(!console.contains("Automatic retry"));
     assert!(console.contains("checkpoints dirty Todo definitions automatically"));
     assert!(console.contains("Press r"));
     assert_eq!(color, Color::LightRed);
@@ -3082,8 +3096,7 @@ fn missing_git_start_shows_readable_recovery_steps_on_normal_terminals() {
             summary: Some(summary.to_string()),
             codex_session_id: None,
         };
-        item.failure_problem =
-            tui_agent_failure_problem(&item.project, Some(&run), 250, Duration::from_secs(300));
+        item.failure_problem = tui_agent_failure_problem(&item.project, Some(&run));
         let problem = item.displayed_problem().unwrap();
         assert!(problem.starts_with("Git recovery available - press r\n"));
         assert!(!problem.contains("Automatic retry"));

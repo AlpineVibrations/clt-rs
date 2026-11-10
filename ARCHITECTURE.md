@@ -89,6 +89,16 @@ used Turso dependency. Application modules import its local API through
   Dialog input is consumed before pane actions, and inspecting metadata never
   changes the task or its stored coordination data. Verify with
   `cargo test --locked --bin clt tui::task_details`.
+- `tui::retry_status` caches the scheduler failure deadline independently of run
+  history. Clock effects update countdown text; rendering reads cached state.
+  Eligible task badges, project rows and a persistent console share that state,
+  preserving stop/manual controls, live ownership, supervisor holds and Git proof.
+  `tui::log_attempt` resolves exact-session retained logs before older recorded
+  output and binds timestamps/outcomes to the displayed path, never file mtime.
+  App-server writer-conflict diagnostics read registration evidence without
+  changing ownership or altering the original RPC error. Verify with
+  `cargo test --locked --bin clt tui::` and
+  `cargo test --locked --bin clt writer_conflict`.
 - Agent Projects keeps typed supervisor notices separate from scan, execution
   and assessment failures. Runtime status and console styling preserve active
   worker and interactive ownership while showing ordinary holds as attention

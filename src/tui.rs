@@ -32,7 +32,9 @@ use ratatui::{
 use tui_input::{Input, InputRequest};
 
 mod help;
+mod log_attempt;
 mod progress;
+mod retry_status;
 mod settings;
 mod task_details;
 
@@ -59,11 +61,11 @@ use crate::{
     runner::{
         AgentRunSettings, agent_codex_session_id_from_log, agent_project_run_log_dir,
         agent_run_settings_from_log, agent_timestamp, agent_timestamp_seconds,
-        latest_agent_log_path, preferred_agent_output_path, preferred_recorded_agent_output_path,
+        latest_agent_log_path, preferred_recorded_agent_output_path,
     },
     scheduler::{
         agent_failure_backoff, agent_lease_holder_liveness, interactive_lease_holder_liveness,
-        remaining_agent_delay, scan_agent_project,
+        scan_agent_project,
     },
     session_control::{
         InteractiveAgentLease, InteractiveCodexResumeMode, InteractiveGuardianDisposition,
@@ -1231,12 +1233,29 @@ pub(super) struct TuiAgentProject {
     pub(super) activity: Option<WorkerActivity>,
     pub(super) daemon_scan_problem: Option<String>,
     pub(super) failure_problem: Option<String>,
+    pub(super) retry_status: Option<retry_status::RetryStatus>,
     pub(super) supervisor_notice: Option<TuiAgentSupervisorNotice>,
     /// What Codex runs for this project when its own settings are unset.
     pub(super) resolved_codex: TuiAgentResolvedCodexTarget,
 }
 
 impl TuiAgentProject {
+    fn displayed_retry(&self) -> Option<&retry_status::RetryStatus> {
+        (self.runtime_state == TuiAgentRuntimeState::RetryScheduled)
+            .then_some(self.retry_status.as_ref())
+            .flatten()
+    }
+
+    fn runtime_label(&self) -> String {
+        self.displayed_retry()
+            .map(|retry| match retry.label.as_str() {
+                "Retry paused" => "RETRY PAUSE".to_string(),
+                "Retry ready" => "RETRY READY".to_string(),
+                label => label.replace("Retry in ", "RETRY "),
+            })
+            .unwrap_or_else(|| self.runtime_state.label().to_string())
+    }
+
     pub(super) fn displayed_problem(&self) -> Option<&str> {
         self.daemon_scan_problem.as_deref().or_else(|| {
             (self.runtime_state == TuiAgentRuntimeState::Error)
@@ -1254,7 +1273,7 @@ impl TuiAgentProject {
     fn row_color(&self, text_color: Color) -> Color {
         if self.displayed_problem().is_some() {
             Color::LightRed
-        } else if self.displayed_supervisor_notice().is_some() {
+        } else if self.displayed_retry().is_some() || self.displayed_supervisor_notice().is_some() {
             Color::LightYellow
         } else if self.project.enabled {
             text_color
@@ -1299,6 +1318,7 @@ pub(super) enum TuiAgentRuntimeState {
     Settling,
     Waiting,
     RetryApproved,
+    RetryScheduled,
     NeedsInput,
     Replan,
     Repair,
@@ -1320,7 +1340,7 @@ impl TuiAgentRuntimeState {
             Self::Reviewing => "REVIEWING",
             Self::Settling => "SETTLING",
             Self::Waiting => "WAITING",
-            Self::RetryApproved => "RETRY",
+            Self::RetryApproved | Self::RetryScheduled => "RETRY",
             Self::NeedsInput => "INPUT",
             Self::Replan => "REPLAN",
             Self::Repair => "REPAIR",
@@ -1630,6 +1650,7 @@ pub(super) struct TuiAgentLogView {
     pub(super) settings: AgentRunSettings,
     pub(super) content: String,
     pub(super) is_live: bool,
+    attempt: Option<log_attempt::Attempt>,
     pub(super) session_target: Option<TuiCodexSessionTarget>,
 }
 
@@ -1643,11 +1664,12 @@ impl TuiAgentLogView {
     ) -> Result<Self> {
         let mut view = Self {
             project_name,
-            path: Some(path),
+            path: Some(path.clone()),
             settings_path,
             settings: AgentRunSettings::default(),
             content: String::new(),
             is_live,
+            attempt: Some(log_attempt::Attempt::from_path(&path)),
             session_target,
         };
         view.refresh()?;
@@ -1662,6 +1684,7 @@ impl TuiAgentLogView {
             settings: AgentRunSettings::default(),
             content,
             is_live: false,
+            attempt: None,
             session_target: None,
         }
     }
@@ -2946,9 +2969,7 @@ pub(super) fn load_tui_agent_panel_snapshot_inner(
                 .as_ref()
                 .filter(|review| review.error.is_some())
                 .map(crate::supervisor::SupervisorReview::message)
-                .or_else(|| {
-                    tui_agent_failure_problem(&project, relevant_failure, now, failure_backoff)
-                });
+                .or_else(|| tui_agent_failure_problem(&project, relevant_failure));
             let activity = active_workers
                 .iter()
                 .find(|worker| worker.project_id == project.id)
@@ -2971,16 +2992,34 @@ pub(super) fn load_tui_agent_panel_snapshot_inner(
                 supervisor_notice.as_ref(),
             );
             let resolved_codex = resolve_tui_agent_codex_target(&store, &project)?;
-            Ok(TuiAgentProject {
+            let controls = store.session_controls_for_project_blocking(project.id)?;
+            let retry_status = retry_status::RetryStatus::new(
+                &project,
+                latest_run.as_ref(),
+                failure_backoff,
+                now,
+                checkins
+                    .iter()
+                    .any(|checkin| daemon_checkin_is_fresh(checkin, now)),
+            );
+            let mut item = TuiAgentProject {
                 project,
                 scan,
                 runtime_state,
                 activity,
                 daemon_scan_problem,
                 failure_problem,
+                retry_status,
                 supervisor_notice,
                 resolved_codex,
-            })
+            };
+            let sealed = pending_git_finalizations
+                .get(&item.project.id)
+                .is_some_and(|state| state.is_finalizing());
+            let retryable_work =
+                item.retry_status.is_some() && retry_status::has_retryable_tasks(&item, &controls);
+            retry_status::apply(&mut item, &controls, sealed, retryable_work);
+            Ok(item)
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -3133,8 +3172,6 @@ pub(super) fn tui_agent_daemon_scan_problem(
 pub(super) fn tui_agent_failure_problem(
     project: &agent::AgentProject,
     latest_run: Option<&agent::AgentRunRecord>,
-    now: u64,
-    failure_backoff: Duration,
 ) -> Option<String> {
     if project.failure_count <= 0 {
         return None;
@@ -3166,9 +3203,8 @@ pub(super) fn tui_agent_failure_problem(
     if !project.enabled {
         return None;
     }
-    let retry = remaining_agent_delay(project.last_failure_at.as_deref(), now, failure_backoff)
-        .map(|remaining| format!("Automatic retry in {remaining}s while the daemon is active."))
-        .unwrap_or_else(|| "Automatic retry is ready when the daemon is active.".to_string());
+    // Retry timing belongs to the scheduler-derived status. A generic failure
+    // can also describe a stopped or held task, which must not promise a retry.
     let correction = if summary.contains("not committed exactly once at the frozen task boundary") {
         "This build checkpoints dirty Todo definitions automatically before the next attempt."
     } else {
@@ -3176,7 +3212,7 @@ pub(super) fn tui_agent_failure_problem(
     };
 
     Some(format!(
-        "Last agent run failed: {summary}\n{retry} {correction} Press r to clear the cooldown and retry now."
+        "Last agent run failed: {summary}\n{correction} Press r to clear the cooldown and retry now."
     ))
 }
 
@@ -3503,7 +3539,17 @@ pub(super) fn tui_agent_panel_instructions() -> &'static str {
 }
 
 pub(super) fn tui_agent_log_title(log_view: &TuiAgentLogView) -> String {
-    let status = if log_view.is_live { "LIVE" } else { "LATEST" };
+    let status = log_view
+        .attempt
+        .as_ref()
+        .map(|attempt| attempt.label(log_view.is_live))
+        .unwrap_or_else(|| {
+            if log_view.is_live {
+                "LIVE".into()
+            } else {
+                "SAVED · Time unrecorded · Outcome unrecorded".into()
+            }
+        });
     let controls = if log_view.session_target.is_some() {
         "s/S/i/c controls; l/Esc closes"
     } else {
@@ -3589,63 +3635,26 @@ pub(super) fn selected_tui_task_log_view_at(
     let Some(session_id) = codex_session_for_task(task) else {
         return Ok(None);
     };
-    let session_target = Some(TuiCodexSessionTarget::new(
-        &selected.project,
-        session_id.clone(),
-    ));
-
-    let live_path = if selected.runtime_state.is_running()
-        || matches!(
-            selected.runtime_state,
-            TuiAgentRuntimeState::Interactive | TuiAgentRuntimeState::Fenced
-        ) {
-        active_agent_log_for_codex_session(selected, state_dir, &session_id)?
-    } else {
-        None
-    };
-
-    let (path, settings_path, is_live) = match live_path {
-        Some(path) => (Some(path.clone()), Some(path), true),
-        None => {
-            let store = open_agent_store_at(state_dir)?;
-            let run = store
-                .latest_output_run_for_codex_session_blocking(selected.project.id, &session_id)?;
-            if let Some(path) = run.as_ref().and_then(preferred_recorded_agent_output_path) {
-                (
-                    Some(path),
-                    run.as_ref()
-                        .and_then(|run| run.stderr_path.as_ref())
-                        .map(PathBuf::from),
-                    false,
-                )
-            } else {
-                // A reaped or recovered worker can retain exact-session logs
-                // even when it never persisted a session-linked run outcome.
-                let control = store.session_control_blocking(selected.project.id, &session_id)?;
-                (
-                    control.as_ref().and_then(|control| {
-                        preferred_agent_output_path(
-                            control.stdout_path.as_deref(),
-                            control.stderr_path.as_deref(),
-                        )
-                    }),
-                    control.and_then(|control| control.stderr_path.map(PathBuf::from)),
-                    false,
-                )
-            }
-        }
-    };
-
-    path.map(|path| {
-        TuiAgentLogView::new(
-            selected.project.name.clone(),
-            path,
-            settings_path,
-            is_live,
-            session_target,
+    let store = open_agent_store_at(state_dir)?;
+    // Prefer a live exact-session log even for legacy workers whose control row
+    // has not been registered. A saved result must not hide a newer attempt.
+    if let Some(path) = active_agent_log_for_codex_session(selected, state_dir, &session_id)? {
+        return log_attempt::attach(
+            &store,
+            selected.project.id,
+            TuiAgentLogView::new(
+                selected.project.name.clone(),
+                path.clone(),
+                Some(path),
+                true,
+                Some(TuiCodexSessionTarget::new(&selected.project, session_id)),
+            )?,
         )
-    })
-    .transpose()
+        .map(Some);
+    }
+    // Session control retains newer output if the worker exits before recording
+    // its result; the registry's previous failure then describes an older run.
+    log_attempt::session_view(&store, selected, &session_id, true)
 }
 
 pub(super) fn active_agent_log_for_codex_session(
@@ -3818,6 +3827,11 @@ pub(super) fn selected_tui_agent_log_view_at(
         return Ok(None);
     };
 
+    let store = open_agent_store_at(state_dir)?;
+    if let Some(session) = log_attempt::newer_project_session(&store, selected.project.id)? {
+        return log_attempt::session_view(&store, selected, &session, false);
+    }
+
     let fenced_session = if matches!(
         selected.runtime_state,
         TuiAgentRuntimeState::Interactive | TuiAgentRuntimeState::Fenced
@@ -3877,7 +3891,8 @@ pub(super) fn selected_tui_agent_log_view_at(
                 let mut run = store.latest_run_for_project_blocking(selected.project.id)?;
                 if let Some(failed_run) = run.as_ref().filter(|run| {
                     matches!(run.status.as_str(), "failure" | "timeout")
-                        && run.summary.as_deref().is_some_and(failure_has_git_recovery)
+                        && run.stdout_path.is_none()
+                        && run.stderr_path.is_none()
                 }) {
                     // Git preflight can fail before any output file exists.
                     // Show that saved failure instead of an older session's log.
@@ -3889,6 +3904,7 @@ pub(super) fn selected_tui_agent_log_view_at(
                             failed_run.summary.as_deref().unwrap_or_default(),
                         ),
                     );
+                    view.attempt = Some(log_attempt::Attempt::from_run(failed_run));
                     view.session_target = failed_run.codex_session_id.clone().map(|session_id| {
                         TuiCodexSessionTarget::new(&selected.project, session_id)
                     });
@@ -3920,12 +3936,16 @@ pub(super) fn selected_tui_agent_log_view_at(
     };
 
     path.map(|path| {
-        TuiAgentLogView::new(
-            selected.project.name.clone(),
-            path,
-            settings_path,
-            is_live,
-            session_target,
+        log_attempt::attach(
+            &store,
+            selected.project.id,
+            TuiAgentLogView::new(
+                selected.project.name.clone(),
+                path,
+                settings_path,
+                is_live,
+                session_target,
+            )?,
         )
     })
     .transpose()
@@ -4220,7 +4240,7 @@ pub(super) fn format_kanban_console_title(
     let reserved = 2 + right_title.map_or(0, |title| title.chars().count());
     let available = width.saturating_sub(reserved);
     let enabled = if project.project.enabled { "ON" } else { "OFF" };
-    let status = format!(" | Agent: {enabled} {}", project.runtime_state.label());
+    let status = format!(" | Agent: {enabled} {}", project.runtime_label());
     let settings = format!(" | {}", format_agent_project_codex_settings_label(project));
 
     let full = format!("{base}{status}{settings}");
@@ -4337,7 +4357,7 @@ pub(super) fn format_agent_project_table_row(
 ) -> String {
     let marker = active_board_marker(is_current_board);
     let state = if item.project.enabled { "ON" } else { "OFF" };
-    let runtime_state = item.runtime_state.label();
+    let runtime_state = item.runtime_label();
     let git = item.project.git_mode.tui_label();
     let codex = compact_agent_codex_settings(
         item.project.codex_provider.as_deref(),
@@ -4348,8 +4368,10 @@ pub(super) fn format_agent_project_table_row(
     let todo = item.scan.todo_count.to_string();
     let doing = item.scan.doing_count.to_string();
     let last_run = format_agent_table_last_run(&item.project);
+    let retry_message = item.displayed_retry().map(|retry| retry.message.as_str());
     let path_or_error = item
         .displayed_problem()
+        .or(retry_message)
         .or_else(|| {
             item.displayed_supervisor_notice()
                 .map(|notice| notice.message.as_str())
@@ -4371,7 +4393,7 @@ pub(super) fn format_agent_project_table_row(
                 fit_cell_right(&(idx + 1).to_string(), 3),
                 fit_cell(state, 6),
                 fit_cell(git, 4),
-                fit_cell(runtime_state, TUI_AGENT_TABLE_RUNTIME_WIDTH),
+                fit_cell(&runtime_state, TUI_AGENT_TABLE_RUNTIME_WIDTH),
                 fit_cell(&item.project.name, project_width),
                 fit_cell_right(&todo, 4),
                 fit_cell_right(&doing, 5),
@@ -4412,7 +4434,7 @@ pub(super) fn format_agent_project_table_row(
             fit_cell_right(&(idx + 1).to_string(), number_width),
             fit_cell(state, state_width),
             fit_cell(git, git_width),
-            fit_cell(runtime_state, runtime_width),
+            fit_cell(&runtime_state, runtime_width),
             fit_cell(&item.project.name, project_width),
             fit_cell_right(&todo, todo_width),
             fit_cell_right(&doing, doing_width),
@@ -5209,6 +5231,13 @@ pub(super) fn tui_console_content<'a>(
             .and_then(TuiAgentProject::displayed_problem)
     {
         return (problem, Color::LightRed);
+    }
+    if agent_pane
+        && let Some(retry) = panel
+            .selected_project()
+            .and_then(TuiAgentProject::displayed_retry)
+    {
+        return (&retry.message, Color::LightYellow);
     }
     if agent_pane
         && let Some(notice) = panel
@@ -6346,6 +6375,19 @@ impl TuiApp {
         }
     }
 
+    fn task_display(&self, entry: &TaskEntry, status: TaskStatus, selected: bool) -> String {
+        format!(
+            "{}{}",
+            retry_status::task_badge(self, status, entry).unwrap_or_default(),
+            task_tui_display_text_with_agent_flag(
+                entry,
+                status,
+                selected,
+                &self.task_agent_session_states
+            )
+        )
+    }
+
     pub(super) fn prepare_render(&mut self, size: Rect) {
         if let Some(details) = &mut self.task_details {
             details.prepare(size);
@@ -6409,11 +6451,10 @@ impl TuiApp {
                     .map(|(idx, entry)| {
                         format!(
                             "- {}{}",
-                            task_tui_display_text_with_agent_flag(
+                            self.task_display(
                                 entry,
                                 TASK_STATUSES[*board_index],
-                                Some(idx) == selected,
-                                &self.task_agent_session_states,
+                                Some(idx) == selected
                             ),
                             self.coordination.board_annotation(entry)
                         )
@@ -6915,7 +6956,15 @@ pub(super) fn execute_tui_effect(
             *last_agent_log_refresh = Instant::now();
         }
         TuiEffect::RefreshTaskSnapshot => app.refresh_task_snapshot(),
-        TuiEffect::RefreshClock => app.current_time = Local::now().format("%H:%M").to_string(),
+        TuiEffect::RefreshClock => {
+            app.current_time = Local::now().format("%H:%M").to_string();
+            let now = agent_timestamp_seconds();
+            for project in &mut app.agent_panel.projects {
+                if let Some(retry) = &mut project.retry_status {
+                    retry.tick(now, project.project.enabled);
+                }
+            }
+        }
         TuiEffect::PaneKey(_) => unreachable!("pane keys require the terminal effect executor"),
         TuiEffect::Quit => {
             if app.agent_settings.is_pending() {
@@ -7113,11 +7162,7 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
                 .map(|entry| {
                     format!(
                         "- {}{}",
-                        task_display_text_with_agent_flag(
-                            entry,
-                            status,
-                            &app.task_agent_session_states,
-                        ),
+                        app.task_display(entry, status, false),
                         app.coordination.board_annotation(entry)
                     )
                 })
@@ -7128,12 +7173,7 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
                 .map(|(idx, entry)| {
                     format!(
                         "- {}{}",
-                        task_tui_display_text_with_agent_flag(
-                            entry,
-                            status,
-                            Some(idx) == selected_idx,
-                            &app.task_agent_session_states,
-                        ),
+                        app.task_display(entry, status, Some(idx) == selected_idx),
                         app.coordination.board_annotation(entry)
                     )
                 })
@@ -7237,6 +7277,12 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
                 };
 
                 let mut badges = Vec::with_capacity(2);
+                if let Some(badge) = retry_status::task_badge(app, status, entry) {
+                    badges.push((
+                        badge.trim_end().len(),
+                        Style::default().fg(Color::LightYellow),
+                    ));
+                }
                 match recoverable_codex_session_id_from_task_content(&entry.content)
                     .and_then(|session| app.task_agent_session_states.get(session))
                 {
@@ -7371,6 +7417,24 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
         app.agent_log_view.as_ref(),
         app.feedback_buffer.as_str(),
     );
+    let retry = if app.agent_log_view.is_none() && app.agent_panel.last_error.is_none() {
+        match app.current_pane {
+            TuiPane::AgentProjects => app.agent_panel.selected_project(),
+            TuiPane::Tasks => app
+                .agent_panel
+                .projects
+                .iter()
+                .filter(|project| app.active_root.starts_with(&project.project.path))
+                .max_by_key(|project| project.project.path.components().count()),
+            _ => None,
+        }
+        .and_then(TuiAgentProject::displayed_retry)
+    } else {
+        None
+    };
+    let (console_content, console_color) = retry
+        .map(|retry| (retry.message.as_str(), Color::LightYellow))
+        .unwrap_or((console_content, console_color));
     let feedback_area = *main_layout.last().unwrap();
     let wrapped_console_content = wrap_input_text(
         console_content,
@@ -7408,10 +7472,14 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
         .block(console_block)
         .style(Style::default().fg(console_color))
         .scroll((
-            tui_log_scroll_offset(
-                &wrapped_console_content,
-                feedback_area.height.saturating_sub(2),
-            ),
+            if retry.is_some() {
+                0
+            } else {
+                tui_log_scroll_offset(
+                    &wrapped_console_content,
+                    feedback_area.height.saturating_sub(2),
+                )
+            },
             0,
         ));
 

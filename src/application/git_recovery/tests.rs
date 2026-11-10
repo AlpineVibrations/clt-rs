@@ -928,8 +928,7 @@ fn branch_mismatch_diagnostic_offers_recovery_with_a_readable_confirmation() {
         .latest_run_for_project_blocking(project.id)
         .unwrap()
         .unwrap();
-    let problem =
-        tui_agent_failure_problem(&project, Some(&run), 105, Duration::from_secs(300)).unwrap();
+    let problem = tui_agent_failure_problem(&project, Some(&run)).unwrap();
     assert!(problem.starts_with("Git recovery available - press r"));
     assert!(problem.contains("refs/heads/auth"));
     assert!(problem.contains(journal.branch_ref.as_deref().unwrap()));
