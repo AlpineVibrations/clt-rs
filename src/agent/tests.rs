@@ -1910,3 +1910,47 @@ fn ensure_agent_state_dir_creates_directory() {
 
     fs::remove_dir_all(root).unwrap();
 }
+#[test]
+fn concurrent_registry_handle_teardown_preserves_open_and_heartbeat_access() {
+    let root = crate::test_support::temp_root("registry-handle-teardown");
+    let state = root.join("state");
+    let project_root = root.join("project");
+    std::fs::create_dir_all(&project_root).unwrap();
+    let store = TursoAgentStore::open_blocking(&state).unwrap();
+    store
+        .register_project_blocking(&project_root, "project")
+        .unwrap();
+    drop(store);
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+    std::thread::scope(|threads| {
+        for _ in 0..4 {
+            let barrier = barrier.clone();
+            let state = &state;
+            threads.spawn(move || {
+                let mut errors = Vec::new();
+                for _ in 0..30 {
+                    barrier.wait();
+                    let store = TursoAgentStore::open_blocking(state);
+                    match &store {
+                        Ok(store) => match store.list_projects_blocking() {
+                            Ok(projects) if projects.len() == 1 => {}
+                            other => {
+                                errors.push(format!("Unexpected registry contents: {other:?}"))
+                            }
+                        },
+                        Err(error) => errors.push(format!("{error:#}")),
+                    }
+                    // Align drops as well as opens to exercise the weak-cache
+                    // teardown boundary used by scheduler/heartbeat threads.
+                    barrier.wait();
+                    drop(store);
+                }
+                assert!(errors.is_empty(), "{}", errors.join("\n"));
+            });
+        }
+    });
+    let store = TursoAgentStore::open_blocking(&state).unwrap();
+    assert_eq!(store.list_projects_blocking().unwrap()[0].name, "project");
+    drop(store);
+    std::fs::remove_dir_all(root).unwrap();
+}

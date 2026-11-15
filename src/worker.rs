@@ -1628,7 +1628,11 @@ fn defer_blocked_task_after_run(job: &AgentRunJob, session: &str) -> Result<bool
         };
         if !status.is_active()
             || (!task_entry_is_blocked(task)
-                && !crate::coordination::session_waiting(&job.project.path, session)?)
+                && !crate::coordination::session_waiting_with_store(
+                    &job.project.path,
+                    session,
+                    store,
+                )?)
             || task_entry_is_stopped(task)
             || task_content_is_manual(&task.content)
         {

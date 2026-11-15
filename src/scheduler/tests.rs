@@ -1266,7 +1266,7 @@ fn agent_daemon_loop_repeats_passes_and_respects_success_cooldown() {
 }
 
 #[test]
-fn agent_daemon_dispatches_independent_worker_outside_async_runtime() {
+fn agent_daemon_recovers_unstarted_lease_and_dispatches_independent_worker() {
     let root = temp_root("agent-daemon-independent-dispatch");
     let state_dir = root.join("state/clt");
     let project_root = root.join("project");
@@ -1278,6 +1278,19 @@ fn agent_daemon_dispatches_independent_worker_outside_async_runtime() {
         .register_project_blocking(&project_root, "project")
         .unwrap();
     let project_id = store.list_projects_blocking().unwrap().remove(0).id;
+    // A failed pass (or dispatch) could not release its reservation because
+    // the registry was busy. The scheduler itself is still alive, and this
+    // lease will not expire for an hour, but no job owns it anymore.
+    assert!(
+        store
+            .try_acquire_lease_blocking(
+                project_id,
+                &agent_scheduler_lease_holder(),
+                &agent_timestamp(),
+                &agent_timestamp_after(3600),
+            )
+            .unwrap()
+    );
     drop(store);
 
     run_agent_daemon_loop_with_executor(
@@ -1307,6 +1320,98 @@ fn agent_daemon_dispatches_independent_worker_outside_async_runtime() {
     );
     assert_eq!(store.run_count_blocking().unwrap(), 0);
 
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn agent_daemon_retries_after_dispatch_cannot_release_its_reservation() {
+    fn fail_first_dispatch(state: &Path, executable: &Path, job: AgentRunJob) -> Result<()> {
+        let attempted = state.join("dispatch-attempted");
+        if !attempted.exists() {
+            fs::write(attempted, "failed before worker reservation")?;
+            // Model a dispatch error whose registry cleanup also failed.
+            anyhow::bail!("registry writer busy; lease cleanup failed");
+        }
+        dispatch_independent_agent_worker_without_service(state, executable, job)
+    }
+
+    let root = temp_root("daemon-retry-unstarted-reservation");
+    let state_dir = root.join("state");
+    let project_root = root.join("project");
+    init_tasks(&project_root, false).unwrap();
+    add_task(&project_root, "Next eligible task", None).unwrap();
+    let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
+    store
+        .register_project_blocking(&project_root, "project")
+        .unwrap();
+    drop(store);
+    run_agent_daemon_loop_with_executor(
+        &state_dir,
+        AgentDaemonExecutor::Independent {
+            executable: root.join("pinned-clt"),
+            dispatch: fail_first_dispatch,
+        },
+        Duration::ZERO,
+        Some(2),
+        new_agent_shutdown_signal(),
+    )
+    .unwrap();
+    let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
+    assert!(state_dir.join("dispatch-attempted").exists());
+    let workers = store.list_active_workers_blocking().unwrap();
+    assert_eq!(workers.len(), 1);
+    assert_eq!(workers[0].state, AGENT_WORKER_STATE_DISPATCHING);
+    assert_eq!(store.run_count_blocking().unwrap(), 0);
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn unstarted_scheduler_cleanup_preserves_active_and_other_owners() {
+    let root = temp_root("scheduler-unstarted-owners");
+    let state_dir = root.join("state");
+    let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
+    let own = agent_scheduler_lease_holder();
+    let other = agent_lease_holder(); // Also alive in this process, but not this daemon.
+    for (name, holder) in [("active", &own), ("unstarted", &own), ("other", &other)] {
+        let path = root.join(name);
+        init_tasks(&path, false).unwrap();
+        store.register_project_blocking(&path, name).unwrap();
+        let id = store
+            .list_projects_blocking()
+            .unwrap()
+            .into_iter()
+            .find(|p| p.name == name)
+            .unwrap()
+            .id;
+        assert!(
+            store
+                .try_acquire_lease_blocking(
+                    id,
+                    holder,
+                    &agent_timestamp(),
+                    &agent_timestamp_after(3600),
+                )
+                .unwrap()
+        );
+    }
+    let projects = store.list_projects_blocking().unwrap();
+    let active = projects.iter().find(|p| p.name == "active").unwrap().id;
+    super::reconcile_unstarted_scheduler_leases(&state_dir, &own, &[active]).unwrap();
+    for project in &projects {
+        let lease = store.lease_for_project_blocking(project.id).unwrap();
+        assert_eq!(
+            lease.is_some(),
+            project.name != "unstarted",
+            "{}",
+            project.name
+        );
+    }
+    // A completed inline run can leave the same kind of reservation behind.
+    super::reconcile_unstarted_scheduler_leases(&state_dir, &other, &[]).unwrap();
+    assert_eq!(store.lease_count_blocking().unwrap(), 1);
+    assert!(store.lease_for_project_blocking(active).unwrap().is_some());
+    drop(store);
     fs::remove_dir_all(root).unwrap();
 }
 

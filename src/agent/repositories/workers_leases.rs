@@ -473,6 +473,56 @@ impl TursoAgentStore {
         Ok(removed > 0)
     }
 
+    /// Called only between daemon passes, after all returned jobs have been
+    /// dispatched and excluding inline jobs still owned by that daemon.
+    /// Compare the full observed lease and recheck durable owners atomically:
+    /// failed best-effort cleanup must not leave an idle reservation until expiry.
+    pub(crate) fn release_unstarted_scheduler_lease_blocking(
+        &self,
+        lease: &AgentLeaseRecord,
+    ) -> Result<bool> {
+        self.blocking.block_on_persist(async {
+            let conn = self.repositories.workers_leases.connect().await?;
+            let removed = conn
+                .execute(
+                    "DELETE FROM leases
+                      WHERE project_id = ?1 AND holder = ?2
+                        AND acquired_at = ?3 AND expires_at = ?4
+                        AND NOT EXISTS (
+                            SELECT 1 FROM agent_workers w
+                             WHERE w.project_id = leases.project_id
+                               AND w.state IN ('dispatching', 'running', 'finalizing')
+                        )
+                        AND NOT EXISTS (
+                            SELECT 1 FROM agent_git_launch_states launch
+                             WHERE launch.project_id = leases.project_id
+                        )
+                        AND NOT EXISTS (
+                            SELECT 1 FROM session_controls sc
+                             WHERE sc.project_id = leases.project_id
+                               AND (sc.state NOT IN ('stopped', 'resume_requested')
+                                    OR sc.child_pid IS NOT NULL
+                                    OR sc.interactive_holder IS NOT NULL
+                                    OR sc.interactive_launch_token IS NOT NULL)
+                        )",
+                    params![
+                        lease.project_id,
+                        lease.holder.as_str(),
+                        lease.acquired_at.as_str(),
+                        lease.expires_at.as_str(),
+                    ],
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to release unstarted scheduler reservation for project {}",
+                        lease.project_id
+                    )
+                })?;
+            Ok(removed > 0)
+        })
+    }
+
     pub(crate) fn reserve_worker_blocking(
         &self,
         reservation: AgentWorkerReservation<'_>,

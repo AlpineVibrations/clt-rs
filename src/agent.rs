@@ -1534,9 +1534,12 @@ impl TursoAgentStore {
             {
                 Ok(db) => break db,
                 Err(error)
-                    if error
-                        .to_string()
-                        .contains("shared WAL coordination map magic mismatch")
+                    if (error.to_string().contains("shared WAL coordination map magic mismatch")
+                        // The engine's weak database cache can expire before
+                        // its previous shared-WAL authority finishes dropping.
+                        // Wait for that teardown, without removing its mapping
+                        // or treating the failed open as lost worker ownership.
+                        || error.to_string().contains("duplicate same-process shared WAL coordination open"))
                         && open_attempt < AGENT_DATABASE_OPEN_RETRY_ATTEMPTS =>
                 {
                     open_attempt += 1;

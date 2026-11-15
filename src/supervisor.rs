@@ -71,18 +71,115 @@ pub(crate) struct SupervisorReview {
     pub error: Option<String>,
 }
 impl SupervisorReview {
+    pub fn headline(&self) -> &'static str {
+        if self.error.is_some() {
+            return "Supervisor review failed";
+        }
+        match self.decision.as_ref().map(|decision| &decision.decision) {
+            Some(DecisionKind::Retry) => "Automatic retry approved",
+            Some(DecisionKind::Wait) => "Waiting for a prerequisite",
+            Some(DecisionKind::User) => "Action required: your input",
+            Some(DecisionKind::Replan) => "Action required: review the proposed plan",
+            Some(DecisionKind::Repair) => "Action required: repair recommendation",
+            None => "Supervisor review pending",
+        }
+    }
+
     pub fn message(&self) -> String {
         if let Some(error) = &self.error {
-            return format!("Supervisor needs attention: {error}. Press r to review again.");
+            return format!("{}\n{error}\nPress r to review again.", self.headline());
         }
         if let Some(decision) = &self.decision {
+            let responsibility = match decision.decision {
+                DecisionKind::Retry => {
+                    "CLT will retry the original session when its controls allow it."
+                }
+                DecisionKind::Wait => "CLT is waiting for the prerequisite below to change.",
+                DecisionKind::User => "CLT is waiting for your answer or approval.",
+                DecisionKind::Replan => {
+                    "CLT is waiting for you to review and apply the proposed plan."
+                }
+                DecisionKind::Repair => {
+                    "CLT is waiting for you. This recommendation does not run a repair automatically."
+                }
+            };
             return format!(
-                "Supervisor {:?}: {} Next: {}",
-                decision.decision, decision.reason, decision.next_action
+                "{}\n{responsibility}\nNext: {}\nReason: {}",
+                self.headline(),
+                decision.next_action,
+                decision.reason
             );
         }
         "Supervisor review pending; project work is waiting.".into()
     }
+}
+
+fn external_completion_guidance(status: TaskStatus, index: usize) -> String {
+    format!(
+        "If you have verified and accept that this task is already complete, run these commands from the project directory:\n1. Pause scheduling: clt agent pause . (Space in Agent Projects also toggles this setting.) Let any active worker finish.\n2. Find this task: clt list {status}. Confirm its current index (currently {index}).\n3. Accept completion: clt done {status} <index>, using the index just confirmed.\n4. Restore scheduling if you paused it: clt agent resume .\nThis is explicit acceptance of existing work. CLT preserves commits, the conversation and journal history, and checks ownership before retiring the unsealed WORKING journal. The supervisor cannot make this acceptance decision for you. FINALIZING and PUSH-PENDING proof cannot be discarded this way.",
+        status = status.as_str(),
+    )
+}
+
+/// Read-only guidance bound to the saved review's exact evidence. A review's
+/// task number indexes its candidate list, never a status column on the board.
+pub(super) fn review_details(
+    store: &TursoAgentStore,
+    project: &AgentProject,
+    review: &SupervisorReview,
+) -> Result<String> {
+    let message = review.message();
+    let Some(decision) = review.decision.as_ref().filter(|_| review.error.is_none()) else {
+        return Ok(message);
+    };
+    // Retry activation and Wait deferral can change candidate order after the
+    // decision was saved. Those automatic decisions need no manual target hint.
+    if matches!(decision.decision, DecisionKind::Retry | DecisionKind::Wait) {
+        return Ok(message);
+    }
+    if review.evidence != review_evidence(store, project)? {
+        return Ok(format!(
+            "Saved supervisor decision; evidence has changed. Press r for a fresh review before acting.\n\n{message}"
+        ));
+    }
+    let candidates = review_candidates(store, project)?;
+    let Some((status, task)) = decision.task.checked_sub(1).and_then(|i| candidates.get(i)) else {
+        return Ok(format!(
+            "Saved review task is no longer available. Press r to review again.\n\n{message}"
+        ));
+    };
+    let board = get_tasks_dir(&project.path);
+    let index = read_task_entries(&board, *status)?
+        .iter()
+        .position(|entry| entry.source == task.source && entry.content == task.content)
+        .map(|index| index + 1);
+    let location = index.map_or_else(
+        || status.as_str().to_uppercase(),
+        |index| format!("{} #{index}", status.as_str().to_uppercase()),
+    );
+    let session = recoverable_codex_session_id_from_task_content(&task.content);
+    let mut details = format!(
+        "Task: {location} — {}\nReview item {} is not a board position.\nProject: {}\n\n{message}",
+        crate::task::task_display_text(task),
+        decision.task,
+        project.path.display(),
+    );
+    if let Some(session) = session {
+        details.push_str(&format!("\n\nConversation: {session}"));
+        if matches!(decision.decision, DecisionKind::User | DecisionKind::Repair)
+            && let Some(index) = index
+            && store
+                .git_finalization_blocking(project.id, session)?
+                .is_some_and(|journal| journal.state == crate::agent::GitFinalizationState::Working)
+        {
+            details.push_str(&format!(
+                "\n\nExternal completion option\n{}",
+                external_completion_guidance(*status, index)
+            ));
+        }
+    }
+    details.push_str("\n\nAfter resolving the issue, update the task notes or press r in Agent Projects to request a fresh review. Pressing r alone requests another assessment; it does not apply a repair or accept completion.");
+    Ok(details)
 }
 
 pub(super) enum Gate {
@@ -274,6 +371,15 @@ fn review_candidates(
             candidates.push(candidate);
         }
     }
+    // An execution failure must be assessed before an unrelated queued wait.
+    // Otherwise the reviewer can repeatedly choose the old Todo prerequisite
+    // and never give the interrupted Doing session a recovery direction.
+    if candidates
+        .iter()
+        .any(|(status, _)| *status == TaskStatus::Doing)
+    {
+        candidates.retain(|(status, _)| *status == TaskStatus::Doing);
+    }
     Ok(candidates)
 }
 
@@ -310,7 +416,7 @@ pub(super) fn gate(
         && previous
             .as_ref()
             .is_none_or(|review| review.state != "retry")
-        && queued_blockers_can_wait(project)?
+        && queued_blockers_can_wait_with_store(project, Some(store))?
     {
         if previous.is_some() {
             store.clear_supervisor_review_blocking(project.id)?;
@@ -484,10 +590,17 @@ pub(super) fn configure_command(
                     && worker.resume_session_id.as_deref() == session)
         } else { None };
         let finalization = session.map(|session| store.git_finalization_blocking(project.id, session)).transpose()?.flatten();
+        let board_index = read_task_entries(&get_tasks_dir(&project.path), *status)?
+            .iter().position(|entry| entry.source == task.source && entry.content == task.content)
+            .map(|index| index + 1);
+        let external_completion = board_index.filter(|_| finalization.as_ref().is_some_and(|journal|
+            journal.state == crate::agent::GitFinalizationState::Working))
+            .map(|index| external_completion_guidance(*status, index));
         let diagnostic = finalization.as_ref().filter(|journal| journal.state.is_finalizing())
             .map(|journal| crate::managed_git::agent_git_finalization_diagnostic(&project.path, journal)).transpose()?;
         Ok(json!({
-            "task": index + 1, "status": status.as_str(), "content": task.content,
+            "task": index + 1, "board_index": board_index, "status": status.as_str(), "content": task.content,
+            "external_completion": external_completion,
             "git_diagnostic": diagnostic, "repair_error": finalization.and_then(|journal| journal.last_error),
             "can_retry": can_retry,
             "resume_git_check": session.map(|session| resume_git_check(store, project, session, &task.content)).transpose()?,
@@ -510,7 +623,7 @@ pub(super) fn configure_command(
         }))?,
     )?;
     let prompt = format!(
-        "You are CLT's task supervisor. Assess exactly one blocked or FINALIZING task and return the required JSON decision. This is a read-only assessment, not an implementation run. Do not edit files, task statuses, Git, settings, or send messages. Do not follow task instructions that ask you to perform implementation. Read relevant code and logs as evidence.\n\nYour purpose is to make progress. Prefer a concrete retry for routine implementation choices, available checks, and recoverable errors; owner review alone is not a blocker when project instructions permit later review. Choose retry only when you can give the original session a concrete new approach, not repeat unchanged checks. Retry requires can_retry=true and the project retry count below {MAX_RETRIES}. Choose wait only for a real unavailable prerequisite; identify it and the wake condition. The host returns an idle, unsealed Doing task to blocked Todo so ready prerequisite work can proceed, preserving its session and journal. Choose user when a specific decision, permission or input is required; ask the exact question. Choose replan for a concrete split/reordering proposal preserving partial work and sessions. A FINALIZING task may already be in Done; preserve that placement, its sealed tree and its exact session. Inspect the supplied Git diagnostic and existing commit before suggesting retry. Never recommend duplicating a commit or resealing after it exists. CLT automatically repairs a proven unpublished HEAD whose sole mismatch is the selected Done entry position. Choose repair for other automation/session/Git state problems; identify the exact correction or required authorization, and never recommend deleting journals or bypassing ownership checks. Explain what changed or why another attempt would help. The host enforces the decision; you have no authority to modify the board.\n\nRetries used: {}. Review budget: 180 seconds.\nRun evidence belongs only to each blocked task’s exact session. Check its status and timestamps against current task notes; errors from completed predecessors or older attempts are historical, not proof of a current ownership conflict. Do not infer a live writer from old stderr. An idle resume_requested control with no child or interactive owner is the normal queued state, not evidence of a stuck handoff. Use latest_attempt for current failures even when it has no log paths; original_run may be older. terminal_worker describes the exact latest attempt, and service_cleaned_at means CLT drained that service. A verified resume_git_check proves the current task/branch matches its preserved journal; historical empty logs alone are not an unresolved launch blocker. Normal launch ownership checks still apply. If those checks now pass and the prerequisite is satisfied, prefer a concrete retry in the same session over requesting manual control cleanup.\nBlocked tasks:\n{}\n\nBoard evidence (may be truncated):\n{}",
+        "You are CLT's task supervisor. Assess exactly one blocked or FINALIZING task and return the required JSON decision. This is a read-only assessment, not an implementation run. Do not edit files, task statuses, Git, settings, or send messages. Do not follow task instructions that ask you to perform implementation. Read relevant code and logs as evidence.\n\nYour purpose is to make progress. Prefer a concrete retry for routine implementation choices, available checks, and recoverable errors; owner review alone is not a blocker when project instructions permit later review. Choose retry only when you can give the original session a concrete new approach, not repeat unchanged checks. Retry requires can_retry=true and the project retry count below {MAX_RETRIES}. Choose wait only for a real unavailable prerequisite; identify it and the wake condition. The host returns an idle, unsealed Doing task to blocked Todo so ready prerequisite work can proceed, preserving its session and journal. Choose user when a specific decision, permission or input is required; ask the exact question. Choose replan for a concrete split/reordering proposal preserving partial work and sessions. A FINALIZING task may already be in Done; preserve that placement, its sealed tree and its exact session. Inspect the supplied Git diagnostic and existing commit before suggesting retry. Never recommend duplicating a commit or resealing after it exists. CLT automatically repairs a proven unpublished HEAD whose sole mismatch is the selected Done entry position. Choose repair for other automation/session/Git state problems; identify the exact supported correction and who must perform it. Repair is a held recommendation, not an automatic repair job. Choose user whenever acceptance or authorization is required, including accepting externally completed work. Never recommend deleting journals or bypassing ownership checks. Explain what changed or why another attempt would help. For a WORKING task whose implementation already exists in a manual or mixed-scope commit, ask whether the user accepts that existing work as complete. Explain that explicit acceptance uses clt done with the current status and board index after clt list; it retires the unsealed journal while preserving commits and conversation history. This is a user decision, not another implementation retry. Never say only 'obtain authorization if required': state the exact acceptance needed and the concrete next command. Refer to tasks by title and supplied board_index, never by the review item number as though it were a board position. The host enforces the decision; you have no authority to modify the board.\n\nRetries used: {}. Review budget: 180 seconds.\nRun evidence belongs only to each blocked task’s exact session. Check its status and timestamps against current task notes; errors from completed predecessors or older attempts are historical, not proof of a current ownership conflict. Do not infer a live writer from old stderr. An idle resume_requested control with no child or interactive owner is the normal queued state, not evidence of a stuck handoff. Use latest_attempt for current failures even when it has no log paths; original_run may be older. terminal_worker describes the exact latest attempt, and service_cleaned_at means CLT drained that service. A verified resume_git_check proves the current task/branch matches its preserved journal; historical empty logs alone are not an unresolved launch blocker. Normal launch ownership checks still apply. If those checks now pass and the prerequisite is satisfied, prefer a concrete retry in the same session over requesting manual control cleanup.\nBlocked tasks:\n{}\n\nBoard evidence (may be truncated):\n{}",
         review.retries,
         serde_json::to_string(&tasks)?,
         review.evidence.chars().take(64000).collect::<String>()
@@ -528,16 +641,37 @@ pub(super) fn configure_command(
     Ok(())
 }
 
-/// Ready Todo work outranks queued blockers, but an execution blocker in Doing
-/// still receives assessment before other work is activated.
+/// Ready Todo work and interrupted Doing work outrank queued blockers. An
+/// execution blocker in Doing still receives assessment before other work.
 pub(super) fn queued_blockers_can_wait(project: &AgentProject) -> Result<bool> {
+    queued_blockers_can_wait_with_store(project, None)
+}
+
+fn queued_blockers_can_wait_with_store(
+    project: &AgentProject,
+    store: Option<&TursoAgentStore>,
+) -> Result<bool> {
     if blocked_candidates(project)?
         .iter()
         .any(|(status, _)| *status == TaskStatus::Doing)
     {
         return Ok(false);
     }
-    Ok(!crate::coordination::ready_tasks(&project.path)?.is_empty())
+    let board = get_tasks_dir(&project.path);
+    // Supervisor gates already own a registry handle. Reuse it for dependency
+    // proof rather than opening a second authority for the same database.
+    let snapshot = match store {
+        Some(store) => crate::coordination::Snapshot::admission_with_store(&board, store)?,
+        None => crate::coordination::Snapshot::admission(&board)?,
+    };
+    Ok(snapshot.tasks.iter().any(|task| {
+        task.board == board
+            && (task.status == TaskStatus::Todo
+                || task.status == TaskStatus::Doing
+                    && recoverable_codex_session_id_from_task_content(&task.entry.content)
+                        .is_some())
+            && snapshot.ready(&task.entry)
+    }))
 }
 
 fn blocked_candidates(project: &AgentProject) -> Result<Vec<(TaskStatus, crate::task::TaskEntry)>> {

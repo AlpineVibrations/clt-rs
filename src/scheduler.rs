@@ -164,6 +164,34 @@ impl Drop for AgentUnstartedLeaseGuard<'_> {
     }
 }
 
+fn reconcile_unstarted_scheduler_leases(
+    state_dir: &Path,
+    holder: &str,
+    active_project_ids: &[i64],
+) -> Result<()> {
+    // Only the owning daemon knows that its previous pass and dispatches have
+    // finished. Never infer this from another live process's lease age.
+    if holder != agent_scheduler_lease_holder() && holder != agent_lease_holder() {
+        return Ok(());
+    }
+    with_agent_store_at(state_dir, |store| {
+        for lease in store.list_active_leases_blocking(&agent_timestamp())? {
+            if lease.holder == holder
+                && !active_project_ids.contains(&lease.project_id)
+                && store.release_unstarted_scheduler_lease_blocking(&lease)?
+            {
+                println!(
+                    "Project {}: action=reclaim reason=unstarted_scheduler_reservation lease_holder={} path={}",
+                    lease.project_name,
+                    lease.holder,
+                    lease.project_path.display()
+                );
+            }
+        }
+        Ok(())
+    })
+}
+
 pub(super) fn acquire_agent_job_stage(
     request: AgentJobAcquisitionRequest<'_>,
 ) -> Result<AgentJobAcquisitionResult> {
@@ -646,9 +674,20 @@ async fn run_agent_daemon_loop_inner(
 
         if !scheduling_stopped && active_passes.is_empty() {
             let task_state_dir = state_dir.clone();
-            let active_project_ids = active_runs.iter().map(|run| run.project_id).collect();
+            let active_project_ids = active_runs
+                .iter()
+                .map(|run| run.project_id)
+                .collect::<Vec<_>>();
             let task_daemon_checkin = daemon_checkin.clone();
             active_passes.push(tokio::task::spawn_blocking(move || {
+                // All prior pass results and dispatches have settled here.
+                // Retry cleanup that may have failed during registry contention
+                // before a leftover lease can fence Git recovery or ready work.
+                reconcile_unstarted_scheduler_leases(
+                    &task_state_dir,
+                    &task_daemon_checkin.holder,
+                    &active_project_ids,
+                )?;
                 run_agent_daemon_scheduler_pass_with_active_and_checkin(
                     &task_state_dir,
                     active_project_ids,
@@ -1981,7 +2020,11 @@ pub(super) fn project_has_resumable_doing_task(
                         )
                 });
             if !cancelled_by_user
-                && !crate::coordination::session_waiting(&project.path, session_id)?
+                && !crate::coordination::session_waiting_with_store(
+                    &project.path,
+                    session_id,
+                    store,
+                )?
             {
                 return Ok(true);
             }
@@ -2025,7 +2068,11 @@ fn interrupted_codex_session_in_doing(
                         )
                 });
             if !cancelled_by_user
-                && !crate::coordination::session_waiting(&project.path, session_id)?
+                && !crate::coordination::session_waiting_with_store(
+                    &project.path,
+                    session_id,
+                    store,
+                )?
             {
                 return Ok(Some(session_id.to_string()));
             }

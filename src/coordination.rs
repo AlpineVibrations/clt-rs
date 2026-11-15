@@ -146,14 +146,29 @@ impl Snapshot {
     }
 
     pub(crate) fn load_at(board: &Path, state: &Path) -> Result<Self> {
-        Self::load_with_context(board, state, true)
+        Self::load_with_context(board, true, |snapshot| snapshot.load_runtime(board, state))
     }
 
     pub(crate) fn admission(board: &Path) -> Result<Self> {
-        Self::load_with_context(board, &agent_state_dir()?, false)
+        Self::load_with_context(board, false, |snapshot| {
+            snapshot.load_runtime(board, &agent_state_dir()?)
+        })
     }
 
-    fn load_with_context(board: &Path, state: &Path, owners: bool) -> Result<Self> {
+    pub(crate) fn admission_with_store(
+        board: &Path,
+        store: &crate::agent::TursoAgentStore,
+    ) -> Result<Self> {
+        Self::load_with_context(board, false, |snapshot| {
+            snapshot.load_runtime_from_store(board, store)
+        })
+    }
+
+    fn load_with_context(
+        board: &Path,
+        owners: bool,
+        load_runtime: impl FnOnce(&mut Self) -> Result<()>,
+    ) -> Result<Self> {
         let mut snapshot = Self::default();
         if !crate::task::board_has_any_status_store(board) {
             return Ok(snapshot);
@@ -176,7 +191,7 @@ impl Snapshot {
                 recoverable_codex_session_id_from_task_content(&task.entry.content).is_some()
             })
         {
-            snapshot.load_runtime(board, state)?;
+            load_runtime(&mut snapshot)?;
         }
         let root = outer.parent().unwrap_or(outer);
         if let Ok(output) = Command::new("git")
@@ -568,7 +583,10 @@ impl Snapshot {
                 } else {
                     "Conflict"
                 };
-                lines.push(format!("- {verdict} with {}: {}", review.other, review.reason));
+                lines.push(format!(
+                    "- {verdict} with {}: {}",
+                    review.other, review.reason
+                ));
                 lines.push(format!("  Evidence: {}", review.evidence));
             }
         }
@@ -731,7 +749,20 @@ pub(crate) fn ready_tasks(root: &Path) -> Result<Vec<TaskEntry>> {
 
 pub(crate) fn session_waiting(root: &Path, session: &str) -> Result<bool> {
     let snapshot = Snapshot::admission(&get_tasks_dir(root))?;
-    Ok(snapshot
+    Ok(session_waiting_in_snapshot(&snapshot, session))
+}
+
+pub(crate) fn session_waiting_with_store(
+    root: &Path,
+    session: &str,
+    store: &crate::agent::TursoAgentStore,
+) -> Result<bool> {
+    let snapshot = Snapshot::admission_with_store(&get_tasks_dir(root), store)?;
+    Ok(session_waiting_in_snapshot(&snapshot, session))
+}
+
+fn session_waiting_in_snapshot(snapshot: &Snapshot, session: &str) -> bool {
+    snapshot
         .tasks
         .iter()
         .filter(|task| {
@@ -739,7 +770,7 @@ pub(crate) fn session_waiting(root: &Path, session: &str) -> Result<bool> {
                 && recoverable_codex_session_id_from_task_content(&task.entry.content)
                     == Some(session)
         })
-        .any(|task| !snapshot.waits(task).is_empty()))
+        .any(|task| !snapshot.waits(task).is_empty())
 }
 
 pub(crate) fn ensure_admitted(board: &Path, status: TaskStatus, index: usize) -> Result<()> {

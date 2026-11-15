@@ -416,6 +416,73 @@ fn unfinished_git_proof_keeps_prerequisite_waiting_until_publication() {
 }
 
 #[test]
+fn admission_reuses_the_supplied_store_and_preserves_pending_completion_proof() {
+    let root = tempfile::tempdir().unwrap();
+    let project_root = root.path().join("project");
+    init_tasks(&project_root, false).unwrap();
+    let project_root = fs::canonicalize(project_root).unwrap();
+    let board = TaskBoard::for_project(&project_root);
+    board
+        .insert_content(
+            TaskStatus::Done,
+            None,
+            "API-01 Publish API. codex:api-session",
+        )
+        .unwrap();
+    board
+        .insert_content(
+            TaskStatus::Doing,
+            None,
+            "UI-02 Use API. Dependencies: API-01. codex:ui-session",
+        )
+        .unwrap();
+    let store = agent::TursoAgentStore::open_blocking(&root.path().join("state")).unwrap();
+    store
+        .register_project_blocking(&project_root, "project")
+        .unwrap();
+    store
+        .create_git_finalization_blocking(agent::NewGitFinalization {
+            project_id: 1,
+            codex_session_id: "api-session",
+            git_mode: AgentGitMode::Commit,
+            starting_head: Some("head"),
+            branch_ref: Some("refs/heads/main"),
+            upstream_ref: None,
+            worktree_baseline: "{}",
+            task_identity: Some("api"),
+            owner_run_token: None,
+            created_at: "1",
+        })
+        .unwrap();
+    assert!(session_waiting_with_store(&project_root, "ui-session", &store).unwrap());
+    for state in [
+        GitFinalizationState::Tracking,
+        GitFinalizationState::CommitPending,
+        GitFinalizationState::Completed,
+    ] {
+        let journal = store
+            .git_finalization_blocking(1, "api-session")
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .compare_and_set_git_finalization_blocking(
+                    1,
+                    "api-session",
+                    journal.generation,
+                    state,
+                    None,
+                    Some("commit"),
+                    None,
+                    "2"
+                )
+                .unwrap()
+        );
+    }
+    assert!(!session_waiting_with_store(&project_root, "ui-session", &store).unwrap());
+}
+
+#[test]
 fn independent_manual_and_automated_work_share_context_without_waiting() {
     let a = task(
         1,

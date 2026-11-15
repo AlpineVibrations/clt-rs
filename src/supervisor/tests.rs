@@ -93,6 +93,129 @@ fn supervisor_settings_and_decisions_survive_restart_and_snapshot() {
     fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn supervisor_repair_guidance_uses_board_position_and_preserves_working_proof() {
+    for folders in [false, true] {
+        let root = temp_root("supervisor-external-completion-guidance");
+        let path = root.join("project");
+        init_tasks(&path, folders).unwrap();
+        let board = TaskBoard::new(get_tasks_dir(&path));
+        for task in [
+            "Keep first task stopped clt:stopped",
+            "Keep second task stopped clt:stopped",
+            "Apply elite and weak templates. BLOCKED 2026-11-01: Parent importer is uncommitted. codex:templates",
+        ] {
+            board.insert_content(TaskStatus::Todo, None, task).unwrap();
+        }
+        initialize_test_git_repository(&path);
+        let store = agent::TursoAgentStore::open_blocking(&root.join("state")).unwrap();
+        store.register_project_blocking(&path, "project").unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        let start = capture_agent_git_start_state(&path, AgentGitMode::Commit).unwrap();
+        let before = board.entries(TaskStatus::Todo).unwrap();
+        store
+            .create_git_finalization_blocking(agent::NewGitFinalization {
+                project_id: project.id,
+                codex_session_id: "templates",
+                git_mode: AgentGitMode::Commit,
+                starting_head: Some(&start.starting_head),
+                branch_ref: start.branch_ref.as_deref(),
+                upstream_ref: start.upstream_ref.as_deref(),
+                worktree_baseline: &start.worktree_baseline,
+                task_identity: durable_task_identity(&before[2].content).as_deref(),
+                owner_run_token: None,
+                created_at: "100",
+            })
+            .unwrap();
+        let journal = store
+            .git_finalization_blocking(project.id, "templates")
+            .unwrap();
+        enable(&store);
+        begin_review(&store, &project).unwrap();
+        let mut command = Command::new("codex");
+        configure_command(&mut command, &store, &project, &root.join("run.err")).unwrap();
+        let prompt = command.get_args().last().unwrap().to_string_lossy();
+        assert!(prompt.contains("\"board_index\":3"), "{prompt}");
+        assert!(prompt.contains("Choose user whenever acceptance or authorization is required"));
+        assert!(prompt.contains("clt done todo <index>"));
+
+        // Existing Repair decisions remain readable without a model re-review.
+        finish_review(&store, &project, &result(&root, json!({
+            "decision":"repair", "task":1,
+            "reason":"The implementation already exists in a mixed-scope commit without a task trailer.",
+            "next_action":"Reconcile the stale WORKING journal through external completion."
+        }))).unwrap();
+        let review = store
+            .supervisor_review_blocking(project.id)
+            .unwrap()
+            .unwrap();
+        let details = review_details(&store, &project, &review).unwrap();
+        assert!(
+            details.contains("Task: TODO #3 — Apply elite and weak templates."),
+            "{details}"
+        );
+        assert!(details.contains("Action required: repair recommendation"));
+        assert!(details.contains("does not run a repair automatically"));
+        assert!(details.contains("clt list todo"));
+        assert!(details.contains("clt done todo <index>"));
+        assert!(details.contains("currently 3"));
+        assert!(details.contains("explicit acceptance"));
+        assert!(matches!(
+            gate(&store, &project, true).unwrap(),
+            Gate::Hold(_)
+        ));
+        assert_eq!(
+            store
+                .git_finalization_blocking(project.id, "templates")
+                .unwrap(),
+            journal
+        );
+        let after = board.entries(TaskStatus::Todo).unwrap();
+        assert_eq!(after.len(), before.len());
+        for (after, before) in after.iter().zip(&before) {
+            assert_eq!(after.content, before.content);
+            assert_eq!(after.source, before.source);
+        }
+        assert!(board.entries(TaskStatus::Done).unwrap().is_empty());
+        assert_eq!(
+            run_test_git(&path, &["rev-parse", "HEAD"]).trim(),
+            start.starting_head
+        );
+
+        // A changed board cannot route a saved review's index to another task.
+        board
+            .insert_content(TaskStatus::Todo, Some(0), "New task clt:stopped")
+            .unwrap();
+        let stale = review_details(&store, &project, &review).unwrap();
+        assert!(stale.contains("evidence has changed"));
+        assert!(!stale.contains("clt done"));
+        assert!(!stale.contains("TODO #3"));
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn supervisor_without_working_journal_does_not_offer_external_completion() {
+    let (root, _, store, project) = fixture("supervisor-no-external-completion");
+    enable(&store);
+    begin_review(&store, &project).unwrap();
+    finish_review(&store, &project, &result(&root, json!({
+        "decision":"user", "task":1,
+        "reason":"Requirements need a decision.", "next_action":"Which behavior should be implemented?"
+    }))).unwrap();
+    let review = store
+        .supervisor_review_blocking(project.id)
+        .unwrap()
+        .unwrap();
+    let details = review_details(&store, &project, &review).unwrap();
+    assert!(details.contains("Action required: your input"));
+    assert!(!details.contains("External completion option"));
+    assert!(!details.contains("clt done"));
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
 struct ReviewingRunner;
 impl crate::runner::AgentRunner for ReviewingRunner {
     fn run_project(&self, request: crate::runner::AgentRunRequest<'_>) -> Result<AgentRunResult> {
@@ -744,6 +867,217 @@ fn supervisor_and_legacy_recovery_allow_ready_todo_after_queued_blockers() {
             fs::remove_dir_all(root).unwrap();
         }
     }
+}
+
+#[test]
+fn queued_supervisor_wait_does_not_starve_interrupted_doing_session() {
+    for folders in [false, true] {
+        let root = temp_root("supervisor-interrupted-doing");
+        let state = root.join("state");
+        let path = root.join("project");
+        init_tasks(&path, folders).unwrap();
+        let board = TaskBoard::new(get_tasks_dir(&path));
+        let waiting = "Qualify renderer. BLOCKED 2026-11-14: GPU unavailable. codex:gpu-wait";
+        let interrupted = "Update defaults. codex:interrupted-defaults";
+        board
+            .insert_content(TaskStatus::Todo, None, waiting)
+            .unwrap();
+        board
+            .insert_content(TaskStatus::Doing, None, interrupted)
+            .unwrap();
+        initialize_test_git_repository(&path);
+        let store = agent::TursoAgentStore::open_blocking(&state).unwrap();
+        store.register_project_blocking(&path, "project").unwrap();
+        store
+            .set_project_git_mode_blocking(1, AgentGitMode::Commit)
+            .unwrap();
+        let project = store.list_projects_blocking().unwrap().remove(0);
+        let start = capture_agent_git_start_state(&path, AgentGitMode::Commit).unwrap();
+        for (session, content) in [("gpu-wait", waiting), ("interrupted-defaults", interrupted)] {
+            store
+                .create_git_finalization_blocking(agent::NewGitFinalization {
+                    project_id: project.id,
+                    codex_session_id: session,
+                    git_mode: AgentGitMode::Commit,
+                    starting_head: Some(&start.starting_head),
+                    branch_ref: start.branch_ref.as_deref(),
+                    upstream_ref: start.upstream_ref.as_deref(),
+                    worktree_baseline: &start.worktree_baseline,
+                    task_identity: durable_task_identity(content).as_deref(),
+                    owner_run_token: None,
+                    created_at: "100",
+                })
+                .unwrap();
+            store
+                .ensure_pending_git_finalization_resume_requested_blocking(project.id, session)
+                .unwrap();
+        }
+        store
+            .record_run_outcome_blocking(agent::AgentRunOutcome {
+                project_id: project.id,
+                status: "failure",
+                started_at: "100",
+                finished_at: Some("101"),
+                exit_code: None,
+                log_dir: None,
+                stdout_path: None,
+                stderr_path: None,
+                summary: Some("Worker heartbeat was stale for at least 60 seconds"),
+                codex_session_id: Some("interrupted-defaults"),
+            })
+            .unwrap();
+        enable(&store);
+        // Reproduce the existing held review of the unrelated Todo task.
+        begin_review(&store, &project).unwrap();
+        finish_review(
+            &store,
+            &project,
+            &result(
+                &root,
+                json!({
+                    "decision":"wait", "task":1, "reason":"GPU unavailable",
+                    "next_action":"Wait for GPU measurements"
+                }),
+            ),
+        )
+        .unwrap();
+        let before = evidence(&project).unwrap();
+        let journals = store
+            .list_pending_git_finalizations_blocking(Some(project.id))
+            .unwrap();
+        let pass = run_agent_scheduler_pass(&state, false, &[]).unwrap();
+        assert_eq!(pass.jobs.len(), 1, "folders={folders}");
+        assert_eq!(
+            pass.jobs[0].task_selection,
+            AgentTaskSelection::ResumeSession
+        );
+        assert_eq!(
+            pass.jobs[0].resume_session_id.as_deref(),
+            Some("interrupted-defaults")
+        );
+        assert_eq!(before, evidence(&project).unwrap());
+        assert_eq!(
+            journals,
+            store
+                .list_pending_git_finalizations_blocking(Some(project.id))
+                .unwrap()
+        );
+        assert!(
+            store
+                .supervisor_review_blocking(project.id)
+                .unwrap()
+                .is_none()
+        );
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn queued_wait_yields_only_to_admitted_automated_work() {
+    let root = temp_root("supervisor-doing-admission");
+    let path = root.join("project");
+    init_tasks(&path, false).unwrap();
+    let board = TaskBoard::new(get_tasks_dir(&path));
+    board
+        .insert_content(
+            TaskStatus::Todo,
+            None,
+            "GPU-01 Qualify renderer. BLOCKED 2026-11-14: GPU unavailable. codex:gpu-wait",
+        )
+        .unwrap();
+    board
+        .insert_content(TaskStatus::Doing, None, "Update defaults. codex:defaults")
+        .unwrap();
+    let store = agent::TursoAgentStore::open_blocking(&root.join("state")).unwrap();
+    store.register_project_blocking(&path, "project").unwrap();
+    let project = store.list_projects_blocking().unwrap().remove(0);
+    for (content, expected) in [
+        ("Update defaults. codex:defaults", true),
+        ("Update defaults. clt:stopped codex:defaults", false),
+        ("Update defaults. clt:manual codex:defaults", false),
+        ("Update defaults.", false),
+        (
+            "Update defaults. BLOCKED 2026-11-14: Missing input. codex:defaults",
+            false,
+        ),
+        (
+            "Update defaults. Dependencies: GPU-01. codex:defaults",
+            false,
+        ),
+    ] {
+        let entry = board.entries(TaskStatus::Doing).unwrap().remove(0);
+        write_task_entry_content(board.path(), TaskStatus::Doing, &entry, content).unwrap();
+        assert_eq!(
+            queued_blockers_can_wait_with_store(&project, Some(&store)).unwrap(),
+            expected,
+            "{content}"
+        );
+    }
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn supervisor_reviews_repeated_doing_failure_before_unrelated_queued_wait() {
+    let (root, _, store, project) = fixture("supervisor-doing-failure-priority");
+    let board = TaskBoard::new(get_tasks_dir(&project.path));
+    let entry = board.entries(TaskStatus::Todo).unwrap().remove(0);
+    write_task_entry_content(
+        board.path(),
+        TaskStatus::Todo,
+        &entry,
+        "Qualify renderer. BLOCKED 2026-11-14: GPU unavailable. codex:gpu-wait",
+    )
+    .unwrap();
+    let entry = board.entries(TaskStatus::Doing).unwrap().remove(0);
+    write_task_entry_content(
+        board.path(),
+        TaskStatus::Doing,
+        &entry,
+        "Update defaults. codex:original-session",
+    )
+    .unwrap();
+    for timestamp in ["100", "101"] {
+        store
+            .record_run_outcome_blocking(agent::AgentRunOutcome {
+                project_id: project.id,
+                status: "failure",
+                started_at: timestamp,
+                finished_at: Some(timestamp),
+                exit_code: None,
+                log_dir: None,
+                stdout_path: None,
+                stderr_path: None,
+                summary: Some("Worker heartbeat was stale for at least 60 seconds"),
+                codex_session_id: Some("original-session"),
+            })
+            .unwrap();
+    }
+    enable(&store);
+    assert!(matches!(
+        gate(&store, &project, true).unwrap(),
+        Gate::Review
+    ));
+    let candidates = review_candidates(&store, &project).unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].0, TaskStatus::Doing);
+    assert!(candidates[0].1.content.contains("codex:original-session"));
+    begin_review(&store, &project).unwrap();
+    let mut command = Command::new("codex");
+    configure_command(&mut command, &store, &project, &root.join("run.err")).unwrap();
+    let prompt = command.get_args().last().unwrap().to_string_lossy();
+    let review_section = prompt
+        .split("Blocked tasks:\n")
+        .nth(1)
+        .unwrap()
+        .split("Board evidence")
+        .next()
+        .unwrap();
+    assert!(review_section.contains("Worker heartbeat was stale"));
+    assert!(!review_section.contains("GPU unavailable"));
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

@@ -6,6 +6,23 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+### Fixed
+
+- Recover unused scheduler reservations after database contention interrupts
+  a pass or worker dispatch, so Git finalization and the next eligible task
+  continue without waiting for the one-hour lease expiry.
+- Resume interrupted Doing tasks despite unrelated queued supervisor waits,
+  preserving their conversation and Git journal. Prioritize execution failures
+  over queued prerequisites when supervisor assessment is needed.
+- Retry transient same-process registry-open races while the previous database
+  handle finishes releasing its shared WAL mapping.
+- Mark supervisor requests for input, replanning and manual repair as `ACTION`,
+  with an explicit explanation of who must act. Keep the action visible above
+  long explanations and provide a scrollable `v` details view.
+- Identify supervisor review items by their actual task title and board position.
+  Explain how to accept externally completed work through the existing guarded
+  Done command, and request explicit acceptance for existing manual commits.
+
 ## [0.9.15] - 2026-11-10
 
 ### Fixed

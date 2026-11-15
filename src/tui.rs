@@ -36,6 +36,7 @@ mod log_attempt;
 mod progress;
 mod retry_status;
 mod settings;
+mod supervisor_notice;
 mod task_details;
 
 use crate::{
@@ -1286,6 +1287,7 @@ impl TuiAgentProject {
 pub(super) struct TuiAgentSupervisorNotice {
     runtime_state: TuiAgentRuntimeState,
     message: String,
+    details: String,
 }
 
 impl TuiAgentSupervisorNotice {
@@ -1303,7 +1305,11 @@ impl TuiAgentSupervisorNotice {
         };
         Some(Self {
             runtime_state,
-            message: review.message(),
+            message: format!(
+                "{}\nPress v for full details and recovery instructions.",
+                review.message()
+            ),
+            details: review.message(),
         })
     }
 }
@@ -1341,9 +1347,7 @@ impl TuiAgentRuntimeState {
             Self::Settling => "SETTLING",
             Self::Waiting => "WAITING",
             Self::RetryApproved | Self::RetryScheduled => "RETRY",
-            Self::NeedsInput => "INPUT",
-            Self::Replan => "REPLAN",
-            Self::Repair => "REPAIR",
+            Self::NeedsInput | Self::Replan | Self::Repair => "ACTION",
             Self::Finalizing => "FINAL",
             Self::PushPending => "PUSH",
             Self::Interactive => "INTERACTIVE",
@@ -2962,14 +2966,20 @@ pub(super) fn load_tui_agent_panel_snapshot_inner(
             } else {
                 None
             };
-            let supervisor_notice = supervisor_review
+            let mut supervisor_notice = supervisor_review
                 .as_ref()
                 .and_then(TuiAgentSupervisorNotice::from_review);
+            if let (Some(notice), Some(review)) = (&mut supervisor_notice, &supervisor_review) {
+                notice.details = crate::supervisor::review_details(&store, &project, review)
+                    .unwrap_or_else(|error| format!("{}\n\nUnable to load current task guidance: {error:#}. Refresh the project before acting.", review.message()));
+            }
             let failure_problem = supervisor_review
                 .as_ref()
                 .filter(|review| review.error.is_some())
                 .map(crate::supervisor::SupervisorReview::message)
-                .or_else(|| tui_agent_failure_problem(&project, relevant_failure));
+                .or_else(|| {
+                    tui_agent_failure_problem(&project, relevant_failure)
+                });
             let activity = active_workers
                 .iter()
                 .find(|worker| worker.project_id == project.id)
@@ -3535,7 +3545,7 @@ pub(super) fn tui_agent_log_refresh_interval() -> Duration {
 }
 
 pub(super) fn tui_agent_panel_instructions() -> &'static str {
-    "u selects supervisor settings (Space on/off, m model, t thinking, f fast). Up/Down selects, Enter opens/adds, Space toggles ON/OFF, Delete removes with confirmation, g cycles Git off/commit/push, m cycles the selected target, M opens Models, f toggles fast, t cycles thinking, r retries after fixing an error, l shows output. s directly stops the selected active, interactive, or fenced session; with output open it controls that exact session. With output open: i takes over a live session and c opens a session (taking over if active). Tab returns to Kanban."
+    "u selects supervisor settings (Space on/off, m model, t thinking, f fast). Up/Down selects, Enter opens/adds, Space toggles ON/OFF, Delete removes with confirmation, g cycles Git off/commit/push, m cycles the selected target, M opens Models, f toggles fast, t cycles thinking, r retries after fixing an error, v shows supervisor details and recovery instructions, l shows output. s directly stops the selected active, interactive, or fenced session; with output open it controls that exact session. With output open: i takes over a live session and c opens a session (taking over if active). Tab returns to Kanban."
 }
 
 pub(super) fn tui_agent_log_title(log_view: &TuiAgentLogView) -> String {
@@ -6175,6 +6185,7 @@ pub(super) struct TuiApp {
     pub(super) steering_delivery: Option<Receiver<Result<String>>>,
     task_summary: Option<progress::TaskSummary>,
     task_details: Option<task_details::Details>,
+    supervisor_details: Option<supervisor_notice::Details>,
     pub(super) feedback_buffer: String,
     pub(super) archive_view: bool,
     pub(super) backlog_visible: bool,
@@ -6225,6 +6236,7 @@ impl TuiApp {
             steering_delivery: None,
             task_summary: None,
             task_details: None,
+            supervisor_details: None,
             feedback_buffer: start_state.feedback_buffer,
             archive_view: false,
             backlog_visible: false,
@@ -6392,6 +6404,9 @@ impl TuiApp {
         if let Some(details) = &mut self.task_details {
             details.prepare(size);
         }
+        if let Some(details) = &mut self.supervisor_details {
+            details.prepare(size);
+        }
         if self.current_mode == Mode::Help {
             self.help.prepare(size);
         }
@@ -6504,6 +6519,12 @@ pub(super) fn update_tui_pane(app: &mut TuiApp, key: KeyEvent) -> Option<Vec<Tui
     if let Some(details) = &mut app.task_details {
         if details.key(key.code) {
             app.task_details = None;
+        }
+        return Some(Vec::new());
+    }
+    if let Some(details) = &mut app.supervisor_details {
+        if details.key(key.code) {
+            app.supervisor_details = None;
         }
         return Some(Vec::new());
     }
@@ -6677,6 +6698,20 @@ pub(super) fn update_tui_agent_projects_pane(
         return Some(vec![TuiEffect::PaneKey(key)]);
     }
     match key.code {
+        KeyCode::Char('v' | 'V') => {
+            if let Some(notice) = app
+                .agent_panel
+                .selected_project()
+                .and_then(TuiAgentProject::displayed_supervisor_notice)
+            {
+                app.supervisor_details =
+                    Some(supervisor_notice::Details::new(notice.details.clone()));
+            } else {
+                app.feedback_buffer =
+                    "No current supervisor decision to inspect for this project.".into();
+            }
+            Some(Vec::new())
+        }
         KeyCode::Esc if app.active_board => {
             app.current_pane = TuiPane::Tasks;
             app.feedback_buffer = tui_task_board_instructions().to_string();
@@ -6994,7 +7029,25 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
     let (console_title, console_right_title) = if let Some(log_view) = app.agent_log_view.as_ref() {
         (tui_agent_log_title(log_view), None)
     } else if app.current_pane == TuiPane::AgentProjects {
-        ("Agent Projects Console".to_string(), None)
+        let title = if let Some(notice) = app
+            .agent_panel
+            .selected_project()
+            .and_then(TuiAgentProject::displayed_supervisor_notice)
+        {
+            if matches!(
+                notice.runtime_state,
+                TuiAgentRuntimeState::NeedsInput
+                    | TuiAgentRuntimeState::Replan
+                    | TuiAgentRuntimeState::Repair
+            ) {
+                "Action required · v details"
+            } else {
+                "Supervisor status · v details"
+            }
+        } else {
+            "Agent Projects Console"
+        };
+        (title.to_string(), None)
     } else if app.current_pane == TuiPane::Models {
         ("Models Console".to_string(), None)
     } else if app.archive_view {
@@ -7472,7 +7525,15 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
         .block(console_block)
         .style(Style::default().fg(console_color))
         .scroll((
-            if retry.is_some() {
+            if retry.is_some()
+                || (app.agent_log_view.is_none()
+                    && app.current_pane == TuiPane::AgentProjects
+                    && app
+                        .agent_panel
+                        .selected_project()
+                        .and_then(TuiAgentProject::displayed_supervisor_notice)
+                        .is_some())
+            {
                 0
             } else {
                 tui_log_scroll_offset(
@@ -7490,6 +7551,9 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
         summary.render(f);
     }
     if let Some(details) = &app.task_details {
+        details.render(f);
+    }
+    if let Some(details) = &app.supervisor_details {
         details.render(f);
     }
 

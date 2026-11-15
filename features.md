@@ -754,22 +754,29 @@ specific reason. This deterministic repair runs even when model supervision is
 disabled. CLT never relaxes the sealed-tree proof or deletes its journal.
 
 
-The optional supervisor reviews execution blockers in Doing before CLT starts another task, and reviews queued blockers when no ready Todo work remains. Blocked Todo tasks waiting on prerequisites do not prevent a ready Todo from running, regardless of its position in the list or an existing WORKING Git journal. Git recovery preserves that deliberate Todo placement and lets its queued resume request wait. A saved review hold from a queued dependency wait is cleared when ready work can proceed. It defaults to off, the CLT default model, high thinking, and fast mode off. Configure it on the single line at the top of Agent Projects (`u` selects the line; `Space`, `m`, `t`, and `f` change its settings). Install the updated binary and restart the scheduler to use the feature.
+The optional supervisor reviews execution blockers in Doing before CLT starts another task, and reviews queued blockers when neither ready Todo nor resumable Doing work remains. Blocked Todo tasks waiting on prerequisites do not prevent a ready Todo from running or an interrupted Doing task from resuming, regardless of its position in the list or an existing WORKING Git journal. Git recovery preserves that deliberate Todo placement and lets its queued resume request wait. A saved review hold from a queued dependency wait is cleared when ready work can proceed. It defaults to off, the CLT default model, high thinking, and fast mode off. Configure it on the single line at the top of Agent Projects (`u` selects the line; `Space`, `m`, `t`, and `f` change its settings). Install the updated binary and restart the scheduler to use the feature.
 
 After the implementation worker exits and saves its blocker evidence, a separate review worker takes the project's lease. It uses a read-only sandbox, the supervisor's model settings, and a three-minute deadline. It examines task notes, relevant project files and the latest available logs for each blocked task’s exact session, then returns one structured decision. Errors from other project sessions are not supplied as current failure evidence:
 
 - **Retry:** give the original task session a concrete new approach. CLT saves the decision before unblocking the task, restores returned Todo work to Doing, and passes the supervisor's direction to the original conversation. Its Git journal and partial work remain intact.
 - **Wait:** identify a real missing prerequisite and what must change. CLT returns an idle, unsealed Doing task to blocked Todo, preserving its blocker, session and journal, so ready prerequisite work can proceed. Explicitly stopped or owned sessions are not moved.
-- **User:** state the exact decision, permission, or input required.
+- **User:** state the exact decision, permission, or input required. This includes
+  accepting work already present in a manual or mixed-scope commit as complete.
 - **Replan:** propose a task split or reordering that preserves existing work.
-- **Repair:** identify an automation or session-state problem and a recovery step.
+- **Repair:** recommend a supported correction for an automation or session-state
+  problem and identify who must perform it. This decision waits for action; it
+  does not start a repair job.
 
-Retry and dependency-wait deferral are automatic actions. The scheduler handles supported pre-activation Git repairs before applying supervisor holds. A queued wait holds only when no ready Todo remains. User, Replan and remaining Repair decisions hold the project and show the reasoning and next action in the selected project's console. Replanning is a proposal, not an automatic rewrite of the task board. Resolve a prerequisite or answer a question in the task notes to provide new evidence, or press `r` on the project to request a fresh review explicitly. Unchanged task evidence reuses the saved decision instead of repeatedly launching a model. The supervisor allows at most two implementation retries before requiring user review; explicit `r` resets that budget. A crashed assessment can be attempted twice on the same evidence. Invalid, stale, failed, or timed-out assessments cannot authorize task changes.
+Retry and dependency-wait deferral are automatic actions. The scheduler handles supported pre-activation Git repairs before applying supervisor holds. A queued wait holds only when no ready Todo or admitted, session-linked Doing work remains. After an interrupted worker, CLT resumes that Doing task in its original conversation through the normal ownership and Git checks. If it repeatedly fails, the supervisor assesses that execution failure before unrelated queued prerequisites. User, Replan and remaining Repair decisions hold the project and show the reasoning and next action in the selected project's console. Replanning is a proposal, not an automatic rewrite of the task board. Resolve a prerequisite or answer a question in the task notes to provide new evidence, or press `r` on the project to request a fresh review explicitly. Unchanged task evidence reuses the saved decision instead of repeatedly launching a model. The supervisor allows at most two implementation retries before requiring user review; explicit `r` resets that budget. A crashed assessment can be attempted twice on the same evidence. Invalid, stale, failed, or timed-out assessments cannot authorize task changes.
 
 Supervisor settings and decisions survive scheduler restarts and registry recovery. Explicit stops, manual ownership, active leases, and the sealed Git manifest retain their protections. Turning the supervisor off restores ordinary scheduling without deleting its saved decisions or changing task sessions. A review already running when it is switched off cannot apply its decision. Supervisor output remains available with the project's usual `l` log control.
 
-Agent Projects shows supervisor decisions in amber as `WAITING`, `INPUT`,
-`REPLAN`, `REPAIR`, or `RETRY`, while an active assessment shows `REVIEWING`.
+Agent Projects shows supervisor decisions in amber as `WAITING`, `ACTION`,
+or `RETRY`, while an active assessment shows `REVIEWING`. `ACTION` means you must
+provide input, review a proposed plan, or perform a recommended repair. The
+console names the decision and says whether CLT is waiting for you, a prerequisite,
+or permission from existing session controls to retry. Its heading and next action
+stay above the explanation instead of scrolling out of view with long messages.
 `RETRY` identifies a saved approval; session stops still take precedence over
 automatic resumption. The selected project’s console includes the reason and next action. `ERROR` in
 red indicates a failed assessment, project scan, or execution rather than an
@@ -777,6 +784,26 @@ ordinary supervisor hold. A database mentioned by a task’s Wait decision is th
 task’s prerequisite; an unavailable CLT registry is reported separately. External
 service availability is not polled by the supervisor: update the task’s blocker
 note or press `r` after restoring the service to request a fresh assessment.
+
+Press `v` on the selected project to read the full supervisor decision and recovery
+instructions. Use Up/Down, PageUp/PageDown and Home/End to scroll; `v`, Enter or Esc
+closes the view. This is a read-only snapshot; it does not perform a repair or
+accept completion. For a current request for user action, it identifies the task by title,
+conversation and actual board position. A supervisor's numbered review item is
+not a Todo/Doing index. Changed evidence requires a fresh review before showing
+task-specific commands.
+
+For an unsealed `WORKING` task, User and Repair details include an external
+completion option. If you have verified and accept the existing work, pause the
+project and let any active worker finish. From its directory, run `clt list todo`
+(or the task's current status), confirm the task's current index, then run
+`clt done todo <index>`. Resume the project afterward. This preserves the existing
+commit and conversation, retains the cancelled journal as history, and checks
+ownership at the transition. A missing task trailer on a manual or mixed-scope
+commit requires this explicit acceptance; the supervisor cannot infer permission
+to discard the unfinished proof. Sealed `FINALIZING` and `PUSH-PENDING` work keeps
+its existing recovery requirements. Pressing `r` requests another assessment; it
+does not accept completion or apply a recommended repair.
 
 If a Repair decision says an unfinished session is stopped, select that task and
 press `Shift+S` to resume the same conversation. This also works when an older
@@ -816,6 +843,14 @@ Reconnecting a drive at its registered path requires no re-registration: the nex
 The first upgrade from a CLT release that predates independent workers cannot detach a run that the old scheduler already owns in-process. To prevent accidentally terminating it, `start` and `stop` refuse while a live legacy scheduler lease exists; let that one-time legacy run finish and retry. Runs dispatched after this feature is installed are independent.
 
 Worker startup and heartbeat records are fenced and bounded. If a worker fails before claiming its service or later stops checking in, the scheduler first drains and verifies that worker's exact launchd/systemd service, records one crash outcome, and only then releases its lease for recovery. This prevents a replacement Codex process from overlapping the old process group.
+
+If database contention interrupts a scheduler pass or worker dispatch and also
+prevents its reservation cleanup, the scheduler retries that cleanup before its
+next pass. It releases only its own unused reservation after checking active
+workers, sessions and pending launches. Git finalization then resumes through
+the existing commit and publication checks before the next eligible task starts;
+there is no need to wait for the reservation's default one-hour expiry. Saved
+log output by itself does not establish task completion.
 
 If prelaunch Git validation or persistence fails, the runner explicitly cancels the gated Codex launch and waits for its process group to stop. The runner then records the original error and log paths and releases its lease for the normal failure-backoff retry. This cancellation is distinct from an unexpected runner disconnect, which still triggers supervisor crash recovery.
 

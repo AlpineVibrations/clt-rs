@@ -2783,7 +2783,10 @@ fn supervisor_decisions_show_actionable_status_without_error_styling() {
         (Some(DecisionKind::User), TuiAgentRuntimeState::NeedsInput),
         (Some(DecisionKind::Replan), TuiAgentRuntimeState::Replan),
         (Some(DecisionKind::Repair), TuiAgentRuntimeState::Repair),
-        (Some(DecisionKind::Retry), TuiAgentRuntimeState::RetryApproved),
+        (
+            Some(DecisionKind::Retry),
+            TuiAgentRuntimeState::RetryApproved,
+        ),
     ] {
         let review = SupervisorReview {
             evidence: "current evidence".into(),
@@ -2860,7 +2863,8 @@ fn supervisor_decisions_show_actionable_status_without_error_styling() {
 
         panel.state.select(Some(0));
         let (console, color) = tui_console_content(true, &panel, None, "instructions");
-        assert_eq!(console, review.message());
+        assert!(console.starts_with(&review.message()));
+        assert!(console.contains("Press v for full details"));
         assert_eq!(color, Color::LightYellow);
         if review.decision.is_some() {
             assert!(console.contains("Next: Restore the required database"));
@@ -2953,6 +2957,79 @@ fn supervisor_notices_preserve_errors_and_live_session_activity() {
 
     review.error = Some("Supervisor did not return a valid decision".into());
     assert!(TuiAgentSupervisorNotice::from_review(&review).is_none());
+}
+
+#[test]
+fn supervisor_action_details_are_modal_and_keep_the_action_visible() {
+    use crate::supervisor::{Decision, DecisionKind, SupervisorReview};
+    let review = SupervisorReview {
+        evidence: "evidence".into(),
+        state: "held".into(),
+        attempts: 1,
+        retries: 0,
+        decision: Some(Decision {
+            decision: DecisionKind::Repair,
+            task: 1,
+            reason: "The implementation exists in a commit. ".repeat(80),
+            next_action: "Accept the verified existing work as complete.".into(),
+        }),
+        retry_session: None,
+        error: None,
+    };
+    let mut app = TuiApp::new(Path::new("/tmp/clt-supervisor-details-test"), true);
+    app.current_pane = TuiPane::AgentProjects;
+    let mut project = tui_agent_project_for_test(1, "demo");
+    project.runtime_state = TuiAgentRuntimeState::Repair;
+    project.supervisor_notice = TuiAgentSupervisorNotice::from_review(&review);
+    app.agent_panel.projects = vec![project];
+    app.agent_panel.state.select(Some(0));
+    app.agent_panel.last_error = None;
+
+    for (width, height) in [(100, 24), (80, 12), (40, 10)] {
+        app.prepare_render(Rect::new(0, 0, width, height));
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| render_tui(frame, &app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Action required"), "{text}");
+        assert!(text.contains("v details"), "{text}");
+    }
+    let press = |app: &mut TuiApp, code| {
+        assert_eq!(
+            update_tui_pane(app, KeyEvent::new(code, KeyModifiers::NONE)),
+            Some(vec![])
+        );
+    };
+    press(&mut app, KeyCode::Char('v'));
+    assert!(app.supervisor_details.is_some());
+    app.prepare_render(Rect::new(0, 0, 40, 10));
+    for key in [
+        KeyCode::End,
+        KeyCode::Char('r'),
+        KeyCode::Char(' '),
+        KeyCode::Delete,
+        KeyCode::Char('s'),
+        KeyCode::Tab,
+        KeyCode::Char('q'),
+    ] {
+        press(&mut app, key);
+        assert!(app.supervisor_details.is_some());
+        assert_eq!(app.current_pane, TuiPane::AgentProjects);
+        assert_eq!(app.agent_panel.state.selected(), Some(0));
+        assert!(app.agent_panel.projects[0].project.enabled);
+    }
+    press(&mut app, KeyCode::Esc);
+    assert!(app.supervisor_details.is_none());
+    // Details cannot expose a held decision while an active owner takes priority.
+    app.agent_panel.projects[0].runtime_state = TuiAgentRuntimeState::Running;
+    press(&mut app, KeyCode::Char('v'));
+    assert!(app.supervisor_details.is_none());
 }
 
 #[test]

@@ -103,6 +103,13 @@ used Turso dependency. Application modules import its local API through
   and assessment failures. Runtime status and console styling preserve active
   worker and interactive ownership while showing ordinary holds as attention
   states. Rendering uses the cached decision without registry reads.
+- Supervisor details resolve review candidate numbers to the current board only
+  after matching saved evidence. External-completion guidance is conditional on
+  an unsealed WORKING journal; reading it never changes tasks, controls or proof.
+  The review prompt supplies actual board indexes and requires a User decision
+  for acceptance of an existing manual commit. `tui::supervisor_notice` renders a
+  scrollable cached snapshot and consumes mutation keys until it closes. The
+  compact console keeps the action at the top; log views retain tail scrolling.
 - `tui::settings` previews project and supervisor edits from cached settings and
   enabled model targets. One background writer uses the existing durable store
   facades; queued edits coalesce by project and setting group without changing
@@ -123,6 +130,15 @@ used Turso dependency. Application modules import its local API through
   cover the existing task's stop/resume controls through review and exact-session
   retry in both board layouts, preserving Git history, journal and staged work.
 - Scheduler decision functions are separate from acquisition and worker effects.
+- Between daemon passes, after every returned job has been dispatched, the
+  scheduler retries cleanup of its own unused reservations. Active inline jobs
+  are excluded. The worker/lease repository atomically compares the observed
+  holder and timestamps and checks active workers, session owners and launch
+  boundaries before deleting only that lease. Pending Git journals and queued
+  resumes remain intact for ordinary reconciliation. Regressions cover failed
+  dispatch cleanup, same-process ownership, renewed/replaced leases and all
+  durable fences: `cargo test --locked --bin clt unstarted` and
+  `cargo test --locked --bin clt agent_daemon`.
 - Direct-session ownership is persisted as `clt:manual` beside the task's terminal conversation marker. Creation publishes directly into Doing; claiming writes ownership before moving; handoff moves into Todo before removing ownership. The project board lock serializes board changes and exact-session selection. Independent manual claims and automated work may coexist; scheduler scans, resume acquisition, blocked recovery and worker result inference exclude manual tasks. Interactive and Git recovery checks protect the selected conversation without fencing unrelated manual work. Creation and status moves preserve neighboring folder paths. Editing and moves to Backlog preserve claims; moves into Todo release the selected claim after publishing its destination. Done and deletion also release it. A conversation with prior automated work keeps its existing journal and controls.
 - Completion can recover absent launch environment from the exact runtime `CODEX_THREAD_ID` and its running session-control record. The project, child liveness, unique token ownership and selected task session are checked before ordinary Git sealing/resealing; journal transactions still recheck the token. Stopped, interactive, missing and ambiguous records cannot supply an automated context. Explicit malformed launch environment remains an error. CLI tests cover recovery without launch variables and rejection of another task's completion.
 
@@ -337,6 +353,19 @@ retains that diagnostic alongside unfinished Git proof. Planning and worker
 regressions cover deferred resumes and rejected scope changes before release.
 
 The supervisor and interactive stop/resume recovery regressions can also be run directly:
+
+Queued supervisor holds yield to admitted, session-linked Doing work as well as
+ready Todo work. The same predicate defers older WORKING journals and queued
+resume controls; ordinary acquisition still enforces ownership and Git proof.
+Doing execution blockers and repeated failures take review priority over queued
+prerequisites. Supervisor, resume and worker-deferral admission reuse their open
+registry store for dependency proof. Regressions preserve both journals and
+board layouts after an interrupted
+worker, and cover stopped/manual/unlinked tasks and unmet dependencies.
+Registry construction also bounds retries for the weak-cache teardown race that
+reports a duplicate same-process WAL mapping. It never clears the live mapping;
+permanent errors retain the original cause. Concurrent open/drop regression:
+`cargo test --locked --bin clt concurrent_registry_handle_teardown`.
 
 ```bash
 cargo test --locked --bin clt supervisor::tests

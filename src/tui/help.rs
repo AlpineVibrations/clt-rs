@@ -70,6 +70,7 @@ m: Cycle the project's model target.
 f / F: Toggle project Fast mode.
 t / T: Cycle project thinking.
 r / R: Retry a failed project, or confirm missing Git-record recovery.
+v / V: Read the supervisor decision, task identity and recovery instructions.
 s / S: Stop/resume the selected session; with output open, control that exact session.
 l / L: Toggle the selected project's live/latest output.
 i: With output open, take over its session and resume automation on return.
@@ -81,6 +82,10 @@ SUPERVISOR SETTINGS (after u in Agent Projects)
 Space: Toggle the supervisor ON/OFF.
 m: Cycle supervisor model. t / T: Cycle thinking. f / F: Toggle Fast.
 u / Esc / Enter / Down: Return to the project list.
+
+SUPERVISOR DETAILS (after v in Agent Projects)
+Up/Down: Scroll. PageUp/PageDown: Scroll a page. Home/End: First/last page.
+v / V / Enter / Esc: Close. This view does not apply repairs or accept completion.
 
 MODELS AND PROVIDERS
 Left/Right: Focus providers/models. Up/Down: Select a row (wraps).
