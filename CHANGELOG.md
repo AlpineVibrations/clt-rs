@@ -6,8 +6,12 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+## [0.9.16] - 2026-11-21
+
 ### Fixed
 
+- Show the Agent Projects removal confirmation above supervisor `ACTION` notices
+  and run confirmed removal in the background so the TUI stays responsive.
 - Recover unused scheduler reservations after database contention interrupts
   a pass or worker dispatch, so Git finalization and the next eligible task
   continue without waiting for the one-hour lease expiry.
@@ -686,7 +690,7 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 - Fixed task moves so destination write failures do not remove the source task.
 - Fixed TUI navigation on empty boards.
 
-[Unreleased]: https://github.com/AlpineVibrations/clt-rs/compare/v0.9.11...HEAD
+[Unreleased]: https://github.com/AlpineVibrations/clt-rs/compare/v0.9.16...HEAD
 [0.9.11]: https://github.com/AlpineVibrations/clt-rs/compare/v0.9.10...v0.9.11
 [0.9.8]: https://github.com/AlpineVibrations/clt-rs/compare/v0.9.7...v0.9.8
 [0.9.7]: https://github.com/AlpineVibrations/clt-rs/compare/v0.9.6...v0.9.7

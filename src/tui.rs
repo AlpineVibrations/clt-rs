@@ -34,6 +34,7 @@ use tui_input::{Input, InputRequest};
 mod help;
 mod log_attempt;
 mod progress;
+mod project_removal;
 mod retry_status;
 mod settings;
 mod supervisor_notice;
@@ -90,9 +91,6 @@ use crate::{
         title_from_path,
     },
 };
-
-#[cfg(not(test))]
-use crate::worker::cleanup_terminal_agent_worker_services;
 
 pub(super) const TODO_BOARD_INDEX: usize = 0;
 pub(super) const DONE_BOARD_INDEX: usize = 2;
@@ -1468,12 +1466,6 @@ impl TuiAgentPanelRefreshWorker {
 }
 
 pub(super) struct TuiCurrentProjectRegistration {
-    pub(super) path: PathBuf,
-    pub(super) name: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct TuiAgentProjectRemoval {
     pub(super) path: PathBuf,
     pub(super) name: String,
 }
@@ -3407,63 +3399,6 @@ pub(super) fn register_selected_current_project(
         Ok(format!(
             "Project already registered: {}",
             registration.0.display()
-        ))
-    }
-}
-
-pub(super) fn selected_tui_agent_project_removal(
-    panel: &TuiAgentPanel,
-) -> Option<TuiAgentProjectRemoval> {
-    panel
-        .selected_project()
-        .map(|entry| TuiAgentProjectRemoval {
-            path: entry.project.path.clone(),
-            name: entry.project.name.clone(),
-        })
-}
-
-pub(super) fn tui_agent_project_removal_prompt(removal: &TuiAgentProjectRemoval) -> String {
-    format!(
-        "Remove agent project '{}' from the list? Press y to confirm; n or Esc cancels.",
-        removal.name
-    )
-}
-
-pub(super) fn remove_tui_agent_project(
-    panel: &mut TuiAgentPanel,
-    active_root: &Path,
-    removal: &TuiAgentProjectRemoval,
-) -> Result<String> {
-    let state_dir = ensure_agent_state_dir()?;
-    let store = open_agent_store_at(&state_dir)?;
-    #[cfg(not(test))]
-    cleanup_terminal_agent_worker_services(&state_dir, &store, Some(&removal.path))?;
-    remove_tui_agent_project_with_store(panel, active_root, removal, &store)
-}
-
-pub(super) fn remove_tui_agent_project_with_store(
-    panel: &mut TuiAgentPanel,
-    active_root: &Path,
-    removal: &TuiAgentProjectRemoval,
-    store: &agent::TursoAgentStore,
-) -> Result<String> {
-    let selected_idx = panel.state.selected().unwrap_or(0);
-    let removed = store.unregister_project_blocking(&removal.path)?;
-
-    if removed {
-        panel
-            .projects
-            .retain(|entry| entry.project.path != removal.path);
-        panel.current_project_registration =
-            current_project_registration(active_root, &panel.projects);
-        panel.last_error = None;
-        panel.select_nearest_row(selected_idx);
-        Ok(format!("Removed agent project: {}", removal.name))
-    } else {
-        panel.refresh(active_root);
-        Ok(format!(
-            "Project is no longer registered: {}",
-            removal.path.display()
         ))
     }
 }
@@ -6198,7 +6133,7 @@ pub(super) struct TuiApp {
     pub(super) models_panel: TuiModelsPanel,
     pub(super) model_input: Option<TuiModelInput>,
     pub(super) awaiting_model_provider_choice: bool,
-    pub(super) pending_agent_project_removal: Option<TuiAgentProjectRemoval>,
+    project_removal: Option<project_removal::Removal>,
     pub(super) pending_git_recovery: Option<GitRecoveryPlan>,
     pub(super) agent_log_view: Option<TuiAgentLogView>,
     pub(super) selected_board: usize,
@@ -6249,7 +6184,7 @@ impl TuiApp {
             models_panel: TuiModelsPanel::new(),
             model_input: None,
             awaiting_model_provider_choice: false,
-            pending_agent_project_removal: None,
+            project_removal: None,
             pending_git_recovery: None,
             agent_log_view: None,
             selected_board: TODO_BOARD_INDEX,
@@ -6411,12 +6346,7 @@ impl TuiApp {
             self.help.prepare(size);
         }
         let input_height = tui_input_height(self, size.width);
-        let (console_content, _) = tui_console_content(
-            self.current_pane == TuiPane::AgentProjects,
-            &self.agent_panel,
-            self.agent_log_view.as_ref(),
-            &self.feedback_buffer,
-        );
+        let (console_content, _) = self.console_content();
         let console_height = tui_feedback_console_height(
             size.height,
             size.width,
@@ -6485,6 +6415,25 @@ impl TuiApp {
             }
         }
     }
+
+    fn project_removal_feedback(&self) -> Option<(&str, Color)> {
+        if self.current_pane == TuiPane::AgentProjects && self.agent_log_view.is_none() {
+            self.project_removal.as_ref()?.feedback()
+        } else {
+            None
+        }
+    }
+
+    fn console_content(&self) -> (&str, Color) {
+        self.project_removal_feedback().unwrap_or_else(|| {
+            tui_console_content(
+                self.current_pane == TuiPane::AgentProjects,
+                &self.agent_panel,
+                self.agent_log_view.as_ref(),
+                &self.feedback_buffer,
+            )
+        })
+    }
 }
 
 pub(super) fn normalize_cached_list_selection(state: &mut ListState, item_count: usize) {
@@ -6503,6 +6452,7 @@ pub(super) enum TuiEffect {
     RefreshTaskSummary,
     ToggleTaskStop,
     CycleTaskThinking,
+    RemoveAgentProject,
     RefreshAgentPanel,
     RefreshModels,
     RefreshSelectedProviderModels,
@@ -6542,6 +6492,9 @@ pub(super) fn update_tui_pane(app: &mut TuiApp, key: KeyEvent) -> Option<Vec<Tui
     }
     if app.current_mode != Mode::View {
         return Some(vec![TuiEffect::PaneKey(key)]);
+    }
+    if let Some(effects) = app.update_project_removal(key) {
+        return Some(effects);
     }
 
     if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
@@ -6948,8 +6901,9 @@ pub(super) fn execute_tui_effect(
                 Err(error) => format!("Unable to stop or start the task: {error}"),
             };
         }
+        TuiEffect::RemoveAgentProject => app.confirm_project_removal(),
         TuiEffect::RefreshAgentPanel => {
-            if !app.agent_settings.is_pending()
+            if !app.agent_panel_write_pending()
                 && agent_panel_refresh.request(&app.active_root, app.agent_settings.revision)
             {
                 *last_agent_panel_refresh = Instant::now();
@@ -7002,9 +6956,8 @@ pub(super) fn execute_tui_effect(
         }
         TuiEffect::PaneKey(_) => unreachable!("pane keys require the terminal effect executor"),
         TuiEffect::Quit => {
-            if app.agent_settings.is_pending() {
+            if app.agent_panel_write_pending() {
                 app.agent_settings.quit_requested = true;
-                app.feedback_buffer = "Saving settings before quitting…".into();
             } else {
                 return true;
             }
@@ -7029,7 +6982,9 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
     let (console_title, console_right_title) = if let Some(log_view) = app.agent_log_view.as_ref() {
         (tui_agent_log_title(log_view), None)
     } else if app.current_pane == TuiPane::AgentProjects {
-        let title = if let Some(notice) = app
+        let title = if app.project_removal_feedback().is_some() {
+            "Agent Projects Console"
+        } else if let Some(notice) = app
             .agent_panel
             .selected_project()
             .and_then(TuiAgentProject::displayed_supervisor_notice)
@@ -7072,12 +7027,7 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
     let input_height = tui_input_height(app, size.width);
 
     let console_height = {
-        let (console_content, _) = tui_console_content(
-            app.current_pane == TuiPane::AgentProjects,
-            &app.agent_panel,
-            app.agent_log_view.as_ref(),
-            app.feedback_buffer.as_str(),
-        );
+        let (console_content, _) = app.console_content();
         tui_feedback_console_height(
             size.height,
             size.width,
@@ -7464,13 +7414,12 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
         ));
     }
 
-    let (console_content, console_color) = tui_console_content(
-        app.current_pane == TuiPane::AgentProjects,
-        &app.agent_panel,
-        app.agent_log_view.as_ref(),
-        app.feedback_buffer.as_str(),
-    );
-    let retry = if app.agent_log_view.is_none() && app.agent_panel.last_error.is_none() {
+    let (console_content, console_color) = app.console_content();
+    let removal_feedback = app.project_removal_feedback().is_some();
+    let retry = if !removal_feedback
+        && app.agent_log_view.is_none()
+        && app.agent_panel.last_error.is_none()
+    {
         match app.current_pane {
             TuiPane::AgentProjects => app.agent_panel.selected_project(),
             TuiPane::Tasks => app
@@ -7502,13 +7451,19 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
     {
         console_block = console_block.title_bottom(log_view.settings_label());
     }
-    if app.agent_settings.is_pending() {
+    if app.agent_panel_write_pending() {
         console_block = console_block.title(
-            Line::from(if app.agent_settings.quit_requested {
-                " Saving settings before quitting… "
-            } else {
-                " Saving settings… "
-            })
+            Line::from(
+                match (
+                    app.agent_settings.is_pending(),
+                    app.agent_settings.quit_requested,
+                ) {
+                    (true, true) => " Saving settings before quitting… ",
+                    (true, false) => " Saving settings… ",
+                    (false, true) => " Removing project before quitting… ",
+                    (false, false) => " Removing project… ",
+                },
+            )
             .alignment(Alignment::Right),
         );
     }
@@ -7525,7 +7480,8 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
         .block(console_block)
         .style(Style::default().fg(console_color))
         .scroll((
-            if retry.is_some()
+            if removal_feedback
+                || retry.is_some()
                 || (app.agent_log_view.is_none()
                     && app.current_pane == TuiPane::AgentProjects
                     && app
@@ -7555,6 +7511,9 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
     }
     if let Some(details) = &app.supervisor_details {
         details.render(f);
+    }
+    if let Some(project_removal::Removal::Confirm(target)) = &app.project_removal {
+        target.render_confirmation(f);
     }
 
     if let Some(plan) = app.pending_git_recovery.as_ref() {
@@ -7612,31 +7571,6 @@ pub(super) fn execute_tui_key_effect(
                 app.feedback_buffer = "Task recovery cancelled".to_string();
             }
             _ => app.pending_git_recovery = Some(plan),
-        }
-        return Ok(false);
-    }
-    if let Some(removal) = app.pending_agent_project_removal.take() {
-        match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                app.feedback_buffer = match remove_tui_agent_project(
-                    &mut app.agent_panel,
-                    &app.active_root,
-                    &removal,
-                ) {
-                    Ok(message) => {
-                        *last_agent_panel_refresh = Instant::now();
-                        message
-                    }
-                    Err(error) => format!("Error: {error}"),
-                };
-            }
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                app.feedback_buffer = format!("Kept agent project: {}", removal.name);
-            }
-            _ => {
-                app.feedback_buffer = tui_agent_project_removal_prompt(&removal);
-                app.pending_agent_project_removal = Some(removal);
-            }
         }
         return Ok(false);
     }
@@ -7735,7 +7669,7 @@ pub(super) fn execute_tui_key_effect(
                         app.agent_panel.select_project_for_path(&app.active_root);
                     }
                     sync_open_tui_agent_log_view(&app.agent_panel, &mut app.agent_log_view);
-                    if !app.agent_settings.is_pending()
+                    if !app.agent_panel_write_pending()
                         && agent_panel_refresh
                             .request(&app.active_root, app.agent_settings.revision)
                     {
@@ -7914,17 +7848,6 @@ pub(super) fn execute_tui_key_effect(
                     KeyCode::Char('h') | KeyCode::Char('H') | KeyCode::Char('?') => {
                         app.current_mode = Mode::Help;
                     }
-                    KeyCode::Delete => {
-                        if let Some(removal) = selected_tui_agent_project_removal(&app.agent_panel)
-                        {
-                            app.agent_log_view = None;
-                            app.feedback_buffer = tui_agent_project_removal_prompt(&removal);
-                            app.pending_agent_project_removal = Some(removal);
-                        } else {
-                            app.feedback_buffer =
-                                "No registered project selected to remove".to_string();
-                        }
-                    }
                     KeyCode::Enter => {
                         if app
                             .agent_panel
@@ -7976,7 +7899,7 @@ pub(super) fn execute_tui_key_effect(
                             Ok(_) => {
                                 app.active_root = project.path.clone();
                                 app.task_agent_session_states.clear();
-                                if !app.agent_settings.is_pending()
+                                if !app.agent_panel_write_pending()
                                     && agent_panel_refresh
                                         .request(&app.active_root, app.agent_settings.revision)
                                 {
@@ -9104,10 +9027,11 @@ pub(super) fn tui_view_with_active_board(
             app.archive_view = false;
         }
 
-        if app.poll_agent_settings() {
+        let settings_completed = app.poll_agent_settings();
+        if app.poll_project_removal() || settings_completed {
             last_agent_panel_refresh = Instant::now() - tui_agent_panel_refresh_interval();
         }
-        if app.agent_settings.quit_requested && !app.agent_settings.is_pending() {
+        if app.agent_settings.quit_requested && !app.agent_panel_write_pending() {
             break;
         }
         for effect in [TuiEffect::RefreshTaskSnapshot, TuiEffect::RefreshClock] {
@@ -9126,6 +9050,7 @@ pub(super) fn tui_view_with_active_board(
 
         if let Some(refresh) = agent_panel_refresh.try_result() {
             if refresh.active_root == app.active_root
+                && !app.agent_panel_write_pending()
                 && app
                     .agent_settings
                     .accepts_refresh(agent_panel_refresh.revision)

@@ -1,0 +1,4 @@
+Keep Agent Projects responsive when removing a project awaiting supervisor action
+
+Completion note:
+COMPLETED 2026-11-21: Agent Projects shows a dedicated removal confirmation over supervisor ACTION notices and runs confirmed unregistration in the background. Verified with formatting, Clippy, the full suite, and a terminal smoke test under registry lock contention. Reran the TUI suite and terminal smoke test after fixing relative registry paths during navigation. clt:manual <!-- clt-coordination: {"id":"8e00919a-8045-4195-af2e-f5df9e514e38","depends_on":[],"scope":{"intent":"Make Agent Projects removal visible and responsive during a supervisor hold","files":["src/tui.rs","src/tui/project_removal.rs","src/tui/tests.rs","features.md","ARCHITECTURE.md","CHANGELOG.md"],"modules":["tui"],"interfaces":[],"resources":[],"behavior":{"agent_projects.removal":"Visible confirmation and background unregistration"}},"reviews":[]} --> codex:01a1feb8-e8f4-7382-b654-4877006de624

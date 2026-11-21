@@ -1140,52 +1140,133 @@ fn tui_agent_panel_uses_auto_refresh_without_command_panel_wording() {
     assert!(tui_agent_panel_instructions().contains("Delete removes with confirmation"));
 }
 
+fn remove_tui_agent_project_with_store(
+    panel: &mut TuiAgentPanel,
+    active_root: &Path,
+    target: &super::project_removal::Target,
+    store: &agent::TursoAgentStore,
+) -> Result<String> {
+    let removed = store.unregister_project_blocking(&target.path)?;
+    Ok(super::project_removal::apply_unregistration(
+        panel,
+        active_root,
+        target,
+        removed,
+    ))
+}
+
 #[test]
-fn tui_agent_project_removal_requires_confirmation_and_only_unregisters() {
+fn tui_agent_project_removal_confirms_and_stays_responsive_over_supervisor_action() {
+    use super::project_removal::Removal;
+    use crate::supervisor::{Decision, DecisionKind, SupervisorReview};
+
     let root = temp_root("tui-agent-remove");
     let state_dir = root.join("state/clt");
     let project_root = root.join("project");
-    fs::create_dir_all(&project_root).unwrap();
+    init_tasks(&project_root, false).unwrap();
     let project_root = fs::canonicalize(project_root).unwrap();
     let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
     store
-        .register_project_blocking(&project_root, "project")
+        .register_project_blocking(&project_root, "FISHDOME")
         .unwrap();
     let project = store.list_projects_blocking().unwrap().remove(0);
-    let mut panel = TuiAgentPanel {
-        enabled_models: Vec::new(),
-        supervisor_settings: Default::default(),
-        supervisor_selected: false,
-        projects: vec![TuiAgentProject {
-            project,
-            scan: AgentProjectScan::empty(),
-            runtime_state: TuiAgentRuntimeState::Idle,
-            daemon_scan_problem: None,
-            failure_problem: None,
-            retry_status: None,
-            supervisor_notice: None,
-            activity: None,
-            resolved_codex: TuiAgentResolvedCodexTarget::default(),
-        }],
-        current_project_registration: None,
-        daemon_status: "not-installed".to_string(),
-        state: ListState::default(),
-        scroll_offset: 0,
-        last_error: None,
+    let project_id = project.id;
+    let review = SupervisorReview {
+        evidence: "blocked task".into(),
+        state: "held".into(),
+        attempts: 1,
+        retries: 0,
+        decision: Some(Decision {
+            decision: DecisionKind::User,
+            task: 1,
+            reason: "Approval requested".into(),
+            next_action: "Review the task".into(),
+        }),
+        retry_session: None,
+        error: None,
     };
-    panel.state.select(Some(0));
+    store
+        .save_supervisor_review_blocking(project_id, &review)
+        .unwrap();
 
-    let removal = selected_tui_agent_project_removal(&panel).unwrap();
-    assert!(tui_agent_project_removal_prompt(&removal).contains("Press y to confirm"));
-    let message =
-        remove_tui_agent_project_with_store(&mut panel, &project_root, &removal, &store).unwrap();
+    let mut app = TuiApp::new(&project_root, false);
+    let mut entry = tui_agent_project_for_test(project_id, "FISHDOME");
+    entry.project = project;
+    entry.runtime_state = TuiAgentRuntimeState::NeedsInput;
+    entry.supervisor_notice = TuiAgentSupervisorNotice::from_review(&review);
+    app.agent_panel.projects = vec![entry, tui_agent_project_for_test(project_id + 1, "other")];
+    app.agent_panel.state.select(Some(0));
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 14)).unwrap();
+    let mut render = |app: &TuiApp| {
+        terminal.draw(|frame| render_tui(frame, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+    };
+    let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+    assert!(render(&app).contains("Action required: your input"));
+    update_tui_pane(&mut app, key(KeyCode::Delete));
+    let dialog = render(&app);
+    assert!(dialog.contains("Remove 'FISHDOME'"));
+    assert!(dialog.contains("Press y to confirm. Press n or Esc to cancel."));
+    assert!(!dialog.contains("Action required: your input"));
+    update_tui_pane(&mut app, key(KeyCode::Down));
+    assert_eq!(app.agent_panel.state.selected(), Some(0));
+    update_tui_pane(&mut app, key(KeyCode::Esc));
+    assert!(render(&app).contains("Kept agent project: FISHDOME"));
+    assert!(!app.agent_panel_write_pending());
+    assert_eq!(store.list_projects_blocking().unwrap().len(), 1);
 
-    assert_eq!(message, "Removed agent project: project");
+    update_tui_pane(&mut app, key(KeyCode::Delete));
+    assert_eq!(
+        update_tui_pane(&mut app, key(KeyCode::Char('y'))),
+        Some(vec![TuiEffect::RemoveAgentProject]),
+    );
+    let (release, wait) = mpsc::channel();
+    let removal_state_dir = state_dir.clone();
+    let pre_removal_revision = app.agent_settings.revision;
+    app.start_project_removal(move |path| {
+        wait.recv_timeout(Duration::from_secs(5))?;
+        agent::TursoAgentStore::open_blocking(&removal_state_dir)?.unregister_project_blocking(path)
+    });
+    assert!(!app.poll_project_removal());
+    assert!(app.agent_panel_write_pending());
+    assert!(render(&app).contains("Removing agent project 'FISHDOME'"));
+    update_tui_pane(&mut app, key(KeyCode::Down));
+    assert_eq!(
+        app.agent_panel.selected_project().unwrap().project.name,
+        "other"
+    );
+    update_tui_pane(&mut app, key(KeyCode::Delete));
+    assert!(matches!(app.project_removal, Some(Removal::Running { .. })));
+    release.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !app.poll_project_removal() {
+        assert!(Instant::now() < deadline, "removal did not complete");
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    assert!(render(&app).contains("Removed agent project: FISHDOME"));
+    assert!(!app.agent_panel_write_pending());
+    assert!(!app.agent_settings.accepts_refresh(pre_removal_revision));
     assert!(store.list_projects_blocking().unwrap().is_empty());
-    assert!(project_root.exists());
-    assert!(panel.projects.is_empty());
-    assert!(panel.selected_current_project_registration().is_some());
-    assert_eq!(panel.state.selected(), Some(0));
+    assert!(
+        store
+            .supervisor_review_blocking(project_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(get_tasks_dir(&project_root).exists());
+    assert_eq!(app.agent_panel.projects.len(), 1);
+    assert_eq!(
+        app.agent_panel.selected_project().unwrap().project.name,
+        "other"
+    );
+    assert!(app.agent_panel.current_project_registration.is_some());
 
     fs::remove_dir_all(root).unwrap();
 }
@@ -1299,7 +1380,7 @@ fn tui_working_project_removal_fixture(protection: &str) -> TuiWorkingProjectRem
 fn tui_agent_project_removal_retires_idle_orphan_journal_and_preserves_files() {
     let mut fixture = tui_working_project_removal_fixture("orphan");
     let todo_before = fs::read(fixture.project_root.join("tasks/todo.md")).unwrap();
-    let removal = selected_tui_agent_project_removal(&fixture.panel).unwrap();
+    let removal = super::project_removal::Target::selected(&fixture.panel).unwrap();
 
     let message = remove_tui_agent_project_with_store(
         &mut fixture.panel,
@@ -1359,7 +1440,7 @@ fn tui_agent_project_removal_retires_idle_orphan_journal_and_preserves_files() {
 fn tui_agent_project_removal_clears_bound_sealed_and_marker_linked_journals() {
     for protection in ["bound", "sealed", "marker"] {
         let mut fixture = tui_working_project_removal_fixture(protection);
-        let removal = selected_tui_agent_project_removal(&fixture.panel).unwrap();
+        let removal = super::project_removal::Target::selected(&fixture.panel).unwrap();
         let todo_before = fs::read(fixture.project_root.join("tasks/todo.md")).unwrap();
         let done_before = fs::read(fixture.project_root.join("tasks/done.md")).unwrap();
 
@@ -1443,7 +1524,7 @@ fn tui_agent_project_removal_preserves_pending_git_work_while_owned() {
                 1,
             ));
         }
-        let removal = selected_tui_agent_project_removal(&fixture.panel).unwrap();
+        let removal = super::project_removal::Target::selected(&fixture.panel).unwrap();
         let error = remove_tui_agent_project_with_store(
             &mut fixture.panel,
             &fixture.project_root,

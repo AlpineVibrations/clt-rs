@@ -103,6 +103,10 @@ used Turso dependency. Application modules import its local API through
   and assessment failures. Runtime status and console styling preserve active
   worker and interactive ownership while showing ordinary holds as attention
   states. Rendering uses the cached decision without registry reads.
+- `tui::project_removal` captures the selected registration in a modal and runs
+  confirmed unregistration through the durable store on a background thread.
+  The result updates the cached project list and invalidates older refreshes.
+  Verify with `cargo test --locked --bin clt tui_agent_project_removal`.
 - Supervisor details resolve review candidate numbers to the current board only
   after matching saved evidence. External-completion guidance is conditional on
   an unsealed WORKING journal; reading it never changes tasks, controls or proof.
