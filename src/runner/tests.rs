@@ -2386,6 +2386,105 @@ fn codex_runner_registers_a_marker_derived_resume_without_a_session_banner() {
 
 #[cfg(unix)]
 #[test]
+fn codex_runner_retries_observation_while_another_registry_writer_is_busy() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let state_dir = root.path().join("state");
+    let board = root.path().join("project");
+    init_tasks(&board, false).unwrap();
+    let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
+    store.register_project_blocking(&board, "project").unwrap();
+    let project = store.list_projects_blocking().unwrap().remove(0);
+    let id = project.id;
+    let now = agent_timestamp();
+    assert!(
+        store
+            .try_acquire_lease_blocking(id, "scheduler", &now, &agent_timestamp_after(60))
+            .unwrap()
+    );
+    let token = "busy-writer-test";
+    let pid = std::process::id();
+    assert!(reserve_test_inline_worker(
+        &store,
+        id,
+        token,
+        "scheduler",
+        pid,
+        &now
+    ));
+    let holder = agent_worker_lease_holder(token);
+    assert!(
+        store
+            .observation_lease_is_live_blocking(id, &holder, Some(token), pid, &now)
+            .unwrap()
+    );
+    for (worker, process, at) in [
+        (token, pid + 1, now.clone()),
+        ("other", pid, now),
+        (token, pid, agent_timestamp_after(3600 * 2)),
+    ] {
+        assert!(
+            !store
+                .observation_lease_is_live_blocking(id, &holder, Some(worker), process, &at)
+                .unwrap()
+        );
+    }
+    let fake_codex = root.path().join("codex");
+    fs::write(&fake_codex,
+        "#!/bin/sh\ntouch launched\nwhile [ ! -f writer-held ]; do sleep 0.05; done\nprintf 'session id: contended\\n' >&2\nwhile [ ! -f finish ]; do sleep 0.05; done\nprintf 'NO_TASKS_LEFT\\n'\n"
+    ).unwrap();
+    fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut runner = CodexAgentRunner::with_command(state_dir, Duration::from_secs(30), fake_codex);
+    runner.lease_renew_interval = Duration::from_millis(200);
+    let running = thread::spawn(move || {
+        runner.run_project(
+            &project,
+            AgentTaskSelection::NextTodo,
+            None,
+            &holder,
+            Some(token),
+            &new_agent_shutdown_signal(),
+        )
+    });
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !board.join("launched").exists() {
+        assert!(Instant::now() < deadline && !running.is_finished());
+        thread::sleep(Duration::from_millis(20));
+    }
+    let guard = loop {
+        if let Some(guard) = store.try_service_restart_guard().unwrap() {
+            break guard;
+        }
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(20));
+    };
+    fs::write(board.join("writer-held"), "").unwrap();
+    thread::sleep(Duration::from_millis(5600));
+    assert!(
+        store
+            .session_control_blocking(id, "contended")
+            .unwrap()
+            .is_none()
+    );
+    fs::write(board.join("finish"), "").unwrap();
+    drop(guard);
+    let result = running.join().unwrap().unwrap();
+    assert_eq!(result.status, "idle");
+    assert_eq!(result.session_run_token.as_deref(), Some(token));
+    assert_eq!(
+        store
+            .session_control_blocking(id, "contended")
+            .unwrap()
+            .unwrap()
+            .run_token
+            .as_deref(),
+        Some(token)
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn codex_runner_without_deadline_renews_its_automated_project_lease() {
     use std::os::unix::fs::PermissionsExt;
 

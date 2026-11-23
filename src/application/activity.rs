@@ -35,7 +35,6 @@ pub(crate) fn describe_worker_activity(
             control.project_id == worker.project_id
                 && control.run_token.as_deref() == Some(worker.worker_token.as_str())
         })
-        .map(|control| control.codex_session_id.as_str())
         .collect();
     let (session, ambiguous) = match sessions.as_slice() {
         [] => (worker.resume_session_id.as_deref(), false),
@@ -43,9 +42,9 @@ pub(crate) fn describe_worker_activity(
             if worker
                 .resume_session_id
                 .as_deref()
-                .is_none_or(|id| id == *session) =>
+                .is_none_or(|id| id == session.codex_session_id) =>
         {
-            (Some(*session), false)
+            (Some(session.codex_session_id.as_str()), false)
         }
         _ => (None, true),
     };
@@ -58,7 +57,9 @@ pub(crate) fn describe_worker_activity(
         WorkerActivityPhase::Reviewing
     } else if session.is_none() {
         WorkerActivityPhase::Starting
-    } else if worker.task_selection == "next_todo" {
+    } else if worker.task_selection == "next_todo"
+        || matches!(sessions.as_slice(), [control] if resume_confirmed(control))
+    {
         WorkerActivityPhase::Running
     } else {
         WorkerActivityPhase::Resuming
@@ -93,6 +94,19 @@ pub(crate) fn describe_worker_activity(
         summary: format!("{verb}: {subject}"),
         session_id: session.map(str::to_string),
     }
+}
+
+fn resume_confirmed(control: &AgentSessionControlRecord) -> bool {
+    // A known session is registered before the launch gate opens. Its current
+    // log gets the session banner after Codex accepts the resume.
+    control.child_pid.is_some()
+        && control.stderr_path.as_deref().is_some_and(|log| {
+            crate::runner::agent_codex_session_id_from_log(Path::new(log))
+                .ok()
+                .flatten()
+                .as_deref()
+                == Some(control.codex_session_id.as_str())
+        })
 }
 
 fn collect_session_task_labels(

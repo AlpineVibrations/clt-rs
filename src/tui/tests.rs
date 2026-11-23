@@ -380,17 +380,33 @@ fn tui_reorganize_prefix_and_arrows_are_unambiguous() {
     let key = |code, modifiers| crossterm::event::KeyEvent::new(code, modifiers);
 
     assert!(tui_toggles_reorganize_mode(&key(
-        KeyCode::Char('r'),
+        KeyCode::Char('m'),
         KeyModifiers::NONE
     )));
-    assert!(tui_toggles_reorganize_mode(&key(
-        KeyCode::Char('R'),
+    assert!(!tui_toggles_reorganize_mode(&key(
+        KeyCode::Char('M'),
         KeyModifiers::SHIFT
     )));
     assert!(!tui_toggles_reorganize_mode(&key(
-        KeyCode::Char('r'),
+        KeyCode::Char('m'),
         KeyModifiers::CONTROL
     )));
+
+    assert!(!tui_toggles_reorganize_mode(&key(
+        KeyCode::Char('r'),
+        KeyModifiers::NONE
+    )));
+    assert!(!tui_toggles_reorganize_mode(&key(
+        KeyCode::Char('m'),
+        KeyModifiers::SHIFT
+    )));
+
+    let mut app = TuiApp::new(Path::new("/tmp/kanban-keys"), true);
+    assert_eq!(
+        update_tui_pane(&mut app, key(KeyCode::Char('m'), KeyModifiers::NONE)),
+        Some(vec![])
+    );
+    assert_eq!(app.current_mode, Mode::Reorganize);
 
     for (code, direction) in [
         (KeyCode::Up, TuiTaskReorganizeDirection::Up),
@@ -413,7 +429,7 @@ fn tui_reorganize_prefix_and_arrows_are_unambiguous() {
     );
 
     assert_eq!(
-        tui_reorganize_input(&key(KeyCode::Char('r'), KeyModifiers::NONE)),
+        tui_reorganize_input(&key(KeyCode::Char('m'), KeyModifiers::NONE)),
         TuiReorganizeInput::Exit
     );
     assert_eq!(
@@ -434,7 +450,7 @@ fn tui_reorganize_prefix_and_arrows_are_unambiguous() {
 fn tui_reorganize_mode_has_a_distinct_title_and_border_color() {
     assert_eq!(
         tui_task_column_title("To Do", true, true),
-        " REORGANIZE MODE: To Do [r/Esc exits] "
+        " REORGANIZE MODE: To Do [m/Esc exits] "
     );
     assert_eq!(
         tui_task_column_title("To Do", true, false),
@@ -3649,7 +3665,7 @@ fn tui_task_board_instructions_only_describe_task_page_controls() {
             .contains("c plans Todo tasks or opens linked sessions (taking over active runs)")
     );
     assert!(instructions.contains("l shows logs"));
-    assert!(instructions.contains("Press r to reorganize"));
+    assert!(instructions.contains("Press m to reorganize"));
     assert!(instructions.contains("Tab opens Agent Projects"));
     assert!(!instructions.contains("toggles ON/OFF"));
     assert!(!instructions.contains("cycles Git"));
@@ -3778,13 +3794,21 @@ fn tui_models_shortcut_preserves_lowercase_m_and_task_input() {
 
         assert_eq!(
             update_tui_pane(&mut app, key).unwrap(),
-            if pane == TuiPane::AgentProjects {
-                Vec::new()
-            } else {
+            if pane == TuiPane::Models {
                 vec![TuiEffect::PaneKey(key)]
+            } else {
+                Vec::new()
             }
         );
         assert_eq!(app.current_pane, pane);
+        assert_eq!(
+            app.current_mode,
+            if pane == TuiPane::Tasks {
+                Mode::Reorganize
+            } else {
+                Mode::View
+            }
+        );
     }
 
     for mode in [Mode::Input, Mode::Edit, Mode::Steer] {
@@ -5144,6 +5168,18 @@ fn normalize_board_selection_clamps_out_of_range_selection() {
     assert_eq!(state.selected(), Some(0));
 
     fs::remove_dir_all(root).unwrap();
+}
+
+fn keep_selected_task_visible(
+    tasks: &[String],
+    selected: Option<usize>,
+    offset: &mut usize,
+    height: usize,
+    width: usize,
+) {
+    let selected =
+        selected.and_then(|i| Some((i, tasks.get(i)?.trim_start_matches("- ").to_owned())));
+    *offset = super::task_scroll_offset(tasks.len(), selected, *offset, height, width);
 }
 
 #[test]

@@ -27,7 +27,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Position, Rect},
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, ListState, Paragraph},
 };
 use tui_input::{Input, InputRequest};
 
@@ -35,6 +35,7 @@ mod help;
 mod log_attempt;
 mod progress;
 mod project_removal;
+mod project_retry;
 mod retry_status;
 mod settings;
 mod supervisor_notice;
@@ -687,8 +688,7 @@ pub(super) fn tui_task_reorganize_direction(
 }
 
 pub(super) fn tui_toggles_reorganize_mode(key: &crossterm::event::KeyEvent) -> bool {
-    matches!(key.code, KeyCode::Char('r' | 'R'))
-        && key.modifiers.difference(KeyModifiers::SHIFT).is_empty()
+    key.code == KeyCode::Char('m') && key.modifiers.is_empty() && key.kind == KeyEventKind::Press
 }
 
 pub(super) fn tui_reorganize_input(key: &crossterm::event::KeyEvent) -> TuiReorganizeInput {
@@ -703,7 +703,7 @@ pub(super) fn tui_reorganize_input(key: &crossterm::event::KeyEvent) -> TuiReorg
 
 pub(super) fn tui_task_column_title(title: &str, selected: bool, reorganizing: bool) -> String {
     if selected && reorganizing {
-        format!(" REORGANIZE MODE: {title} [r/Esc exits] ")
+        format!(" REORGANIZE MODE: {title} [m/Esc exits] ")
     } else if selected {
         format!("{title}   <<<<<< * >>>>>>     ")
     } else {
@@ -880,85 +880,36 @@ pub(super) fn reorganize_selected_tui_task(
     }
 }
 
-pub(super) fn task_display_height(
-    task: &str,
-    idx: usize,
-    selected_idx: Option<usize>,
-    col_width: usize,
-) -> usize {
-    let cleaned = task.replace("- ", "");
-    let desc = if let Some(start) = cleaned.rfind(" (") {
-        if cleaned.ends_with(')') {
-            &cleaned[..start]
-        } else {
-            &cleaned[..]
-        }
-    } else {
-        &cleaned[..]
-    };
-
-    if Some(idx) == selected_idx {
-        wrap_text(desc, col_width.saturating_sub(5))
-            .lines()
-            .count()
-            .max(1)
-    } else {
-        1
-    }
-}
-
-pub(super) fn keep_selected_task_visible(
-    tasks: &[String],
-    selected_idx: Option<usize>,
-    scroll_offset: &mut usize,
+fn task_scroll_offset(
+    count: usize,
+    selected: Option<(usize, String)>,
+    current: usize,
     viewport_height: usize,
     col_width: usize,
-) {
-    if tasks.is_empty() || viewport_height == 0 {
-        *scroll_offset = 0;
-        return;
+) -> usize {
+    if viewport_height == 0 || count == 0 {
+        return 0;
     }
-
-    let selected_idx = selected_idx.filter(|idx| *idx < tasks.len());
-
-    // Reclaim empty space below the list when a task collapses or the viewport grows.
-    // Keep the largest bottom-aligned offset that fits whole task rows.
-    let mut max_scroll_offset = tasks.len() - 1;
-    let mut remaining_height = viewport_height;
-    for (idx, task) in tasks.iter().enumerate().rev() {
-        let height = task_display_height(task, idx, selected_idx, col_width);
-        if height > remaining_height {
-            break;
-        }
-        remaining_height -= height;
-        max_scroll_offset = idx;
-    }
-    *scroll_offset = (*scroll_offset).min(max_scroll_offset);
-
-    let Some(selected_idx) = selected_idx else {
-        return;
+    let Some((index, text)) = selected.filter(|(index, _)| *index < count) else {
+        return current.min(count.saturating_sub(viewport_height));
     };
-
-    if selected_idx < *scroll_offset {
-        *scroll_offset = selected_idx;
-    }
-
-    while *scroll_offset < selected_idx {
-        let visible_height: usize = tasks[*scroll_offset..=selected_idx]
-            .iter()
-            .enumerate()
-            .map(|(offset, task)| {
-                let idx = *scroll_offset + offset;
-                task_display_height(task, idx, Some(selected_idx), col_width)
-            })
-            .sum();
-
-        if visible_height <= viewport_height {
-            break;
-        }
-
-        *scroll_offset += 1;
-    }
+    // Only the selected row wraps. All rows below it take one line each.
+    let height = wrap_text(&text, col_width.saturating_sub(5))
+        .lines()
+        .count()
+        .max(1);
+    let below = count - index - 1;
+    let bottom_aligned = if below >= viewport_height {
+        count - viewport_height
+    } else if height > viewport_height - below {
+        (index + 1).min(count - 1)
+    } else {
+        count
+            .saturating_add(height - 1)
+            .saturating_sub(viewport_height)
+    };
+    let first_visible = index.saturating_sub(viewport_height.saturating_sub(height));
+    current.min(bottom_aligned).clamp(first_visible, index)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1199,7 +1150,7 @@ impl TuiTaskSnapshot {
 }
 
 pub(super) fn tui_task_board_instructions() -> &'static str {
-    "Arrows navigate boards and tasks, Enter messages running Doing agents or opens subtasks/edits, e edits, n or + creates a subtask under the selected task, and Space creates a task. Press v for task details and metadata. Press r to reorganize; use Shift+Arrows to move tasks. Tab opens Agent Projects, M opens Models, and h/? opens Help. Task control: t cycles Todo thinking, s shows a read-only progress summary, S stops/starts tasks, i interrupts for interaction, c plans Todo tasks or opens linked sessions (taking over active runs), and l shows logs."
+    "Arrows navigate boards and tasks, Enter messages running Doing agents or opens subtasks/edits, e edits, n or + creates a subtask under the selected task, and Space creates a task. Press v for task details and metadata. Press r to retry the project. Press m to reorganize. Use Shift+Arrows to move tasks. Tab opens Agent Projects, M opens Models, and h/? opens Help. Task control: t cycles Todo thinking, s shows a read-only progress summary, S stops/starts tasks, i interrupts for interaction, c plans Todo tasks or opens linked sessions (taking over active runs), and l shows logs."
 }
 
 pub(super) fn tui_start_state(active_board: bool) -> TuiStartState {
@@ -3399,32 +3350,6 @@ pub(super) fn register_selected_current_project(
         Ok(format!(
             "Project already registered: {}",
             registration.0.display()
-        ))
-    }
-}
-
-pub(super) fn retry_selected_tui_agent_project(
-    panel: &mut TuiAgentPanel,
-    active_root: &Path,
-) -> Result<String> {
-    let Some(project) = panel.selected_project().map(|entry| entry.project.clone()) else {
-        return Ok("No registered project selected".to_string());
-    };
-
-    let store = open_agent_store()?;
-    let changed = store.clear_project_failure_backoff_for_path_blocking(&project.path)?;
-    store.clear_supervisor_review_blocking(project.id)?;
-    panel.refresh(active_root);
-
-    if changed {
-        Ok(format!(
-            "Queued {} for immediate retry; the daemon will run it when active",
-            project.name
-        ))
-    } else {
-        Ok(format!(
-            "Project is no longer registered: {}",
-            project.path.display()
         ))
     }
 }
@@ -6134,6 +6059,7 @@ pub(super) struct TuiApp {
     pub(super) model_input: Option<TuiModelInput>,
     pub(super) awaiting_model_provider_choice: bool,
     project_removal: Option<project_removal::Removal>,
+    retries: Vec<project_retry::Retry>,
     pub(super) pending_git_recovery: Option<GitRecoveryPlan>,
     pub(super) agent_log_view: Option<TuiAgentLogView>,
     pub(super) selected_board: usize,
@@ -6144,6 +6070,7 @@ pub(super) struct TuiApp {
     pub(super) archive_state: ListState,
     pub(super) archive_scroll_offset: usize,
     pub(super) task_snapshot: TuiTaskSnapshot,
+    task_snapshot_loaded: Option<Instant>,
     pub(super) current_time: String,
 }
 
@@ -6185,6 +6112,7 @@ impl TuiApp {
             model_input: None,
             awaiting_model_provider_choice: false,
             project_removal: None,
+            retries: Vec::new(),
             pending_git_recovery: None,
             agent_log_view: None,
             selected_board: TODO_BOARD_INDEX,
@@ -6194,6 +6122,7 @@ impl TuiApp {
             board_scroll_offsets: [0; 4],
             archive_state: ListState::default(),
             archive_scroll_offset: 0,
+            task_snapshot_loaded: None,
             task_snapshot: TuiTaskSnapshot {
                 board_title: if start_with_active_board {
                     board_display_name(root, &board_dir)
@@ -6299,6 +6228,16 @@ impl TuiApp {
         let board_dir = self.board_dir();
         self.task_snapshot =
             TuiTaskSnapshot::load(&self.active_root, &board_dir, self.active_board);
+        self.task_snapshot_loaded = Some(Instant::now());
+    }
+
+    fn refresh_task_snapshot_if_due(&mut self) {
+        if self
+            .task_snapshot_loaded
+            .is_none_or(|at| at.elapsed() >= Duration::from_secs(1))
+        {
+            self.refresh_task_snapshot();
+        }
     }
 
     pub(super) fn normalize_cached_task_selections(&mut self) {
@@ -6366,49 +6305,38 @@ impl TuiApp {
             self.models_panel.provider_viewport_height = content_height.saturating_sub(4) as usize;
             self.models_panel.model_viewport_height = content_height.saturating_sub(4) as usize;
         } else if self.archive_view {
-            let display_tasks = self
-                .task_snapshot
-                .archived_entries
-                .iter()
-                .enumerate()
-                .map(|(idx, entry)| {
-                    format!(
-                        "- {}",
-                        task_tui_display_text(entry, Some(idx) == self.archive_state.selected())
-                    )
-                })
-                .collect::<Vec<_>>();
-            keep_selected_task_visible(
-                &display_tasks,
-                self.archive_state.selected(),
-                &mut self.archive_scroll_offset,
+            let entries = &self.task_snapshot.archived_entries;
+            let selected = self
+                .archive_state
+                .selected()
+                .and_then(|i| Some((i, task_tui_display_text(entries.get(i)?, true))));
+            self.archive_scroll_offset = task_scroll_offset(
+                entries.len(),
+                selected,
+                self.archive_scroll_offset,
                 content_height.saturating_sub(2) as usize,
                 size.width as usize,
             );
         } else {
             let visible_boards = visible_tui_board_indices(self.backlog_visible);
             let col_width = (size.width / visible_boards.len() as u16) as usize;
-            for board_index in visible_boards {
-                let selected = self.board_states[*board_index].selected();
-                let display_tasks = self.task_snapshot.board_entries[*board_index]
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, entry)| {
+            for &i in visible_boards {
+                let entries = &self.task_snapshot.board_entries[i];
+                let selected = self.board_states[i].selected().and_then(|index| {
+                    let entry = entries.get(index)?;
+                    Some((
+                        index,
                         format!(
-                            "- {}{}",
-                            self.task_display(
-                                entry,
-                                TASK_STATUSES[*board_index],
-                                Some(idx) == selected
-                            ),
+                            "{}{}",
+                            self.task_display(entry, TASK_STATUSES[i], true),
                             self.coordination.board_annotation(entry)
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                keep_selected_task_visible(
-                    &display_tasks,
+                        ),
+                    ))
+                });
+                self.board_scroll_offsets[i] = task_scroll_offset(
+                    entries.len(),
                     selected,
-                    &mut self.board_scroll_offsets[*board_index],
+                    self.board_scroll_offsets[i],
                     content_height.saturating_sub(2) as usize,
                     col_width,
                 );
@@ -6425,14 +6353,26 @@ impl TuiApp {
     }
 
     fn console_content(&self) -> (&str, Color) {
-        self.project_removal_feedback().unwrap_or_else(|| {
-            tui_console_content(
-                self.current_pane == TuiPane::AgentProjects,
-                &self.agent_panel,
-                self.agent_log_view.as_ref(),
-                &self.feedback_buffer,
-            )
-        })
+        if let Some(feedback) = self
+            .project_removal_feedback()
+            .or_else(|| self.retry_feedback())
+        {
+            return feedback;
+        }
+        if self.agent_log_view.is_none()
+            && self.agent_panel.last_error.is_none()
+            && let Some(retry) = self
+                .console_project()
+                .and_then(TuiAgentProject::displayed_retry)
+        {
+            return (&retry.message, Color::LightYellow);
+        }
+        tui_console_content(
+            self.current_pane == TuiPane::AgentProjects,
+            &self.agent_panel,
+            self.agent_log_view.as_ref(),
+            &self.feedback_buffer,
+        )
     }
 }
 
@@ -6453,6 +6393,7 @@ pub(super) enum TuiEffect {
     ToggleTaskStop,
     CycleTaskThinking,
     RemoveAgentProject,
+    RetryAgentProject,
     RefreshAgentPanel,
     RefreshModels,
     RefreshSelectedProviderModels,
@@ -6527,6 +6468,21 @@ pub(super) fn update_tui_pane(app: &mut TuiApp, key: KeyEvent) -> Option<Vec<Tui
     }
     if key.code == KeyCode::Char('q') {
         return Some(vec![TuiEffect::Quit]);
+    }
+
+    if matches!(key.code, KeyCode::Char('r' | 'R'))
+        && key.modifiers.difference(KeyModifiers::SHIFT).is_empty()
+        && match app.current_pane {
+            TuiPane::Tasks => !app.archive_view,
+            TuiPane::AgentProjects => !app.agent_panel.supervisor_selected,
+            TuiPane::Models => false,
+        }
+    {
+        return Some(if key.kind == KeyEventKind::Press {
+            vec![TuiEffect::RetryAgentProject]
+        } else {
+            Vec::new()
+        });
     }
 
     match app.current_pane {
@@ -6722,6 +6678,13 @@ pub(super) fn update_tui_tasks_pane(app: &mut TuiApp, key: KeyEvent) -> Option<V
         };
     }
 
+    if tui_toggles_reorganize_mode(&key) {
+        app.current_mode = Mode::Reorganize;
+        app.feedback_buffer =
+            "Use arrows to move the task. Press m or Esc to exit Reorganize mode.".into();
+        return Some(Vec::new());
+    }
+
     if !key
         .modifiers
         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
@@ -6877,6 +6840,7 @@ pub(super) fn execute_tui_effect(
             app.refresh_task_snapshot();
         }
         TuiEffect::ToggleTaskStop => {
+            app.task_snapshot_loaded = None;
             let board_dir = app.board_dir();
             let selected_status = TASK_STATUSES[app.selected_board];
             let Some((_, task)) = selected_task_entry_in_board(
@@ -6902,6 +6866,7 @@ pub(super) fn execute_tui_effect(
             };
         }
         TuiEffect::RemoveAgentProject => app.confirm_project_removal(),
+        TuiEffect::RetryAgentProject => app.request_project_retry(),
         TuiEffect::RefreshAgentPanel => {
             if !app.agent_panel_write_pending()
                 && agent_panel_refresh.request(&app.active_root, app.agent_settings.revision)
@@ -6921,7 +6886,7 @@ pub(super) fn execute_tui_effect(
             if app.agent_log_view.is_some() {
                 // Other panes do not scan the board. Refresh before choosing a
                 // log when returning so it follows the current task selection.
-                app.refresh_task_snapshot();
+                app.refresh_task_snapshot_if_due();
                 app.normalize_cached_task_selections();
             }
             let selected_task = app.board_states[app.selected_board]
@@ -6944,7 +6909,7 @@ pub(super) fn execute_tui_effect(
             }
             *last_agent_log_refresh = Instant::now();
         }
-        TuiEffect::RefreshTaskSnapshot => app.refresh_task_snapshot(),
+        TuiEffect::RefreshTaskSnapshot => app.refresh_task_snapshot_if_due(),
         TuiEffect::RefreshClock => {
             app.current_time = Local::now().format("%H:%M").to_string();
             let now = agent_timestamp_seconds();
@@ -6982,7 +6947,7 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
     let (console_title, console_right_title) = if let Some(log_view) = app.agent_log_view.as_ref() {
         (tui_agent_log_title(log_view), None)
     } else if app.current_pane == TuiPane::AgentProjects {
-        let title = if app.project_removal_feedback().is_some() {
+        let title = if app.project_removal_feedback().is_some() || app.retry_feedback().is_some() {
             "Agent Projects Console"
         } else if let Some(notice) = app
             .agent_panel
@@ -7076,16 +7041,6 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
         let selected_idx = app.archive_state.selected();
         let col_width = content_area.width as usize;
         let entries = &app.task_snapshot.archived_entries;
-        let display_tasks: Vec<String> = entries
-            .iter()
-            .enumerate()
-            .map(|(idx, entry)| {
-                format!(
-                    "- {}",
-                    task_tui_display_text(entry, Some(idx) == selected_idx)
-                )
-            })
-            .collect();
         let highlight_style = Style::default().fg(Color::Black).bg(c_highlight);
         let block = Block::default()
             .title(" Archived - press A again to leave ")
@@ -7099,18 +7054,13 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
         let inner_area = block.inner(content_area);
 
         let mut current_y = 0;
-        for (idx, (t, entry)) in display_tasks
-            .iter()
-            .zip(entries.iter())
-            .enumerate()
-            .skip(app.archive_scroll_offset)
-        {
-            let cleaned = t.strip_prefix("- ").unwrap_or(t);
+        for (idx, entry) in entries.iter().enumerate().skip(app.archive_scroll_offset) {
             let is_selected = Some(idx) == selected_idx;
+            let text = task_tui_display_text(entry, is_selected);
             let mut wrapped_content = if is_selected {
-                wrap_text(cleaned, col_width.saturating_sub(5))
+                wrap_text(&text, col_width.saturating_sub(5))
             } else {
-                cleaned.to_string()
+                text
             };
             if entry.has_subtasks {
                 wrapped_content.push_str(" >");
@@ -7160,67 +7110,6 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
             let selected_idx = app.board_states[board_index].selected();
             let col_width = (size.width / column_count as u16) as usize;
             let entries = &app.task_snapshot.board_entries[board_index];
-            let tasks: Vec<String> = entries
-                .iter()
-                .map(|entry| {
-                    format!(
-                        "- {}{}",
-                        app.task_display(entry, status, false),
-                        app.coordination.board_annotation(entry)
-                    )
-                })
-                .collect();
-            let display_tasks: Vec<String> = entries
-                .iter()
-                .enumerate()
-                .map(|(idx, entry)| {
-                    format!(
-                        "- {}{}",
-                        app.task_display(entry, status, Some(idx) == selected_idx),
-                        app.coordination.board_annotation(entry)
-                    )
-                })
-                .collect();
-            let _items: Vec<ListItem> = tasks
-                .clone()
-                .into_iter()
-                .enumerate()
-                .map(|(idx, t)| {
-                    let cleaned = t.replace("- ", "");
-
-                    let (desc, meta) = if let Some(start) = cleaned.rfind(" (") {
-                        if cleaned.ends_with(')') {
-                            (
-                                &cleaned[..start],
-                                Some(&cleaned[start + 2..cleaned.len() - 1]),
-                            )
-                        } else {
-                            (&cleaned[..], None)
-                        }
-                    } else {
-                        (&cleaned[..], None)
-                    };
-
-                    let mut line = Line::from(vec![
-                        Span::raw(format!("{}. ", idx + 1)),
-                        Span::raw(if Some(idx) == selected_idx {
-                            wrap_text(desc, col_width.saturating_sub(5))
-                        } else {
-                            desc.to_string()
-                        }),
-                    ]);
-
-                    if let Some(m) = meta {
-                        line.spans.push(
-                            Span::raw(format!(" ({})", m))
-                                .style(Style::default().bg(Color::DarkGray).fg(Color::White)),
-                        );
-                    }
-
-                    ListItem::new(line)
-                })
-                .collect();
-
             let task_focus_active = matches!(app.current_mode, Mode::View | Mode::Reorganize)
                 && app.current_pane == TuiPane::Tasks;
             let highlight_style = if task_focus_active {
@@ -7235,20 +7124,23 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
                 f,
                 chunks[column_index],
                 titles[board_index],
-                tasks.len(),
+                entries.len(),
                 app.selected_board == board_index,
                 reorganizing,
                 colors[board_index],
             );
             let mut current_y = 0;
-            for (idx, (t, entry)) in display_tasks
+            for (idx, entry) in entries
                 .iter()
-                .zip(entries.iter())
                 .enumerate()
                 .skip(app.board_scroll_offsets[board_index])
             {
-                let cleaned = t.strip_prefix("- ").unwrap_or(t);
                 let is_selected = Some(idx) == selected_idx;
+                let text = format!(
+                    "{}{}",
+                    app.task_display(entry, status, is_selected),
+                    app.coordination.board_annotation(entry)
+                );
 
                 let style = if is_selected {
                     highlight_style
@@ -7257,9 +7149,9 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
                 };
 
                 let mut wrapped_content = if is_selected {
-                    wrap_text(cleaned, col_width.saturating_sub(5))
+                    wrap_text(&text, col_width.saturating_sub(5))
                 } else {
-                    cleaned.to_string()
+                    text
                 };
                 if entry.has_subtasks {
                     wrapped_content.push_str(" >");
@@ -7415,28 +7307,11 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
     }
 
     let (console_content, console_color) = app.console_content();
-    let removal_feedback = app.project_removal_feedback().is_some();
-    let retry = if !removal_feedback
-        && app.agent_log_view.is_none()
-        && app.agent_panel.last_error.is_none()
-    {
-        match app.current_pane {
-            TuiPane::AgentProjects => app.agent_panel.selected_project(),
-            TuiPane::Tasks => app
-                .agent_panel
-                .projects
-                .iter()
-                .filter(|project| app.active_root.starts_with(&project.project.path))
-                .max_by_key(|project| project.project.path.components().count()),
-            _ => None,
-        }
-        .and_then(TuiAgentProject::displayed_retry)
-    } else {
-        None
-    };
-    let (console_content, console_color) = retry
-        .map(|retry| (retry.message.as_str(), Color::LightYellow))
-        .unwrap_or((console_content, console_color));
+    let action_feedback =
+        app.project_removal_feedback().is_some() || app.retry_feedback().is_some();
+    let retry = app
+        .console_project()
+        .and_then(TuiAgentProject::displayed_retry);
     let feedback_area = *main_layout.last().unwrap();
     let wrapped_console_content = wrap_input_text(
         console_content,
@@ -7460,6 +7335,8 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
                 ) {
                     (true, true) => " Saving settings before quitting… ",
                     (true, false) => " Saving settings… ",
+                    (false, true) if app.retry_pending() => " Finishing retry before quitting… ",
+                    (false, false) if app.retry_pending() => " Requesting retry… ",
                     (false, true) => " Removing project before quitting… ",
                     (false, false) => " Removing project… ",
                 },
@@ -7480,8 +7357,8 @@ pub(super) fn render_tui(f: &mut ratatui::Frame<'_>, app: &TuiApp) {
         .block(console_block)
         .style(Style::default().fg(console_color))
         .scroll((
-            if removal_feedback
-                || retry.is_some()
+            if action_feedback
+                || (app.agent_log_view.is_none() && retry.is_some())
                 || (app.agent_log_view.is_none()
                     && app.current_pane == TuiPane::AgentProjects
                     && app
@@ -7653,6 +7530,11 @@ pub(super) fn execute_tui_key_effect(
         }
         if !execute_pane_key {
             return Ok(false);
+        }
+        // Pane commands can change the board or switch roots. Text editing
+        // changes files only on submit. Cached navigation needs no disk scan.
+        if matches!(app.current_mode, Mode::View | Mode::Reorganize) || key.code == KeyCode::Enter {
+            app.task_snapshot_loaded = None;
         }
     }
     match app.current_mode {
@@ -7975,38 +7857,6 @@ pub(super) fn execute_tui_key_effect(
                         app.current_pane = TuiPane::Models;
                         app.feedback_buffer = tui_models_instructions().to_string();
                     }
-                    KeyCode::Char('r') | KeyCode::Char('R') => {
-                        if let Some(project) = app.agent_panel.selected_project()
-                            && project.failure_problem.as_deref().is_some_and(|problem| {
-                                problem.starts_with("Git recovery available")
-                            })
-                        {
-                            let result = open_agent_store().and_then(|store| {
-                                plan_git_recovery(&store, &project.project, None)
-                            });
-                            match result {
-                                Ok(plan) => {
-                                    app.agent_log_view = None;
-                                    app.pending_git_recovery = Some(plan);
-                                }
-                                Err(error) => {
-                                    app.agent_panel.last_error =
-                                        Some(format!("Unable to prepare recovery: {error}"))
-                                }
-                            }
-                            return Ok(false);
-                        }
-                        app.feedback_buffer = match retry_selected_tui_agent_project(
-                            &mut app.agent_panel,
-                            &app.active_root,
-                        ) {
-                            Ok(message) => message,
-                            Err(error) => {
-                                format!("Unable to retry selected project: {error}")
-                            }
-                        };
-                        *last_agent_panel_refresh = Instant::now();
-                    }
                     KeyCode::Char('s' | 'S') => {
                         let target_result = if app.agent_log_view.is_some() {
                             viewed_tui_codex_session_target(app.agent_log_view.as_ref())
@@ -8247,11 +8097,6 @@ pub(super) fn execute_tui_key_effect(
                     &mut app.board_states[app.selected_board],
                     direction,
                 );
-            } else if tui_toggles_reorganize_mode(&key) {
-                app.current_mode = Mode::Reorganize;
-                app.feedback_buffer =
-                    "Reorganize mode active: use Arrows to move tasks; press r or Esc to exit."
-                        .to_string();
             } else if tui_starts_subtask_input(&key) {
                 if let Some((idx, entry)) = selected_task_entry_in_board(
                     &board_dir,
@@ -8890,7 +8735,7 @@ pub(super) fn execute_tui_key_effect(
             }
             TuiReorganizeInput::Ignore => {
                 app.feedback_buffer =
-                    "Reorganize mode active: use Arrows to move tasks; press r or Esc to exit."
+                    "Use arrows to move the task. Press m or Esc to exit Reorganize mode."
                         .to_string();
             }
         },
@@ -9028,7 +8873,8 @@ pub(super) fn tui_view_with_active_board(
         }
 
         let settings_completed = app.poll_agent_settings();
-        if app.poll_project_removal() || settings_completed {
+        let retry_completed = app.poll_project_retries();
+        if app.poll_project_removal() || settings_completed || retry_completed {
             last_agent_panel_refresh = Instant::now() - tui_agent_panel_refresh_interval();
         }
         if app.agent_settings.quit_requested && !app.agent_panel_write_pending() {

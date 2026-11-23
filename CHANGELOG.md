@@ -6,6 +6,22 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+## [0.9.17] - 2026-11-23
+
+### Changed
+
+- Press `r` to retry the current project from Kanban. Lowercase `m` enters
+  Reorganize mode. Press `m` again or `Esc` to exit.
+
+### Fixed
+
+- Keep automated Codex runs working through temporary contention from other
+  projects updating the shared agent registry. Show `RUNNING` once Codex
+  confirms the resumed session.
+- Acknowledge retry requests immediately in Agent Projects and Kanban. Show
+  the outcome and keep navigation responsive during the registry write. Large
+  boards also avoid rereading and formatting every task on each navigation key.
+
 ## [0.9.16] - 2026-11-21
 
 ### Fixed
@@ -690,7 +706,8 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 - Fixed task moves so destination write failures do not remove the source task.
 - Fixed TUI navigation on empty boards.
 
-[Unreleased]: https://github.com/AlpineVibrations/clt-rs/compare/v0.9.16...HEAD
+[Unreleased]: https://github.com/AlpineVibrations/clt-rs/compare/v0.9.17...HEAD
+[0.9.17]: https://github.com/AlpineVibrations/clt-rs/compare/v0.9.16...v0.9.17
 [0.9.11]: https://github.com/AlpineVibrations/clt-rs/compare/v0.9.10...v0.9.11
 [0.9.8]: https://github.com/AlpineVibrations/clt-rs/compare/v0.9.7...v0.9.8
 [0.9.7]: https://github.com/AlpineVibrations/clt-rs/compare/v0.9.6...v0.9.7

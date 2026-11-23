@@ -187,6 +187,21 @@ used Turso dependency. Application modules import its local API through
   Regressions include a live child surviving more than five seconds of writer
   contention, renewal after release, and parent disconnect while the lock is held.
   Run `cargo test --locked --bin clt session_control::guardian_lease`.
+- During live observation the runner uses a store handle with nonblocking writer
+  acquisition. Only contention before mutation is retryable. A pending write
+  rechecks the project lease, worker token and PID before retrying. Session
+  registration and Git linkage finish before normal exit. Verify with
+  `cargo test --locked --bin clt codex_runner_retries_observation`.
+- Worker activity promotes an exact resumed session to running when the current
+  worker's registered child log contains its matching session banner. Verify
+  with `cargo test --locked --bin clt application::activity`.
+- The TUI submits retry requests on a background thread per requested project.
+  Its transaction compares the selected registration and clears cooldown and
+  supervisor review together. Completion invalidates older panel refreshes.
+  The board measures only the selected row for scrolling, formats visible rows
+  and periodically refreshes its task snapshot between edits. Verify with
+  `cargo test --locked --bin clt tui::retry_status` and
+  `cargo test --locked --bin clt keep_selected_task_visible`.
 - Registry writer-lock acquisition is bounded. Ordinary store operations retain checkpoint pins only while their futures run, explicitly rolling back on completion; idle handles do not pin old WAL generations. Under the writer lock, opens before migrations and durable updates before mutation/dirty marking attempt engine-managed WAL truncation at 64 MiB. Real readers may defer it; the 128 MiB admission guard remains a fallback for legacy clients and long reads. Recovery retains its lifetime pin until integrity verification, releases only that pin, truncates through the engine, and verifies integrity again before publishing a snapshot. Idle opens also retain exclusive maintenance; live stores and worker/session processes defer that path. Successful routine exclusive maintenance deletes only its own backup after verified teardown and durable snapshot publication; manual and failed recovery bundles remain quarantined. Recovery bypasses the admission guard to permit checkpointing.
 - Turso rows are mapped to agent-domain records inside `agent::repositories`.
 - The pinned Turso core carries a local reader-ownership fix under `vendor/`; its provenance and patch are documented there. Keep operation checkpoint pins and the partial-checkpoint, overlapping-store, live cross-process WAL truncation, and interrupted-WAL regressions when updating the dependency.

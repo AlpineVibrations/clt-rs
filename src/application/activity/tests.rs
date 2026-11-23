@@ -75,6 +75,15 @@ fn activity_follows_the_exact_worker_session_across_board_moves() {
         let activity = describe_worker_activity(&worker, &controls);
         assert_eq!(activity.phase, WorkerActivityPhase::Resuming);
         assert_eq!(activity.summary, "Resuming: DOING #1 — Feather mask");
+        fs::write(root.join("err"), "session id: other\n").unwrap();
+        assert_eq!(
+            describe_worker_activity(&worker, &controls).phase,
+            WorkerActivityPhase::Resuming
+        );
+        fs::write(root.join("err"), "session id: owned\n").unwrap();
+        let running = describe_worker_activity(&worker, &controls);
+        assert_eq!(running.phase, WorkerActivityPhase::Running);
+        assert_eq!(running.summary, "Working on: DOING #1 — Feather mask");
         board
             .move_task_after_lock(TaskStatus::Doing, TaskStatus::Done, 1)
             .unwrap();

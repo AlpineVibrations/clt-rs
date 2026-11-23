@@ -71,7 +71,7 @@ impl RetryStatus {
             "Retry paused".into()
         } else if remaining > 0 {
             guidance =
-                "Automatic retry is scheduled. No action is needed while the countdown runs.";
+                "Automatic retry is scheduled. Press r to retry now.";
             format!("Retry in {}:{:02}", remaining / 60, remaining % 60)
         } else {
             guidance =

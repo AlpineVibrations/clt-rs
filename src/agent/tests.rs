@@ -1368,12 +1368,47 @@ fn agent_store_immediate_retry_clears_only_the_selected_project_failure_count() 
             .unwrap()
     );
 
+    let review = crate::supervisor::SupervisorReview {
+        evidence: "failed attempt".into(),
+        state: "held".into(),
+        attempts: 1,
+        retries: 0,
+        decision: None,
+        retry_session: None,
+        error: None,
+    };
+    store
+        .save_supervisor_review_blocking(project_id, &review)
+        .unwrap();
+    assert!(
+        !store
+            .retry_registered_project_blocking(&project_root, Some(project_id + 1))
+            .unwrap()
+    );
+    assert_eq!(store.list_projects_blocking().unwrap()[0].failure_count, 1);
     assert!(
         store
             .clear_project_failure_backoff_for_path_blocking(&project_root)
             .unwrap()
     );
     assert_eq!(store.list_projects_blocking().unwrap()[0].failure_count, 0);
+    assert!(
+        store
+            .supervisor_review_blocking(project_id)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store
+            .retry_registered_project_blocking(&project_root, Some(project_id))
+            .unwrap()
+    );
+    assert!(
+        store
+            .supervisor_review_blocking(project_id)
+            .unwrap()
+            .is_none()
+    );
     assert_eq!(store.run_count_blocking().unwrap(), 1);
 
     fs::remove_dir_all(root).unwrap();

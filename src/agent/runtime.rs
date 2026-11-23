@@ -15,6 +15,17 @@ pub(super) struct AgentStoreBlockingAdapter {
     state_dir: PathBuf,
     database: Option<Database>,
     recovering: bool,
+    nonblocking_writes: bool,
+}
+
+impl super::TursoAgentStore {
+    /// Let the process supervisor poll its child between contended writes.
+    /// Only this store handle changes its lock acquisition policy.
+    #[cfg(unix)]
+    pub(crate) fn with_nonblocking_writes(mut self) -> Self {
+        self.blocking.nonblocking_writes = true;
+        self
+    }
 }
 
 impl AgentStoreBlockingAdapter {
@@ -25,6 +36,7 @@ impl AgentStoreBlockingAdapter {
             state_dir: state_dir.to_path_buf(),
             database: None,
             recovering,
+            nonblocking_writes: false,
         })
     }
 
@@ -97,6 +109,11 @@ impl AgentStoreBlockingAdapter {
     }
 
     pub(super) fn block_on_persist<T>(&self, future: impl Future<Output = Result<T>>) -> Result<T> {
+        if self.nonblocking_writes {
+            return self
+                .try_block_on_persist(future)?
+                .ok_or_else(|| recovery::RegistryWriterBusy.into());
+        }
         let writer = recovery::write_lock(&self.state_dir)?;
         self.persist_with_writer(writer, future)
     }

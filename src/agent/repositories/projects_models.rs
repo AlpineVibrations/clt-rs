@@ -114,6 +114,16 @@ impl TursoAgentStore {
         &self,
         project_root: &Path,
     ) -> Result<bool> {
+        self.retry_registered_project_blocking(project_root, None)
+    }
+
+    /// A panel retry clears the selected registration's supervisor review in
+    /// the same transaction. A replacement registration at this path is distinct.
+    pub(crate) fn retry_registered_project_blocking(
+        &self,
+        project_root: &Path,
+        selected_project_id: Option<i64>,
+    ) -> Result<bool> {
         self.blocking.block_on_persist(async {
             let mut conn = self.repositories.projects_models.connect().await?;
             let path = project_root.display().to_string();
@@ -146,11 +156,22 @@ impl TursoAgentStore {
             }
             let changed = transaction
                 .execute(
-                    "UPDATE projects SET failure_count = 0, updated_at = ?1 WHERE path = ?2",
-                    params![agent_timestamp(), path.as_str()],
+                    "UPDATE projects SET failure_count = 0, updated_at = ?1
+                      WHERE path = ?2 AND (?3 IS NULL OR id = ?3)",
+                    params![agent_timestamp(), path.as_str(), selected_project_id],
                 )
                 .await
                 .with_context(|| format!("Failed to clear project {path} failure cooldown"))?;
+            if changed > 0
+                && let Some(id) = selected_project_id
+                && self
+                    .pending_migration_version()
+                    .is_none_or(|version| version > 20)
+            {
+                transaction
+                    .execute("DELETE FROM supervisor_reviews WHERE project_id = ?1", [id])
+                    .await?;
+            }
             transaction
                 .commit()
                 .await

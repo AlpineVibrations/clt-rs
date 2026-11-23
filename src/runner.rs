@@ -2349,6 +2349,8 @@ impl CodexAgentRunner {
         }
         drop(todo_launch_lock);
         #[cfg(unix)]
+        let store = store.with_nonblocking_writes();
+        #[cfg(unix)]
         let wait_result = wait_for_automated_supervisor_with_timeout_and_heartbeat(
             AutomatedSupervisorWaitHandles {
                 process: &mut child,
@@ -2367,7 +2369,40 @@ impl CodexAgentRunner {
                     &mut last_heartbeat_stderr_bytes,
                 )
             },
-            || {
+            |retrying_write| {
+                if retrying_write
+                    && !store.observation_lease_is_live_blocking(
+                        project.id,
+                        lease_holder,
+                        effective_worker_token.as_deref(),
+                        std::process::id(),
+                        &agent_timestamp(),
+                    )?
+                {
+                    anyhow::bail!(
+                        "Automated Codex lease expired or ownership changed while waiting to update the registry for project {}",
+                        project.id
+                    );
+                }
+                if observed_session_id.is_none() {
+                    observed_session_id = agent_codex_session_id_from_log(&stderr_path)?;
+                }
+                // Stop and handoff requests remain observable while a writer is busy.
+                let should_poll_control = last_session_control_poll.is_none_or(|last_poll| {
+                    last_poll.elapsed() >= Duration::from_millis(AGENT_SESSION_CONTROL_POLL_MILLIS)
+                });
+                if should_poll_control && let Some(session_id) = observed_session_id.as_deref() {
+                    if let Some(control) = store.session_control_blocking(project.id, session_id)?
+                        && let Some(action) = automated_session_control_action_for_generation(
+                            &control,
+                            child_pid,
+                            &run_file_stem,
+                        )
+                    {
+                        requested_control_cell.set(Some(action));
+                    }
+                    last_session_control_poll = Some(Instant::now());
+                }
                 if last_lease_renewal.elapsed() >= runner.lease_renew_interval {
                     let expires_at = agent_timestamp_after(runner.lease_timeout.as_secs());
                     let renewed = if let Some(worker_token) = effective_worker_token.as_deref() {
@@ -2387,9 +2422,6 @@ impl CodexAgentRunner {
                         );
                     }
                     last_lease_renewal = Instant::now();
-                }
-                if observed_session_id.is_none() {
-                    observed_session_id = agent_codex_session_id_from_log(&stderr_path)?;
                 }
                 if let Some(session_id) = observed_session_id.as_deref()
                     && !session_registered
@@ -2417,7 +2449,6 @@ impl CodexAgentRunner {
                         selected_task_identity.as_deref(),
                     ) {
                         Ok(attached) => {
-                            session_linked = attached;
                             if attached {
                                 if store
                                     .git_finalization_blocking(project.id, session_id)?
@@ -2438,6 +2469,7 @@ impl CodexAgentRunner {
                                     session_id,
                                     &run_file_stem,
                                 )?;
+                                session_linked = true;
                             }
                         }
                         Err(error) if !session_link_error_logged => {
@@ -2451,23 +2483,6 @@ impl CodexAgentRunner {
                         }
                         Err(_) => {}
                     }
-                }
-                let should_poll_control = last_session_control_poll.is_none_or(|last_poll| {
-                    last_poll.elapsed() >= Duration::from_millis(AGENT_SESSION_CONTROL_POLL_MILLIS)
-                });
-                if should_poll_control {
-                    if let Some(session_id) = observed_session_id.as_deref()
-                        && let Some(control) =
-                            store.session_control_blocking(project.id, session_id)?
-                        && let Some(action) = automated_session_control_action_for_generation(
-                            &control,
-                            child_pid,
-                            &run_file_stem,
-                        )
-                    {
-                        requested_control_cell.set(Some(action));
-                    }
-                    last_session_control_poll = Some(Instant::now());
                 }
                 Ok(())
             },
@@ -2722,7 +2737,7 @@ pub(super) fn wait_for_automated_supervisor_with_timeout_and_heartbeat(
     timeout: Duration,
     heartbeat_interval: Duration,
     mut heartbeat: impl FnMut(Duration) -> Result<()>,
-    mut observe: impl FnMut() -> Result<()>,
+    mut observe: impl FnMut(bool) -> Result<()>,
     mut should_shutdown: impl FnMut() -> bool,
 ) -> Result<AgentProcessWait> {
     let AutomatedSupervisorWaitHandles {
@@ -2737,21 +2752,30 @@ pub(super) fn wait_for_automated_supervisor_with_timeout_and_heartbeat(
     };
     let started = Instant::now();
     let mut last_heartbeat = started;
+    let mut retrying_write = false;
 
     loop {
-        if let Err(error) = observe() {
-            request_automated_supervisor_stop(control);
-            wait_for_automated_supervisor_reaped(supervisor, proof).with_context(|| {
-                format!(
-                    "Automated Codex observation failed ({error:#}); its supervisor did not prove the process group reaped"
-                )
-            })?;
-            return Err(error);
-        }
+        retrying_write = match observe(retrying_write) {
+            Ok(()) => false,
+            Err(error) if error.is::<agent::recovery::RegistryWriterBusy>() => true,
+            Err(error) => {
+                request_automated_supervisor_stop(control);
+                wait_for_automated_supervisor_reaped(supervisor, proof).with_context(|| {
+                    format!(
+                        "Automated Codex observation failed ({error:#}); its supervisor did not prove the process group reaped"
+                    )
+                })?;
+                return Err(error);
+            }
+        };
 
-        if let Some(status) = supervisor
+        // Keep the real exit status while pending registration or linkage is
+        // retried. The run deadline applies only while the supervisor is live.
+        let exited = supervisor
             .try_wait()
-            .context("Failed to poll automated Codex supervisor")?
+            .context("Failed to poll automated Codex supervisor")?;
+        if let Some(status) = exited
+            && !retrying_write
         {
             let status = verify_automated_supervisor_reaped(status, proof)?;
             control.take();
@@ -2764,7 +2788,7 @@ pub(super) fn wait_for_automated_supervisor_with_timeout_and_heartbeat(
             return Ok(AgentProcessWait::Interrupted(Some(status)));
         }
 
-        if !timeout.is_zero() && started.elapsed() >= timeout {
+        if exited.is_none() && !timeout.is_zero() && started.elapsed() >= timeout {
             request_automated_supervisor_stop(control);
             let status = wait_for_automated_supervisor_reaped(supervisor, proof)?;
             return Ok(AgentProcessWait::TimedOut(Some(status)));

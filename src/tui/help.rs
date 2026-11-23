@@ -45,7 +45,8 @@ A: Open the read-only archive.
 b: Move the selected task to Backlog.
 B: Show/hide the Backlog column.
 Delete: Permanently delete the selected task.
-r / R: Enter sticky Reorganize mode.
+r / R: Retry the current project.
+m: Enter sticky Reorganize mode.
 Shift+Up/Down or Ctrl+P/N: Reorder the selected task up/down.
 Shift+Left/Right: Move the task to the previous/next visible column.
 4-9: Move the selected task to that numbered position in its column.
@@ -53,7 +54,7 @@ Shift+Left/Right: Move the task to the previous/next visible column.
 REORGANIZE MODE
 Up/Down: Reorder the selected task.
 Left/Right: Move the task between visible columns.
-r / R / Esc: Exit Reorganize mode.
+m / Esc: Exit Reorganize mode.
 
 ARCHIVE
 Up/Down: Select previous/next archived task (wraps).

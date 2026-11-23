@@ -25,6 +25,51 @@ fn task(content: &str) -> TaskEntry {
 }
 
 #[test]
+fn retry_key_acknowledges_a_busy_writer_and_keeps_navigation_responsive() {
+    let mut app = TuiApp::new(Path::new("/tmp/retry-demo"), true);
+    app.agent_panel.projects = vec![retry_project()];
+    app.active_root = app.agent_panel.projects[0].project.path.clone();
+    app.agent_panel.state.select(Some(0));
+    let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+    app.agent_panel.projects[0].retry_status = None;
+    for pane in [TuiPane::Tasks, TuiPane::AgentProjects] {
+        app.current_pane = pane;
+        for ch in ['r', 'R'] {
+            assert_eq!(
+                update_tui_pane(&mut app, key(KeyCode::Char(ch))),
+                Some(vec![TuiEffect::RetryAgentProject])
+            );
+        }
+    }
+    app.agent_panel.projects[0] = retry_project();
+    let (release, blocked) = mpsc::channel();
+    app.start_project_retry(1, "retry-demo".into(), move || {
+        blocked.recv()?;
+        anyhow::bail!("project lease is active")
+    });
+    app.start_project_retry(1, "retry-demo".into(), || panic!("duplicate retry"));
+    assert!(
+        app.console_content()
+            .0
+            .contains("Requesting retry for retry-demo")
+    );
+    update_tui_pane(&mut app, key(KeyCode::Tab));
+    assert_eq!(app.current_pane, TuiPane::Tasks);
+    assert!(app.retry_pending());
+    assert!(!app.poll_project_retries());
+    let revision = app.agent_settings.revision;
+    release.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !app.poll_project_retries() {
+        assert!(Instant::now() < deadline);
+        thread::yield_now();
+    }
+    assert!(!app.agent_settings.accepts_refresh(revision));
+    assert!(app.console_content().0.contains("project lease is active"));
+    assert_eq!(app.console_content().1, Color::LightRed);
+}
+
+#[test]
 fn cooldown_survives_missing_or_nonfailure_latest_record_and_ticks_to_ready() {
     let mut project = retry_project();
     assert_eq!(project.runtime_state, TuiAgentRuntimeState::RetryScheduled);

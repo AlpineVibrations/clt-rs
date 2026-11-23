@@ -34,7 +34,7 @@ the Git root by default, or the current directory outside Git. Use `--local` to
 force the current directory. Prefer individual task files? Use `clt init --folders`
 when creating the board.
 
-In the TUI, use arrow keys to navigate, `Space` to add, `e` to edit, `r` to
+In the TUI, use arrow keys to navigate, `Space` to add, `e` to edit, `r` to retry, `m` to
 reorganize, and `q` to quit. `B` shows Backlog; `Tab` opens Agent Projects.
 See the [feature guide](features.md) for nested boards, archives, shell integration,
 and the full controls.

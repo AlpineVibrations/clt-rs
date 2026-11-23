@@ -59,6 +59,10 @@ impl Drop for RegistryAccess {
 
 pub(crate) struct RegistryWriteLock(File);
 
+#[derive(Debug, thiserror::Error)]
+#[error("Another CLT process is updating the shared agent registry. Retry shortly.")]
+pub(crate) struct RegistryWriterBusy;
+
 impl Drop for RegistryWriteLock {
     fn drop(&mut self) {
         let _ = self.0.unlock();
@@ -100,9 +104,7 @@ pub(super) fn write_lock(state_dir: &Path) -> Result<RegistryWriteLock> {
             Err(fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(25));
             }
-            Err(fs::TryLockError::WouldBlock) => anyhow::bail!(
-                "Another CLT process is still updating the agent registry; retry shortly. If it stays busy, close other CLT windows and run `clt agent recover`."
-            ),
+            Err(fs::TryLockError::WouldBlock) => return Err(RegistryWriterBusy.into()),
             Err(fs::TryLockError::Error(error)) => {
                 return Err(error).context("Failed to serialize durable registry updates");
             }

@@ -754,6 +754,36 @@ impl TursoAgentStore {
         ))
     }
 
+    /// A deferred observation may resume only under the original live lease
+    /// and, for a durable worker, its exact running process generation.
+    #[cfg(unix)]
+    pub(crate) fn observation_lease_is_live_blocking(
+        &self,
+        project_id: i64,
+        holder: &str,
+        worker_token: Option<&str>,
+        worker_pid: u32,
+        now: &str,
+    ) -> Result<bool> {
+        self.blocking.block_on(async {
+            let conn = self.repositories.workers_leases.connect().await?;
+            Ok(query_count(
+                &conn,
+                "SELECT COUNT(*) FROM leases l
+                  WHERE l.project_id = ?1 AND l.holder = ?2
+                    AND CAST(l.expires_at AS INTEGER) > CAST(?3 AS INTEGER)
+                    AND (?4 IS NULL OR EXISTS (
+                        SELECT 1 FROM agent_workers w
+                         WHERE w.project_id = l.project_id AND w.lease_holder = l.holder
+                           AND w.worker_token = ?4 AND w.worker_pid = ?5 AND w.state = 'running'
+                    ))",
+                params![project_id, holder, now, worker_token, i64::from(worker_pid)],
+            )
+            .await?
+                == 1)
+        })
+    }
+
     pub(crate) fn worker_fence_snapshot_blocking(
         &self,
         worker_token: &str,

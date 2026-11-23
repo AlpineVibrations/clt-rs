@@ -77,6 +77,7 @@ impl Removal {
 impl TuiApp {
     pub(super) fn agent_panel_write_pending(&self) -> bool {
         self.agent_settings.is_pending()
+            || self.retry_pending()
             || matches!(self.project_removal, Some(Removal::Running { .. }))
     }
 
