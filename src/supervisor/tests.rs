@@ -331,6 +331,45 @@ fn supervisor_waits_without_rechecking_unchanged_evidence_and_off_restores_norma
 }
 
 #[test]
+fn supervisor_input_hold_reuses_git_checks_until_the_task_changes() {
+    let (root, _, store, project) = fixture("supervisor-input-hold");
+    enable(&store);
+    begin_review(&store, &project).unwrap();
+    finish_review(
+        &store,
+        &project,
+        &result(
+            &root,
+            json!({
+                "decision": "user", "task": 1, "reason": "Permission needed",
+                "next_action": "Record approval in the task"
+            }),
+        ),
+    )
+    .unwrap();
+    let mut review = store.supervisor_review_blocking(project.id).unwrap().unwrap();
+    let mut saved: serde_json::Value = serde_json::from_str(&review.evidence).unwrap();
+    saved["session_eligibility"][0]["resume_git_check"] = json!({"status": "verified"});
+    review.evidence = serde_json::to_string(&saved).unwrap();
+    store.save_supervisor_review_blocking(project.id, &review).unwrap();
+    assert_ne!(review_evidence(&store, &project).unwrap(), review.evidence);
+    assert!(matches!(gate(&store, &project, true).unwrap(), Gate::Hold(_)));
+
+    let board = crate::task::TaskBoard::new(get_tasks_dir(&project.path));
+    let task = board.entry(TaskStatus::Doing, 1).unwrap();
+    board
+        .write_entry_content(
+            TaskStatus::Doing,
+            &task,
+            "Fix renderer. BLOCKED 2026-10-06: User provided new details. codex:original-session",
+        )
+        .unwrap();
+    assert!(matches!(gate(&store, &project, true).unwrap(), Gate::Review));
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn supervisor_resume_reassesses_stopped_repair_and_preserves_the_original_work() {
     for folders in [false, true] {
         let root = temp_root("supervisor-resume-repair");

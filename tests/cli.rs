@@ -177,6 +177,76 @@ fn coordination_manual_claims_and_automation_use_the_same_overlap_admission() {
     assert_success(&w.run(&["context", "--check", "todo", "1"]));
 }
 
+#[test]
+fn coordination_manual_done_allows_potential_overlap() {
+    let shared = r#"{"files":["shared.rs"]}"#;
+    for folders in [false, true] {
+        let w = TestWorkspace::new("coordination-manual-done");
+        assert_success(&w.run(if folders {
+            &["init", "--folders"]
+        } else {
+            &["init"]
+        }));
+        for (title, session) in [
+            ("Active work", "00000000-0000-4000-8000-000000000011"),
+            ("First finish", "00000000-0000-4000-8000-000000000012"),
+            ("Second finish", "00000000-0000-4000-8000-000000000013"),
+        ] {
+            assert_success(&w.run(&["start", title, "--session", session]));
+        }
+        let peer = coordinated_id(&w, "doing", "1");
+        assert_success(&w.run(&["coordinate", "doing", "1", "--scope", shared]));
+        for index in ["2", "3"] {
+            assert_success(&w.run(&["coordinate", "doing", index, "--scope", shared]));
+        }
+        let result = w.run(&["context", "--check", "doing", "2"]);
+        assert!(!result.status.success());
+        assert!(String::from_utf8_lossy(&result.stderr).contains("Potential overlap"));
+
+        assert_success(&w.run(&["add", "Unfinished prerequisite"]));
+        let prerequisite = coordinated_id(&w, "todo", "1");
+        assert_success(&w.run(&["coordinate", "doing", "2", "--depends-on", &prerequisite]));
+        let result = w.run(&["done", "doing", "2"]);
+        assert!(!result.status.success());
+        assert!(String::from_utf8_lossy(&result.stderr).contains("prerequisite is unfinished"));
+        assert_success(&w.run(&[
+            "coordinate",
+            "doing",
+            "2",
+            "--remove-dependency",
+            &prerequisite,
+        ]));
+
+        assert_success(&w.run(&[
+            "coordinate",
+            "doing",
+            "2",
+            "--conflict",
+            &peer,
+            "--reason",
+            "Both change the response contract",
+        ]));
+        let result = w.run(&["status", "doing", "2", "done"]);
+        assert!(!result.status.success());
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains("Both change the response contract")
+        );
+
+        // The updated scope invalidates the review but still overlaps the peer.
+        let revised_scope = r#"{"intent":"Finish documentation","files":["shared.rs"]}"#;
+        assert_success(&w.run(&["coordinate", "doing", "2", "--scope", revised_scope]));
+        assert_success(&w.run(&["done", "doing", "2"]));
+        assert_success(&w.run(&["status", "doing", "2", "done"]));
+
+        let (doing, _) = assert_success(&w.run(&["list", "doing"]));
+        assert!(doing.contains("1. [CLI] Active work"));
+        assert!(!doing.contains("First finish") && !doing.contains("Second finish"));
+        let (done, _) = assert_success(&w.run(&["list", "done"]));
+        assert!(done.contains("1. Second finish") && done.contains("2. First finish"));
+        assert!(!done.contains("[CLI]"));
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn coordination_finalization_owner_exit_preserves_child_lock_and_shared_index() {

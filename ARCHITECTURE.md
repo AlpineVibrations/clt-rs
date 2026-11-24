@@ -53,9 +53,12 @@ used Turso dependency. Application modules import its local API through
   waits from overlap assessments and execution blockers. Pair fingerprints bind
   requirements and declared scope; no missing-metadata or dirty-worktree project
   fence is introduced. Selection, activation, manual claims, completion and
-  resume acquisition share admission. Waiting consumers cannot block their own
-  prerequisites; workers preserve their session and unsealed journal when
-  returning automated coordination waits to Todo.
+  resume acquisition share admission. The CLI and TUI check an explicit
+  Doing-to-Done move under the board lock before cancelling a Git journal or
+  moving the task. For a manually claimed task, this check permits potential
+  overlap while still enforcing explicit conflicts and dependency proof.
+  Waiting consumers cannot block their own prerequisites. Workers preserve the
+  session and unsealed journal when returning coordination waits to Todo.
 - CLI context and cached TUI annotations expose owners, scope and specific waits.
   The private app-server worker polls context changes and uses its existing
   exact-turn steering transport, without replacing threads or taking over manual
@@ -386,9 +389,17 @@ reports a duplicate same-process WAL mapping. It never clears the live mapping;
 permanent errors retain the original cause. Concurrent open/drop regression:
 `cargo test --locked --bin clt concurrent_registry_handle_teardown`.
 
+Todo and Backlog moves with a WORKING journal reuse the idle ownership
+check under the board lock. Scheduler Git reconciliation and worker lease
+acquisition exclude a backlogged session. Input and replan holds reuse saved
+Git diagnostics while tracking board content and session eligibility. Repair
+and sealed Git holds continue to verify proof. The daemon logs supervisor
+waits on changes.
+
 ```bash
 cargo test --locked --bin clt supervisor::tests
 cargo test --locked --bin clt session_control::tests
+cargo test --locked --bin clt idle_managed_todo_can_round_trip_through_backlog
 ```
 
 Coordination regressions cover both board layouts, stable references and edits,
@@ -407,6 +418,7 @@ Targeted checks:
 
 ```bash
 cargo test --locked --bin clt coordination
+cargo test --locked --bin clt tui_done_move
 cargo test --locked --test cli coordination
 cargo test --locked --bin clt managed_git::tests
 ```

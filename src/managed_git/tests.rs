@@ -1437,6 +1437,135 @@ fn externally_completed_working_task_fixture(
 }
 
 #[test]
+fn idle_managed_todo_can_round_trip_through_backlog() {
+    let root = temp_root("backlog-managed-todo");
+    init_tasks(&root, false).unwrap();
+    let root = fs::canonicalize(root).unwrap();
+    let state = agent::isolated_unit_test_agent_state_dir();
+    let board = get_tasks_dir(&root);
+    let session = "backlog-managed-session";
+    let task = "Resolve the blocker. — BLOCKED 2026-11-22: Await input";
+    let content = format!("{task} codex:{session}");
+    insert_task(&root, TaskStatus::Todo, None, task, None).unwrap();
+    initialize_test_git_repository(&root);
+    let start = capture_agent_git_start_state(&root, AgentGitMode::Commit).unwrap();
+    fs::write(board.join("todo.md"), format!("# To Do Tasks\n- {content}\n")).unwrap();
+    let store = agent::TursoAgentStore::open_blocking(&state).unwrap();
+    store.register_project_blocking(&root, "backlog").unwrap();
+    let project = store.list_projects_blocking().unwrap().remove(0);
+    assert!(
+        store
+            .create_git_finalization_blocking(agent::NewGitFinalization {
+                project_id: project.id,
+                codex_session_id: session,
+                git_mode: AgentGitMode::Commit,
+                starting_head: Some(&start.starting_head),
+                branch_ref: start.branch_ref.as_deref(),
+                upstream_ref: start.upstream_ref.as_deref(),
+                worktree_baseline: &start.worktree_baseline,
+                task_identity: durable_task_identity(task).as_deref(),
+                owner_run_token: None,
+                created_at: "100",
+            })
+            .unwrap()
+    );
+    assert!(
+        store
+            .ensure_pending_git_finalization_resume_requested_blocking(project.id, session)
+            .unwrap()
+    );
+    let journal = store.git_finalization_blocking(project.id, session).unwrap();
+    let control = store.session_control_blocking(project.id, session).unwrap();
+    let now = agent_timestamp();
+    assert!(
+        store
+            .try_acquire_lease_blocking(project.id, "active-owner", &now, &agent_timestamp_after(60))
+            .unwrap()
+    );
+    assert!(
+        move_task_in_board(&board, TaskStatus::Todo, TaskStatus::Backlog, "1")
+            .unwrap_err()
+            .to_string()
+            .contains("active or reserved")
+    );
+    store.release_lease_blocking(project.id, "active-owner").unwrap();
+    move_task_in_board(&board, TaskStatus::Todo, TaskStatus::Backlog, "1").unwrap();
+    assert!(read_task_entries(&board, TaskStatus::Todo).unwrap().is_empty());
+    assert_eq!(task_entry_at(&board, TaskStatus::Backlog, 1).unwrap().content, content);
+    assert!(run_agent_scheduler_pass(&state, false, &[]).unwrap().jobs.is_empty());
+    assert_eq!(store.git_finalization_blocking(project.id, session).unwrap(), journal);
+    assert_eq!(store.session_control_blocking(project.id, session).unwrap(), control);
+
+    // An unrelated task can run while the backlogged task's branch is absent.
+    run_test_git(&root, &["switch", "-c", "independent-work"]);
+    add_task(&root, "Independent Todo", None).unwrap();
+    let scheduled = run_agent_scheduler_pass(&state, false, &[]).unwrap();
+    let [job] = scheduled.jobs.as_slice() else {
+        panic!("Expected one independent Todo job");
+    };
+    assert_eq!(job.task_selection, AgentTaskSelection::NextTodo);
+    release_agent_job_lease_for_shutdown(job).unwrap();
+    run_test_git(&root, &["switch", "-"]);
+
+    // Simulate interruption after the promotion wrote its Markdown destination.
+    fs::write(board.join("todo.md"), format!("# To Do Tasks\n- {content}\n")).unwrap();
+    move_task_in_board(&board, TaskStatus::Backlog, TaskStatus::Todo, "1").unwrap();
+    assert!(read_task_entries(&board, TaskStatus::Backlog).unwrap().is_empty());
+    assert_eq!(read_task_entries(&board, TaskStatus::Todo).unwrap().len(), 1);
+    assert_eq!(task_entry_at(&board, TaskStatus::Todo, 1).unwrap().content, content);
+    assert_eq!(
+        resumable_codex_session_for_project(&state, &project, agent_timestamp_seconds()).unwrap().as_deref(),
+        Some(session)
+    );
+    drop(store);
+    fs::remove_dir_all(state).unwrap();
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn user_done_move_checks_prerequisites_before_cancelling_a_git_journal() {
+    let session_id = "session-external-completion-with-prerequisite";
+    let (root, project_root, store, finalization) = externally_completed_working_task_fixture(
+        "automated-git-external-completion-with-prerequisite",
+        session_id,
+    );
+    assert!(
+        store
+            .transition_session_control_state_blocking(
+                finalization.project_id,
+                session_id,
+                AgentSessionControlState::Running,
+                AgentSessionControlState::Stopped,
+            )
+            .unwrap()
+    );
+    add_task(&project_root, "API-01 Publish the API.", None).unwrap();
+    let board = TaskBoard::for_project(&project_root);
+    let entry = board.entry(TaskStatus::Doing, 1).unwrap();
+    let content =
+        format!("UI-01 Accept the external work. Dependencies: API-01. codex:{session_id}");
+    board
+        .write_entry_content(TaskStatus::Doing, &entry, &content)
+        .unwrap();
+
+    let error = move_task_to_done_in_board_with_store(board.path(), TaskStatus::Doing, "1", &store)
+        .unwrap_err();
+    assert!(error.to_string().contains("prerequisite is unfinished"));
+    let current = store
+        .git_finalization_blocking(finalization.project_id, session_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.state, GitFinalizationState::Working);
+    assert_eq!(current.generation, finalization.generation);
+    assert_eq!(
+        board.entry(TaskStatus::Doing, 1).unwrap().content.trim(),
+        content
+    );
+    assert!(board.entries(TaskStatus::Done).unwrap().is_empty());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn user_done_move_accepts_external_completion_for_idle_working_journal() {
     let session_id = "session-external-completion";
     let (root, project_root, store, finalization) = externally_completed_working_task_fixture(

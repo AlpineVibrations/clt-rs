@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, atomic::Ordering},
     thread,
@@ -211,7 +211,8 @@ pub(super) fn acquire_agent_job_stage(
     let board = get_tasks_dir(&project.path);
     let _board_lock = acquire_board_mutation_lock(&board)?;
     if let Some(session) = resume_session_id.as_deref()
-        && board_has_manual_session(&board, session)?
+        && (board_has_manual_session(&board, session)?
+            || task_status_for_codex_session_in_board(&board, session)? == Some(TaskStatus::Backlog))
     {
         return Ok(AgentJobAcquisitionResult::SessionSuspended);
     }
@@ -529,6 +530,7 @@ async fn run_agent_daemon_loop_inner(
     let mut scheduled_passes = 0;
     let mut active_passes: Vec<tokio::task::JoinHandle<Result<AgentSchedulerStart>>> = Vec::new();
     let mut active_runs: Vec<AgentDaemonRun> = Vec::new();
+    let mut supervisor_waits = HashMap::new();
     let mut next_sleep = poll_interval;
     let mut recovery_error = None;
 
@@ -613,6 +615,8 @@ async fn run_agent_daemon_loop_inner(
                     continue;
                 }
             };
+            log_supervisor_wait_changes(&supervisor_waits, &start.supervisor_waits);
+            supervisor_waits = start.supervisor_waits;
             print_agent_scheduler_pass(&start.pass);
             next_sleep = agent_daemon_sleep_interval(&start.pass, poll_interval);
             for job in start.jobs {
@@ -770,12 +774,21 @@ pub(super) fn print_agent_scheduler_pass(pass: &AgentSchedulerPass) {
     );
 }
 
+fn log_supervisor_wait_changes(previous: &HashMap<i64, String>, current: &HashMap<i64, String>) {
+    for (project_id, message) in current {
+        if previous.get(project_id) != Some(message) {
+            println!("{message}");
+        }
+    }
+}
+
 pub(super) fn run_agent_once_with_runner(
     state_dir: &Path,
     runner: &dyn AgentRunner,
 ) -> Result<AgentSchedulerPass> {
     let shutdown = new_agent_shutdown_signal();
     let mut start = run_agent_scheduler_pass(state_dir, true, &[])?;
+    log_supervisor_wait_changes(&HashMap::new(), &start.supervisor_waits);
     for job in start.jobs {
         let completion = run_agent_job(job, runner, &shutdown)?;
         print_agent_run_completion(&completion)?;
@@ -991,6 +1004,7 @@ pub(super) fn run_agent_scheduler_pass_with_max_global_jobs(
         runs_recorded: 0,
     };
     let mut jobs = Vec::new();
+    let mut supervisor_waits = HashMap::new();
     // A later project can fail after earlier jobs acquired leases. Until the
     // entire pass returns, none of those jobs has been dispatched to a worker.
     let mut unstarted_leases = AgentUnstartedLeaseGuard::new(state_dir);
@@ -1145,11 +1159,14 @@ pub(super) fn run_agent_scheduler_pass_with_max_global_jobs(
             let supervised = match gate {
                 crate::supervisor::Gate::Normal => None,
                 crate::supervisor::Gate::Hold(message) => {
-                    println!(
-                        "Project {}: action=supervisor_wait reason={} path={}",
-                        project.name,
-                        message,
-                        project.path.display()
+                    supervisor_waits.insert(
+                        project.id,
+                        format!(
+                            "Project {}: action=supervisor_wait reason={} path={}",
+                            project.name,
+                            message,
+                            project.path.display()
+                        ),
                     );
                     continue;
                 }
@@ -1186,9 +1203,7 @@ pub(super) fn run_agent_scheduler_pass_with_max_global_jobs(
             }
         }
 
-        let finalizations_before_reconcile = with_agent_store_at(state_dir, |store| {
-            store.list_pending_git_finalizations_blocking(Some(project.id))
-        })?;
+        let finalizations_before_reconcile = agent_git_finalizations_to_reconcile(state_dir, &project)?;
         if !finalizations_before_reconcile.is_empty() {
             // An abandoned WORKING session can still carry its dead worker token.
             // Restore the exact journal generation before the guarded lease checks it.
@@ -1245,9 +1260,7 @@ pub(super) fn run_agent_scheduler_pass_with_max_global_jobs(
             };
 
             let reconciliation_result = (|| -> Result<Vec<agent::GitFinalizationRecord>> {
-                let current = with_agent_store_at(state_dir, |store| {
-                    store.list_pending_git_finalizations_blocking(Some(project.id))
-                })?;
+                let current = agent_git_finalizations_to_reconcile(state_dir, &project)?;
                 // Retrying Codex cannot repair a changed Git boundary. Record
                 // the failed attempt once, then recover it outside this lease
                 // using the same board and idle-owner fences as explicit recovery.
@@ -1295,6 +1308,7 @@ pub(super) fn run_agent_scheduler_pass_with_max_global_jobs(
                 let reconciled = match reconcile_pending_agent_git_finalizations(
                     state_dir,
                     &project,
+                    current,
                     Some(&finalization_lease),
                 ) {
                     Ok(finalizations)
@@ -1308,9 +1322,7 @@ pub(super) fn run_agent_scheduler_pass_with_max_global_jobs(
                             "CLT's bounded publication attempt made no remotely provable progress; the exact frozen publication remains pending",
                             &finalization_lease,
                         )?;
-                        with_agent_store_at(state_dir, |store| {
-                            store.list_pending_git_finalizations_blocking(Some(project.id))
-                        })?
+                        agent_git_finalizations_to_reconcile(state_dir, &project)?
                     }
                     Ok(finalizations) => finalizations,
                     Err(error) => {
@@ -1330,9 +1342,7 @@ pub(super) fn run_agent_scheduler_pass_with_max_global_jobs(
                             project.name,
                             project.path.display()
                         );
-                        with_agent_store_at(state_dir, |store| {
-                            store.list_pending_git_finalizations_blocking(Some(project.id))
-                        })?
+                        agent_git_finalizations_to_reconcile(state_dir, &project)?
                     }
                 };
                 for finalization in reconciled
@@ -1444,11 +1454,14 @@ pub(super) fn run_agent_scheduler_pass_with_max_global_jobs(
             let supervised = match gate {
                 crate::supervisor::Gate::Normal => None,
                 crate::supervisor::Gate::Hold(message) => {
-                    println!(
-                        "Project {}: action=supervisor_wait reason={} path={}",
-                        project.name,
-                        message,
-                        project.path.display()
+                    supervisor_waits.insert(
+                        project.id,
+                        format!(
+                            "Project {}: action=supervisor_wait reason={} path={}",
+                            project.name,
+                            message,
+                            project.path.display()
+                        ),
                     );
                     continue;
                 }
@@ -1700,7 +1713,30 @@ pub(super) fn run_agent_scheduler_pass_with_max_global_jobs(
     }
 
     unstarted_leases.disarm();
-    Ok(AgentSchedulerStart { pass, jobs })
+    Ok(AgentSchedulerStart { pass, jobs, supervisor_waits })
+}
+
+fn agent_git_finalizations_to_reconcile(
+    state_dir: &Path,
+    project: &agent::AgentProject,
+) -> Result<Vec<agent::GitFinalizationRecord>> {
+    let journals = with_agent_store_at(state_dir, |store| {
+        store.list_pending_git_finalizations_blocking(Some(project.id))
+    })?;
+    let mut active = Vec::with_capacity(journals.len());
+    for journal in journals {
+        // Backlog explicitly defers a Working journal and its queued resume.
+        // Leave the frozen state in the registry for a future promotion.
+        if journal.state == GitFinalizationState::Working
+            && journal.commit_oid.is_none()
+            && task_status_for_codex_session(&project.path, &journal.codex_session_id)?
+                == Some(TaskStatus::Backlog)
+        {
+            continue;
+        }
+        active.push(journal);
+    }
+    Ok(active)
 }
 
 pub(super) fn agent_lease_for_project(
@@ -2171,6 +2207,9 @@ fn queued_resume_can_wait(
     else {
         return Ok(false);
     };
+    if status == TaskStatus::Backlog {
+        return Ok(true);
+    }
     // A saved Git resume request is not permission to override a later stop.
     // Read through the stop suffix, and yield even when no ready work exists.
     if status != TaskStatus::Done

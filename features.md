@@ -773,6 +773,11 @@ After the implementation worker exits and saves its blocker evidence, a separate
 
 Retry and dependency-wait deferral are automatic actions. The scheduler handles supported pre-activation Git repairs before applying supervisor holds. A queued wait holds only when no ready Todo or admitted, session-linked Doing work remains. After an interrupted worker, CLT resumes that Doing task in its original conversation through the normal ownership and Git checks. If it repeatedly fails, the supervisor assesses that execution failure before unrelated queued prerequisites. User, Replan and remaining Repair decisions hold the project and show the reasoning and next action in the selected project's console. Replanning is a proposal, not an automatic rewrite of the task board. Resolve a prerequisite or answer a question in the task notes to provide new evidence, or press `r` on the project to request a fresh review explicitly. Unchanged task evidence reuses the saved decision instead of repeatedly launching a model. The supervisor allows at most two implementation retries before requiring user review; explicit `r` resets that budget. A crashed assessment can be attempted twice on the same evidence. Invalid, stale, failed, or timed-out assessments cannot authorize task changes.
 
+While a User or Replan decision waits for input, the scheduler checks for
+task-board and session eligibility changes and reuses the saved Git checks.
+The service logs a supervisor hold when it starts or its message changes.
+Repair decisions and sealed finalizations still track changes to Git proof.
+
 Supervisor settings and decisions survive scheduler restarts and registry recovery. Explicit stops, manual ownership, active leases, and the sealed Git manifest retain their protections. Turning the supervisor off restores ordinary scheduling without deleting its saved decisions or changing task sessions. A review already running when it is switched off cannot apply its decision. Supervisor output remains available with the project's usual `l` log control.
 
 Agent Projects shows supervisor decisions in amber as `WAITING`, `ACTION`,
@@ -1052,6 +1057,12 @@ related task clears its overlap wait. Only affected tasks wait; other ready task
 remain eligible. `context --check STATUS INDEX` returns nonzero while the selected
 task is waiting or explicitly stopped.
 
+To record finished work on a `[CLI]` task, move it from Doing to Done in the
+TUI, with `clt done doing <index>`, or with `clt status doing <index> done`.
+The move succeeds when potential scope overlap is the only warning, including
+after the Codex window has closed. Explicit conflicts, unfinished prerequisites,
+and Git finalization requirements still apply.
+
 Update scope before expanding work and recheck context before further edits and
 completion. The owning automated worker refreshes context in its existing turn
 when tasks start, finish, or change scope. Direct sessions refresh with `clt context`
@@ -1114,6 +1125,11 @@ clt status backlog 1 todo
 ```
 
 Automated agent runs ignore Backlog tasks until they are promoted to To Do.
+An idle Todo task with a `WORKING` Git journal can move to Backlog using
+`clt status` or the TUI's `b` key. Both columns must use the same storage
+format. CLT preserves the task's blocker notes, conversation, and journal.
+Any queued resume waits while the task is in Backlog. Moving it to Todo
+returns it to the usual scheduling and ownership checks.
 
 ### Moving Tasks
 Change the status of a task:

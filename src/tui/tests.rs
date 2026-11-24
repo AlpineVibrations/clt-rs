@@ -643,6 +643,69 @@ fn tui_moving_manual_work_to_todo_releases_the_claim_and_keeps_the_session() {
 }
 
 #[test]
+fn tui_done_move_completes_manual_work_with_potential_overlap() {
+    use crate::task::coordination::{Metadata, Scope, write};
+
+    for folders in [false, true] {
+        let root = temp_root("tui-manual-done-overlap");
+        init_tasks(&root, folders).unwrap();
+        let board = TaskBoard::for_project(&root);
+        let make_task = |title: &str, id: u128| {
+            write(
+                &format!("{title} clt:manual codex:session-{id}"),
+                &Metadata {
+                    id: uuid::Uuid::from_u128(id).to_string(),
+                    scope: Scope {
+                        files: vec!["shared.rs".into()],
+                        ..Scope::default()
+                    },
+                    ..Metadata::default()
+                },
+            )
+            .unwrap()
+        };
+        let finished = make_task("Finished change", 1);
+        let active = make_task("Still active", 2);
+        board
+            .insert_content(TaskStatus::Doing, None, &finished)
+            .unwrap();
+        board
+            .insert_content(TaskStatus::Doing, None, &active)
+            .unwrap();
+        let mut states = [
+            ListState::default(),
+            ListState::default(),
+            ListState::default(),
+            ListState::default(),
+        ];
+        let mut selected = 1;
+        states[selected].select(Some(0));
+        let result = reorganize_selected_tui_task(
+            board.path(),
+            &TASK_STATUSES,
+            &mut states,
+            &mut selected,
+            false,
+            TuiTaskReorganizeDirection::Right,
+        );
+
+        assert_eq!(result, "Moved task to done");
+        assert_eq!(selected, 2);
+        assert_eq!(states[selected].selected(), Some(0));
+        assert_eq!(board.entries(TaskStatus::Doing).unwrap().len(), 1);
+        assert_eq!(
+            board.entry(TaskStatus::Doing, 1).unwrap().content.trim(),
+            active
+        );
+        assert_eq!(
+            board.entry(TaskStatus::Done, 1).unwrap().content.trim(),
+            finished
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
 fn tui_done_move_selects_and_shows_the_newest_completion() {
     for folders in [false, true] {
         let root = temp_root("tui-done-visible");

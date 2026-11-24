@@ -55,11 +55,11 @@ async fn session_can_enable_git(
     ).await? == 1)
 }
 
-/// A stopped/idle session can be cancelled under the board lock without taking
+/// An idle task can be moved or cancelled under the board lock without taking
 /// another task's project lease. Every live worker and lease must be attributable
 /// to a different conversation or a read-only supervisor review. Reviews recheck
 /// board evidence before applying a decision; implementation launches still fence.
-async fn can_delete_idle_task(
+async fn can_mutate_idle_working_task(
     conn: &Connection,
     project_id: i64,
     session_id: &str,
@@ -123,6 +123,24 @@ async fn can_delete_idle_task(
 }
 
 impl TursoAgentStore {
+    pub(crate) fn can_move_idle_working_task_blocking(
+        &self,
+        journal: &GitFinalizationRecord,
+    ) -> Result<bool> {
+        self.blocking.block_on(async {
+            let conn = self.repositories.git_journals.connect().await?;
+            can_mutate_idle_working_task(
+                &conn,
+                journal.project_id,
+                &journal.codex_session_id,
+                journal.generation,
+                journal.task_identity.as_deref(),
+                &agent_timestamp(),
+            )
+            .await
+        })
+    }
+
     /// Reserve an idle project for explicit recovery. A reviewed branch-mismatch
     /// journal is retired atomically with stopping its session, retaining its proof.
     #[allow(clippy::too_many_arguments)]
@@ -829,7 +847,7 @@ impl TursoAgentStore {
             })?;
 
         let session_scoped_deletion = cancellation == GitTaskCancellation::Deletion
-            && can_delete_idle_task(
+            && can_mutate_idle_working_task(
                 &transaction,
                 project_id,
                 codex_session_id,

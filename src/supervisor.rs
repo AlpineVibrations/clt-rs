@@ -137,7 +137,7 @@ pub(super) fn review_details(
     if matches!(decision.decision, DecisionKind::Retry | DecisionKind::Wait) {
         return Ok(message);
     }
-    if review.evidence != review_evidence(store, project)? {
+    if review.evidence != current_review_evidence(store, project, Some(review))? {
         return Ok(format!(
             "Saved supervisor decision; evidence has changed. Press r for a fresh review before acting.\n\n{message}"
         ));
@@ -215,6 +215,14 @@ pub(super) fn evidence(project: &AgentProject) -> Result<String> {
 }
 
 fn review_evidence(store: &TursoAgentStore, project: &AgentProject) -> Result<String> {
+    current_review_evidence(store, project, None)
+}
+
+fn current_review_evidence(
+    store: &TursoAgentStore,
+    project: &AgentProject,
+    previous: Option<&SupervisorReview>,
+) -> Result<String> {
     let mut seals = Vec::new();
     for journal in store.list_pending_git_finalizations_blocking(Some(project.id))? {
         if journal.state.is_finalizing() {
@@ -236,17 +244,43 @@ fn review_evidence(store: &TursoAgentStore, project: &AgentProject) -> Result<St
     // Resume/stop controls can resolve (or introduce) an ownership blocker
     // without changing the board or a WORKING journal. Bind decisions to that
     // eligibility, not heartbeat timestamps or replacement recovery tokens.
-    let session_eligibility = review_candidates(store, project)?
+    let candidates = review_candidates(store, project)?;
+    // Once a decision requires user input, task edits, eligibility changes or
+    // explicit retry can wake it. Reuse the recorded Git checks while waiting;
+    // repair decisions and sealed work still track changes to Git proof.
+    let saved_evidence = previous
+        .filter(|review| {
+            seals.is_empty()
+                && review.state == "held"
+                && review.error.is_none()
+                && review.decision.as_ref().is_some_and(|decision| {
+                    matches!(decision.decision, DecisionKind::User | DecisionKind::Replan)
+                })
+        })
+        .and_then(|review| serde_json::from_str::<serde_json::Value>(&review.evidence).ok());
+    let saved_checks = saved_evidence
+        .as_ref()
+        .and_then(|value| value["session_eligibility"].as_array());
+    let session_eligibility = candidates
         .iter()
         .filter_map(|(_, task)| {
             recoverable_codex_session_id_from_task_content(&task.content)
                 .map(|session| (session, task))
         })
         .map(|(session, task)| {
+            let saved_check = saved_checks.and_then(|checks| {
+                checks.iter()
+                    .find(|check| check["session"].as_str() == Some(session))
+                    .and_then(|check| check.get("resume_git_check"))
+            });
+            let git_check = match saved_check {
+                Some(check) => check.clone(),
+                None => resume_git_check(store, project, session, &task.content)?,
+            };
             Ok(json!({
                 "session": session,
                 "can_retry": retry_session_is_idle(store, project.id, session)?,
-                "resume_git_check": resume_git_check(store, project, session, &task.content)?,
+                "resume_git_check": git_check,
             }))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -408,7 +442,19 @@ pub(super) fn gate(
     let repeated = !repeated_failure_candidates(store, project)?.is_empty();
     let has_blocked =
         has_blocked || repeated || sealed && !review_candidates(store, project)?.is_empty();
-    let previous = store.supervisor_review_blocking(project.id)?;
+    let mut previous = store.supervisor_review_blocking(project.id)?;
+    if let Some(session) = previous
+        .as_ref()
+        .filter(|review| review.state == "retry")
+        .and_then(|review| review.retry_session.as_deref())
+        && crate::task::task_status_for_codex_session_in_board(
+            &get_tasks_dir(&project.path),
+            session,
+        )? == Some(TaskStatus::Backlog)
+    {
+        store.clear_supervisor_review_blocking(project.id)?;
+        previous = None;
+    }
     // Queued dependency waits are not execution failures. A ready predecessor
     // must be able to run even if an older review held the whole project.
     if !sealed
@@ -422,14 +468,6 @@ pub(super) fn gate(
             store.clear_supervisor_review_blocking(project.id)?;
         }
         return Ok(Gate::Normal);
-    }
-    if let Some(session) = previous
-        .as_ref()
-        .filter(|review| review.state == "retry")
-        .and_then(|review| review.retry_session.as_deref())
-        && !retry_session_is_idle(store, project.id, session)?
-    {
-        return Ok(Gate::Hold("Supervisor-approved task is stopped or owned by another session control; preserve that control.".into()));
     }
     if !has_blocked
         && previous
@@ -449,6 +487,9 @@ pub(super) fn gate(
                 session,
                 &mut linked,
             )?;
+            if !retry_session_is_idle(store, project.id, session)? {
+                return Ok(Gate::Hold("Supervisor-approved task is stopped or owned by another session control; preserve that control.".into()));
+            }
             if let [(status, task)] = linked.as_slice()
                 && retry_status_available(store, project, *status, session)?
                 && !task_entry_is_blocked(task)
@@ -469,7 +510,7 @@ pub(super) fn gate(
             return Ok(Gate::Normal);
         }
     }
-    let current = review_evidence(store, project)?;
+    let current = current_review_evidence(store, project, previous.as_ref())?;
     let Some(review) = previous.filter(|review| review.evidence == current) else {
         return Ok(Gate::Review);
     };

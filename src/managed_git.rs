@@ -4482,11 +4482,11 @@ pub(super) fn reconcile_agent_git_finalization(
 pub(super) fn reconcile_pending_agent_git_finalizations(
     state_dir: &Path,
     project: &agent::AgentProject,
+    journals: Vec<agent::GitFinalizationRecord>,
     finalization_lease: Option<&AgentGitFinalizationLease>,
 ) -> Result<Vec<agent::GitFinalizationRecord>> {
     let store = open_agent_store_at(state_dir)?;
-    store
-        .list_pending_git_finalizations_blocking(Some(project.id))?
+    journals
         .into_iter()
         .map(|finalization| {
             let result = reconcile_agent_git_finalization(

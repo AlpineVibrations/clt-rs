@@ -6,6 +6,17 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+## [0.9.18] - 2026-11-24
+
+### Fixed
+
+- Allow the TUI and CLI to move a manually claimed Doing task to Done when
+  potential scope overlap is the only warning.
+- Allow idle Todo tasks with a working Git journal to move to Backlog and
+  return later with their original session and journal.
+- Reuse saved Git checks when a supervisor decision needs user input or a
+  plan review, and log supervisor waits only when they change.
+
 ## [0.9.17] - 2026-11-23
 
 ### Changed
@@ -706,7 +717,8 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 - Fixed task moves so destination write failures do not remove the source task.
 - Fixed TUI navigation on empty boards.
 
-[Unreleased]: https://github.com/AlpineVibrations/clt-rs/compare/v0.9.17...HEAD
+[Unreleased]: https://github.com/AlpineVibrations/clt-rs/compare/v0.9.18...HEAD
+[0.9.18]: https://github.com/AlpineVibrations/clt-rs/compare/v0.9.17...v0.9.18
 [0.9.17]: https://github.com/AlpineVibrations/clt-rs/compare/v0.9.16...v0.9.17
 [0.9.11]: https://github.com/AlpineVibrations/clt-rs/compare/v0.9.10...v0.9.11
 [0.9.8]: https://github.com/AlpineVibrations/clt-rs/compare/v0.9.7...v0.9.8

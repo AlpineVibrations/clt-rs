@@ -1,0 +1,5 @@
+Allow idle managed tasks in Backlog and avoid repeated checks of unchanged blockers
+
+COMPLETED 2026-11-24: Preserved idle managed Todo tasks and their queued sessions while in Backlog. Reused saved supervisor Git checks during input holds and logged waits on change. Moved the aifx-app task and verified its exact text and WORKING journal. Full test suite, Clippy, and formatting checks passed.
+
+clt:manual <!-- clt-coordination: {"id":"7c9c071b-e70e-4bed-a6a3-72539d709d48","depends_on":[],"scope":{"intent":"Preserve idle managed Git tasks while they are in Backlog and avoid duplicate supervisor checks or wait logs for unchanged blockers","files":["src/application.rs","src/agent/repositories/git_journals.rs","src/scheduler.rs","src/supervisor.rs","src/supervisor/tests.rs","src/managed_git.rs","src/managed_git/tests.rs","features.md","CHANGELOG.md","ARCHITECTURE.md"],"modules":["application","managed_git","scheduler","supervisor"],"interfaces":[],"resources":[],"behavior":{}},"reviews":[]} --> codex:01a20ebf-dd52-7cb3-9875-6c644e392bc8

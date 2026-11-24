@@ -79,6 +79,12 @@ pub(crate) struct Snapshot {
     pub changed_files: BTreeSet<String>,
 }
 
+#[derive(Clone, Copy)]
+enum OverlapPolicy {
+    All,
+    ConflictsOnly,
+}
+
 fn collect(board: &Path, tasks: &mut Vec<Task>) -> Result<()> {
     let source = TaskBoard::new(board);
     for status in TaskStatus::ALL {
@@ -350,6 +356,10 @@ impl Snapshot {
     }
 
     pub(crate) fn waits(&self, task: &Task) -> Vec<String> {
+        self.waits_with_overlap_policy(task, OverlapPolicy::All)
+    }
+
+    fn waits_with_overlap_policy(&self, task: &Task, policy: OverlapPolicy) -> Vec<String> {
         if task.complete() {
             return Vec::new();
         }
@@ -389,11 +399,39 @@ impl Snapshot {
             {
                 continue;
             }
-            if let Some(reason) = overlap(task, other, &self.changed_files) {
+            if let Some(reason) = overlap(task, other, &self.changed_files, policy) {
                 waits.push(reason);
             }
         }
         waits
+    }
+
+    pub(crate) fn ensure_admitted(
+        &self,
+        board: &Path,
+        status: TaskStatus,
+        index: usize,
+    ) -> Result<()> {
+        let waits = self.waits(self.selected(board, status, index)?);
+        anyhow::ensure!(waits.is_empty(), "{}", waits.join("\n"));
+        Ok(())
+    }
+
+    pub(crate) fn ensure_user_completion_admitted(
+        &self,
+        board: &Path,
+        status: TaskStatus,
+        index: usize,
+    ) -> Result<()> {
+        let task = self.selected(board, status, index)?;
+        let policy = if status == TaskStatus::Doing && task_content_is_manual(&task.entry.content) {
+            OverlapPolicy::ConflictsOnly
+        } else {
+            OverlapPolicy::All
+        };
+        let waits = self.waits_with_overlap_policy(task, policy);
+        anyhow::ensure!(waits.is_empty(), "{}", waits.join("\n"));
+        Ok(())
     }
 
     fn depends_on(&self, task: &Task, id: &str, seen: &mut BTreeSet<String>) -> bool {
@@ -641,7 +679,12 @@ fn inferred_symbols(task: &Task) -> BTreeSet<String> {
         .collect()
 }
 
-fn overlap(task: &Task, other: &Task, changed: &BTreeSet<String>) -> Option<String> {
+fn overlap(
+    task: &Task,
+    other: &Task,
+    changed: &BTreeSet<String>,
+    policy: OverlapPolicy,
+) -> Option<String> {
     for (key, value) in &task.meta.scope.behavior {
         if let Some(other_value) = other.meta.scope.behavior.get(key)
             && value != other_value
@@ -672,7 +715,7 @@ fn overlap(task: &Task, other: &Task, changed: &BTreeSet<String>) -> Option<Stri
             compatible = true;
         }
     }
-    if compatible {
+    if compatible || matches!(policy, OverlapPolicy::ConflictsOnly) {
         return None;
     }
     let mut concerns = BTreeSet::new();
@@ -774,11 +817,7 @@ fn session_waiting_in_snapshot(snapshot: &Snapshot, session: &str) -> bool {
 }
 
 pub(crate) fn ensure_admitted(board: &Path, status: TaskStatus, index: usize) -> Result<()> {
-    let snapshot = Snapshot::admission(board)?;
-    let task = snapshot.selected(board, status, index)?;
-    let waits = snapshot.waits(task);
-    anyhow::ensure!(waits.is_empty(), "{}", waits.join("\n"));
-    Ok(())
+    Snapshot::admission(board)?.ensure_admitted(board, status, index)
 }
 
 pub(crate) fn ensure_new_manual_admitted(board: &Path, content: &str) -> Result<()> {

@@ -22,6 +22,7 @@ use crate::{
         self, AGENT_DB_FILE, AgentGitMode, AgentSessionControlState, GitFinalizationState,
         GitTaskCancellation, agent_state_dir, open_agent_store, open_agent_store_at,
     },
+    coordination::Snapshot,
     managed_git::{
         AgentGitProofContext, AgentGitStartState, capture_agent_git_resealed_manifest,
         capture_agent_git_staged_manifest, git_commit_is_ancestor, git_optional_stdout,
@@ -231,6 +232,7 @@ pub(super) struct AgentRunCompletion {
 pub(super) struct AgentSchedulerStart {
     pub(super) pass: AgentSchedulerPass,
     pub(super) jobs: Vec<AgentRunJob>,
+    pub(super) supervisor_waits: std::collections::HashMap<i64, String>,
 }
 
 pub(super) struct AgentDaemonRun {
@@ -1110,32 +1112,10 @@ pub(super) fn ensure_managed_git_task_mutation_allowed(
     allow_working_preserving_mutation: bool,
     proposed_working_content: Option<&str>,
 ) -> Result<()> {
-    let Some(session_id) = recoverable_codex_session_id_from_task_content(&entry.content) else {
+    let Some((_, finalization)) = pending_git_journal_for_task(board_dir, entry)? else {
         return Ok(());
     };
-    let state_dir = agent_state_dir()?;
-    if !state_dir.join(AGENT_DB_FILE).is_file() {
-        return Ok(());
-    }
-    let canonical_board = fs::canonicalize(board_dir).unwrap_or_else(|_| board_dir.to_path_buf());
-    let store = open_agent_store_at(&state_dir)?;
-    if store.pending_migration_version().is_some() {
-        return Ok(());
-    }
-    let Some(project) = store
-        .list_projects_blocking()?
-        .into_iter()
-        .filter(|project| canonical_board.starts_with(project.path.join("tasks")))
-        .max_by_key(|project| project.path.as_os_str().len())
-    else {
-        return Ok(());
-    };
-    let Some(finalization) = store.git_finalization_blocking(project.id, session_id)? else {
-        return Ok(());
-    };
-    if finalization.state.is_terminal() {
-        return Ok(());
-    }
+    let session_id = &finalization.codex_session_id;
     if allow_working_preserving_mutation && finalization.state == GitFinalizationState::Working {
         if let Some(proposed_content) = proposed_working_content {
             let bound_identity = finalization.task_identity.as_deref().context(
@@ -1153,6 +1133,30 @@ pub(super) fn ensure_managed_git_task_mutation_allowed(
         "Task {session_id} has a managed Git journal in {}; resume that exact agent session instead of changing, moving, archiving, reordering, or deleting its durable task evidence",
         finalization.state.status_label()
     )
+}
+
+fn pending_git_journal_for_task(
+    board_dir: &Path,
+    entry: &TaskEntry,
+) -> Result<Option<(agent::TursoAgentStore, agent::GitFinalizationRecord)>> {
+    let Some(session_id) = recoverable_codex_session_id_from_task_content(&entry.content) else {
+        return Ok(None);
+    };
+    let state_dir = agent_state_dir()?;
+    if !state_dir.join(AGENT_DB_FILE).is_file() {
+        return Ok(None);
+    }
+    let store = open_agent_store_at(&state_dir)?;
+    if store.pending_migration_version().is_some() {
+        return Ok(None);
+    }
+    let Some(project) = agent_project_for_board(&store, board_dir)? else {
+        return Ok(None);
+    };
+    Ok(store
+        .git_finalization_blocking(project.id, session_id)?
+        .filter(|journal| !journal.state.is_terminal())
+        .map(|journal| (store, journal)))
 }
 
 pub(super) fn ensure_working_task_content_preserves_identity(
@@ -1466,9 +1470,6 @@ pub(super) fn move_task_to_done(
     } else {
         None
     };
-    if from != TaskStatus::Done {
-        crate::coordination::ensure_admitted(&board, from, index)?;
-    }
     let Some(context) = automated_completion_context(root)? else {
         return Ok(
             match move_task_in_board(&get_tasks_dir(root), from, TaskStatus::Done, task_index_str)?
@@ -1540,6 +1541,8 @@ pub(super) fn move_task_to_done_with_agent_store(
         session_id == running_session_id,
         "The selected task belongs to another Codex session; list tasks and select this conversation's task"
     );
+    Snapshot::admission_with_store(&board_dir, store)?
+        .ensure_admitted(&board_dir, from, task_index)?;
     if !task_content_has_completed_note(&entry.content) {
         anyhow::bail!(
             "Automated Git completion requires a dated COMPLETED YYYY-MM-DD: note before moving the task to Done"
@@ -1547,7 +1550,7 @@ pub(super) fn move_task_to_done_with_agent_store(
     }
     let Some(mut finalization) = store.git_finalization_blocking(project.id, session_id)? else {
         if effective_agent_git_mode(store, &project, Some(session_id))? == AgentGitMode::Off {
-            move_task_in_board_after_lock(&board_dir, from, TaskStatus::Done, task_index)?;
+            apply_task_move_after_lock(&board, from, TaskStatus::Done, task_index, &entry)?;
             return Ok(false);
         }
         anyhow::bail!(
@@ -1690,23 +1693,6 @@ fn agent_project_for_board(
         .max_by_key(|project| project.path.as_os_str().len()))
 }
 
-#[cfg(test)]
-fn move_user_task_to_done_with_store_after_lock(
-    board_dir: &Path,
-    from: TaskStatus,
-    task_index: usize,
-    entry: &TaskEntry,
-    store: &agent::TursoAgentStore,
-) -> Result<Option<String>> {
-    mutate_user_managed_task_with_store_after_lock(
-        board_dir,
-        entry,
-        store,
-        GitTaskCancellation::ExternalCompletion,
-        || move_task_in_board_after_lock(board_dir, from, TaskStatus::Done, task_index),
-    )
-}
-
 fn mutate_user_managed_task_with_store_after_lock(
     board_dir: &Path,
     entry: &TaskEntry,
@@ -1811,16 +1797,21 @@ fn mutate_user_managed_task_with_store_after_lock(
 }
 
 fn move_user_task_to_done_after_lock(
-    board_dir: &Path,
+    board: &TaskBoard,
     from: TaskStatus,
     task_index: usize,
     entry: &TaskEntry,
 ) -> Result<Option<String>> {
+    let board_dir = board.path();
+    if from != TaskStatus::Done {
+        Snapshot::admission(board_dir)?
+            .ensure_user_completion_admitted(board_dir, from, task_index)?;
+    }
     mutate_user_managed_task_after_lock(
         board_dir,
         entry,
         GitTaskCancellation::ExternalCompletion,
-        || move_task_in_board_after_lock(board_dir, from, TaskStatus::Done, task_index),
+        || apply_task_move_after_lock(board, from, TaskStatus::Done, task_index, entry),
     )
 }
 
@@ -1858,7 +1849,18 @@ pub(super) fn move_task_in_board(
     let board = TaskBoard::new(board_dir);
     let entry = board.entry(from, task_index)?;
     if to == TaskStatus::Done {
-        return move_user_task_to_done_after_lock(board_dir, from, task_index, &entry);
+        return move_user_task_to_done_after_lock(&board, from, task_index, &entry);
+    }
+    if matches!(
+        (from, to),
+        (TaskStatus::Todo, TaskStatus::Backlog) | (TaskStatus::Backlog, TaskStatus::Todo)
+    ) {
+        if let Some((store, journal)) = pending_git_journal_for_task(board_dir, &entry)? {
+            move_idle_managed_task_after_lock(&board, from, to, task_index, &entry, &store, &journal)?;
+        } else {
+            move_task_in_board_after_lock(board_dir, from, to, task_index)?;
+        }
+        return Ok(None);
     }
     ensure_managed_git_task_mutation_allowed(
         board_dir,
@@ -1870,6 +1872,50 @@ pub(super) fn move_task_in_board(
     Ok(None)
 }
 
+fn move_idle_managed_task_after_lock(
+    board: &TaskBoard,
+    from: TaskStatus,
+    to: TaskStatus,
+    task_index: usize,
+    entry: &TaskEntry,
+    store: &agent::TursoAgentStore,
+    journal: &agent::GitFinalizationRecord,
+) -> Result<()> {
+    anyhow::ensure!(
+        journal.state == GitFinalizationState::Working && journal.commit_oid.is_none(),
+        "Task {} has a managed Git journal in {}; finish its commit proof before moving it to {to}",
+        journal.codex_session_id,
+        journal.state.status_label(),
+    );
+    anyhow::ensure!(
+        store.can_move_idle_working_task_blocking(journal)?,
+        "Task {} has an active or reserved agent session; wait for it to settle before moving it to {to}",
+        journal.codex_session_id,
+    );
+    let markdown = matches!(entry.source, TaskSource::MarkdownLine { .. });
+    anyhow::ensure!(
+        markdown == matches!(board.status_store(to)?, StatusStore::MarkdownFile(_)),
+        "Moving an idle managed task to {to} requires both statuses to use the same storage format"
+    );
+    let copies = board
+        .entries(to)?
+        .into_iter()
+        .filter(|candidate| {
+            recoverable_codex_session_id_from_task_content(&candidate.content)
+                == Some(journal.codex_session_id.as_str())
+        })
+        .collect::<Vec<_>>();
+    match copies.as_slice() {
+        [] => board.move_task_without_reordering_after_lock(from, to, task_index),
+        // Markdown moves write the destination before removing the source.
+        // If interrupted, a retry can finish that move with the exact copy.
+        [copy] if markdown && copy.content == entry.content => {
+            board.remove_entry_without_reordering(from, entry)
+        }
+        _ => anyhow::bail!("Task {} already has ambiguous copies in {to}", journal.codex_session_id),
+    }
+}
+
 #[cfg(test)]
 pub(super) fn move_task_to_done_in_board_with_store(
     board_dir: &Path,
@@ -1879,8 +1925,19 @@ pub(super) fn move_task_to_done_in_board_with_store(
 ) -> Result<Option<String>> {
     let task_index = parse_one_based_task_index(task_index_str)?;
     let _mutation_lock = acquire_board_mutation_lock(board_dir)?;
-    let entry = task_entry_at(board_dir, from, task_index)?;
-    move_user_task_to_done_with_store_after_lock(board_dir, from, task_index, &entry, store)
+    let board = TaskBoard::new(board_dir);
+    let entry = board.entry(from, task_index)?;
+    if from != TaskStatus::Done {
+        Snapshot::admission_with_store(board_dir, store)?
+            .ensure_user_completion_admitted(board_dir, from, task_index)?;
+    }
+    mutate_user_managed_task_with_store_after_lock(
+        board_dir,
+        &entry,
+        store,
+        GitTaskCancellation::ExternalCompletion,
+        || apply_task_move_after_lock(&board, from, TaskStatus::Done, task_index, &entry),
+    )
 }
 
 #[cfg(test)]
@@ -1908,6 +1965,17 @@ pub(super) fn move_task_in_board_after_lock(
     if matches!(to, TaskStatus::Doing | TaskStatus::Done) && from != to {
         crate::coordination::ensure_admitted(board_dir, from, task_index)?;
     }
+    apply_task_move_after_lock(&board, from, to, task_index, &entry)
+}
+
+fn apply_task_move_after_lock(
+    board: &TaskBoard,
+    from: TaskStatus,
+    to: TaskStatus,
+    task_index: usize,
+    entry: &TaskEntry,
+) -> Result<()> {
+    let board_dir = board.path();
     let manual_session = if to == TaskStatus::Todo && task_content_is_manual(&entry.content) {
         let session = recoverable_codex_session_id_from_task_content(&entry.content)
             .context("Manual task needs its attached Codex conversation before moving to Todo")?;
