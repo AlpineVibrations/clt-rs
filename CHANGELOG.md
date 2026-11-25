@@ -6,6 +6,11 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+### Changed
+
+- Open keyboard help to the current screen, with browsable topics, aligned
+  shortcuts, and live search by key or action.
+
 ## [0.9.18] - 2026-11-24
 
 ### Fixed

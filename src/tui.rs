@@ -6140,6 +6140,11 @@ impl TuiApp {
         self.agent_log_view = Some(log_view);
     }
 
+    fn open_help(&mut self) {
+        self.help = help::Help::new(self.current_pane, self.archive_view);
+        self.current_mode = Mode::Help;
+    }
+
     fn open_steering(&mut self, target: SteeringTarget) {
         self.current_mode = Mode::Steer;
         self.steering_target = Some(target);
@@ -6426,7 +6431,7 @@ pub(super) fn update_tui_pane(app: &mut TuiApp, key: KeyEvent) -> Option<Vec<Tui
         return Some(vec![TuiEffect::PaneKey(key)]);
     }
     if app.current_mode == Mode::Help {
-        if app.help.key(key.code) {
+        if app.help.key(key) {
             app.current_mode = Mode::View;
         }
         return Some(Vec::new());
@@ -6462,8 +6467,7 @@ pub(super) fn update_tui_pane(app: &mut TuiApp, key: KeyEvent) -> Option<Vec<Tui
     }
 
     if matches!(key.code, KeyCode::Char('h' | 'H' | '?')) {
-        app.help = help::Help::default();
-        app.current_mode = Mode::Help;
+        app.open_help();
         return Some(Vec::new());
     }
     if key.code == KeyCode::Char('q') {
@@ -7591,9 +7595,7 @@ pub(super) fn execute_tui_key_effect(
                         };
                     }
                     KeyCode::Char('q') => return Ok(true),
-                    KeyCode::Char('h') | KeyCode::Char('H') | KeyCode::Char('?') => {
-                        app.current_mode = Mode::Help
-                    }
+                    KeyCode::Char('h' | 'H' | '?') => app.open_help(),
                     KeyCode::Left => {
                         app.models_panel.focus = TuiModelsFocus::Providers;
                         app.feedback_buffer = tui_models_instructions().to_string();
@@ -7727,9 +7729,7 @@ pub(super) fn execute_tui_key_effect(
                         }
                     }
                     KeyCode::Char('q') => return Ok(true),
-                    KeyCode::Char('h') | KeyCode::Char('H') | KeyCode::Char('?') => {
-                        app.current_mode = Mode::Help;
-                    }
+                    KeyCode::Char('h' | 'H' | '?') => app.open_help(),
                     KeyCode::Enter => {
                         if app
                             .agent_panel
@@ -8055,9 +8055,7 @@ pub(super) fn execute_tui_key_effect(
                         app.feedback_buffer = "Returned to Kanban view".to_string();
                     }
                     KeyCode::Char('q') => return Ok(true),
-                    KeyCode::Char('h') | KeyCode::Char('H') | KeyCode::Char('?') => {
-                        app.current_mode = Mode::Help;
-                    }
+                    KeyCode::Char('h' | 'H' | '?') => app.open_help(),
                     KeyCode::Up => {
                         let tasks = read_archived_task_entries(&board_dir).unwrap_or_default();
                         if !tasks.is_empty() {
@@ -8635,9 +8633,7 @@ pub(super) fn execute_tui_key_effect(
                             Err(error) => format!("Error: {error}"),
                         };
                     }
-                    KeyCode::Char('h') | KeyCode::Char('H') | KeyCode::Char('?') => {
-                        app.current_mode = Mode::Help;
-                    }
+                    KeyCode::Char('h' | 'H' | '?') => app.open_help(),
                     KeyCode::Up => {
                         let state = &mut app.board_states[app.selected_board];
                         let tasks = read_tasks_in_board(&board_dir, statuses[app.selected_board])
@@ -8740,7 +8736,7 @@ pub(super) fn execute_tui_key_effect(
             }
         },
         Mode::Help => {
-            if app.help.key(key.code) {
+            if app.help.key(key) {
                 app.current_mode = Mode::View;
             }
         }
@@ -8962,7 +8958,8 @@ pub(super) fn tui_view_with_active_board(
         app.poll_task_summary();
         terminal_session.set_text_input(
             matches!(app.current_mode, Mode::Input | Mode::Edit | Mode::Steer)
-                || app.model_input.is_some(),
+                || app.model_input.is_some()
+                || (app.current_mode == Mode::Help && app.help.is_searching()),
         )?;
         app.prepare_render(terminal.size()?.into());
         terminal.draw(|f| render_tui(f, &app))?;
@@ -8970,6 +8967,9 @@ pub(super) fn tui_view_with_active_board(
         #[allow(clippy::collapsible_if)]
         if event::poll(std::time::Duration::from_millis(100))? {
             match event::read()? {
+                Event::Paste(content) if app.current_mode == Mode::Help => {
+                    app.help.paste(&content);
+                }
                 Event::Paste(content) if app.model_input.is_some() => {
                     if let Some(input) = app.model_input.as_mut() {
                         input.insert_paste(&content);

@@ -1,215 +1,463 @@
-//! Complete keyboard reference and a scrollable, read-only help dialog.
-use crossterm::event::KeyCode;
+//! Contextual, searchable keyboard help. The modal consumes its own input.
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     Frame,
-    layout::Rect,
-    style::{Color, Style},
-    widgets::{Block, Borders, Clear, Paragraph},
+    layout::{Margin, Position, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{
+        Block, BorderType, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation,
+        ScrollbarState,
+    },
 };
+use tui_input::Input;
 
-use super::wrap_text;
+mod reference;
 
-// Keep this reference aligned with the pane reducers, execute_tui_key_effect,
-// handle_input_key and progress::task_summary_key when adding commands.
-const COMMANDS: &str = "\
-HELP NAVIGATION
-Up/Down: Scroll one line.
-PageUp/PageDown: Scroll one page. Home/End: First/last page.
-h / H / ? / Enter / Esc: Close help and return to the same screen.
+use super::{TuiPane, byte_index_at_char, handle_input_key, tui_cancels_task_prompt, wrap_text};
+use reference::Topic;
 
-COMMON (outside text input and dialogs)
-h / H / ?: Open this help.
-Tab / Shift+Tab: Toggle Tasks and Agent Projects; return from Models.
-M: Open Models from the task board or Agent Projects; return from Models.
-q: Quit CLT.
+const ACCENT: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+const KEY: Style = Style::new().add_modifier(Modifier::BOLD);
+const SIDEBAR_WIDTH: u16 = 18;
+const TWO_COLUMN_WIDTH: u16 = 44;
 
-TASK BOARD
-Up/Down: Select previous/next task (wraps).
-Left/Right: Focus previous/next visible column (wraps).
-0 / 1 / 2 / 3: Focus Backlog / Todo / Doing / Done; 0 also shows Backlog.
-Space: Create a task at the current selection.
-Enter: Message a running Doing agent; otherwise open subtasks or edit. With no selection, create a task.
-e: Edit the selected task.
-n / +: Create a subtask under the selected task.
-Backspace: Return to the parent board.
-Esc: Close an open log; otherwise unselect the task.
-t: Cycle the selected Todo's thinking override, including default.
-s: Open a read-only task progress summary.
-v / V: Inspect task details, scope, dependencies and other metadata.
-Shift+S: Stop/start the selected task.
-i: Take over a linked live/stopped session interactively; resume automation on return.
-c: Plan a Todo or open its linked session (including CLI tasks); take over an active run.
-l / L: Toggle the selected task's output (project output if none selected).
-a: Move the selected task to the archive.
-A: Open the read-only archive.
-b: Move the selected task to Backlog.
-B: Show/hide the Backlog column.
-Delete: Permanently delete the selected task.
-r / R: Retry the current project.
-m: Enter sticky Reorganize mode.
-Shift+Up/Down or Ctrl+P/N: Reorder the selected task up/down.
-Shift+Left/Right: Move the task to the previous/next visible column.
-4-9: Move the selected task to that numbered position in its column.
-
-REORGANIZE MODE
-Up/Down: Reorder the selected task.
-Left/Right: Move the task between visible columns.
-m / Esc: Exit Reorganize mode.
-
-ARCHIVE
-Up/Down: Select previous/next archived task (wraps).
-A: Return to the task board. The archive is read-only.
-v / V: Inspect the selected archived task's details and metadata.
-
-AGENT PROJECTS
-Up/Down: Select a project.
-Enter: Open its task board; register the current project on the add row.
-Space: Toggle the selected project ON/OFF; register it on the add row.
-Delete: Remove the selected project after confirmation.
-g / G: Cycle project Git mode: off / commit / push.
-m: Cycle the project's model target.
-f / F: Toggle project Fast mode.
-t / T: Cycle project thinking.
-r / R: Retry a failed project, or confirm missing Git-record recovery.
-v / V: Read the supervisor decision, task identity and recovery instructions.
-s / S: Stop/resume the selected session; with output open, control that exact session.
-l / L: Toggle the selected project's live/latest output.
-i: With output open, take over its session and resume automation on return.
-c: With output open, open its session interactively (take over if active).
-Esc: Close an open log; otherwise return to the active task board.
-u: Select/deselect global supervisor settings.
-
-SUPERVISOR SETTINGS (after u in Agent Projects)
-Space: Toggle the supervisor ON/OFF.
-m: Cycle supervisor model. t / T: Cycle thinking. f / F: Toggle Fast.
-u / Esc / Enter / Down: Return to the project list.
-
-SUPERVISOR DETAILS (after v in Agent Projects)
-Up/Down: Scroll. PageUp/PageDown: Scroll a page. Home/End: First/last page.
-v / V / Enter / Esc: Close. This view does not apply repairs or accept completion.
-
-MODELS AND PROVIDERS
-Left/Right: Focus providers/models. Up/Down: Select a row (wraps).
-PageUp/PageDown: Move one page. Home/End: Select first/last row.
-Space: Enable/disable the selected provider or model.
-f / F: Toggle model favorite. t / T: Cycle model thinking.
-d / D: Set the CLT default model.
-c / C: Set the Codex default model and its thinking setting.
-n / N: Open provider choices: 1 OpenAI, 2 OpenRouter, 3 Ollama, 4 LM Studio, 5 custom endpoint.
-r / R: Discover/refresh the selected provider's models.
-a / A: Manually add a model ID to the selected provider.
-k / K: Store/replace the provider API key; submit empty input to clear it.
-x / X / Delete: Remove the selected non-built-in provider and its key.
-/: Search model names and IDs; submit empty input to clear the search.
-M / Tab / Shift+Tab / Esc: Return to the previous pane (Esc closes a log first).
-
-TASK PROGRESS DIALOG
-s: Refresh the snapshot. Up/Down: Scroll.
-Esc / Enter: Close the summary. q: Quit CLT.
-
-TASK DETAILS (after v on a task)
-Up/Down: Scroll. PageUp/PageDown: Scroll a page. Home/End: First/last page.
-v / V / Enter / Esc: Close. Reopen to see the latest cached metadata.
-
-TEXT INPUT (tasks, agent messages, models and providers)
-Enter: Submit the task, message, search or current provider/model field.
-Esc: Cancel input. Ctrl+C: Cancel a task or agent-message prompt.
-Left/Right: Move by character. Up/Down: Move between wrapped rows.
-Home / Ctrl+A: Start of input. End / Ctrl+E: End of input.
-Ctrl/Alt+Left/Right or Alt+B/F: Move by word.
-Backspace / Delete: Delete previous/next character.
-Ctrl/Alt+Backspace or Ctrl+W: Delete previous word.
-Ctrl/Alt+Delete: Delete next word.
-Ctrl+U: Clear input. Ctrl+K: Delete to end of input.
-Paste: Insert text; task/message prompts retain multiline pastes.
-
-CONFIRMATION PROMPTS
-y / n: Initialize a task board at startup / continue without one.
-Ctrl+C: Cancel initialization and exit.
-y / n / Esc: Confirm / cancel project removal or Git recovery.
-1-4 / 5: Choose a provider preset / custom endpoint after n in Models.
-Esc: Cancel provider selection.\n";
+#[derive(Default)]
+struct Search {
+    query: Input,
+    scroll: usize,
+}
 
 #[derive(Default)]
 pub(super) struct Help {
-    scroll: u16,
-    page_height: u16,
-    line_count: u16,
+    topic: Topic,
+    topic_scroll: usize,
+    search: Option<Search>,
+    layout: Layout,
+    rows: Vec<Line<'static>>,
 }
 
-fn layout(size: Rect) -> (Rect, String) {
-    let width = size.width.min(100);
-    let text = COMMANDS
-        .lines()
-        .map(|line| wrap_text(line, width.saturating_sub(2).max(1) as usize))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let height = size.height.min(text.lines().count() as u16 + 2);
-    (
-        Rect::new(
-            size.x + size.width.saturating_sub(width) / 2,
-            size.y + size.height.saturating_sub(height) / 2,
+#[derive(Default)]
+struct Layout {
+    area: Rect,
+    bordered: bool,
+    sidebar: Rect,
+    header: Rect,
+    body: Rect,
+}
+
+impl Layout {
+    fn new(size: Rect, searching: bool) -> Self {
+        let width = (size.width - if size.width >= 68 { 4 } else { 0 }).min(104);
+        let height = (size.height - if size.height >= 14 { 2 } else { 0 }).min(28);
+        let area = Rect::new(
+            size.x + (size.width - width) / 2,
+            size.y + (size.height - height) / 2,
             width,
             height,
-        ),
-        text,
-    )
+        );
+        let bordered = width > 2 && height > 2;
+        let inner = if bordered {
+            area.inner(Margin::new(1, 1))
+        } else {
+            area
+        };
+
+        let show_sidebar = !searching
+            && inner.width >= SIDEBAR_WIDTH + TWO_COLUMN_WIDTH + 2
+            && inner.height as usize >= Topic::ALL.len();
+        let sidebar_width = if show_sidebar { SIDEBAR_WIDTH } else { 0 };
+        let sidebar = Rect::new(inner.x, inner.y, sidebar_width, inner.height);
+
+        let mut content = Rect::new(
+            sidebar.right(),
+            inner.y,
+            inner.width - sidebar.width,
+            inner.height,
+        );
+        if content.width >= 24 {
+            content = content.inner(Margin::new(1, 0));
+        }
+        let header_height = u16::from(!show_sidebar && content.height > 1);
+        let header = Rect::new(content.x, content.y, content.width, header_height);
+        let body = Rect::new(
+            content.x,
+            header.bottom(),
+            content.width,
+            content.height - header.height,
+        );
+
+        Self {
+            area,
+            bordered,
+            sidebar,
+            header,
+            body,
+        }
+    }
+}
+
+fn reference_rows(topic: Topic, query: Option<&str>, width: usize) -> Vec<Line<'static>> {
+    let query = query.map(str::to_ascii_lowercase);
+    let mut rows = Vec::new();
+
+    for topic in Topic::ALL
+        .into_iter()
+        .filter(|candidate| query.is_some() || *candidate == topic)
+    {
+        for &(section, commands) in topic.sections() {
+            let mut matches = commands
+                .iter()
+                .filter(|&&(keys, action)| {
+                    query.as_deref().is_none_or(|query| {
+                        query.split_whitespace().all(|term| {
+                            keys.split(", ").any(|key| key.eq_ignore_ascii_case(term))
+                                || (term.len() > 1
+                                    && [keys, action, topic.title(), section]
+                                        .iter()
+                                        .any(|field| field.to_ascii_lowercase().contains(term)))
+                        })
+                    })
+                })
+                .peekable();
+            if matches.peek().is_none() {
+                continue;
+            }
+
+            if !rows.is_empty() {
+                rows.push(Line::default());
+            }
+            let heading = if query.is_some() {
+                format!("{} / {section}", topic.title())
+            } else {
+                section.to_owned()
+            };
+            rows.extend(
+                wrap_text(&heading, width)
+                    .lines()
+                    .map(|line| Line::styled(line.to_owned(), ACCENT)),
+            );
+            for &(keys, action) in matches {
+                append_shortcut(&mut rows, width, keys, action);
+            }
+        }
+    }
+
+    if rows.is_empty() {
+        rows.extend(
+            wrap_text("No matching shortcuts", width)
+                .lines()
+                .map(|line| Line::raw(line.to_owned())),
+        );
+    }
+    rows
+}
+
+fn append_shortcut(rows: &mut Vec<Line<'static>>, width: usize, keys: &'static str, action: &str) {
+    const KEY_COLUMN: usize = 22;
+    let two_columns = width >= TWO_COLUMN_WIDTH as usize;
+    let indent = if two_columns {
+        KEY_COLUMN
+    } else if width >= 16 {
+        2
+    } else {
+        0
+    };
+    let inline = two_columns && keys.len() + 2 <= KEY_COLUMN;
+    if !inline {
+        rows.extend(
+            wrap_text(keys, width)
+                .lines()
+                .map(|line| Line::styled(line.to_owned(), KEY)),
+        );
+    }
+
+    for (index, line) in wrap_text(action, width - indent).lines().enumerate() {
+        let label = if inline && index == 0 { keys } else { "" };
+        rows.push(Line::from(vec![
+            Span::styled(label, KEY),
+            Span::raw(" ".repeat(indent - label.len())),
+            Span::raw(line.to_owned()),
+        ]));
+    }
 }
 
 impl Help {
-    pub(super) fn prepare(&mut self, size: Rect) {
-        let (area, text) = layout(size);
-        self.page_height = area.height.saturating_sub(2).max(1);
-        self.line_count = text.lines().count() as u16;
-        self.scroll = self.scroll.min(self.max_scroll());
-    }
-
-    fn max_scroll(&self) -> u16 {
-        self.line_count.saturating_sub(self.page_height)
-    }
-
-    /// Returns true only for help's dismissal keys; all other input is consumed.
-    pub(super) fn key(&mut self, code: KeyCode) -> bool {
-        match code {
-            KeyCode::Enter | KeyCode::Esc | KeyCode::Char('h' | 'H' | '?') => return true,
-            KeyCode::Up => self.scroll = self.scroll.saturating_sub(1),
-            KeyCode::Down => self.scroll = self.scroll.saturating_add(1),
-            KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(self.page_height),
-            KeyCode::PageDown => self.scroll = self.scroll.saturating_add(self.page_height),
-            KeyCode::Home => self.scroll = 0,
-            KeyCode::End => self.scroll = self.max_scroll(),
-            _ => {}
+    pub(super) fn new(pane: TuiPane, archive: bool) -> Self {
+        let topic = match pane {
+            TuiPane::Tasks if archive => Topic::Archive,
+            TuiPane::Tasks => Topic::Tasks,
+            TuiPane::AgentProjects => Topic::Projects,
+            TuiPane::Models => Topic::Models,
+        };
+        Self {
+            topic,
+            ..Self::default()
         }
-        self.scroll = self.scroll.min(self.max_scroll());
+    }
+
+    pub(super) fn is_searching(&self) -> bool {
+        self.search.is_some()
+    }
+
+    pub(super) fn prepare(&mut self, size: Rect) {
+        self.layout = Layout::new(size, self.is_searching());
+        let query = self.search.as_ref().map(|search| search.query.value());
+        self.rows = reference_rows(self.topic, query, self.layout.body.width.max(1) as usize);
+        let max_scroll = self.max_scroll();
+        let scroll = self.scroll_mut();
+        *scroll = (*scroll).min(max_scroll);
+    }
+
+    fn page_height(&self) -> usize {
+        self.layout.body.height.max(1) as usize
+    }
+
+    fn max_scroll(&self) -> usize {
+        self.rows.len().saturating_sub(self.page_height())
+    }
+
+    fn scroll_mut(&mut self) -> &mut usize {
+        self.search
+            .as_mut()
+            .map_or(&mut self.topic_scroll, |search| &mut search.scroll)
+    }
+
+    fn change_topic(&mut self, delta: isize) {
+        self.topic = self.topic.adjacent(delta);
+        self.topic_scroll = 0;
+        self.search = None;
+    }
+
+    /// Returns true only on dismissal. Search and browsing consume all other keys.
+    pub(super) fn key(&mut self, key: KeyEvent) -> bool {
+        let searching = self.is_searching();
+        if searching && tui_cancels_task_prompt(&key) {
+            self.search = None;
+            return false;
+        }
+        let page = self.page_height() as isize;
+        let max_scroll = self.max_scroll();
+        let delta = match key.code {
+            KeyCode::Enter | KeyCode::Esc | KeyCode::Char('h' | 'H' | '?') if !searching => {
+                return true;
+            }
+            KeyCode::Char('/') if !searching => {
+                self.search = Some(Search::default());
+                return false;
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                self.change_topic(
+                    if key.code == KeyCode::BackTab || key.modifiers.contains(KeyModifiers::SHIFT) {
+                        -1
+                    } else {
+                        1
+                    },
+                );
+                return false;
+            }
+            KeyCode::Left if !searching => {
+                self.change_topic(-1);
+                return false;
+            }
+            KeyCode::Right if !searching => {
+                self.change_topic(1);
+                return false;
+            }
+            KeyCode::Up => -1,
+            KeyCode::Down => 1,
+            KeyCode::PageUp => -page,
+            KeyCode::PageDown => page,
+            KeyCode::Home if !searching => {
+                self.topic_scroll = 0;
+                return false;
+            }
+            KeyCode::End if !searching => {
+                self.topic_scroll = max_scroll;
+                return false;
+            }
+            _ => {
+                if let Some(search) = &mut self.search {
+                    let before = search.query.value().to_owned();
+                    handle_input_key(&mut search.query, key, "", 1);
+                    if search.query.value() != before {
+                        search.scroll = 0;
+                    }
+                }
+                return false;
+            }
+        };
+        let scroll = self.scroll_mut();
+        *scroll = scroll.saturating_add_signed(delta).min(max_scroll);
         false
     }
 
+    pub(super) fn paste(&mut self, content: &str) {
+        if let Some(search) = &mut self.search {
+            let text: String = content
+                .chars()
+                .filter_map(|ch| {
+                    if ch.is_whitespace() {
+                        Some(' ')
+                    } else if !ch.is_control() {
+                        Some(ch)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let mut query = search.query.value().to_owned();
+            let cursor = search.query.cursor();
+            query.insert_str(byte_index_at_char(&query, cursor), &text);
+            search.query = Input::new(query).with_cursor(cursor + text.chars().count());
+            search.scroll = 0;
+        }
+    }
+
     pub(super) fn render(&self, frame: &mut Frame<'_>) {
-        let (area, text) = layout(frame.area());
-        let lines = text.lines().count() as u16;
-        let height = area.height.saturating_sub(2);
-        let scroll = self.scroll.min(lines.saturating_sub(height));
-        let title = format!(" Help {}/{} ", scroll.saturating_add(1), lines);
-        let footer = if area.width >= 68 {
-            " Up/Down scroll | PgUp/PgDn | Home/End | h/?/Enter/Esc close "
-        } else {
-            " Up/Down scroll | Esc close "
-        };
-        frame.render_widget(Clear, area);
-        frame.render_widget(
-            Paragraph::new(text)
-                .scroll((scroll, 0))
-                .style(Style::default().fg(Color::White))
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Yellow))
-                        .title(title)
-                        .title_bottom(footer),
-                ),
+        let Layout {
             area,
+            bordered,
+            sidebar,
+            header,
+            body,
+        } = self.layout;
+        if area.is_empty() {
+            return;
+        }
+        frame.render_widget(Clear, area);
+        if bordered {
+            let title = if sidebar.is_empty() && header.is_empty() && !self.is_searching() {
+                format!(" {} ", self.topic.title())
+            } else {
+                " Keyboard shortcuts ".to_owned()
+            };
+            frame.render_widget(
+                Block::bordered()
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::new().fg(Color::Cyan))
+                    .title(Line::styled(title, ACCENT))
+                    .title_bottom(footer(self.is_searching(), area.width.saturating_sub(2))),
+                area,
+            );
+        }
+
+        if !sidebar.is_empty() {
+            self.render_topics(frame, sidebar);
+        } else if !header.is_empty() {
+            if let Some(search) = &self.search {
+                render_search(frame, header, &search.query);
+            } else {
+                frame.render_widget(
+                    Line::styled(format!("‹  {}  ›", self.topic.title()), ACCENT).centered(),
+                    header,
+                );
+            }
+        }
+
+        let scroll = self
+            .search
+            .as_ref()
+            .map_or(self.topic_scroll, |search| search.scroll);
+        for (row, line) in body.rows().zip(self.rows.iter().skip(scroll)) {
+            frame.render_widget(line, row);
+        }
+
+        if bordered && !body.is_empty() && self.max_scroll() > 0 {
+            let mut state = ScrollbarState::new(self.max_scroll() + 1)
+                .position(scroll)
+                .viewport_content_length(self.page_height());
+            frame.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(None)
+                    .end_symbol(None)
+                    .track_symbol(Some("│"))
+                    .thumb_symbol("┃")
+                    .track_style(Style::new().fg(Color::Cyan))
+                    .thumb_style(Style::new().fg(Color::LightCyan)),
+                Rect::new(area.right() - 1, body.y, 1, body.height),
+                &mut state,
+            );
+        }
+    }
+
+    fn render_topics(&self, frame: &mut Frame<'_>, area: Rect) {
+        let divider = Block::new()
+            .borders(Borders::RIGHT)
+            .border_style(Style::new().fg(Color::DarkGray));
+        let inner = divider.inner(area);
+        frame.render_widget(divider, area);
+        for (row, topic) in inner.rows().zip(Topic::ALL) {
+            let active = topic == self.topic;
+            let marker = if active { "› " } else { "  " };
+            let style = if active {
+                ACCENT.add_modifier(Modifier::REVERSED)
+            } else {
+                Style::new()
+            };
+            frame.render_widget(
+                Line::styled(
+                    format!(
+                        "{marker}{:<width$}",
+                        topic.title(),
+                        width = inner.width as usize - 2
+                    ),
+                    style,
+                ),
+                row,
+            );
+        }
+    }
+}
+
+fn render_search(frame: &mut Frame<'_>, area: Rect, query: &Input) {
+    let mut field = area;
+    if area.width >= 4 {
+        frame.render_widget(Line::styled("/ ", ACCENT), Rect::new(area.x, area.y, 2, 1));
+        field.x += 2;
+        field.width -= 2;
+    }
+    let scroll = query.visual_scroll(field.width.saturating_sub(1) as usize);
+    if query.value().is_empty() {
+        frame.render_widget(
+            Line::raw("Search by shortcut or action")
+                .style(Style::new().add_modifier(Modifier::DIM)),
+            field,
+        );
+    } else {
+        frame.render_widget(
+            Paragraph::new(query.value()).scroll((0, scroll.min(u16::MAX as usize) as u16)),
+            field,
         );
     }
+    let cursor = query
+        .visual_cursor()
+        .saturating_sub(scroll)
+        .min(field.width.saturating_sub(1) as usize);
+    frame.set_cursor_position(Position::new(field.x + cursor as u16, field.y));
+}
+
+fn footer(searching: bool, width: u16) -> Line<'static> {
+    let options = if searching {
+        [
+            " ↑/↓ Results  PgUp/PgDn Page  Esc Back ",
+            " ↑/↓ Results  Esc Back ",
+            " Esc Back ",
+            " Esc ",
+        ]
+    } else {
+        [
+            " ←/→ Topics  ↑/↓ Scroll  PgUp/PgDn Page  / Search  Esc Close ",
+            " ←/→ Topics  ↑/↓ Scroll  / Search  Esc ",
+            " ←/→ Topics  ↑/↓  / Search  Esc ",
+            " ←/→  / Search  Esc ",
+        ]
+    };
+    options
+        .into_iter()
+        .map(Line::raw)
+        .find(|line| line.width() <= width as usize)
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

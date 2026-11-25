@@ -148,17 +148,17 @@ When the current project is registered, the Kanban console title appends its age
 ### Keyboard help
 
 Press `h`, `H`, or `?` from the task board, archive, Agent Projects, or Models
-to open the complete keyboard reference. Commands are grouped by screen,
-including Reorganize mode, supervisor settings, task progress, text input and
-confirmation prompts. The reference includes project Fast/Thinking/retry keys,
-model enable/favorite/API-key controls, and the task board's `4`–`9` position
-shortcuts.
+to see the shortcuts for that screen. Use Left/Right or Tab/Shift+Tab to browse
+topics. Sections group related actions, and shortcuts appear beside their
+descriptions or above them on narrow terminals.
 
-Help wraps to the terminal width. Use Up/Down to scroll a line, PageUp/PageDown
-to scroll a page, and Home/End to reach the beginning or end. The border shows
-the current line and navigation hints. Press `h`, `H`, `?`, `Enter`, or `Esc` to
-close help and return to the same screen; other commands are inactive while it
-is open. Reopening help starts at the top.
+Press `/` and type a key or action, such as `Ctrl+N` or `API key`. Results update
+as you type and show which screen each shortcut belongs to. Press `Esc` to
+return to the topic and scroll position you were browsing.
+
+Use Up/Down to scroll a line and PageUp/PageDown to scroll a page. While
+browsing, Home/End jump to the start or end of the topic. Press `h`, `H`, `?`,
+`Enter`, or `Esc` from a topic to close help and return to the same selection.
 
 ### Task details and metadata
 
