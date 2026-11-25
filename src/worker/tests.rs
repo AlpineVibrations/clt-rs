@@ -2617,7 +2617,7 @@ fn successful_worker_reservation_atomically_supersedes_old_abandonment() {
 
 #[test]
 fn incompatible_schema_migration_is_deferred_for_pinned_workers() {
-    let future_migration_version = 21;
+    let future_migration_version = 22;
     let root = temp_root("agent-worker-migration-barrier");
     let state_dir = root.join("state/clt");
     let project_root = root.join("project");

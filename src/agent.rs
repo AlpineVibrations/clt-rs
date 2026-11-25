@@ -1175,6 +1175,12 @@ const AGENT_MIGRATIONS: &[AgentMigration<'static>] = &[
             )",
         ],
     },
+    AgentMigration {
+        version: 21,
+        statements: &["INSERT OR IGNORE INTO model_targets (
+                provider_id, model_id, label, enabled, favorite, created_at, updated_at
+             ) VALUES ('openai', 'gpt-6.2-astra', 'GPT-6.2 Astra', 1, 0, datetime('now'), datetime('now'))"],
+    },
 ];
 
 pub(super) struct TursoAgentStore {

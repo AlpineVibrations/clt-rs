@@ -6,6 +6,10 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ## [Unreleased]
 
+### Added
+
+- Add GPT-6.2 Astra to the built-in OpenAI model catalog.
+
 ### Changed
 
 - Open keyboard help to the current screen, with browsable topics, aligned

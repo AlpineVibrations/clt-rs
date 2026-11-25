@@ -1522,6 +1522,14 @@ fn agent_store_persists_provider_catalog_favorites_and_clt_default() {
         gpt_5_6_models,
         std::collections::BTreeSet::from(["gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"])
     );
+    assert!(openai_models.contains(&agent::AgentModelTarget {
+        provider_id: "openai".to_string(),
+        model_id: "gpt-6.2-astra".to_string(),
+        label: "GPT-6.2 Astra".to_string(),
+        enabled: true,
+        favorite: false,
+        reasoning_effort: None,
+    }));
     assert_eq!(
         store.model_defaults_blocking().unwrap(),
         agent::AgentModelDefaults::default()
@@ -1570,6 +1578,42 @@ fn agent_store_persists_provider_catalog_favorites_and_clt_default() {
             .unwrap()
             .contains(&target)
     );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn agent_store_upgrade_preserves_an_existing_gpt_6_2_astra_target() {
+    let root = temp_root("agent-model-astra-upgrade");
+    let state_dir = root.join("state/clt");
+    let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
+    let target = agent::AgentModelTarget {
+        provider_id: "openai".to_string(),
+        model_id: "gpt-6.2-astra".to_string(),
+        label: "My Astra".to_string(),
+        enabled: false,
+        favorite: true,
+        reasoning_effort: Some("high".to_string()),
+    };
+    store.upsert_model_target_blocking(&target).unwrap();
+    drop(store);
+
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let db =
+            turso::Builder::new_local(state_dir.join(AGENT_DB_FILE).to_string_lossy().as_ref())
+                .build()
+                .await
+                .unwrap();
+        db.connect()
+            .unwrap()
+            .execute("DELETE FROM schema_migrations WHERE version = 21", ())
+            .await
+            .unwrap();
+    });
+
+    let store = agent::TursoAgentStore::open_blocking(&state_dir).unwrap();
+    let models = store.list_model_targets_blocking(Some("openai")).unwrap();
+    assert!(models.contains(&target));
 
     fs::remove_dir_all(root).unwrap();
 }
